@@ -3,9 +3,12 @@ const linux = std.os.linux;
 const client = @import("../wayland/client.zig");
 const protocol = @import("../wayland/protocol.zig");
 const UsbHidComposite = @import("../usb/hid.zig").UsbHidComposite;
+const Gpio = @import("../soc/gpio.zig").Gpio;
+const board_sheet = @import("../ui/board_sheet.zig");
 
-/// Wayland XDG-Shell desktop window presenting the simulated HDMI output
-/// and forwarding keyboard & mouse events to the virtual USB HID composite device.
+/// Wayland XDG-Shell desktop window with client-side TitleBar (`44px`),
+/// drop-down Board & GPIO Status Sheet, HDMI display output, and USB HID
+/// keyboard & mouse forwarding.
 pub const WaylandWindow = struct {
     gpa: std.mem.Allocator,
     display: *client.Display,
@@ -21,6 +24,8 @@ pub const WaylandWindow = struct {
     xdg_surface: client.Proxy,
     toplevel: client.Proxy,
 
+    display_width: u32,
+    display_height: u32,
     width: u32,
     height: u32,
 
@@ -34,15 +39,24 @@ pub const WaylandWindow = struct {
 
     last_mouse_x: ?f64 = null,
     last_mouse_y: ?f64 = null,
+    last_button_serial: u32 = 0,
+
     hid: ?*UsbHidComposite = null,
+    gpio: *Gpio,
+    ui: board_sheet.BoardUi,
+    status: board_sheet.SystemStatus = .{},
 
     pub fn create(
         gpa: std.mem.Allocator,
         environ: std.process.Environ,
-        width: u32,
-        height: u32,
+        display_width: u32,
+        display_height: u32,
         hid: *UsbHidComposite,
+        gpio: *Gpio,
     ) !*WaylandWindow {
+        var ui = try board_sheet.BoardUi.init(gpa);
+        errdefer ui.deinit();
+
         const display = try client.Display.connectEnviron(gpa, environ);
         errdefer display.disconnect();
 
@@ -56,6 +70,9 @@ pub const WaylandWindow = struct {
         const shm = (try globals.bind(registry, protocol.wl_shm.name, protocol.wl_shm.version, null)) orelse return error.MissingShm;
         const wm_base = (try globals.bind(registry, protocol.xdg_wm_base.name, protocol.xdg_wm_base.version, .{ .ptr = win, .handler = wmBaseEvent })) orelse return error.MissingXdgWmBase;
 
+        const total_width = display_width;
+        const total_height = display_height + board_sheet.BoardUi.title_bar_height;
+
         win.* = .{
             .gpa = gpa,
             .display = display,
@@ -66,9 +83,17 @@ pub const WaylandWindow = struct {
             .surface = undefined,
             .xdg_surface = undefined,
             .toplevel = undefined,
-            .width = width,
-            .height = height,
+            .display_width = display_width,
+            .display_height = display_height,
+            .width = total_width,
+            .height = total_height,
             .hid = hid,
+            .gpio = gpio,
+            .ui = ui,
+            .status = .{
+                .hdmi_width = @intCast(display_width),
+                .hdmi_height = @intCast(display_height),
+            },
         };
 
         win.seat = try globals.bind(registry, protocol.wl_seat.name, protocol.wl_seat.version, .{ .ptr = win, .handler = seatEvent });
@@ -92,7 +117,7 @@ pub const WaylandWindow = struct {
         }
         {
             var m = try win.toplevel.request(protocol.xdg_toplevel.request.set_title);
-            m.string("FauxPi — Raspberry Pi Zero (HDMI)").end();
+            m.string("Raspberry Pi Zero").end();
         }
         {
             var m = try win.toplevel.request(protocol.xdg_toplevel.request.set_app_id);
@@ -115,6 +140,7 @@ pub const WaylandWindow = struct {
     }
 
     pub fn destroy(self: *WaylandWindow) void {
+        self.ui.deinit();
         if (self.shm_map.len > 0) {
             _ = linux.munmap(self.shm_map.ptr, self.shm_map.len);
         }
@@ -140,7 +166,6 @@ pub const WaylandWindow = struct {
         if (linux.errno(map_rc) != .SUCCESS) return error.SystemError;
         self.shm_map = @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(map_rc))[0..pool_size];
 
-        // Dup fd for sending over Wayland socket (Builder.fd closes the sent fd)
         const dup_rc = linux.dup(self.shm_fd);
         if (linux.errno(dup_rc) != .SUCCESS) return error.SystemError;
         const send_fd: linux.fd_t = @intCast(dup_rc);
@@ -169,10 +194,26 @@ pub const WaylandWindow = struct {
         }
     }
 
+    /// Returns the full window backbuffer (`width * height`).
     pub fn backbufferPixels(self: *WaylandWindow) []u32 {
         const count = self.width * self.height;
         const byte_off = @as(usize, self.cur_buf) * count * 4;
         return @alignCast(std.mem.bytesAsSlice(u32, self.shm_map[byte_off .. byte_off + count * 4]));
+    }
+
+    /// Returns the HDMI display slice of the current backbuffer (`display_width * display_height`,
+    /// starting below the `44px` TitleBar).
+    pub fn displayPixels(self: *WaylandWindow) []u32 {
+        const full = self.backbufferPixels();
+        const top_offset = @as(usize, board_sheet.BoardUi.title_bar_height) * @as(usize, self.width);
+        const disp_count = @as(usize, self.display_width) * @as(usize, self.display_height);
+        return full[top_offset .. top_offset + disp_count];
+    }
+
+    /// Renders the client-side TitleBar (`y = 0..44`) and, when open, the drop-down
+    /// Board & GPIO Status Sheet over the current backbuffer.
+    pub fn compositeUi(self: *WaylandWindow) void {
+        self.ui.paint(self.backbufferPixels(), self.width, self.height, self.status, self.gpio);
     }
 
     pub fn present(self: *WaylandWindow) !void {
@@ -196,6 +237,22 @@ pub const WaylandWindow = struct {
 
     pub fn pollEvents(self: *WaylandWindow) !void {
         try self.display.pollAndDispatch();
+    }
+
+    fn startMove(self: *WaylandWindow) void {
+        const seat = self.seat orelse return;
+        var m = self.toplevel.request(protocol.xdg_toplevel.request.move) catch return;
+        m.uint(seat.id).uint(self.last_button_serial).end();
+    }
+
+    fn toggleMaximized(self: *WaylandWindow) void {
+        self.ui.maximized = !self.ui.maximized;
+        const op: u16 = if (self.ui.maximized)
+            protocol.xdg_toplevel.request.set_maximized
+        else
+            protocol.xdg_toplevel.request.unset_maximized;
+        var m = self.toplevel.request(op) catch return;
+        m.end();
     }
 
     fn wmBaseEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
@@ -262,16 +319,19 @@ pub const WaylandWindow = struct {
                 const sy = r.fixed() catch return;
                 self.last_mouse_x = sx;
                 self.last_mouse_y = sy;
+                _ = self.ui.pointerMotion(@floatCast(sx), @floatCast(sy), self.status, self.gpio);
             },
             protocol.wl_pointer.event.leave => {
                 self.last_mouse_x = null;
                 self.last_mouse_y = null;
+                self.ui.pointerLeave();
             },
             protocol.wl_pointer.event.motion => {
                 _ = r.uint() catch return; // time
                 const sx = r.fixed() catch return;
                 const sy = r.fixed() catch return;
-                if (self.last_mouse_x != null and self.last_mouse_y != null) {
+                const in_ui = self.ui.pointerMotion(@floatCast(sx), @floatCast(sy), self.status, self.gpio);
+                if (!in_ui and self.last_mouse_x != null and self.last_mouse_y != null) {
                     const dx_f = std.math.clamp(@round(sx - self.last_mouse_x.?), -127.0, 127.0);
                     const dy_f = std.math.clamp(@round(sy - self.last_mouse_y.?), -127.0, 127.0);
                     const dx: i8 = @intFromFloat(dx_f);
@@ -282,10 +342,38 @@ pub const WaylandWindow = struct {
                 self.last_mouse_y = sy;
             },
             protocol.wl_pointer.event.button => {
-                _ = r.uint() catch return; // serial
+                const serial = r.uint() catch return;
                 _ = r.uint() catch return; // time
                 const button = r.uint() catch return;
                 const state = r.uint() catch return;
+                const pressed = (state == protocol.wl_pointer.button_state.pressed);
+                self.last_button_serial = serial;
+
+                const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
+                const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
+
+                if (button == protocol.input.btn_left) {
+                    const action = self.ui.pointerButton(sx, sy, pressed, self.status, self.gpio);
+                    switch (action) {
+                        .start_drag => {
+                            self.startMove();
+                            return;
+                        },
+                        .toggle_maximize => {
+                            self.toggleMaximized();
+                            return;
+                        },
+                        .close => {
+                            self.closed = true;
+                            return;
+                        },
+                        .consumed => return,
+                        .none => {},
+                    }
+                } else if (self.ui.sheet_open or sy < @as(f32, @floatFromInt(board_sheet.BoardUi.title_bar_height))) {
+                    return;
+                }
+
                 const bit: u8 = switch (button) {
                     protocol.input.btn_left => 1 << 0,
                     protocol.input.btn_right => 1 << 1,
@@ -293,13 +381,17 @@ pub const WaylandWindow = struct {
                     else => 0,
                 };
                 if (bit != 0) {
-                    hid.handleMouseButton(bit, state == protocol.wl_pointer.button_state.pressed);
+                    hid.handleMouseButton(bit, pressed);
                 }
             },
             protocol.wl_pointer.event.axis => {
                 _ = r.uint() catch return; // time
                 const axis = r.uint() catch return;
                 const value = r.fixed() catch return;
+                const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
+                if (self.ui.sheet_open or sy < @as(f32, @floatFromInt(board_sheet.BoardUi.title_bar_height))) {
+                    return;
+                }
                 if (axis == protocol.wl_pointer.axis.vertical_scroll and value != 0) {
                     const wheel: i8 = if (value < 0) 1 else -1;
                     hid.handleMouseMotion(0, 0, wheel);
@@ -324,7 +416,19 @@ pub const WaylandWindow = struct {
                 _ = r.uint() catch return; // time
                 const key = r.uint() catch return;
                 const state = r.uint() catch return;
-                hid.handleEvdevKey(key, state == protocol.wl_keyboard.key_state.pressed);
+                const pressed = (state == protocol.wl_keyboard.key_state.pressed);
+                if (self.ui.sheet_open) {
+                    // Escape (evdev key 1) closes the mode menu or the board sheet
+                    if (key == 1 and pressed) {
+                        if (self.ui.mode_menu_open) {
+                            self.ui.mode_menu_open = false;
+                        } else {
+                            self.ui.sheet_open = false;
+                        }
+                    }
+                    return;
+                }
+                hid.handleEvdevKey(key, pressed);
             },
             else => {},
         }

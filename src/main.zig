@@ -38,6 +38,11 @@ pub const vc4_hdmi = @import("vc4/hdmi.zig");
 
 pub const wl_protocol = @import("wayland/protocol.zig");
 pub const wl_client = @import("wayland/client.zig");
+pub const font = @import("font/font.zig");
+pub const ui_board = @import("ui/board.zig");
+pub const ui_gpio_model = @import("ui/gpio_model.zig");
+pub const ui_canvas = @import("ui/canvas.zig");
+pub const ui_board_sheet = @import("ui/board_sheet.zig");
 pub const window = @import("app/window.zig");
 
 const Bcm2835 = bcm2835.Bcm2835;
@@ -216,16 +221,18 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     defer if (wl_win) |w| w.destroy();
 
     if (!opts.headless) {
-        wl_win = try window.WaylandWindow.create(gpa, environ, opts.width, opts.height, &soc.usb.hid);
-        // Clear initial window to dark slate
-        const pixels = wl_win.?.backbufferPixels();
-        @memset(pixels, 0xFF101418);
+        wl_win = try window.WaylandWindow.create(gpa, environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
+        const disp_pixels = wl_win.?.displayPixels();
+        @memset(disp_pixels, 0xFF101418);
+        wl_win.?.compositeUi();
         try wl_win.?.present();
     }
 
     const vblank_interval_ns: u64 = 16_666_667; // 60 Hz
     var last_vblank_ns: u64 = monotonicNs();
     var last_guest_vblank_us: u64 = 0;
+    var active_us_accum: u64 = 0;
+    var idle_us_accum: u64 = 0;
 
     while (true) {
         if (wl_win) |w| {
@@ -243,13 +250,15 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
         // Advance 1 MHz system timer proportionally to instructions executed (~4 instructions per us at 1 GHz -> min 1 us)
         const timer_ticks: u64 = if (ran > 0) @max(ran / 16, 1) else 1;
+        active_us_accum += timer_ticks;
         soc.timer.advance(timer_ticks, &soc.intc);
         soc.updateIrqs();
 
         if (cpu.mmu.halted_wfi and !soc.hasPendingIrq() and !soc.hasPendingFiq()) {
             // Fast-forward timer to next compare match (capped at 2000 us so vblank/UI stays responsive)
-            const jump = soc.timer.usUntilNextMatch(2000);
-            soc.timer.advance(@max(jump, 1), &soc.intc);
+            const jump = @max(soc.timer.usUntilNextMatch(2000), 1);
+            idle_us_accum += jump;
+            soc.timer.advance(jump, &soc.intc);
             soc.updateIrqs();
             cpu.mmu.halted_wfi = false;
         }
@@ -265,8 +274,18 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             soc.triggerVblank();
 
             if (wl_win) |w| {
-                const pixels = w.backbufferPixels();
-                _ = soc.renderDisplayFrame(pixels, opts.width, opts.height);
+                const total_us = active_us_accum + idle_us_accum;
+                if (total_us > 0) {
+                    const busy = (@as(f32, @floatFromInt(active_us_accum)) * 100.0) / @as(f32, @floatFromInt(total_us));
+                    w.status.cpu_busy_percent = w.status.cpu_busy_percent * 0.7 + busy * 0.3;
+                    w.status.temperature_c = 38.0 + (w.status.cpu_busy_percent * 0.14);
+                }
+                active_us_accum = 0;
+                idle_us_accum = 0;
+
+                const disp_pixels = w.displayPixels();
+                w.status.hdmi_active = soc.renderDisplayFrame(disp_pixels, opts.width, opts.height);
+                w.compositeUi();
                 try w.present();
             }
         }

@@ -129,6 +129,16 @@ pub const xdg_toplevel = struct {
         pub const set_parent = 1;
         pub const set_title = 2;
         pub const set_app_id = 3;
+        pub const show_window_menu = 4;
+        pub const move = 5;
+        pub const resize = 6;
+        pub const set_max_size = 7;
+        pub const set_min_size = 8;
+        pub const set_maximized = 9;
+        pub const unset_maximized = 10;
+        pub const set_fullscreen = 11;
+        pub const unset_fullscreen = 12;
+        pub const set_minimized = 13;
     };
     pub const event = struct {
         pub const configure = 0;

@@ -14,15 +14,55 @@ pub const Gpio = struct {
         alt1 = 0b101,
         alt2 = 0b110,
         alt3 = 0b111,
+
+        pub fn alt(f: Function) ?u4 {
+            return switch (f) {
+                .input, .output => null,
+                .alt0 => 0,
+                .alt1 => 1,
+                .alt2 => 2,
+                .alt3 => 3,
+                .alt4 => 4,
+                .alt5 => 5,
+            };
+        }
     };
+
+    pub const Mode = enum {
+        input,
+        input_pull_up,
+        input_pull_down,
+        output_low,
+        output_high,
+
+        pub fn label(m: Mode) []const u8 {
+            return switch (m) {
+                .input => "Input",
+                .input_pull_up => "Input, pulled up",
+                .input_pull_down => "Input, pulled down",
+                .output_low => "Output, low",
+                .output_high => "Output, high",
+            };
+        }
+    };
+
+    /// Default pull-ups at reset: pins 0..8, 34..36, 46..53
+    pub const DEFAULT_PULL_UP_MASK: u64 = 0x1ff | (0x7 << 34) | (0xff << 46);
+    /// Default no-pull pins at reset: 28..29, 44..45
+    pub const DEFAULT_NO_PULL_MASK: u64 = (0x3 << 28) | (0x3 << 44);
+    /// Default pull-down pins at reset: all remaining pins 0..53
+    pub const DEFAULT_PULL_DOWN_MASK: u64 = ((@as(u64, 1) << 54) - 1) & ~(DEFAULT_PULL_UP_MASK | DEFAULT_NO_PULL_MASK);
 
     /// Function select registers GPFSEL0..5
     gpfsel: [6]u32 = [_]u32{0} ** 6,
     /// Output levels driven by GPSET / GPCLR
     out_level: u64 = 0,
-    /// External input pin levels (default: pull-ups on I2C pins 2,3; GPIO 46 = HDMI_HPD_N = 0 = active/connected)
+    /// Pull-up and pull-down masks (initialized to BCM2835 power-on defaults)
+    pull_up_mask: u64 = DEFAULT_PULL_UP_MASK,
+    pull_down_mask: u64 = DEFAULT_PULL_DOWN_MASK,
+    /// External hardware pin levels (GPIO 46 = HDMI_HPD_N = 0 = active/connected)
     ext_level: u64 = (1 << 2) | (1 << 3),
-    /// Mask of pins driven externally (vs driven by output register)
+    /// Mask of pins driven by external hardware (e.g., GPIO 46 HDMI HPD)
     ext_mask: u64 = (1 << 46),
 
     /// Event detect status and edge/level enables
@@ -37,7 +77,14 @@ pub const Gpio = struct {
     gppudclk: [2]u32 = [_]u32{ 0, 0 },
 
     pub fn effectiveLevels(self: *const Gpio) u64 {
-        return (self.out_level & ~self.ext_mask) | (self.ext_level & self.ext_mask);
+        var out_mask: u64 = 0;
+        for (0..54) |p| {
+            if (self.getPinFunction(@intCast(p)) == .output) {
+                out_mask |= (@as(u64, 1) << @intCast(p));
+            }
+        }
+        const input_levels = (self.pull_up_mask & ~self.ext_mask) | (self.ext_level & self.ext_mask);
+        return (self.out_level & out_mask) | (input_levels & ~out_mask);
     }
 
     pub fn getPinFunction(self: *const Gpio, pin: u6) Function {
@@ -47,9 +94,65 @@ pub const Gpio = struct {
         return @enumFromInt(@as(u3, @truncate(self.gpfsel[reg_idx] >> shift)));
     }
 
+    pub fn setPinFunction(self: *Gpio, pin: u6, func: Function) void {
+        if (pin >= 54) return;
+        const reg_idx = pin / 10;
+        const shift: u5 = @intCast((pin % 10) * 3);
+        self.gpfsel[reg_idx] = (self.gpfsel[reg_idx] & ~(@as(u32, 7) << shift)) | (@as(u32, @intFromEnum(func)) << shift);
+    }
+
     pub fn getPinLevel(self: *const Gpio, pin: u6) bool {
         if (pin >= 54) return false;
         return ((self.effectiveLevels() >> pin) & 1) != 0;
+    }
+
+    pub fn getPinMode(self: *const Gpio, pin: u6) ?Mode {
+        if (pin >= 54) return null;
+        return switch (self.getPinFunction(pin)) {
+            .output => if (self.getPinLevel(pin)) .output_high else .output_low,
+            .input => blk: {
+                const bit = @as(u64, 1) << pin;
+                if ((self.pull_up_mask & bit) != 0) break :blk .input_pull_up;
+                if ((self.pull_down_mask & bit) != 0) break :blk .input_pull_down;
+                break :blk .input;
+            },
+            else => null,
+        };
+    }
+
+    pub fn setPinMode(self: *Gpio, pin: u6, mode: Mode) void {
+        if (pin >= 54) return;
+        const prev = self.effectiveLevels();
+        const bit = @as(u64, 1) << pin;
+        switch (mode) {
+            .input => {
+                self.setPinFunction(pin, .input);
+                self.pull_up_mask &= ~bit;
+                self.pull_down_mask &= ~bit;
+                self.ext_mask &= ~bit;
+            },
+            .input_pull_up => {
+                self.setPinFunction(pin, .input);
+                self.pull_up_mask |= bit;
+                self.pull_down_mask &= ~bit;
+                self.ext_mask &= ~bit;
+            },
+            .input_pull_down => {
+                self.setPinFunction(pin, .input);
+                self.pull_up_mask &= ~bit;
+                self.pull_down_mask |= bit;
+                self.ext_mask &= ~bit;
+            },
+            .output_low => {
+                self.setPinFunction(pin, .output);
+                self.out_level &= ~bit;
+            },
+            .output_high => {
+                self.setPinFunction(pin, .output);
+                self.out_level |= bit;
+            },
+        }
+        self.updateEdgeEvents(prev, self.effectiveLevels());
     }
 
     pub fn setExternalPin(self: *Gpio, pin: u6, high: bool) void {
@@ -63,6 +166,25 @@ pub const Gpio = struct {
             self.ext_level &= ~bit;
         }
         self.updateEdgeEvents(prev, self.effectiveLevels());
+    }
+
+    fn applyPullClock(self: *Gpio, clk_mask: u64) void {
+        if (clk_mask == 0) return;
+        switch (self.gppud & 3) {
+            0 => { // Off
+                self.pull_up_mask &= ~clk_mask;
+                self.pull_down_mask &= ~clk_mask;
+            },
+            1 => { // Pull-down
+                self.pull_down_mask |= clk_mask;
+                self.pull_up_mask &= ~clk_mask;
+            },
+            2 => { // Pull-up
+                self.pull_up_mask |= clk_mask;
+                self.pull_down_mask &= ~clk_mask;
+            },
+            else => {},
+        }
     }
 
     fn updateEdgeEvents(self: *Gpio, prev: u64, curr: u64) void {
@@ -108,7 +230,10 @@ pub const Gpio = struct {
     pub fn write32(self: *Gpio, offset: u32, val: u32) void {
         const prev = self.effectiveLevels();
         switch (offset) {
-            0x00, 0x04, 0x08, 0x0c, 0x10, 0x14 => self.gpfsel[offset / 4] = val,
+            0x00, 0x04, 0x08, 0x0c, 0x10, 0x14 => {
+                self.gpfsel[offset / 4] = val;
+                self.updateEdgeEvents(prev, self.effectiveLevels());
+            },
             0x1c => { // GPSET0
                 self.out_level |= @as(u64, val);
                 self.updateEdgeEvents(prev, self.effectiveLevels());
@@ -140,8 +265,16 @@ pub const Gpio = struct {
             0x88 => self.gpafen = (self.gpafen & 0xFFFFFFFF00000000) | val,
             0x8c => self.gpafen = (self.gpafen & 0x00000000FFFFFFFF) | (@as(u64, val) << 32),
             0x94 => self.gppud = val,
-            0x98 => self.gppudclk[0] = val,
-            0x9c => self.gppudclk[1] = val,
+            0x98 => {
+                self.gppudclk[0] = val;
+                self.applyPullClock(@as(u64, val));
+                self.updateEdgeEvents(prev, self.effectiveLevels());
+            },
+            0x9c => {
+                self.gppudclk[1] = val;
+                self.applyPullClock(@as(u64, val & 0x3fffff) << 32);
+                self.updateEdgeEvents(prev, self.effectiveLevels());
+            },
             else => {},
         }
     }
