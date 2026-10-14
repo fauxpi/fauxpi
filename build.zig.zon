@@ -1,0 +1,11 @@
+.{
+    .name = .fauxpi,
+    .version = "0.1.0",
+    .fingerprint = 0xd66fda550e7c5466,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

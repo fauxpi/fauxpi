@@ -1,0 +1,88 @@
+#!/bin/sh
+# Run the Zig version this project is pinned to, downloading it on first use.
+#
+# Usage: scripts/zig <zig arguments>    e.g. scripts/zig build test
+#
+# Zig is fetched from ziglang.org into build/zig/, checked against the SHA-256
+# published in ziglang.org's release index, and reused afterwards. A `zig` on
+# PATH is used instead if it is already the pinned version.
+#
+# Environment:
+#   ZIG_MIRROR  Base URL to download from instead of https://ziglang.org
+#               (must serve download/index.json and the release tarballs)
+set -eu
+
+ZIG_VERSION=0.16.0
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+MIRROR=${ZIG_MIRROR:-https://ziglang.org}
+
+if command -v zig >/dev/null 2>&1 && [ "$(zig version 2>/dev/null)" = "$ZIG_VERSION" ]; then
+	exec zig "$@"
+fi
+
+case $(uname -m) in
+x86_64 | amd64) arch=x86_64 ;;
+aarch64 | arm64) arch=aarch64 ;;
+armv7l | armv6l) arch=arm ;;
+riscv64) arch=riscv64 ;;
+*) echo "error: no Zig download known for CPU $(uname -m)" >&2; exit 1 ;;
+esac
+case $(uname -s) in
+Linux) os=linux ;;
+Darwin) os=macos ;;
+*) echo "error: no Zig download known for $(uname -s)" >&2; exit 1 ;;
+esac
+
+ZIG_DIR=$ROOT/build/zig/zig-$arch-$os-$ZIG_VERSION
+DAZZLE_ZIG_DIR=$ROOT/../dazzle/build/zig/zig-$arch-$os-$ZIG_VERSION
+if [ ! -x "$ZIG_DIR/zig" ] && [ -x "$DAZZLE_ZIG_DIR/zig" ]; then
+	mkdir -p "$ROOT/build/zig"
+	ln -s "$DAZZLE_ZIG_DIR" "$ZIG_DIR"
+fi
+
+if [ ! -x "$ZIG_DIR/zig" ]; then
+	for tool in curl tar xz python3; do
+		command -v "$tool" >/dev/null 2>&1 || {
+			echo "error: downloading Zig needs $tool (or install Zig $ZIG_VERSION yourself)" >&2
+			exit 1
+		}
+	done
+	tmp=$(mktemp -d)
+	trap 'rm -rf "$tmp"' EXIT
+
+	echo "Downloading Zig $ZIG_VERSION for $arch-$os from $MIRROR" >&2
+	curl -fsSL -o "$tmp/index.json" "$MIRROR/download/index.json"
+	# Look up the tarball and its checksum in the release index.
+	info=$(python3 - "$tmp/index.json" "$ZIG_VERSION" "$arch-$os" <<'EOF'
+import json, sys
+index, version, target = sys.argv[1:]
+entry = json.load(open(index)).get(version, {}).get(target)
+if not entry:
+    sys.exit(f"error: Zig {version} has no download for {target}")
+print(entry["tarball"].rsplit("/", 1)[1], entry["shasum"])
+EOF
+	)
+	tarball=${info% *}
+	shasum=${info#* }
+
+	curl -fL --progress-bar -o "$tmp/$tarball" "$MIRROR/download/$ZIG_VERSION/$tarball"
+	if command -v sha256sum >/dev/null 2>&1; then
+		actual=$(sha256sum "$tmp/$tarball" | cut -d' ' -f1)
+	else
+		actual=$(shasum -a 256 "$tmp/$tarball" | cut -d' ' -f1)
+	fi
+	if [ "$actual" != "$shasum" ]; then
+		echo "error: checksum mismatch for $tarball" >&2
+		echo "  expected $shasum" >&2
+		echo "  got      $actual" >&2
+		exit 1
+	fi
+
+	mkdir -p "$ROOT/build/zig"
+	tar -xJf "$tmp/$tarball" -C "$tmp"
+	rm -rf "$ZIG_DIR"
+	mv "$tmp/${tarball%.tar.xz}" "$ZIG_DIR"
+	echo "Installed Zig $ZIG_VERSION in $ZIG_DIR" >&2
+fi
+
+exec "$ZIG_DIR/zig" "$@"
