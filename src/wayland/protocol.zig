@@ -33,7 +33,7 @@ pub const wl_callback = struct {
 
 pub const wl_compositor = struct {
     pub const name = "wl_compositor";
-    pub const version = 4;
+    pub const version = 6;
     pub const request = struct {
         pub const create_surface = 0;
         pub const create_region = 1;
@@ -57,6 +57,24 @@ pub const wl_surface = struct {
     pub const event = struct {
         pub const enter = 0;
         pub const leave = 1;
+        pub const preferred_buffer_scale = 2;
+        pub const preferred_buffer_transform = 3;
+    };
+};
+
+pub const wl_output = struct {
+    pub const name = "wl_output";
+    pub const version = 4;
+    pub const request = struct {
+        pub const release = 0;
+    };
+    pub const event = struct {
+        pub const geometry = 0;
+        pub const mode = 1;
+        pub const done = 2;
+        pub const scale = 3;
+        pub const name = 4;
+        pub const description = 5;
     };
 };
 

@@ -183,6 +183,7 @@ pub const Canvas = struct {
     width: u32,
     height: u32,
     stride: u32,
+    scale: f32 = 1.0,
     clip: ?Rect = null,
     origin: Point = .{ 0, 0 },
     font: *const Font,
@@ -248,14 +249,22 @@ pub const Canvas = struct {
     }
 
     fn drawTextWithFont(c: *Canvas, f: *const Font, size: f32, x: f32, baseline: f32, str: []const u8, color: Color) f32 {
-        const style: Style = .{
+        const sc = @max(c.scale, 1.0);
+        const logical_style: Style = .{
             .font = f,
             .size = size,
             .color = color.toArgb(),
         };
-        const ox = x + c.origin[0];
-        const oy = baseline + c.origin[1];
-        if (color.a <= 0 or str.len == 0) return x + text_mod.measure(style, str);
+        const logical_w = text_mod.measure(logical_style, str);
+        if (color.a <= 0 or str.len == 0) return x + logical_w;
+
+        const phys_style: Style = .{
+            .font = f,
+            .size = size * sc,
+            .color = color.toArgb(),
+        };
+        const ox = (x + c.origin[0]) * sc;
+        const oy = (baseline + c.origin[1]) * sc;
 
         const tc: text_mod.Canvas = .{
             .pixels = c.pixels,
@@ -263,18 +272,19 @@ pub const Canvas = struct {
             .height = c.height,
             .stride = c.stride,
         };
-        const end = text_mod.draw(tc, c.cache, style, ox, oy, str) catch (ox + text_mod.measure(style, str));
-        return end - c.origin[0];
+        const end_phys = text_mod.draw(tc, c.cache, phys_style, ox, oy, str) catch (ox + logical_w * sc);
+        return (end_phys / sc) - c.origin[0];
     }
 
-    fn roundedRect(c: *Canvas, r_in: Rect, radii_in: Radii, stroke: f32, color: Color) void {
+    fn roundedRect(c: *Canvas, r_in: Rect, radii_in: Radii, stroke_in: f32, color: Color) void {
+        const sc = @max(c.scale, 1.0);
         const r: Rect = .{
-            .x = r_in.x + c.origin[0],
-            .y = r_in.y + c.origin[1],
-            .w = r_in.w,
-            .h = r_in.h,
+            .x = (r_in.x + c.origin[0]) * sc,
+            .y = (r_in.y + c.origin[1]) * sc,
+            .w = r_in.w * sc,
+            .h = r_in.h * sc,
         };
-        if (r.w <= 0 or r.h <= 0 or color.a <= 0 or stroke <= 0) return;
+        if (r.w <= 0 or r.h <= 0 or color.a <= 0 or stroke_in <= 0) return;
 
         const screen_rect: Rect = .{
             .x = 0,
@@ -282,7 +292,15 @@ pub const Canvas = struct {
             .w = @floatFromInt(c.width),
             .h = @floatFromInt(c.height),
         };
-        const active_clip = if (c.clip) |cl| (screen_rect.intersect(cl) orelse return) else screen_rect;
+        const active_clip = if (c.clip) |cl| blk: {
+            const scaled_clip: Rect = .{
+                .x = cl.x * sc,
+                .y = cl.y * sc,
+                .w = cl.w * sc,
+                .h = cl.h * sc,
+            };
+            break :blk screen_rect.intersect(scaled_clip) orelse return;
+        } else screen_rect;
         const box = r.outset(1.0).intersect(active_clip) orelse return;
 
         const x0: u32 = @intFromFloat(@max(0.0, @floor(box.x)));
@@ -297,13 +315,14 @@ pub const Canvas = struct {
         const cy = r.y + hh;
         const limit = @min(hw, hh);
         const radii: Radii = .{
-            .tl = std.math.clamp(radii_in.tl, 0.0, limit),
-            .tr = std.math.clamp(radii_in.tr, 0.0, limit),
-            .br = std.math.clamp(radii_in.br, 0.0, limit),
-            .bl = std.math.clamp(radii_in.bl, 0.0, limit),
+            .tl = std.math.clamp(radii_in.tl * sc, 0.0, limit),
+            .tr = std.math.clamp(radii_in.tr * sc, 0.0, limit),
+            .br = std.math.clamp(radii_in.br * sc, 0.0, limit),
+            .bl = std.math.clamp(radii_in.bl * sc, 0.0, limit),
         };
         const max_r = radii.max();
-        const filled = stroke >= fill_stroke;
+        const filled = stroke_in >= fill_stroke;
+        const stroke = if (filled) fill_stroke else stroke_in * sc;
         const argb = color.toArgb();
         const base_alpha: f32 = color.a * 255.0;
 
@@ -366,7 +385,7 @@ pub const Canvas = struct {
 
 const testing = std.testing;
 
-test "canvas shapes and icons draw anti-aliased pixels" {
+test "canvas shapes and icons draw anti-aliased pixels at 1x and 2x scale" {
     const f = try Font.init(fira_ttf);
     const ic = try Font.init(icons_ttf);
     var cache = GlyphCache.init(testing.allocator);
@@ -384,11 +403,9 @@ test "canvas shapes and icons draw anti-aliased pixels" {
     };
 
     c.fillRoundedRect(.{ .x = 10, .y = 10, .w = 40, .h = 20 }, .all(6), Theme.dark.primary);
-    // Center of the filled rounded rect is primary color
     try testing.expectEqual(Theme.dark.primary.toArgb(), pixels[20 * 100 + 30]);
 
     c.strokeCircle(.{ 75, 30 }, 12, 2, Theme.dark.on_surface);
-    // Center of stroked circle is untouched background
     try testing.expectEqual(@as(u32, 0xff141218), pixels[30 * 100 + 75]);
 
     c.drawIcon(.developer_board, 10, 34, 20, Theme.dark.on_surface);
@@ -399,4 +416,20 @@ test "canvas shapes and icons draw anti-aliased pixels" {
         }
     }
     try testing.expect(icon_lit > 40);
+
+    // 2x HiDPI scale: logical 100x60 into physical 200x120 buffer
+    var pixels_2x: [200 * 120]u32 = @splat(0xff141218);
+    var c2: Canvas = .{
+        .pixels = &pixels_2x,
+        .width = 200,
+        .height = 120,
+        .stride = 200,
+        .scale = 2.0,
+        .font = &f,
+        .icon_font = &ic,
+        .cache = &cache,
+    };
+    c2.fillRoundedRect(.{ .x = 10, .y = 10, .w = 40, .h = 20 }, .all(6), Theme.dark.primary);
+    // Logical center (30, 20) -> physical center (60, 40)
+    try testing.expectEqual(Theme.dark.primary.toArgb(), pixels_2x[40 * 200 + 60]);
 }

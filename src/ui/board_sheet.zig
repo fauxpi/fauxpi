@@ -498,23 +498,28 @@ pub const BoardUi = struct {
         }
     }
 
-    /// Renders the client-side TitleBar (`y = 0..44`) and, when open, the
-    /// drop-down Board & GPIO Status Sheet over `pixels`.
+    /// Renders the client-side TitleBar (`y = 0..44` logical) and, when open, the
+    /// drop-down Board & GPIO Status Sheet over `pixels` at `scale` (e.g. 1x or 2x).
     pub fn paint(
         self: *BoardUi,
         pixels: []u32,
         win_w: u32,
         win_h: u32,
+        scale: u32,
         status: SystemStatus,
         gpio_hw: *const Gpio,
     ) void {
+        const sc = @max(scale, 1);
         self.updateLayout(win_w, win_h, status, gpio_hw);
 
+        const buf_w = win_w * sc;
+        const buf_h = win_h * sc;
         var c: Canvas = .{
             .pixels = pixels,
-            .width = win_w,
-            .height = win_h,
-            .stride = win_w,
+            .width = buf_w,
+            .height = buf_h,
+            .stride = buf_w,
+            .scale = @floatFromInt(sc),
             .font = &self.font,
             .icon_font = &self.icon_font,
             .cache = &self.cache,
@@ -1021,7 +1026,7 @@ test "TitleBar and BoardSheet toggle, select parts, and configure GPIO pins" {
     @memset(pixels, 0xff000000);
 
     // 1. Paint closed state (only TitleBar at top 44px)
-    ui.paint(pixels, win_w, win_h, status, &hw);
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
     try testing.expect(!ui.sheet_open);
 
     // Dragging the center of the title bar returns .start_drag
@@ -1033,9 +1038,16 @@ test "TitleBar and BoardSheet toggle, select parts, and configure GPIO pins" {
     try testing.expectEqual(Action.consumed, ui.pointerButton(btn_r.x + 10, btn_r.y + 10, false, status, &hw));
     try testing.expect(ui.sheet_open);
 
-    // Paint with the drop-down sheet open
-    ui.paint(pixels, win_w, win_h, status, &hw);
+    // Paint with the drop-down sheet open at 1x and 2x HiDPI scale
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
     try testing.expect(ui.sheet_rect.h > 300);
+
+    const pixels_2x = try testing.allocator.alloc(u32, (win_w * 2) * (win_h * 2));
+    defer testing.allocator.free(pixels_2x);
+    @memset(pixels_2x, 0xff000000);
+    ui.paint(pixels_2x, win_w, win_h, 2, status, &hw);
+    // TitleBar spans physical rows 0..88 at 2x scale
+    try testing.expectEqual(Theme.dark.surface_container.toArgb(), pixels_2x[80 * (win_w * 2) + 200]);
 
     // Pin 11 (index 10, GPIO 17) is selected by default; open the mode menu and set "Output, high"
     const mb = ui.mode_btn_rect;
