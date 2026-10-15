@@ -136,10 +136,10 @@ pub const Vchiq = struct {
     pub const VC_AUDIO_MSG_TYPE_STOP: u32 = 7;
     pub const VC_AUDIO_MSG_TYPE_WRITE: u32 = 8;
 
-    // Layout offsets within vchiq_slot_zero
+    // Layout offsets within vchiq_slot_zero (sizeof(vchiq_shared_state) == 372 with DEBUG_MAX == 11)
     const MASTER_OFFSET: u32 = 32;
-    const SLAVE_OFFSET: u32 = 408;
-    const SLOTS_INFO_OFFSET: u32 = 784;
+    const SLAVE_OFFSET: u32 = 404;
+    const SLOTS_INFO_OFFSET: u32 = 776;
     const SLOT_SIZE: u32 = 4096;
 
     // Layout offsets within vchiq_shared_state
@@ -153,6 +153,10 @@ pub const Vchiq = struct {
     const STATE_RECYCLE_ARMED: u32 = 32;
     const STATE_RECYCLE_FIRED: u32 = 36;
     const STATE_SLOT_QUEUE_RECYCLE: u32 = 44;
+    const STATE_SYNC_TRIGGER_ARMED: u32 = 48;
+    const STATE_SYNC_TRIGGER_FIRED: u32 = 52;
+    const STATE_SYNC_RELEASE_ARMED: u32 = 60;
+    const STATE_SYNC_RELEASE_FIRED: u32 = 64;
     const STATE_SLOT_QUEUE: u32 = 72;
 
     pub const PendingComplete = struct {
@@ -237,8 +241,11 @@ pub const Vchiq = struct {
         }
         std.mem.writeInt(u32, ram[master + STATE_SLOT_QUEUE_RECYCLE ..][0..4], num_slots, .little);
         std.mem.writeInt(u32, ram[master + STATE_TX_POS ..][0..4], 0, .little);
-        std.mem.writeInt(u32, ram[master + STATE_TRIGGER_ARMED ..][0..4], 0, .little);
-        std.mem.writeInt(u32, ram[master + STATE_RECYCLE_ARMED ..][0..4], 0, .little);
+        // Keep master remote_events armed = 1 so Linux remote_event_signal() always writes BELL2
+        std.mem.writeInt(u32, ram[master + STATE_TRIGGER_ARMED ..][0..4], 1, .little);
+        std.mem.writeInt(u32, ram[master + STATE_RECYCLE_ARMED ..][0..4], 1, .little);
+        std.mem.writeInt(u32, ram[master + STATE_SYNC_TRIGGER_ARMED ..][0..4], 1, .little);
+        std.mem.writeInt(u32, ram[master + STATE_SYNC_RELEASE_ARMED ..][0..4], 1, .little);
 
         // Allocate first master slot for VPU -> ARM messages
         self.vc_current_slot = slot_first;
@@ -337,9 +344,15 @@ pub const Vchiq = struct {
         const master = base + MASTER_OFFSET;
         const slave = base + SLAVE_OFFSET;
 
-        // Clear master.trigger.fired and master.recycle.fired
+        // Clear master remote_event fired flags and keep armed = 1 so ARM continues ringing BELL2
         std.mem.writeInt(u32, ram[master + STATE_TRIGGER_FIRED ..][0..4], 0, .little);
+        std.mem.writeInt(u32, ram[master + STATE_TRIGGER_ARMED ..][0..4], 1, .little);
         std.mem.writeInt(u32, ram[master + STATE_RECYCLE_FIRED ..][0..4], 0, .little);
+        std.mem.writeInt(u32, ram[master + STATE_RECYCLE_ARMED ..][0..4], 1, .little);
+        std.mem.writeInt(u32, ram[master + STATE_SYNC_TRIGGER_FIRED ..][0..4], 0, .little);
+        std.mem.writeInt(u32, ram[master + STATE_SYNC_TRIGGER_ARMED ..][0..4], 1, .little);
+        std.mem.writeInt(u32, ram[master + STATE_SYNC_RELEASE_FIRED ..][0..4], 0, .little);
+        std.mem.writeInt(u32, ram[master + STATE_SYNC_RELEASE_ARMED ..][0..4], 1, .little);
 
         const slave_init = std.mem.readInt(u32, ram[slave + STATE_INITIALISED ..][0..4], .little);
         if (slave_init == 0) return;
@@ -692,7 +705,7 @@ pub const Vchiq = struct {
         if (slot_phys + offset_in_slot + 8 + payload.len > ram.len) return;
 
         if (offset_in_slot == 0) {
-            const info_off = base + SLOTS_INFO_OFFSET + self.vc_current_slot * 8;
+            const info_off = base + SLOTS_INFO_OFFSET + self.vc_current_slot * 4;
             if (info_off + 4 <= ram.len) {
                 std.mem.writeInt(i16, ram[info_off..][0..2], 1, .little); // use_count = 1
                 std.mem.writeInt(i16, ram[info_off + 2 ..][0..2], 0, .little); // release_count = 0
@@ -837,7 +850,7 @@ test "Vchiq AUDS service opens, configures, streams PCM, and respects audio_conn
     // Initialize slot_zero at 0x1000: master slots 1..4, slave slots 5..8, sync slot 9
     const base: u32 = 0x1000;
     const master = base + 32;
-    const slave = base + 408;
+    const slave = base + 404;
     std.mem.writeInt(u32, ram[master + 4 ..][0..4], 1, .little); // master.slot_first = 1
     std.mem.writeInt(u32, ram[master + 8 ..][0..4], 4, .little); // master.slot_last = 4
     std.mem.writeInt(u32, ram[master + 12 ..][0..4], 9, .little); // master.slot_sync = 9

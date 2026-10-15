@@ -779,6 +779,7 @@ pub const BoardUi = struct {
         if (cfg.sd_connected) |v| {
             status.sd_connected = v and (self.selected_sd_card_idx != null);
         }
+        status.power_connected = false;
         return true;
     }
 

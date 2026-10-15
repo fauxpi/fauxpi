@@ -421,8 +421,9 @@ pub const Qcow2Disk = struct {
         if (self.cluster_dirty and self.cached_vcluster != std.math.maxInt(u64)) {
             const vcluster = self.cached_vcluster;
             self.cluster_dirty = false;
-            if (!isAllZero(self.cluster_cache)) {
-                const host_off = try self.lookupHostClusterOffset(vcluster, true);
+            const existing_off = try self.lookupHostClusterOffset(vcluster, false);
+            if (existing_off != 0 or !isAllZero(self.cluster_cache)) {
+                const host_off = if (existing_off != 0) existing_off else try self.lookupHostClusterOffset(vcluster, true);
                 try pwriteAll(self.fd, self.cluster_cache, host_off);
             }
         }

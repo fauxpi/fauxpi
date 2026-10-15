@@ -308,10 +308,16 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     defer gpa.free(ram);
     @memset(ram, 0);
 
+    var headless_qcow2: ?qcow2.Qcow2Disk = null;
+    defer if (headless_qcow2) |*d| d.deinit();
     var sd_image_buf: ?[]u8 = null;
     defer if (sd_image_buf) |b| gpa.free(b);
     if (opts.sd_path) |sd_path| {
-        sd_image_buf = try readSdImageLinux(gpa, sd_path);
+        if (qcow2.Qcow2Disk.openExistingFile(gpa, sd_path)) |disk| {
+            headless_qcow2 = disk;
+        } else |_| {
+            sd_image_buf = try readSdImageLinux(gpa, sd_path);
+        }
     }
 
     var soc = Bcm2835.init(ram, opts.width, opts.height);
@@ -340,16 +346,21 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     }
 
     const initial_sd = if (wl_win) |w|
-        (w.status.sd_connected and (w.ui.activeSdCard() != null or sd_image_buf != null))
+        (w.status.sd_connected and (w.ui.activeSdCard() != null or sd_image_buf != null or headless_qcow2 != null))
     else
-        (sd_image_buf != null);
+        (sd_image_buf != null or headless_qcow2 != null);
 
     if (initial_power and (initial_sd or opts.kernel_path != null)) {
         const bm = if (wl_win) |w| w.status.board_model else (opts.board_model orelse .pi_zero);
         const serial = if (wl_win) |w| w.status.serial_u64 else 0x00000000fa000001;
         const mac = if (wl_win) |w| w.status.mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
         const wifi_mac = if (wl_win) |w| w.status.wifi_mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 };
-        const active_qcow2: ?*qcow2.Qcow2Disk = if (wl_win) |w| (if (initial_sd and w.ui.activeSdCard() != null) &w.ui.activeSdCard().?.disk else null) else null;
+        const active_qcow2: ?*qcow2.Qcow2Disk = if (wl_win) |w|
+            (if (initial_sd and w.ui.activeSdCard() != null) &w.ui.activeSdCard().?.disk else if (initial_sd and headless_qcow2 != null) &(headless_qcow2.?) else null)
+        else if (initial_sd and headless_qcow2 != null)
+            &(headless_qcow2.?)
+        else
+            null;
         const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, if (initial_sd) sd_image_buf else null, bm, serial, mac, wifi_mac);
         if (wl_win) |w| syncWindowPeripheralsToSoc(w, &soc);
         cpu.initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);

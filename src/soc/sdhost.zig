@@ -454,6 +454,9 @@ pub const SdHost = struct {
             self.transfer_mode = .none;
             self.sdhsts &= ~SDHSTS_DATA_FLAG;
             if (self.sdhblc > 0) self.sdhblc = 0;
+            if (self.qcow2_disk) |disk| {
+                disk.flush() catch {};
+            }
         }
     }
 };
