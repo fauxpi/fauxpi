@@ -104,9 +104,6 @@ pub const WaylandWindow = struct {
         const shm = (try globals.bind(registry, protocol.wl_shm.name, protocol.wl_shm.version, null)) orelse return error.MissingShm;
         const wm_base = (try globals.bind(registry, protocol.xdg_wm_base.name, protocol.xdg_wm_base.version, .{ .ptr = win, .handler = wmBaseEvent })) orelse return error.MissingXdgWmBase;
 
-        const total_width = display_width;
-        const total_height = display_height + board_sheet.BoardUi.title_bar_height;
-
         var status: board_sheet.SystemStatus = .{
             .serial_u64 = ui.parsedSerial(),
             .mac_address = ui.parsedMac(),
@@ -115,6 +112,10 @@ pub const WaylandWindow = struct {
             .hdmi_height = @intCast(display_height),
         };
         ui.configureXdgStorage(environ, &status);
+
+        const total_width = display_width;
+        const total_height = display_height + board_sheet.BoardUi.title_bar_height +
+            (if (status.gpio_connected) board_sheet.BoardUi.gpio_panel_height else 0);
 
         win.* = .{
             .gpa = gpa,
@@ -519,8 +520,11 @@ pub const WaylandWindow = struct {
     /// `BoardUi` at native HiDPI resolution (`scale`).
     pub fn compositeUi(self: *WaylandWindow) void {
         self.ui_dirty = false;
-        if (self.pending_scale != self.scale and self.pending_scale >= 1) {
-            self.scale = self.pending_scale;
+        const desired_h = self.display_height + board_sheet.BoardUi.title_bar_height +
+            (if (self.status.gpio_connected) board_sheet.BoardUi.gpio_panel_height else 0);
+        if ((self.pending_scale != self.scale and self.pending_scale >= 1) or self.height != desired_h) {
+            if (self.pending_scale >= 1) self.scale = self.pending_scale;
+            self.height = desired_h;
             self.initShmBuffers() catch {};
             self.ui_dirty = false;
         }
@@ -877,7 +881,7 @@ pub const WaylandWindow = struct {
 
                 if (button == protocol.input.btn_left) {
                     const action = self.ui.pointerButton(sx, sy, pressed, self.status, self.gpio);
-                    const over_ui = self.ui.sheet_open or sy < @as(f32, @floatFromInt(board_sheet.BoardUi.title_bar_height));
+                    const over_ui = self.ui.isPointInUi(sx, sy, self.status);
                     self.updateCursorShape(over_ui);
                     switch (action) {
                         .start_drag => {
@@ -909,6 +913,7 @@ pub const WaylandWindow = struct {
                             } else {
                                 self.status.hdmi_active = false;
                                 self.status.cpu_busy_percent = 0.0;
+                                self.gpio.resetSocState();
                             }
                             return;
                         },
@@ -955,6 +960,14 @@ pub const WaylandWindow = struct {
                             self.ui.saveSettings(self.status) catch {};
                             return;
                         },
+                        .toggle_gpio => {
+                            self.status.gpio_connected = !self.status.gpio_connected;
+                            if (!self.status.gpio_connected) {
+                                self.gpio.clearHeaderExternalPins();
+                            }
+                            self.ui.saveSettings(self.status) catch {};
+                            return;
+                        },
                         .select_board => {
                             self.setBoardModel(self.ui.selected_board_model);
                             return;
@@ -978,7 +991,7 @@ pub const WaylandWindow = struct {
                         },
                         .none => {},
                     }
-                } else if (self.ui.sheet_open or sy < @as(f32, @floatFromInt(board_sheet.BoardUi.title_bar_height))) {
+                } else if (self.ui.isPointInUi(sx, sy, self.status)) {
                     return;
                 }
 
@@ -997,8 +1010,9 @@ pub const WaylandWindow = struct {
                 _ = r.uint() catch return; // time
                 const axis = r.uint() catch return;
                 const value = r.fixed() catch return;
+                const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
                 const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
-                if (self.ui.sheet_open or sy < @as(f32, @floatFromInt(board_sheet.BoardUi.title_bar_height))) {
+                if (self.ui.isPointInUi(sx, sy, self.status)) {
                     return;
                 }
                 if (axis == protocol.wl_pointer.axis.vertical_scroll and value != 0) {
@@ -1047,8 +1061,9 @@ pub const WaylandWindow = struct {
                             return;
                         }
                         self.ui.sheet_open = false;
-                        const sy: f64 = self.last_mouse_y orelse 0.0;
-                        self.updateCursorShape(sy < @as(f64, @floatFromInt(board_sheet.BoardUi.title_bar_height)));
+                        const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
+                        const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
+                        self.updateCursorShape(self.ui.isPointInUi(sx, sy, self.status));
                     }
                     return;
                 }

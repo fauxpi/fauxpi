@@ -76,6 +76,44 @@ pub const Gpio = struct {
     gppud: u32 = 0,
     gppudclk: [2]u32 = [_]u32{ 0, 0 },
     act_pulse_latch: bool = false,
+    ui_dirty_latch: bool = false,
+
+    pub const HEADER_PIN_MASK: u64 = 0x0fff_ffff;
+
+    pub fn takeUiDirty(self: *Gpio) bool {
+        const d = self.ui_dirty_latch;
+        self.ui_dirty_latch = false;
+        return d;
+    }
+
+    /// Clears external user switch overrides on the 28 header GPIO pins (0..27),
+    /// returning input pins to their configured pull-up / pull-down levels.
+    pub fn clearHeaderExternalPins(self: *Gpio) void {
+        const prev = self.effectiveLevels();
+        self.ext_mask &= ~HEADER_PIN_MASK;
+        self.updateEdgeEvents(prev, self.effectiveLevels());
+        self.ui_dirty_latch = true;
+    }
+
+    /// Resets volatile SoC GPIO register state (GPFSEL, GPSET/GPCLR, GPPUD/GPPUDCLK, event enables)
+    /// to BCM283x power-on hardware defaults while preserving external hardware connections.
+    pub fn resetSocState(self: *Gpio) void {
+        self.gpfsel = [_]u32{0} ** 6;
+        self.out_level = 0;
+        self.pull_up_mask = DEFAULT_PULL_UP_MASK;
+        self.pull_down_mask = DEFAULT_PULL_DOWN_MASK;
+        self.gpeds = 0;
+        self.gpren = 0;
+        self.gpfen = 0;
+        self.gphen = 0;
+        self.gplen = 0;
+        self.gparen = 0;
+        self.gpafen = 0;
+        self.gppud = 0;
+        self.gppudclk = [_]u32{ 0, 0 };
+        self.act_pulse_latch = false;
+        self.ui_dirty_latch = true;
+    }
 
     pub fn effectiveLevels(self: *const Gpio) u64 {
         var out_mask: u64 = 0;
@@ -99,7 +137,14 @@ pub const Gpio = struct {
         if (pin >= 54) return;
         const reg_idx = pin / 10;
         const shift: u5 = @intCast((pin % 10) * 3);
+        const old = self.getPinFunction(pin);
         self.gpfsel[reg_idx] = (self.gpfsel[reg_idx] & ~(@as(u32, 7) << shift)) | (@as(u32, @intFromEnum(func)) << shift);
+        if (old != func) {
+            if (pin < 28) {
+                self.ext_mask &= ~(@as(u64, 1) << pin);
+            }
+            self.ui_dirty_latch = true;
+        }
     }
 
     pub fn getPinLevel(self: *const Gpio, pin: u6) bool {
@@ -169,6 +214,7 @@ pub const Gpio = struct {
             },
         }
         self.updateEdgeEvents(prev, self.effectiveLevels());
+        self.ui_dirty_latch = true;
     }
 
     pub fn setExternalPin(self: *Gpio, pin: u6, high: bool) void {
@@ -182,6 +228,7 @@ pub const Gpio = struct {
             self.ext_level &= ~bit;
         }
         self.updateEdgeEvents(prev, self.effectiveLevels());
+        if (pin < 28) self.ui_dirty_latch = true;
     }
 
     fn applyPullClock(self: *Gpio, clk_mask: u64) void {
@@ -190,14 +237,20 @@ pub const Gpio = struct {
             0 => { // Off
                 self.pull_up_mask &= ~clk_mask;
                 self.pull_down_mask &= ~clk_mask;
+                self.ext_mask &= ~(clk_mask & HEADER_PIN_MASK);
+                if ((clk_mask & HEADER_PIN_MASK) != 0) self.ui_dirty_latch = true;
             },
             1 => { // Pull-down
                 self.pull_down_mask |= clk_mask;
                 self.pull_up_mask &= ~clk_mask;
+                self.ext_mask &= ~(clk_mask & HEADER_PIN_MASK);
+                if ((clk_mask & HEADER_PIN_MASK) != 0) self.ui_dirty_latch = true;
             },
             2 => { // Pull-up
                 self.pull_up_mask |= clk_mask;
                 self.pull_down_mask &= ~clk_mask;
+                self.ext_mask &= ~(clk_mask & HEADER_PIN_MASK);
+                if ((clk_mask & HEADER_PIN_MASK) != 0) self.ui_dirty_latch = true;
             },
             else => {},
         }
@@ -247,12 +300,28 @@ pub const Gpio = struct {
         const prev = self.effectiveLevels();
         switch (offset) {
             0x00, 0x04, 0x08, 0x0c, 0x10, 0x14 => {
-                self.gpfsel[offset / 4] = val;
+                const reg_idx = offset / 4;
+                const old_reg = self.gpfsel[reg_idx];
+                self.gpfsel[reg_idx] = val;
+                if (old_reg != val and reg_idx < 3) {
+                    const diff = old_reg ^ val;
+                    for (0..10) |sub| {
+                        const pin: u6 = @intCast(reg_idx * 10 + sub);
+                        if (pin >= 28) break;
+                        const shift: u5 = @intCast(sub * 3);
+                        if (((diff >> shift) & 7) != 0) {
+                            self.ext_mask &= ~(@as(u64, 1) << pin);
+                            self.ui_dirty_latch = true;
+                        }
+                    }
+                }
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },
             0x1c => { // GPSET0
                 if ((val & (1 << 29)) != 0) self.act_pulse_latch = true;
+                const prev_out = self.out_level;
                 self.out_level |= @as(u64, val);
+                if (((self.out_level ^ prev_out) & HEADER_PIN_MASK) != 0) self.ui_dirty_latch = true;
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },
             0x20 => { // GPSET1
@@ -262,7 +331,9 @@ pub const Gpio = struct {
             },
             0x28 => { // GPCLR0
                 if ((val & (1 << 29)) != 0) self.act_pulse_latch = true;
+                const prev_out = self.out_level;
                 self.out_level &= ~@as(u64, val);
+                if (((self.out_level ^ prev_out) & HEADER_PIN_MASK) != 0) self.ui_dirty_latch = true;
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },
             0x2c => { // GPCLR1

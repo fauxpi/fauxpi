@@ -243,9 +243,13 @@ fn loadGuestBoot(
     mac_address: [6]u8,
     wifi_mac_address: [6]u8,
 ) !loader.BootResult {
+    const saved_hdr_ext_mask = soc.gpio.ext_mask & gpio.Gpio.HEADER_PIN_MASK;
+    const saved_hdr_ext_level = soc.gpio.ext_level & gpio.Gpio.HEADER_PIN_MASK;
     soc.usb.hid.net.deinit();
     @memset(ram, 0);
     soc.* = Bcm2835.init(ram, opts.width, opts.height);
+    soc.gpio.ext_mask = (soc.gpio.ext_mask & ~gpio.Gpio.HEADER_PIN_MASK) | saved_hdr_ext_mask;
+    soc.gpio.ext_level = (soc.gpio.ext_level & ~gpio.Gpio.HEADER_PIN_MASK) | saved_hdr_ext_level;
     soc.is_bcm2837 = board_model.isBcm2837();
     soc.setHdmiConnected(true);
     soc.mailbox.board_revision = board_model.boardRevision();
@@ -483,6 +487,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 const state_changed = (idle_rendered_power != w.status.power_connected) or
                     (idle_rendered_booted != guest_booted);
                 const needs_redraw = w.ui_dirty or
+                    soc.gpio.takeUiDirty() or
                     state_changed or
                     (w.pending_scale != w.scale);
 
@@ -610,6 +615,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     (soc.act_led_hold_frames > 0) or
                     soc.sdhost.activity_latch or
                     soc.gpio.act_pulse_latch or
+                    soc.gpio.ui_dirty_latch or
                     soc.mailbox.exp_act_latch or
                     w.ui_dirty or
                     (w.pending_scale != w.scale) or
@@ -721,8 +727,10 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     hdmi_changed = true;
                 }
 
+                const gpio_ui_dirty = soc.gpio.takeUiDirty();
                 const need_present = hdmi_changed or
                     leds_changed or
+                    gpio_ui_dirty or
                     w.ui_dirty or
                     (w.pending_scale != w.scale);
                 if (need_present) {

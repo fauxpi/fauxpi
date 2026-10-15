@@ -6,6 +6,7 @@
 const std = @import("std");
 const canvas_mod = @import("canvas.zig");
 const board = @import("board.zig");
+const gpio_model = @import("gpio_model.zig");
 const soc_gpio = @import("../soc/gpio.zig");
 const qcow2_mod = @import("../soc/qcow2.zig");
 
@@ -176,6 +177,7 @@ pub const SystemStatus = struct {
     audio_connected: bool = true,
     power_connected: bool = false,
     sd_connected: bool = false,
+    gpio_connected: bool = false,
     usb_hub_connected: bool = true,
     usb_keyboard_connected: bool = true,
     usb_mouse_connected: bool = true,
@@ -193,6 +195,7 @@ pub const Action = enum {
     toggle_audio,
     toggle_power,
     toggle_sd,
+    toggle_gpio,
     select_sd_image,
     select_sd_card,
     toggle_usb_hub,
@@ -215,6 +218,7 @@ pub const FocusedSettingField = enum {
 pub const InteractiveTarget = enum {
     sd_connector,
     sd_card,
+    gpio,
     hdmi,
     audio,
     power,
@@ -236,6 +240,7 @@ pub const HubLayout = struct {
     pub const spare_port_rect: board.Rect = .{ .x = 96.4, .y = 14.0, .w = 8.6, .h = 5.2 };
     pub const eth_port_rect: board.Rect = .{ .x = 108.6, .y = 14.0, .w = 11.6, .h = 6.8 };
 
+    pub const gpio_cable_min_y: f32 = -11.0;
     pub const top_cable_min_y: f32 = 0.0;
     pub const bottom_cable_max_y: f32 = 48.0;
     pub const usb_cable_horiz_y: f32 = 45.2;
@@ -284,6 +289,7 @@ pub const HubLayout = struct {
 
 pub const BoardUi = struct {
     pub const title_bar_height: u32 = 44;
+    pub const gpio_panel_height: u32 = 136;
     pub const bar_btn_size: f32 = 34;
 
     pub const TitleCacheKey = struct {
@@ -308,6 +314,7 @@ pub const BoardUi = struct {
         hovered_target: ?InteractiveTarget = null,
         sd_card_name_hash: u64 = 0,
         sd_connected: bool = false,
+        gpio_connected: bool = false,
         hdmi_connected: bool = false,
         audio_connected: bool = false,
         power_connected: bool = false,
@@ -317,6 +324,16 @@ pub const BoardUi = struct {
         ethernet_connected: bool = false,
         act_led_on: bool = false,
         pwr_led_on: bool = false,
+    };
+
+    pub const GpioCacheKey = struct {
+        win_w: u32 = 0,
+        scale: u32 = 0,
+        board_model: BoardModel = .pi_zero,
+        output_mask: u32 = 0,
+        input_mask: u32 = 0,
+        level_mask: u32 = 0,
+        hovered_input_idx: ?usize = null,
     };
 
     gpa: std.mem.Allocator,
@@ -413,11 +430,21 @@ pub const BoardUi = struct {
     sd_browse_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_add_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
 
-    /// Cached rasterized pixel buffers for TitleBar and Board diagram.
+    /// Bottom GPIO Outputs (LEDs) & Inputs (Switches) box state (shown when `status.gpio_connected` is true).
+    gpio_box_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    gpio_output_pins: [28]u6 = @splat(0),
+    gpio_output_count: usize = 0,
+    gpio_input_pins: [28]u6 = @splat(0),
+    gpio_input_count: usize = 0,
+    hovered_gpio_input_idx: ?usize = null,
+
+    /// Cached rasterized pixel buffers for TitleBar, Board diagram, and GPIO panel.
     title_cache: []u32 = &.{},
     title_cache_key: TitleCacheKey = .{},
     board_cache: []u32 = &.{},
     board_cache_key: BoardCacheKey = .{},
+    gpio_cache: []u32 = &.{},
+    gpio_cache_key: GpioCacheKey = .{},
 
     pub fn init(gpa: std.mem.Allocator) !BoardUi {
         const font = try Font.init(canvas_mod.fira_ttf);
@@ -440,6 +467,7 @@ pub const BoardUi = struct {
         self.sd_cards.deinit(self.gpa);
         if (self.title_cache.len > 0) self.gpa.free(self.title_cache);
         if (self.board_cache.len > 0) self.gpa.free(self.board_cache);
+        if (self.gpio_cache.len > 0) self.gpa.free(self.gpio_cache);
         self.cache.deinit();
     }
 
@@ -609,6 +637,7 @@ pub const BoardUi = struct {
         dhcp_enabled: ?bool = null,
         selected_sd_card: ?[]const u8 = null,
         sd_connected: ?bool = null,
+        gpio_connected: ?bool = null,
         hdmi_connected: ?bool = null,
         audio_connected: ?bool = null,
         usb_hub_connected: ?bool = null,
@@ -653,6 +682,7 @@ pub const BoardUi = struct {
             \\  "dhcp_enabled": {},
             \\  "selected_sd_card": "{s}",
             \\  "sd_connected": {},
+            \\  "gpio_connected": {},
             \\  "hdmi_connected": {},
             \\  "audio_connected": {},
             \\  "usb_hub_connected": {},
@@ -670,6 +700,7 @@ pub const BoardUi = struct {
                 status.dhcp_enabled,
                 esc_name_buf[0..esc_len],
                 status.sd_connected,
+                status.gpio_connected,
                 status.hdmi_connected,
                 status.audio_connected,
                 status.usb_hub_connected,
@@ -764,6 +795,7 @@ pub const BoardUi = struct {
         status.wifi_mac_address = self.parsedWifiMac();
 
         if (cfg.dhcp_enabled) |v| status.dhcp_enabled = v;
+        if (cfg.gpio_connected) |v| status.gpio_connected = v;
         if (cfg.hdmi_connected) |v| status.hdmi_connected = v;
         if (cfg.audio_connected) |v| status.audio_connected = v;
         if (cfg.usb_hub_connected) |v| status.usb_hub_connected = v;
@@ -1059,7 +1091,7 @@ pub const BoardUi = struct {
         var r = drawing.bounds();
         const hl = HubLayout.forBoard(drawing);
         const x0 = @min(r.x, -HubLayout.sd_ext_left_mm);
-        const y0 = @min(r.y, HubLayout.top_cable_min_y);
+        const y0 = @min(r.y, HubLayout.gpio_cable_min_y);
         const x1 = if (hl.has_external_hub)
             @max(r.x + r.w, hl.hub_rect.x + hl.hub_rect.w + 1.0)
         else
@@ -1139,6 +1171,15 @@ pub const BoardUi = struct {
         var usb_double_idx: usize = 0;
         for (drawing.parts) |p| {
             switch (p.kind) {
+                .gpio, .gpio_holes => {
+                    const gpio_hit: board.Rect = .{
+                        .x = p.rect.x - 0.5,
+                        .y = HubLayout.gpio_cable_min_y,
+                        .w = p.rect.w + 1.0,
+                        .h = (p.rect.y + p.rect.h) - HubLayout.gpio_cable_min_y,
+                    };
+                    if (rectContainsMm(gpio_hit, pt)) return .gpio;
+                },
                 .micro_sd, .sd => {
                     const ext_w: f32 = if (sd_connected) 9.0 else HubLayout.sd_ext_left_mm;
                     const sd_card_hit: board.Rect = .{
@@ -1379,7 +1420,7 @@ pub const BoardUi = struct {
     }
 
     /// Updates layout geometry for `(win_w, win_h)` so hit testing and painting match.
-    pub fn updateLayout(self: *BoardUi, win_w: u32, win_h: u32, status: SystemStatus, _: *const Gpio) void {
+    pub fn updateLayout(self: *BoardUi, win_w: u32, win_h: u32, status: SystemStatus, gpio_hw: *const Gpio) void {
         self.last_win_w = win_w;
         self.last_win_h = win_h;
         const cur_board = BoardModel.fromModel(status.model);
@@ -1393,6 +1434,44 @@ pub const BoardUi = struct {
         }
 
         const w_f: f32 = @floatFromInt(win_w);
+        const h_f: f32 = @floatFromInt(win_h);
+        const gpio_h: f32 = @floatFromInt(gpio_panel_height);
+        if (status.gpio_connected and h_f > gpio_h) {
+            self.gpio_box_rect = .{
+                .x = 0.0,
+                .y = h_f - gpio_h,
+                .w = w_f,
+                .h = gpio_h,
+            };
+        } else {
+            self.gpio_box_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        }
+
+        // Populate ordered header GPIO outputs and inputs (from low to high pin number 0..27)
+        const hdr_mask = headerGpioMask(status.model);
+        var out_n: usize = 0;
+        var in_n: usize = 0;
+        for (0..28) |pin_usize| {
+            const pin: u6 = @intCast(pin_usize);
+            if (((hdr_mask >> @intCast(pin)) & 1) == 0) continue;
+            switch (gpio_hw.getPinFunction(pin)) {
+                .output => {
+                    self.gpio_output_pins[out_n] = pin;
+                    out_n += 1;
+                },
+                .input => {
+                    self.gpio_input_pins[in_n] = pin;
+                    in_n += 1;
+                },
+                else => {},
+            }
+        }
+        self.gpio_output_count = out_n;
+        self.gpio_input_count = in_n;
+        if (self.hovered_gpio_input_idx) |hidx| {
+            if (!status.gpio_connected or hidx >= in_n) self.hovered_gpio_input_idx = null;
+        }
+
         const sheet_w = @min(@max(w_f - 32.0, 360.0), 740.0);
         const sheet_x = @round((w_f - sheet_w) * 0.5);
         const sheet_y: f32 = @floatFromInt(title_bar_height);
@@ -1401,7 +1480,7 @@ pub const BoardUi = struct {
         const drawing = board.forModel(status.model) orelse &board.pi_zero;
         const bounds = boardBoundsWithPeripherals(drawing);
         const max_bw: f32 = sheet_w - 2.0 * pad;
-        const max_bh: f32 = 280.0;
+        const max_bh: f32 = 300.0;
         const bw = max_bw;
         const bh = @min(bw * bounds.h / bounds.w, max_bh);
         const actual_bw = bw * @min(1.0, bh / (bw * bounds.h / bounds.w));
@@ -1549,6 +1628,59 @@ pub const BoardUi = struct {
         };
     }
 
+    /// Returns a 28-bit mask of BCM GPIO numbers (`0..27`) exposed on the board's 40-pin GPIO header.
+    pub fn headerGpioMask(model: []const u8) u32 {
+        const hdr = gpio_model.headerFor(model) orelse return 0x0fff_ffff;
+        var mask: u32 = 0;
+        for (hdr) |p| {
+            switch (p) {
+                .gpio => |bcm| {
+                    if (bcm < 28) mask |= (@as(u32, 1) << @intCast(bcm));
+                },
+                else => {},
+            }
+        }
+        return mask;
+    }
+
+    /// Returns the bounding box of output LED cell `idx` inside `gpio_box_rect`.
+    pub fn gpioOutputLedRect(self: *const BoardUi, idx: usize) Rect {
+        const gb = self.gpio_box_rect;
+        const start_x = gb.x + 112.0;
+        const avail_w = @max(280.0, gb.w - 112.0 - 20.0);
+        const count: f32 = @floatFromInt(@max(self.gpio_output_count, 28));
+        const pitch: f32 = @min(40.0, @floor(avail_w / count));
+        return .{
+            .x = start_x + @as(f32, @floatFromInt(idx)) * pitch,
+            .y = gb.y + 10.0,
+            .w = pitch - 2.0,
+            .h = 46.0,
+        };
+    }
+
+    /// Returns the clickable bounding box of input switch `idx` inside `gpio_box_rect`.
+    pub fn gpioInputSwitchRect(self: *const BoardUi, idx: usize) Rect {
+        const gb = self.gpio_box_rect;
+        const start_x = gb.x + 112.0;
+        const avail_w = @max(280.0, gb.w - 112.0 - 20.0);
+        const count: f32 = @floatFromInt(@max(self.gpio_input_count, 28));
+        const pitch: f32 = @min(40.0, @floor(avail_w / count));
+        return .{
+            .x = start_x + @as(f32, @floatFromInt(idx)) * pitch,
+            .y = gb.y + 68.0,
+            .w = pitch - 2.0,
+            .h = 58.0,
+        };
+    }
+
+    /// Returns true if `(x, y)` is over the TitleBar, an open BoardSheet, or the connected GPIO box.
+    pub fn isPointInUi(self: *const BoardUi, x: f32, y: f32, status: SystemStatus) bool {
+        if (y < @as(f32, @floatFromInt(title_bar_height))) return true;
+        if (self.sheet_open) return true;
+        if (status.gpio_connected and self.gpio_box_rect.contains(.{ x, y })) return true;
+        return false;
+    }
+
     pub fn sdMenuRowRect(self: *const BoardUi, idx: usize) Rect {
         const mr = self.sd_card_menu_rect;
         return .{
@@ -1581,7 +1713,7 @@ pub const BoardUi = struct {
     }
 
     /// Handles pointer motion at `(x, y)` in window coordinates.
-    /// Returns true if the pointer is over the TitleBar or an open BoardSheet.
+    /// Returns true if the pointer is over the TitleBar, an open BoardSheet, or the connected GPIO box.
     pub fn pointerMotion(self: *BoardUi, x: f32, y: f32, status: SystemStatus, gpio_hw: *const Gpio) bool {
         self.updateLayout(self.last_win_w, self.last_win_h, status, gpio_hw);
         const pt: Point = .{ x, y };
@@ -1589,6 +1721,17 @@ pub const BoardUi = struct {
         self.board_btn_hovered = self.boardBtnRect(self.last_win_w).contains(pt);
         self.max_btn_hovered = maxBtnRect(self.last_win_w).contains(pt);
         self.close_btn_hovered = closeBtnRect(self.last_win_w).contains(pt);
+
+        // Track hover over GPIO input switches in the GPIO box below the display
+        self.hovered_gpio_input_idx = null;
+        if (status.gpio_connected and self.gpio_box_rect.contains(pt) and (!self.sheet_open or !self.sheet_rect.contains(pt))) {
+            for (0..self.gpio_input_count) |idx| {
+                if (self.gpioInputSwitchRect(idx).contains(pt)) {
+                    self.hovered_gpio_input_idx = idx;
+                    break;
+                }
+            }
+        }
 
         if (!self.sheet_open) {
             self.hovered_target = null;
@@ -1606,7 +1749,7 @@ pub const BoardUi = struct {
             self.sd_browse_btn_hovered = false;
             self.sd_add_btn_hovered = false;
             self.sd_manage_close_hovered = false;
-            return y < @as(f32, @floatFromInt(title_bar_height));
+            return y < @as(f32, @floatFromInt(title_bar_height)) or (status.gpio_connected and self.gpio_box_rect.contains(pt));
         }
 
         if (self.sd_manage_open) {
@@ -1720,6 +1863,7 @@ pub const BoardUi = struct {
         self.sd_browse_btn_hovered = false;
         self.sd_add_btn_hovered = false;
         self.sd_manage_close_hovered = false;
+        self.hovered_gpio_input_idx = null;
         self.hovered_target = null;
     }
 
@@ -1780,6 +1924,20 @@ pub const BoardUi = struct {
         self.board_btn_pressed = false;
         self.max_btn_pressed = false;
         self.close_btn_pressed = false;
+
+        // GPIO box below the display (interactive when not covered by the drop-down sheet)
+        if (status.gpio_connected and self.gpio_box_rect.contains(pt) and (!self.sheet_open or !self.sheet_rect.contains(pt))) {
+            if (!pressed) {
+                for (0..self.gpio_input_count) |idx| {
+                    if (self.gpioInputSwitchRect(idx).contains(pt)) {
+                        const pin = self.gpio_input_pins[idx];
+                        gpio_hw.setExternalPin(pin, !gpio_hw.getPinLevel(pin));
+                        return .consumed;
+                    }
+                }
+            }
+            return .consumed;
+        }
 
         if (!self.sheet_open) return .none;
 
@@ -1951,6 +2109,7 @@ pub const BoardUi = struct {
                         .usb_keyboard => .toggle_usb_keyboard,
                         .usb_mouse => .toggle_usb_mouse,
                         .ethernet => .toggle_ethernet,
+                        .gpio => .toggle_gpio,
                     };
                 }
             }
@@ -1964,8 +2123,8 @@ pub const BoardUi = struct {
         }
     }
 
-    /// Renders the client-side TitleBar (`y = 0..44` logical) and, when open, the
-    /// drop-down Board Sheet over `pixels` at `scale` (e.g. 1x or 2x).
+    /// Renders the client-side TitleBar (`y = 0..44` logical), the GPIO box below the display when
+    /// connected, and, when open, the drop-down Board Sheet over `pixels` at `scale` (e.g. 1x or 2x).
     pub fn paint(
         self: *BoardUi,
         pixels: []u32,
@@ -1991,18 +2150,26 @@ pub const BoardUi = struct {
             .cache = &self.cache,
         };
 
+        const disp_bottom_h: u32 = if (status.gpio_connected and win_h > gpio_panel_height)
+            win_h - gpio_panel_height
+        else
+            win_h;
+
         if (!status.hdmi_connected or !status.hdmi_active) {
-            self.paintNoSignal(&c, win_w, win_h, status.hdmi_connected);
+            self.paintNoSignal(&c, win_w, disp_bottom_h, status.hdmi_connected);
+        }
+        if (status.gpio_connected and win_h > gpio_panel_height) {
+            self.paintGpioBox(&c, win_w, status, gpio_hw);
         }
         self.paintTitleBar(&c, win_w);
         if (self.sheet_open) {
-            self.paintSheet(&c, win_w, win_h, status);
+            self.paintSheet(&c, win_w, disp_bottom_h, status);
         }
     }
 
-    fn paintNoSignal(self: *BoardUi, c: *Canvas, win_w: u32, win_h: u32, hdmi_connected: bool) void {
+    fn paintNoSignal(self: *BoardUi, c: *Canvas, win_w: u32, disp_bottom_h: u32, hdmi_connected: bool) void {
         const w_f: f32 = @floatFromInt(win_w);
-        const h_f: f32 = @floatFromInt(win_h);
+        const h_f: f32 = @floatFromInt(disp_bottom_h);
         const top_y: f32 = @floatFromInt(title_bar_height);
         if (h_f <= top_y) return;
 
@@ -2183,20 +2350,20 @@ pub const BoardUi = struct {
         self: *BoardUi,
         c: *Canvas,
         _: u32,
-        win_h: u32,
+        disp_bottom_h: u32,
         status: SystemStatus,
     ) void {
         const t = &self.theme;
         const sc_f = @max(c.scale, 1.0);
         const sc: u32 = @intFromFloat(sc_f);
-        const h_f: f32 = @floatFromInt(win_h);
+        const h_f: f32 = @floatFromInt(disp_bottom_h);
         const top_y: f32 = @floatFromInt(title_bar_height);
 
         const sr = self.sheet_rect;
         // Dim the HDMI display behind the drop-down sheet using SWAR (skipping the opaque upper body of sheet_rect)
         if (h_f > top_y) {
             const py_start: u32 = title_bar_height * sc;
-            const py_end: u32 = @min(c.height, win_h * sc);
+            const py_end: u32 = @min(c.height, disp_bottom_h * sc);
             const sr_x0: u32 = @intFromFloat(@max(0.0, @ceil((sr.x + 2.0) * sc_f)));
             const sr_x1: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(c.width)), @floor((sr.x + sr.w - 2.0) * sc_f)));
             const sr_opaque_y1: u32 = @intFromFloat(@max(@as(f32, @floatFromInt(py_start)), @floor((sr.y + sr.h - 17.0) * sc_f)));
@@ -2246,6 +2413,7 @@ pub const BoardUi = struct {
                 .usb_keyboard_connected = status.usb_keyboard_connected,
                 .usb_mouse_connected = status.usb_mouse_connected,
                 .ethernet_connected = status.ethernet_connected,
+                .gpio_connected = status.gpio_connected,
                 .act_led_on = status.act_led_on,
                 .pwr_led_on = status.pwr_led_on,
             };
@@ -2290,6 +2458,182 @@ pub const BoardUi = struct {
         self.paintBoardDrawing(c, drawing, self.board_rect, status);
         self.paintSettingsSection(c, status);
         self.paintSdPopups(c);
+    }
+
+    /// Renders the GPIO box below the display when the GPIO ribbon cable is connected.
+    /// First section: LEDs for outputs ordered from low to high pin numbers.
+    /// Second section: interactive switches for inputs ordered from low to high pin numbers.
+    fn paintGpioBox(
+        self: *BoardUi,
+        c: *Canvas,
+        win_w: u32,
+        status: SystemStatus,
+        gpio_hw: *const Gpio,
+    ) void {
+        const gb = self.gpio_box_rect;
+        if (gb.w <= 0 or gb.h <= 0) return;
+
+        const sc_f = @max(c.scale, 1.0);
+        const sc: u32 = @intFromFloat(sc_f);
+        const box_y_px: u32 = @intFromFloat(@round(gb.y * sc_f));
+        const box_w_px: u32 = win_w * sc;
+        const box_h_px: u32 = gpio_panel_height * sc;
+        if (box_y_px + box_h_px > c.height or box_w_px > c.width) return;
+
+        const hdr_mask = headerGpioMask(status.model);
+        var out_mask: u32 = 0;
+        var in_mask: u32 = 0;
+        var level_mask: u32 = 0;
+        for (0..28) |pin_usize| {
+            const pin: u6 = @intCast(pin_usize);
+            const bit: u32 = @as(u32, 1) << @intCast(pin);
+            if ((hdr_mask & bit) == 0) continue;
+            switch (gpio_hw.getPinFunction(pin)) {
+                .output => out_mask |= bit,
+                .input => in_mask |= bit,
+                else => {},
+            }
+            if (gpio_hw.getPinLevel(pin)) level_mask |= bit;
+        }
+
+        const total_px = @as(usize, box_w_px) * @as(usize, box_h_px);
+        const gkey: GpioCacheKey = .{
+            .win_w = win_w,
+            .scale = sc,
+            .board_model = BoardModel.fromModel(status.model),
+            .output_mask = out_mask,
+            .input_mask = in_mask,
+            .level_mask = level_mask,
+            .hovered_input_idx = self.hovered_gpio_input_idx,
+        };
+
+        if (self.gpio_cache.len == total_px and std.meta.eql(self.gpio_cache_key, gkey)) {
+            for (0..box_h_px) |ry| {
+                const dst_row = c.pixels[(box_y_px + ry) * c.stride ..][0..box_w_px];
+                const src_row = self.gpio_cache[ry * box_w_px ..][0..box_w_px];
+                @memcpy(dst_row, src_row);
+            }
+            return;
+        }
+
+        const t = &self.theme;
+        c.fillRect(gb, t.surface_container);
+        c.fillRect(.{ .x = gb.x, .y = gb.y, .w = gb.w, .h = 1.0 }, t.outline_variant);
+
+        const card_r: Rect = .{
+            .x = gb.x + 12.0,
+            .y = gb.y + 8.0,
+            .w = gb.w - 24.0,
+            .h = gb.h - 16.0,
+        };
+        c.fillRoundedRect(card_r, .all(10.0), t.surface);
+        c.strokeRoundedRect(card_r, .all(10.0), 1.0, t.outline_variant);
+
+        // Divider between Section 1 (Outputs) and Section 2 (Inputs)
+        const div_y = gb.y + 60.0;
+        c.fillRect(.{ .x = card_r.x + 12.0, .y = div_y, .w = card_r.w - 24.0, .h = 1.0 }, t.outline_variant.withAlpha(0.6));
+
+        // Section 1: Outputs (LEDs ordered from low to high pin numbers)
+        _ = c.drawText(13.0, gb.x + 24.0, gb.y + 32.0, "Outputs", t.on_surface);
+        _ = c.drawText(11.0, gb.x + 24.0, gb.y + 47.0, "GPIO LEDs", t.on_surface_variant);
+
+        if (self.gpio_output_count == 0) {
+            _ = c.drawText(12.5, gb.x + 116.0, gb.y + 39.0, "No pins configured as outputs", t.on_surface_variant);
+        } else {
+            const num_st: canvas_mod.Style = .{ .font = &self.font, .size = 11.0 };
+            for (0..self.gpio_output_count) |idx| {
+                const pin = self.gpio_output_pins[idx];
+                const cell = self.gpioOutputLedRect(idx);
+                const cx = @round(cell.x + cell.w * 0.5);
+                const led_cy = @round(cell.y + 15.0);
+                const high = gpio_hw.getPinLevel(pin);
+
+                if (high) {
+                    const led_col = Color.rgb(0x22E55E);
+                    c.fillCircle(.{ cx, led_cy }, 9.5, led_col.withAlpha(0.28));
+                    c.fillCircle(.{ cx, led_cy }, 6.5, led_col);
+                    c.fillCircle(.{ cx - 1.8, led_cy - 1.8 }, 2.0, Color.rgb(0xC8FFDA));
+                    c.strokeCircle(.{ cx, led_cy }, 6.5, 1.0, Color.rgb(0x16A34A));
+                } else {
+                    c.fillCircle(.{ cx, led_cy }, 6.5, t.surface_container_highest);
+                    c.strokeCircle(.{ cx, led_cy }, 6.5, 1.2, t.outline);
+                }
+
+                var pin_buf: [8]u8 = undefined;
+                const pin_lbl = std.fmt.bufPrint(&pin_buf, "{d}", .{pin}) catch "";
+                const tw = c.measureText(11.0, pin_lbl);
+                _ = c.drawText(
+                    11.0,
+                    @round(cx - tw * 0.5),
+                    @round(cell.y + 32.0 + num_st.ascent()),
+                    pin_lbl,
+                    if (high) t.on_surface else t.on_surface_variant,
+                );
+            }
+        }
+
+        // Section 2: Inputs (interactive switches ordered from low to high pin numbers)
+        _ = c.drawText(13.0, gb.x + 24.0, gb.y + 93.0, "Inputs", t.on_surface);
+        _ = c.drawText(11.0, gb.x + 24.0, gb.y + 108.0, "GPIO Switches", t.on_surface_variant);
+
+        if (self.gpio_input_count == 0) {
+            _ = c.drawText(12.5, gb.x + 116.0, gb.y + 100.0, "No pins configured as inputs", t.on_surface_variant);
+        } else {
+            const num_st: canvas_mod.Style = .{ .font = &self.font, .size = 11.0 };
+            for (0..self.gpio_input_count) |idx| {
+                const pin = self.gpio_input_pins[idx];
+                const cell = self.gpioInputSwitchRect(idx);
+                const cx = @round(cell.x + cell.w * 0.5);
+                const high = gpio_hw.getPinLevel(pin);
+                const hovered = (self.hovered_gpio_input_idx == idx);
+
+                const sw_w: f32 = 16.0;
+                const sw_h: f32 = 30.0;
+                const sw_r: Rect = .{
+                    .x = @round(cx - sw_w * 0.5),
+                    .y = @round(cell.y + 3.0),
+                    .w = sw_w,
+                    .h = sw_h,
+                };
+                const track_bg = if (high) t.primary else t.surface_container_highest;
+                const track_border = if (hovered)
+                    t.on_surface
+                else if (high)
+                    t.primary
+                else
+                    t.outline;
+                c.fillRoundedRect(sw_r, .all(sw_w * 0.5), track_bg);
+                c.strokeRoundedRect(sw_r, .all(sw_w * 0.5), if (hovered) 1.5 else 1.1, track_border);
+
+                const knob_cy = if (high) (sw_r.y + 8.0) else (sw_r.y + sw_r.h - 8.0);
+                const knob_col = if (high) t.on_primary else t.on_surface_variant;
+                c.fillCircle(.{ cx, knob_cy }, 5.5, knob_col);
+
+                var pin_buf: [8]u8 = undefined;
+                const pin_lbl = std.fmt.bufPrint(&pin_buf, "{d}", .{pin}) catch "";
+                const tw = c.measureText(11.0, pin_lbl);
+                _ = c.drawText(
+                    11.0,
+                    @round(cx - tw * 0.5),
+                    @round(cell.y + 38.0 + num_st.ascent()),
+                    pin_lbl,
+                    if (high or hovered) t.on_surface else t.on_surface_variant,
+                );
+            }
+        }
+
+        if (self.gpio_cache.len != total_px) {
+            if (self.gpio_cache.len > 0) self.gpa.free(self.gpio_cache);
+            self.gpio_cache = self.gpa.alloc(u32, total_px) catch &.{};
+        }
+        if (self.gpio_cache.len == total_px) {
+            for (0..box_h_px) |ry| {
+                const src_row = c.pixels[(box_y_px + ry) * c.stride ..][0..box_w_px];
+                const dst_row = self.gpio_cache[ry * box_w_px ..][0..box_w_px];
+                @memcpy(dst_row, src_row);
+            }
+            self.gpio_cache_key = gkey;
+        }
     }
 
     fn paintSettingsSection(self: *const BoardUi, c: *Canvas, status: SystemStatus) void {
@@ -2746,6 +3090,7 @@ pub const BoardUi = struct {
                     break :blk !hl.has_external_hub and (self.hovered_target == if (idx == 0) InteractiveTarget.usb_keyboard else InteractiveTarget.usb_mouse);
                 },
                 .ethernet => !hl.has_external_hub and self.hovered_target == .ethernet,
+                .gpio, .gpio_holes => self.hovered_target == .gpio,
                 else => false,
             };
             const pr = map(tr, part.rect);
@@ -2771,6 +3116,24 @@ pub const BoardUi = struct {
 
         const max_y = tr.y + hl.bottom_cable_max_y * s;
         const max_x = tr.x + hl.right_cable_max_x * s;
+
+        // 0. 40-pin GPIO IDC ribbon cable connector on the top edge of the board
+        for (b.parts) |part| {
+            if (part.kind == .gpio or part.kind == .gpio_holes) {
+                const hovered = (self.hovered_target == .gpio);
+                drawGpioRibbonCable(
+                    c,
+                    map(tr, part.rect),
+                    tr.y + HubLayout.gpio_cable_min_y * s,
+                    s,
+                    if (hovered) t.primary else ink,
+                    t.primary,
+                    t.surface,
+                    status.gpio_connected,
+                    hovered,
+                );
+            }
+        }
 
         // 1. Micro-SD card (connected into slot or pulled out to the left)
         const sd_card_name = self.activeSdCardName();
@@ -3787,6 +4150,93 @@ fn drawUsbHubAndPeripherals(
     );
 }
 
+/// Draws the 40-pin GPIO IDC ribbon cable and connector above/on the GPIO header.
+/// When `connected` is true, the IDC connector sits over the 40-pin GPIO header with the flat
+/// ribbon cable extending up to `min_y`. When `connected` is false, the IDC connector is pulled
+/// up above the top edge of the board with a visible gap above the GPIO pins.
+pub fn drawGpioRibbonCable(
+    c: *Canvas,
+    gpio_r: Rect,
+    min_y: f32,
+    s: f32,
+    ink: Color,
+    accent: Color,
+    surface_bg: Color,
+    connected: bool,
+    hovered: bool,
+) void {
+    const conn_r: Rect = if (connected)
+        gpio_r.outset(0.35 * s)
+    else .{
+        .x = gpio_r.x - 0.35 * s,
+        .y = gpio_r.y - 7.8 * s,
+        .w = gpio_r.w + 0.7 * s,
+        .h = gpio_r.h,
+    };
+
+    const ribbon_x = gpio_r.x + 0.8 * s;
+    const ribbon_w = gpio_r.w - 1.6 * s;
+    const ribbon_bottom = conn_r.y;
+    if (ribbon_bottom > min_y and ribbon_w > 2.0) {
+        const rib_r: Rect = .{
+            .x = ribbon_x,
+            .y = min_y,
+            .w = ribbon_w,
+            .h = ribbon_bottom - min_y,
+        };
+        c.fillRect(rib_r, surface_bg);
+        c.fillRect(rib_r, if (hovered) accent.withAlpha(0.20) else ink.withAlpha(0.12));
+
+        // Pin-1 red edge stripe on the left conductor of the ribbon cable
+        const stripe_w = @max(1.5, ribbon_w / 24.0);
+        c.fillRect(
+            .{ .x = rib_r.x + line_w, .y = rib_r.y, .w = stripe_w, .h = rib_r.h },
+            red.withAlpha(if (hovered) 0.85 else 0.72),
+        );
+
+        // Vertical conductor grooves across the flat ribbon cable
+        const grooves: usize = 19;
+        for (1..grooves) |gi| {
+            const gx = rib_r.x + (rib_r.w * @as(f32, @floatFromInt(gi))) / @as(f32, @floatFromInt(grooves));
+            c.fillRect(.{ .x = gx, .y = rib_r.y, .w = 1.0, .h = rib_r.h }, ink.withAlpha(0.28));
+        }
+
+        // Left and right outer edges of the ribbon cable
+        c.fillRect(.{ .x = rib_r.x, .y = rib_r.y, .w = line_w, .h = rib_r.h }, ink);
+        c.fillRect(.{ .x = rib_r.x + rib_r.w - line_w, .y = rib_r.y, .w = line_w, .h = rib_r.h }, ink);
+    }
+
+    // IDC 40-pin connector housing with strain-relief clamp bar and center polarizing key
+    const rad: Radii = .all(0.7 * s);
+    c.fillRoundedRect(conn_r, rad, surface_bg);
+    c.fillRoundedRect(conn_r, rad, if (hovered) accent.withAlpha(0.28) else ink.withAlpha(0.18));
+    c.strokeRoundedRect(conn_r, rad, heavy_w, ink);
+
+    // Strain-relief bar running horizontally across the middle of the IDC housing
+    const bar_h = @max(1.5, conn_r.h * 0.34);
+    const bar_r: Rect = .{
+        .x = conn_r.x + 1.0 * s,
+        .y = conn_r.y + (conn_r.h - bar_h) * 0.5,
+        .w = conn_r.w - 2.0 * s,
+        .h = bar_h,
+    };
+    c.strokeRoundedRect(bar_r, .all(0.3 * s), line_w, ink.withAlpha(0.85));
+
+    // Polarizing center tab on top of the IDC housing
+    const key_w = @min(6.0 * s, conn_r.w * 0.14);
+    const key_h = @max(1.2, 1.1 * s);
+    const key_r: Rect = .{
+        .x = conn_r.x + (conn_r.w - key_w) * 0.5,
+        .y = conn_r.y,
+        .w = key_w,
+        .h = key_h,
+    };
+    c.fillRect(key_r, ink.withAlpha(0.45));
+
+    // Pin-1 triangle marker on the left side of the IDC housing
+    c.fillCircle(.{ conn_r.x + 2.0 * s, conn_r.y + conn_r.h - 1.4 * s }, @max(1.2, 0.55 * s), red.withAlpha(0.85));
+}
+
 fn evdevKeyToCardNameChar(evdev_key: u32, shift: bool) ?u8 {
     const lower: ?u8 = switch (evdev_key) {
         2 => '1',
@@ -4350,3 +4800,116 @@ test "BoardUi persistent images and settings.json with custom and default card n
         try testing.expectEqualStrings("Card 2", ui2.newCardName());
     }
 }
+
+test "GPIO ribbon cable connector and GPIO box outputs LEDs and input switches" {
+    var ui = try BoardUi.init(testing.allocator);
+    defer ui.deinit();
+
+    var hw: Gpio = .{};
+    var status: SystemStatus = .{};
+
+    // 1. Disconnected by default
+    try testing.expect(!status.gpio_connected);
+
+    const win_w: u32 = 1280;
+    const win_h_disconnected: u32 = 764;
+    const win_h_connected: u32 = 764 + BoardUi.gpio_panel_height;
+    const pixels = try testing.allocator.alloc(u32, win_w * win_h_connected);
+    defer testing.allocator.free(pixels);
+    @memset(pixels, 0xff000000);
+
+    ui.paint(pixels[0 .. win_w * win_h_disconnected], win_w, win_h_disconnected, 1, status, &hw);
+    try testing.expectEqual(@as(f32, 0.0), ui.gpio_box_rect.h);
+
+    // 2. Clicking the GPIO ribbon cable / header on the board diagram toggles .toggle_gpio
+    const tr = BoardUi.boardTransform(&board.pi_zero, ui.board_rect);
+    const gpio_click_x = tr.x + 32.5 * tr.scale;
+    const gpio_click_y = tr.y + (-4.0) * tr.scale; // over the unplugged IDC ribbon cable above the GPIO header
+    try testing.expect(ui.pointerMotion(gpio_click_x, gpio_click_y, status, &hw));
+    try testing.expectEqual(@as(?InteractiveTarget, .gpio), ui.hovered_target);
+    _ = ui.pointerButton(gpio_click_x, gpio_click_y, true, status, &hw);
+    try testing.expectEqual(Action.toggle_gpio, ui.pointerButton(gpio_click_x, gpio_click_y, false, status, &hw));
+
+    // Connect the GPIO ribbon cable
+    status.gpio_connected = true;
+    ui.paint(pixels, win_w, win_h_connected, 1, status, &hw);
+    try testing.expectEqual(@as(f32, @floatFromInt(BoardUi.gpio_panel_height)), ui.gpio_box_rect.h);
+    try testing.expectEqual(@as(f32, 764.0), ui.gpio_box_rect.y);
+
+    // 3. Hardware reset defaults: all 28 header pins (0..27) are inputs ordered low-to-high;
+    //    pins 0..8 default high (pulled up) and pins 9..27 default low (pulled down).
+    try testing.expectEqual(@as(usize, 0), ui.gpio_output_count);
+    try testing.expectEqual(@as(usize, 28), ui.gpio_input_count);
+    for (0..28) |idx| {
+        const pin = ui.gpio_input_pins[idx];
+        try testing.expectEqual(@as(u6, @intCast(idx)), pin);
+        if (pin <= 8) {
+            try testing.expect(hw.getPinLevel(pin));
+        } else {
+            try testing.expect(!hw.getPinLevel(pin));
+        }
+    }
+
+    // 4. Close the board sheet and toggle input switches in the GPIO box below the display
+    ui.sheet_open = false;
+    ui.updateLayout(win_w, win_h_connected, status, &hw);
+
+    // Toggle GPIO 4 (default high -> low) and GPIO 17 (default low -> high)
+    const sw4 = ui.gpioInputSwitchRect(4);
+    hw.write32(0x4C, 1 << 17); // GPREN0: rising edge detect on GPIO 17
+    hw.write32(0x58, 1 << 4); // GPFEN0: falling edge detect on GPIO 4
+    _ = ui.pointerButton(sw4.x + sw4.w * 0.5, sw4.y + sw4.h * 0.5, true, status, &hw);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(sw4.x + sw4.w * 0.5, sw4.y + sw4.h * 0.5, false, status, &hw));
+    try testing.expect(!hw.getPinLevel(4));
+
+    const sw17 = ui.gpioInputSwitchRect(17);
+    _ = ui.pointerButton(sw17.x + sw17.w * 0.5, sw17.y + sw17.h * 0.5, true, status, &hw);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(sw17.x + sw17.w * 0.5, sw17.y + sw17.h * 0.5, false, status, &hw));
+    try testing.expect(hw.getPinLevel(17));
+    try testing.expect(hw.irqPending());
+    try testing.expect(hw.takeUiDirty());
+
+    // 5. Guest OS reconfigures GPIO pins via MMIO (GPFSEL, GPSET, GPCLR, GPPUD, GPPUDCLK):
+    //    Configure GPIO 21, GPIO 5, and GPIO 18 as outputs (0b001).
+    //    Notice GPFSEL0 also contains GPIO 4 (currently overridden low by switch): read-modify-write
+    //    of GPFSEL0 to set GPIO 5 as output must NOT clobber GPIO 4's input switch override!
+    const gpfsel0_prev = hw.read32(0x00);
+    hw.write32(0x00, gpfsel0_prev | (0b001 << 15)); // GPIO 5 -> output
+    hw.write32(0x04, 0b001 << 24); // GPIO 18 -> output
+    hw.write32(0x08, 0b001 << 3); // GPIO 21 -> output
+    hw.write32(0x1C, (1 << 5) | (1 << 21)); // GPSET0: set GPIO 5 and GPIO 21 high
+    try testing.expect(hw.takeUiDirty());
+
+    ui.paint(pixels, win_w, win_h_connected, 1, status, &hw);
+
+    // Outputs section has 3 pins ordered low-to-high: [5, 18, 21]
+    try testing.expectEqual(@as(usize, 3), ui.gpio_output_count);
+    try testing.expectEqual(@as(u6, 5), ui.gpio_output_pins[0]);
+    try testing.expectEqual(@as(u6, 18), ui.gpio_output_pins[1]);
+    try testing.expectEqual(@as(u6, 21), ui.gpio_output_pins[2]);
+    try testing.expect(hw.getPinLevel(5));
+    try testing.expect(!hw.getPinLevel(18));
+    try testing.expect(hw.getPinLevel(21));
+
+    // Inputs section now has 25 pins ordered low-to-high (excluding 5, 18, 21), and GPIO 4 kept its switch override
+    try testing.expectEqual(@as(usize, 25), ui.gpio_input_count);
+    for (1..ui.gpio_input_count) |i| {
+        try testing.expect(ui.gpio_input_pins[i - 1] < ui.gpio_input_pins[i]);
+    }
+    try testing.expect(!hw.getPinLevel(4));
+
+    // Guest OS reconfigures pull-up on input pin 12 via GPPUD (0x94) + GPPUDCLK0 (0x98)
+    try testing.expect(!hw.getPinLevel(12));
+    hw.write32(0x94, 2); // Pull-up
+    hw.write32(0x98, 1 << 12); // Clock pull into GPIO 12
+    hw.write32(0x94, 0);
+    hw.write32(0x98, 0);
+    try testing.expect(hw.takeUiDirty());
+    try testing.expect(hw.getPinLevel(12));
+
+    // Guest OS clears GPIO 21 via GPCLR0 (0x28)
+    hw.write32(0x28, 1 << 21);
+    try testing.expect(!hw.getPinLevel(21));
+    ui.paint(pixels, win_w, win_h_connected, 1, status, &hw);
+}
+
