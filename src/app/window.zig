@@ -52,6 +52,7 @@ pub const WaylandWindow = struct {
 
     configured: bool = false,
     closed: bool = false,
+    ui_dirty: bool = true,
     power_reconnected: bool = false,
     sd_disconnected: bool = false,
     sd_reconnected: bool = false,
@@ -308,6 +309,7 @@ pub const WaylandWindow = struct {
                     self.ui.setPendingSdImageFile(trimmed, fsize);
                 }
                 self.picker_len = 0;
+                self.ui_dirty = true;
                 return;
             }
             self.picker_len += rc;
@@ -490,6 +492,7 @@ pub const WaylandWindow = struct {
         self.has_buffers = true;
         self.cur_buf = 0;
         self.cursor_mode = .unknown;
+        self.ui_dirty = true;
 
         {
             var m = try pool.request(protocol.wl_shm_pool.request.destroy);
@@ -515,9 +518,11 @@ pub const WaylandWindow = struct {
     /// backbuffer (pixel-doubling `scale x scale` when `scale > 1`) and renders
     /// `BoardUi` at native HiDPI resolution (`scale`).
     pub fn compositeUi(self: *WaylandWindow) void {
+        self.ui_dirty = false;
         if (self.pending_scale != self.scale and self.pending_scale >= 1) {
             self.scale = self.pending_scale;
             self.initShmBuffers() catch {};
+            self.ui_dirty = false;
         }
 
         const sc = @max(self.scale, 1);
@@ -592,6 +597,24 @@ pub const WaylandWindow = struct {
         self.pollSdImagePicker();
     }
 
+    pub fn waitEvents(self: *WaylandWindow, timeout_ms: i32) !void {
+        const was_dirty = self.ui_dirty;
+        try self.display.pollAndDispatch();
+        self.pollSdImagePicker();
+        if (self.closed or (!was_dirty and self.ui_dirty)) return;
+
+        var fds: [2]linux.pollfd = .{
+            .{ .fd = self.display.conn.fd, .events = linux.POLL.IN, .revents = 0 },
+            .{ .fd = self.picker_fd, .events = linux.POLL.IN, .revents = 0 },
+        };
+        const nfds: linux.nfds_t = if (self.picker_fd >= 0) 2 else 1;
+        const rc = linux.poll(&fds, nfds, timeout_ms);
+        if (linux.errno(rc) == .SUCCESS and rc > 0) {
+            try self.display.pollAndDispatch();
+            self.pollSdImagePicker();
+        }
+    }
+
     fn startMove(self: *WaylandWindow) void {
         const seat = self.seat orelse return;
         var m = self.toplevel.request(protocol.xdg_toplevel.request.move) catch return;
@@ -612,6 +635,7 @@ pub const WaylandWindow = struct {
             h.setHubKind(@import("../usb/hid.zig").HubKind.fromModel(self.status.model));
             h.hub_connected = self.status.usb_hub_connected;
         }
+        self.ui_dirty = true;
         self.ui.saveSettings(self.status) catch {};
         var m = self.toplevel.request(protocol.xdg_toplevel.request.set_title) catch return;
         m.string(self.ui.title).end();
@@ -619,6 +643,7 @@ pub const WaylandWindow = struct {
 
     fn toggleMaximized(self: *WaylandWindow) void {
         self.ui.maximized = !self.ui.maximized;
+        self.ui_dirty = true;
         const op: u16 = if (self.ui.maximized)
             protocol.xdg_toplevel.request.set_maximized
         else
@@ -632,7 +657,11 @@ pub const WaylandWindow = struct {
         if (opcode == protocol.wl_surface.event.preferred_buffer_scale) {
             const factor = r.int() catch return;
             if (factor >= 1 and factor <= 4) {
-                self.pending_scale = @intCast(factor);
+                const new_scale: u32 = @intCast(factor);
+                if (self.pending_scale != new_scale) {
+                    self.pending_scale = new_scale;
+                    self.ui_dirty = true;
+                }
             }
         }
     }
@@ -642,7 +671,11 @@ pub const WaylandWindow = struct {
         if (opcode == protocol.wl_output.event.scale) {
             const factor = r.int() catch return;
             if (factor >= 1 and factor <= 4) {
-                self.pending_scale = @intCast(factor);
+                const new_scale: u32 = @intCast(factor);
+                if (self.pending_scale != new_scale) {
+                    self.pending_scale = new_scale;
+                    self.ui_dirty = true;
+                }
             }
         }
     }
@@ -663,6 +696,7 @@ pub const WaylandWindow = struct {
             var m = self.xdg_surface.request(protocol.xdg_surface.request.ack_configure) catch return;
             m.uint(serial).end();
             self.configured = true;
+            self.ui_dirty = true;
         }
     }
 
@@ -670,6 +704,7 @@ pub const WaylandWindow = struct {
         const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
         if (opcode == protocol.xdg_toplevel.event.close) {
             self.closed = true;
+            self.ui_dirty = true;
         }
     }
 
@@ -784,12 +819,14 @@ pub const WaylandWindow = struct {
                 if (!in_ui) {
                     self.updateGuestMouseTarget(sx, sy);
                 }
+                self.ui_dirty = true;
             },
             protocol.wl_pointer.event.leave => {
                 self.last_mouse_x = null;
                 self.last_mouse_y = null;
                 self.cursor_mode = .unknown;
                 self.ui.pointerLeave();
+                self.ui_dirty = true;
             },
             protocol.wl_pointer.event.motion => {
                 _ = r.uint() catch return; // time
@@ -802,6 +839,7 @@ pub const WaylandWindow = struct {
                 }
                 self.last_mouse_x = sx;
                 self.last_mouse_y = sy;
+                self.ui_dirty = true;
             },
             protocol.wl_pointer.event.button => {
                 const serial = r.uint() catch return;
@@ -810,6 +848,7 @@ pub const WaylandWindow = struct {
                 const state = r.uint() catch return;
                 const pressed = (state == protocol.wl_pointer.button_state.pressed);
                 self.last_button_serial = serial;
+                self.ui_dirty = true;
 
                 const sx_f64 = self.last_mouse_x orelse 0.0;
                 const sy_f64 = self.last_mouse_y orelse 0.0;
@@ -969,6 +1008,7 @@ pub const WaylandWindow = struct {
                 const pressed = (state == protocol.wl_keyboard.key_state.pressed);
                 self.ui.updateModifierKey(key, pressed);
                 if (self.ui.sheet_open) {
+                    self.ui_dirty = true;
                     if (pressed and self.ui.handleKey(key)) {
                         self.status.serial_u64 = self.ui.parsedSerial();
                         self.status.mac_address = self.ui.parsedMac();

@@ -372,10 +372,16 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     else
         null;
     defer if (host_audio) |ha| ha.destroy(gpa);
+    if (host_audio) |ha| ha.setPaused(!guest_booted);
+
+    var idle_rendered_power: ?bool = null;
+    var idle_rendered_booted: ?bool = null;
 
     if (wl_win) |w| {
         const disp_pixels = w.displayPixels();
         @memset(disp_pixels, 0xFF101418);
+        idle_rendered_power = w.status.power_connected;
+        idle_rendered_booted = guest_booted;
         w.compositeUi();
         try w.present();
     }
@@ -423,7 +429,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 const active_sd = if (w.status.sd_connected) sd_image_buf else null;
                 if (active_qcow2 != null or active_sd != null or opts.kernel_path != null) {
                     if (host_audio) |ha| ha.setPaused(true);
-                    defer if (host_audio) |ha| ha.setPaused(false);
                     if (loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, active_sd, w.status.board_model, w.status.serial_u64, w.status.mac_address, w.status.wifi_mac_address)) |reboot_res| {
                         syncWindowPeripheralsToSoc(w, &soc);
                         cpu = .{};
@@ -432,6 +437,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                         last_guest_vblank_us = 0;
                         active_us_accum = 0;
                         idle_us_accum = 0;
+                        if (host_audio) |ha| ha.setPaused(false);
                     } else |err| {
                         std.debug.print("fauxpi: failed to boot SD image: {s}\n", .{@errorName(err)});
                         guest_booted = false;
@@ -444,23 +450,37 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
 
             if (!w.status.power_connected or !guest_booted) {
-                const now_ns = monotonicNs();
-                if (now_ns -| last_vblank_ns >= vblank_interval_ns) {
-                    last_vblank_ns = now_ns;
-                    w.status.cpu_busy_percent = 0.0;
-                    w.status.temperature_c = @max(25.0, w.status.temperature_c - 0.05);
-                    w.status.hdmi_active = false;
-                    w.status.act_led_on = false;
-                    w.status.pwr_led_on = w.status.power_connected;
-                    w.compositeUi();
-                    try w.present();
+                if (host_audio) |ha| ha.setPaused(true);
+                const state_changed = (idle_rendered_power != w.status.power_connected) or
+                    (idle_rendered_booted != guest_booted);
+                const needs_redraw = w.ui_dirty or
+                    state_changed or
+                    (w.pending_scale != w.scale);
+
+                if (needs_redraw) {
+                    const now_ns = monotonicNs();
+                    const elapsed_ns = now_ns -| last_vblank_ns;
+                    if (state_changed or elapsed_ns >= vblank_interval_ns) {
+                        last_vblank_ns = now_ns;
+                        w.status.cpu_busy_percent = 0.0;
+                        w.status.temperature_c = 25.0;
+                        w.status.hdmi_active = false;
+                        w.status.act_led_on = false;
+                        w.status.pwr_led_on = w.status.power_connected;
+                        idle_rendered_power = w.status.power_connected;
+                        idle_rendered_booted = guest_booted;
+                        w.compositeUi();
+                        try w.present();
+                    } else {
+                        const wait_ms: i32 = @intCast(@max((vblank_interval_ns - elapsed_ns + 999_999) / 1_000_000, 1));
+                        try w.waitEvents(wait_ms);
+                    }
                 } else {
-                    try w.pollEvents();
-                    var req: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
-                    _ = linux.nanosleep(&req, null);
+                    try w.waitEvents(-1);
                 }
                 continue;
             }
+            idle_rendered_booted = null;
         }
         if (soc.pm.reboot_requested) break;
         if (opts.max_steps != 0 and cpu.cycles >= opts.max_steps) break;

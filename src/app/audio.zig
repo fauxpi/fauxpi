@@ -53,6 +53,8 @@ pub const HostAudioOutput = struct {
 
     pub fn destroy(self: *HostAudioOutput, allocator: std.mem.Allocator) void {
         self.running.store(false, .release);
+        _ = self.fifo.write_idx.fetchAdd(1, .seq_cst);
+        self.fifo.wakeConsumer();
         if (self.thread) |t| {
             t.join();
             self.thread = null;
@@ -62,7 +64,10 @@ pub const HostAudioOutput = struct {
     }
 
     pub fn setPaused(self: *HostAudioOutput, p: bool) void {
-        self.paused.store(p, .release);
+        const prev = self.paused.swap(p, .acq_rel);
+        if (prev and !p) {
+            self.fifo.wakeConsumer();
+        }
     }
 
     fn tryOpenPulse(self: *HostAudioOutput) bool {
@@ -219,15 +224,13 @@ pub const HostAudioOutput = struct {
 
         while (self.running.load(.acquire)) {
             if (self.paused.load(.acquire)) {
-                var req: linux.timespec = .{ .sec = 0, .nsec = 5_000_000 };
-                _ = linux.nanosleep(&req, null);
+                self.fifo.waitForFrames(&self.running, &self.paused);
                 continue;
             }
 
             const frames = self.fifo.popFrames(&buf);
             if (frames == 0) {
-                var req: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
-                _ = linux.nanosleep(&req, null);
+                self.fifo.waitForFrames(&self.running, &self.paused);
                 continue;
             }
 

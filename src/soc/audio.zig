@@ -12,6 +12,7 @@ pub const AudioFifo = struct {
     samples: [CAPACITY * 2]i16 = [_]i16{0} ** (CAPACITY * 2),
     write_idx: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     read_idx: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    consumer_sleeping: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Resampler state (guest sample rate -> 48 kHz)
     phase_fp: u32 = 0,
@@ -46,6 +47,44 @@ pub const AudioFifo = struct {
         self.samples[slot + 1] = right;
         self.write_idx.store(w +% 1, .release);
         self.total_frames_pushed += 1;
+        if (self.consumer_sleeping.load(.acquire) != 0) {
+            self.wakeConsumer();
+        }
+    }
+
+    pub fn wakeConsumer(self: *AudioFifo) void {
+        _ = std.os.linux.futex_4arg(
+            @ptrCast(&self.write_idx.raw),
+            .{ .cmd = .WAKE, .private = true },
+            1,
+            null,
+        );
+    }
+
+    pub fn waitForFrames(
+        self: *AudioFifo,
+        running: *const std.atomic.Value(bool),
+        paused: *const std.atomic.Value(bool),
+    ) void {
+        if (!running.load(.acquire)) return;
+        const w = self.write_idx.load(.acquire);
+        const r = self.read_idx.load(.acquire);
+        if (!paused.load(.acquire) and w != r) return;
+
+        self.consumer_sleeping.store(1, .seq_cst);
+        defer self.consumer_sleeping.store(0, .release);
+
+        if (!running.load(.acquire)) return;
+        const w2 = self.write_idx.load(.seq_cst);
+        const r2 = self.read_idx.load(.acquire);
+        if (!paused.load(.acquire) and w2 != r2) return;
+
+        _ = std.os.linux.futex_4arg(
+            @ptrCast(&self.write_idx.raw),
+            .{ .cmd = .WAIT, .private = true },
+            w2,
+            null,
+        );
     }
 
     /// Pushes one stereo sample frame at `src_rate_hz`, resampling linearly to `HOST_SAMPLE_RATE` (48 kHz).
