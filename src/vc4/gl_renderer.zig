@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_posix = @import("../host/posix.zig");
 const qpu = @import("qpu.zig");
 const qpu_sim = @import("qpu_sim.zig");
 const qpu_to_glsl = @import("qpu_to_glsl.zig");
@@ -58,7 +59,7 @@ pub const GlRenderer = struct {
         valid: bool = false,
     };
 
-    egl_lib: ?std.DynLib = null,
+    egl_lib: ?host_posix.DynLib = null,
     dpy: EGLDisplay = null,
     ctx: EGLContext = null,
     available: bool = false,
@@ -92,7 +93,7 @@ pub const GlRenderer = struct {
     }
 
     fn tryInitEgl(self: *GlRenderer) void {
-        var lib = std.DynLib.open("libEGL.so.1") catch return;
+        var lib = host_posix.DynLib.open("libEGL.so.1") catch return;
         const eglGetDisplay = lib.lookup(*const fn (?*anyopaque) callconv(.c) EGLDisplay, "eglGetDisplay") orelse {
             lib.close();
             return;

@@ -7,9 +7,14 @@ const UsbHidComposite = @import("../usb/hid.zig").UsbHidComposite;
 const Gpio = @import("../soc/gpio.zig").Gpio;
 const board_sheet = @import("../ui/board_sheet.zig");
 pub const macos_window = @import("macos_window.zig");
+pub const windows_window = @import("windows_window.zig");
 
-/// Platform-native desktop window backend (`MacosWindow` on macOS, `WaylandWindow` on Linux).
-pub const Window = if (builtin.os.tag == .macos) macos_window.MacosWindow else WaylandWindow;
+/// Platform-native desktop window backend (`WindowsWindow` on Windows, `MacosWindow` on macOS, `WaylandWindow` on Linux).
+pub const Window = switch (builtin.os.tag) {
+    .macos => macos_window.MacosWindow,
+    .windows => windows_window.WindowsWindow,
+    else => WaylandWindow,
+};
 
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern "c" fn _exit(status: c_int) noreturn;

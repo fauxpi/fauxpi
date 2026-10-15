@@ -531,22 +531,9 @@ pub const BoardUi = struct {
         return false;
     }
 
-    /// Resolves `$XDG_DATA_HOME/fauxpi` (or `$HOME/.local/share/fauxpi` when `XDG_DATA_HOME` is unset/empty).
+    /// Resolves `$XDG_DATA_HOME/fauxpi` (or `$HOME/.local/share/fauxpi` on POSIX, `%LOCALAPPDATA%/fauxpi` on Windows).
     pub fn resolveXdgDataDir(buf: []u8, environ: std.process.Environ) ?[]const u8 {
-        const Environ = std.process.Environ;
-        if (Environ.getPosix(environ, "XDG_DATA_HOME")) |xdg| {
-            const trimmed = std.mem.trimEnd(u8, xdg, "/");
-            if (trimmed.len > 0) {
-                return std.fmt.bufPrint(buf, "{s}/fauxpi", .{trimmed}) catch null;
-            }
-        }
-        if (Environ.getPosix(environ, "HOME")) |home| {
-            const trimmed = std.mem.trimEnd(u8, home, "/");
-            if (trimmed.len > 0) {
-                return std.fmt.bufPrint(buf, "{s}/.local/share/fauxpi", .{trimmed}) catch null;
-            }
-        }
-        return null;
+        return host_posix.resolveAppDataDir(buf, environ);
     }
 
     /// Configures persistent storage under `$XDG_DATA_HOME/fauxpi`, loading existing QCOW2 images
@@ -584,77 +571,21 @@ pub const BoardUi = struct {
         }
     }
 
+    fn appendDiscoveredQcow2(self: *BoardUi, card_name: []const u8, full_path: []const u8) void {
+        if (self.hasCardNamed(card_name)) return;
+        var disk = Qcow2Disk.openExistingFile(self.gpa, full_path) catch return;
+        const sz = SdCardSize.smallestFitting(disk.virtual_size) orelse .gb_32;
+        const entry = makeNamedSdCardEntry(card_name, full_path, disk.diskAllocatedBytes(), sz, disk);
+        self.sd_cards.append(self.gpa, entry) catch {
+            disk.deinit();
+        };
+    }
+
     /// Scans `self.imagesDir()` (`$XDG_DATA_HOME/fauxpi/images`) for `.qcow2` files and opens them.
     pub fn loadImagesFromDir(self: *BoardUi) void {
         if (self.images_dir_len == 0) return;
         const dir_path = self.imagesDir();
-
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (dir_path.len >= path_buf.len) return;
-        @memcpy(path_buf[0..dir_path.len], dir_path);
-        path_buf[dir_path.len] = 0;
-
-        if (host_posix.is_linux) {
-            const fd_rc = std.os.linux.openat(
-                std.os.linux.AT.FDCWD,
-                path_buf[0..dir_path.len :0],
-                .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true },
-                0,
-            );
-            if (std.os.linux.errno(fd_rc) != .SUCCESS) return;
-            const dir_fd: std.os.linux.fd_t = @intCast(fd_rc);
-            defer _ = std.os.linux.close(dir_fd);
-
-            var dents_buf: [4096]u8 align(8) = undefined;
-            while (true) {
-                const n = std.os.linux.getdents64(dir_fd, &dents_buf, dents_buf.len);
-                if (std.os.linux.errno(n) != .SUCCESS or n == 0) break;
-                var at: usize = 0;
-                while (at < n) {
-                    const reclen = std.mem.readInt(u16, dents_buf[at + 16 ..][0..2], .little);
-                    const d_name = std.mem.sliceTo(dents_buf[at + 19 .. at + reclen], 0);
-                    at += reclen;
-                    if (d_name.len <= ".qcow2".len or d_name[0] == '.') continue;
-                    if (!std.mem.endsWith(u8, d_name, ".qcow2")) continue;
-
-                    const card_name = d_name[0 .. d_name.len - ".qcow2".len];
-                    if (self.hasCardNamed(card_name)) continue;
-
-                    var full_buf: [std.fs.max_path_bytes]u8 = undefined;
-                    const full_path = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir_path, d_name }) catch continue;
-
-                    var disk = Qcow2Disk.openExistingFile(self.gpa, full_path) catch continue;
-                    const sz = SdCardSize.smallestFitting(disk.virtual_size) orelse .gb_32;
-                    const entry = makeNamedSdCardEntry(card_name, full_path, disk.diskAllocatedBytes(), sz, disk);
-                    self.sd_cards.append(self.gpa, entry) catch {
-                        disk.deinit();
-                        continue;
-                    };
-                }
-            }
-        } else {
-            const dir_ptr = std.c.opendir(path_buf[0..dir_path.len :0]) orelse return;
-            defer _ = std.c.closedir(dir_ptr);
-            while (std.c.readdir(dir_ptr)) |ent| {
-                const d_name = std.mem.sliceTo(&ent.name, 0);
-                if (d_name.len <= ".qcow2".len or d_name[0] == '.') continue;
-                if (!std.mem.endsWith(u8, d_name, ".qcow2")) continue;
-
-                const card_name = d_name[0 .. d_name.len - ".qcow2".len];
-                if (self.hasCardNamed(card_name)) continue;
-
-                var full_buf: [std.fs.max_path_bytes]u8 = undefined;
-                const full_path = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir_path, d_name }) catch continue;
-
-                var disk = Qcow2Disk.openExistingFile(self.gpa, full_path) catch continue;
-                const sz = SdCardSize.smallestFitting(disk.virtual_size) orelse .gb_32;
-                const entry = makeNamedSdCardEntry(card_name, full_path, disk.diskAllocatedBytes(), sz, disk);
-                self.sd_cards.append(self.gpa, entry) catch {
-                    disk.deinit();
-                    continue;
-                };
-            }
-        }
+        host_posix.forEachQcow2File(dir_path, self, appendDiscoveredQcow2);
 
         var i: usize = 1;
         while (i < self.sd_cards.items.len) : (i += 1) {

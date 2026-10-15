@@ -54,7 +54,7 @@ pub const SdHost = struct {
     // Backing storage (in-memory slice, pread/pwrite file descriptor, or QCOW2 virtual disk)
     image_data: ?[]u8 = null,
     image_const: ?[]const u8 = null,
-    image_fd: ?std.posix.fd_t = null,
+    image_fd: ?host_posix.fd_t = null,
     qcow2_disk: ?*qcow2.Qcow2Disk = null,
     image_size: u64 = 512 * 1024 * 1024,
 
@@ -87,7 +87,7 @@ pub const SdHost = struct {
         self.image_size = data.len;
     }
 
-    pub fn attachFile(self: *SdHost, fd: std.posix.fd_t, size: u64) void {
+    pub fn attachFile(self: *SdHost, fd: host_posix.fd_t, size: u64) void {
         self.detach();
         self.image_fd = fd;
         self.image_size = size;

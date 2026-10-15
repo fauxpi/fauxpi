@@ -1,13 +1,16 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const host_posix = @import("../host/posix.zig");
 const audio_mod = @import("../soc/audio.zig");
 
-/// Non-blocking host audio output player for Linux and macOS.
+/// Non-blocking host audio output player for Linux, macOS, and Windows.
 /// - On Linux: spawns a background playback thread that drains 48 kHz stereo S16_LE PCM frames
 ///   from `AudioFifo` and streams them to PulseAudio/PipeWire (`libpulse-simple.so.0`)
 ///   or ALSA (`libasound.so.2`).
 /// - On macOS: opens an `AudioToolbox` `AudioQueueNewOutput` stream (4x 512-frame buffers at 48 kHz)
 ///   that pulls stereo S16_LE frames directly from `AudioFifo`.
+/// - On Windows: opens a `WinMM` (`winmm.dll` `waveOutOpen`) 48 kHz stereo S16_LE stream driven by
+///   4 ring-buffered `WAVEHDR` blocks from the background worker thread.
 pub const HostAudioOutput = struct {
     const PaSimple = opaque {};
     const PaSampleSpec = extern struct {
@@ -51,19 +54,41 @@ pub const HostAudioOutput = struct {
     const AQ_BUFFER_BYTES: u32 = AQ_BUFFER_FRAMES * 4;
     const AQ_NUM_BUFFERS: usize = 4;
 
+    const HWAVEOUT = ?*anyopaque;
+    const WAVEFORMATEX = extern struct {
+        wFormatTag: u16 = 1, // WAVE_FORMAT_PCM
+        nChannels: u16 = 2,
+        nSamplesPerSec: u32 = audio_mod.AudioFifo.HOST_SAMPLE_RATE,
+        nAvgBytesPerSec: u32 = audio_mod.AudioFifo.HOST_SAMPLE_RATE * 4,
+        nBlockAlign: u16 = 4,
+        wBitsPerSample: u16 = 16,
+        cbSize: u16 = 0,
+    };
+    const WAVEHDR = extern struct {
+        lpData: [*]u8,
+        dwBufferLength: u32,
+        dwBytesRecorded: u32 = 0,
+        dwUser: usize = 0,
+        dwFlags: u32 = 0,
+        dwLoops: u32 = 0,
+        lpNext: ?*WAVEHDR = null,
+        reserved: usize = 0,
+    };
+    const WHDR_DONE: u32 = 0x00000001;
+
     fifo: *audio_mod.AudioFifo,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 
     // PulseAudio simple API state (Linux)
-    pa_lib: ?std.DynLib = null,
+    pa_lib: ?host_posix.DynLib = null,
     pa_handle: ?*PaSimple = null,
     pa_simple_write: ?*const fn (*PaSimple, *const anyopaque, usize, *c_int) callconv(.c) c_int = null,
     pa_simple_free: ?*const fn (*PaSimple) callconv(.c) void = null,
 
     // ALSA API fallback state (Linux)
-    alsa_lib: ?std.DynLib = null,
+    alsa_lib: ?host_posix.DynLib = null,
     alsa_handle: ?*SndPcm = null,
     snd_pcm_writei: ?*const fn (*SndPcm, *const anyopaque, c_ulong) callconv(.c) c_long = null,
     snd_pcm_recover: ?*const fn (*SndPcm, c_int, c_int) callconv(.c) c_int = null,
@@ -71,11 +96,22 @@ pub const HostAudioOutput = struct {
     snd_pcm_close: ?*const fn (*SndPcm) callconv(.c) c_int = null,
 
     // AudioToolbox AudioQueue state (macOS)
-    aq_lib: ?std.DynLib = null,
+    aq_lib: ?host_posix.DynLib = null,
     aq_handle: ?*AudioQueueOpaque = null,
     aq_enqueue: ?*const fn (*AudioQueueOpaque, *AudioQueueBuffer, u32, ?*const anyopaque) callconv(.c) i32 = null,
     aq_stop: ?*const fn (*AudioQueueOpaque, u8) callconv(.c) i32 = null,
     aq_dispose: ?*const fn (*AudioQueueOpaque, u8) callconv(.c) i32 = null,
+
+    // WinMM waveOut state (Windows)
+    winmm_lib: ?host_posix.DynLib = null,
+    winmm_handle: HWAVEOUT = null,
+    winmm_write: ?*const fn (HWAVEOUT, *WAVEHDR, u32) callconv(.c) u32 = null,
+    winmm_unprepare: ?*const fn (HWAVEOUT, *WAVEHDR, u32) callconv(.c) u32 = null,
+    winmm_reset: ?*const fn (HWAVEOUT) callconv(.c) u32 = null,
+    winmm_close: ?*const fn (HWAVEOUT) callconv(.c) u32 = null,
+    winmm_headers: [AQ_NUM_BUFFERS]WAVEHDR = undefined,
+    winmm_buffers: [AQ_NUM_BUFFERS][AQ_BUFFER_FRAMES * 2]i16 = undefined,
+    winmm_cur_idx: usize = 0,
 
     pub fn create(allocator: std.mem.Allocator, fifo: *audio_mod.AudioFifo) !*HostAudioOutput {
         const self = try allocator.create(HostAudioOutput);
@@ -130,7 +166,7 @@ pub const HostAudioOutput = struct {
     }
 
     fn tryOpenAudioToolbox(self: *HostAudioOutput) bool {
-        var lib = std.DynLib.open("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox") catch return false;
+        var lib = host_posix.DynLib.open("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox") catch return false;
         const aq_new = lib.lookup(
             *const fn (
                 *const AudioStreamBasicDescription,
@@ -225,8 +261,82 @@ pub const HostAudioOutput = struct {
         return true;
     }
 
+    fn tryOpenWinMm(self: *HostAudioOutput) bool {
+        var lib = host_posix.DynLib.open("winmm.dll") catch return false;
+        const wave_open = lib.lookup(
+            *const fn (*HWAVEOUT, u32, *const WAVEFORMATEX, usize, usize, u32) callconv(.c) u32,
+            "waveOutOpen",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+        const wave_prep = lib.lookup(
+            *const fn (HWAVEOUT, *WAVEHDR, u32) callconv(.c) u32,
+            "waveOutPrepareHeader",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+        const wave_write = lib.lookup(
+            *const fn (HWAVEOUT, *WAVEHDR, u32) callconv(.c) u32,
+            "waveOutWrite",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+        const wave_unprep = lib.lookup(
+            *const fn (HWAVEOUT, *WAVEHDR, u32) callconv(.c) u32,
+            "waveOutUnprepareHeader",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+        const wave_reset = lib.lookup(
+            *const fn (HWAVEOUT) callconv(.c) u32,
+            "waveOutReset",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+        const wave_close = lib.lookup(
+            *const fn (HWAVEOUT) callconv(.c) u32,
+            "waveOutClose",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+
+        const fmt: WAVEFORMATEX = .{};
+        var hwo: HWAVEOUT = null;
+        // WAVE_MAPPER = 0xFFFFFFFF
+        if (wave_open(&hwo, 0xFFFF_FFFF, &fmt, 0, 0, 0) != 0 or hwo == null) {
+            lib.close();
+            return false;
+        }
+
+        self.winmm_lib = lib;
+        self.winmm_handle = hwo;
+        self.winmm_write = wave_write;
+        self.winmm_unprepare = wave_unprep;
+        self.winmm_reset = wave_reset;
+        self.winmm_close = wave_close;
+        self.winmm_cur_idx = 0;
+
+        for (0..AQ_NUM_BUFFERS) |i| {
+            @memset(&self.winmm_buffers[i], 0);
+            self.winmm_headers[i] = .{
+                .lpData = @ptrCast(&self.winmm_buffers[i]),
+                .dwBufferLength = AQ_BUFFER_BYTES,
+                .dwFlags = 0,
+            };
+            _ = wave_prep(hwo, &self.winmm_headers[i], @sizeOf(WAVEHDR));
+            self.winmm_headers[i].dwFlags |= WHDR_DONE;
+        }
+        return true;
+    }
+
     fn tryOpenPulse(self: *HostAudioOutput) bool {
-        var lib = std.DynLib.open("libpulse-simple.so.0") catch return false;
+        var lib = host_posix.DynLib.open("libpulse-simple.so.0") catch return false;
         const pa_simple_new = lib.lookup(
             *const fn (
                 ?[*:0]const u8,
@@ -295,7 +405,7 @@ pub const HostAudioOutput = struct {
     }
 
     fn tryOpenAlsa(self: *HostAudioOutput) bool {
-        var lib = std.DynLib.open("libasound.so.2") catch return false;
+        var lib = host_posix.DynLib.open("libasound.so.2") catch return false;
         const snd_pcm_open = lib.lookup(
             *const fn (*?*SndPcm, [*:0]const u8, c_int, c_int) callconv(.c) c_int,
             "snd_pcm_open",
@@ -355,6 +465,20 @@ pub const HostAudioOutput = struct {
     }
 
     fn closeBackend(self: *HostAudioOutput) void {
+        if (self.winmm_handle) |hwo| {
+            if (self.winmm_reset) |reset_fn| _ = reset_fn(hwo);
+            if (self.winmm_unprepare) |unprep_fn| {
+                for (0..AQ_NUM_BUFFERS) |i| {
+                    _ = unprep_fn(hwo, &self.winmm_headers[i], @sizeOf(WAVEHDR));
+                }
+            }
+            if (self.winmm_close) |close_fn| _ = close_fn(hwo);
+            self.winmm_handle = null;
+        }
+        if (self.winmm_lib) |*lib| {
+            lib.close();
+            self.winmm_lib = null;
+        }
         if (self.aq_handle) |q| {
             if (self.aq_stop) |stop_fn| _ = stop_fn(q, 1);
             if (self.aq_dispose) |disp_fn| _ = disp_fn(q, 1);
@@ -400,12 +524,29 @@ pub const HostAudioOutput = struct {
 
             if (!backend_initialized) {
                 backend_initialized = true;
-                if (!self.tryOpenPulse()) {
+                if (builtin.os.tag == .windows) {
+                    _ = self.tryOpenWinMm();
+                } else if (!self.tryOpenPulse()) {
                     _ = self.tryOpenAlsa();
                 }
             }
 
-            if (self.pa_handle) |pa| {
+            if (builtin.os.tag == .windows) {
+                if (self.winmm_handle) |hwo| {
+                    if (self.winmm_write) |write_fn| {
+                        const idx = self.winmm_cur_idx;
+                        self.winmm_cur_idx = (idx + 1) % AQ_NUM_BUFFERS;
+                        const hdr = &self.winmm_headers[idx];
+                        if ((hdr.dwFlags & WHDR_DONE) != 0) {
+                            const sample_count = frames * 2;
+                            @memcpy(self.winmm_buffers[idx][0..sample_count], buf[0..sample_count]);
+                            hdr.dwBufferLength = @intCast(frames * 4);
+                            hdr.dwFlags &= ~WHDR_DONE;
+                            _ = write_fn(hwo, hdr, @sizeOf(WAVEHDR));
+                        }
+                    }
+                }
+            } else if (self.pa_handle) |pa| {
                 if (self.pa_simple_write) |write_fn| {
                     var err: c_int = 0;
                     _ = write_fn(pa, @ptrCast(&buf), frames * 4, &err);
@@ -425,3 +566,4 @@ pub const HostAudioOutput = struct {
         }
     }
 };
+

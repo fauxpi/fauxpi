@@ -133,7 +133,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     const gpa = gpa_state.allocator();
 
     var opts: CliOptions = .{};
-    var args = init.args.iterate();
+    var args = if (builtin.os.tag == .windows)
+        (init.args.iterateAllocator(gpa) catch return 1)
+    else
+        init.args.iterate();
+    defer if (builtin.os.tag == .windows) args.deinit();
     _ = args.next(); // program name
 
     while (args.next()) |arg| {
