@@ -337,6 +337,13 @@ pub const BoardUi = struct {
         hovered_input_idx: ?usize = null,
     };
 
+    pub const HeaderGpioPin = struct {
+        /// 1-based physical pin number on the Raspberry Pi GPIO header (1..40).
+        header_pin: u8 = 0,
+        /// Broadcom SoC GPIO line number (0..27).
+        bcm: u6 = 0,
+    };
+
     gpa: std.mem.Allocator,
     font: Font,
     icon_font: Font,
@@ -442,9 +449,9 @@ pub const BoardUi = struct {
 
     /// Bottom GPIO Outputs (LEDs) & Inputs (Switches) box state (shown when `status.gpio_connected` is true).
     gpio_box_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    gpio_output_pins: [28]u6 = @splat(0),
+    gpio_output_pins: [28]HeaderGpioPin = @splat(.{}),
     gpio_output_count: usize = 0,
-    gpio_input_pins: [28]u6 = @splat(0),
+    gpio_input_pins: [28]HeaderGpioPin = @splat(.{}),
     gpio_input_count: usize = 0,
     hovered_gpio_input_idx: ?usize = null,
 
@@ -1499,23 +1506,36 @@ pub const BoardUi = struct {
             self.gpio_box_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         }
 
-        // Populate ordered header GPIO outputs and inputs (from low to high pin number 0..27)
-        const hdr_mask = headerGpioMask(status.model);
+        // Populate ordered header GPIO outputs and inputs by RPi physical header pin number (1..40),
+        // skipping 3.3V (pins 1, 17), 5V (pins 2, 4), and Ground (pins 6, 9, 14, 20, 25, 30, 34, 39).
+        const hdr = gpio_model.headerFor(status.model) orelse &gpio_model.header_40;
         var out_n: usize = 0;
         var in_n: usize = 0;
-        for (0..28) |pin_usize| {
-            const pin: u6 = @intCast(pin_usize);
-            if (((hdr_mask >> @intCast(pin)) & 1) == 0) continue;
-            switch (gpio_hw.getPinFunction(pin)) {
-                .output => {
-                    self.gpio_output_pins[out_n] = pin;
-                    out_n += 1;
+        for (hdr, 0..) |entry, hdr_idx| {
+            switch (entry) {
+                .gpio => |bcm| {
+                    if (bcm >= 28) continue;
+                    const item: HeaderGpioPin = .{
+                        .header_pin = @intCast(hdr_idx + 1),
+                        .bcm = bcm,
+                    };
+                    switch (gpio_hw.getPinFunction(bcm)) {
+                        .output => {
+                            if (out_n < self.gpio_output_pins.len) {
+                                self.gpio_output_pins[out_n] = item;
+                                out_n += 1;
+                            }
+                        },
+                        .input => {
+                            if (in_n < self.gpio_input_pins.len) {
+                                self.gpio_input_pins[in_n] = item;
+                                in_n += 1;
+                            }
+                        },
+                        else => {},
+                    }
                 },
-                .input => {
-                    self.gpio_input_pins[in_n] = pin;
-                    in_n += 1;
-                },
-                else => {},
+                .power_3v3, .power_5v, .ground => {},
             }
         }
         self.gpio_output_count = out_n;
@@ -1982,8 +2002,8 @@ pub const BoardUi = struct {
             if (!pressed) {
                 for (0..self.gpio_input_count) |idx| {
                     if (self.gpioInputSwitchRect(idx).contains(pt)) {
-                        const pin = self.gpio_input_pins[idx];
-                        gpio_hw.setExternalPin(pin, !gpio_hw.getPinLevel(pin));
+                        const bcm = self.gpio_input_pins[idx].bcm;
+                        gpio_hw.setExternalPin(bcm, !gpio_hw.getPinLevel(bcm));
                         return .consumed;
                     }
                 }
@@ -2596,11 +2616,11 @@ pub const BoardUi = struct {
         } else {
             const num_st: canvas_mod.Style = .{ .font = &self.font, .size = 11.0 };
             for (0..self.gpio_output_count) |idx| {
-                const pin = self.gpio_output_pins[idx];
+                const item = self.gpio_output_pins[idx];
                 const cell = self.gpioOutputLedRect(idx);
                 const cx = @round(cell.x + cell.w * 0.5);
                 const led_cy = @round(cell.y + 15.0);
-                const high = gpio_hw.getPinLevel(pin);
+                const high = gpio_hw.getPinLevel(item.bcm);
 
                 if (high) {
                     const led_col = Color.rgb(0x22E55E);
@@ -2614,7 +2634,7 @@ pub const BoardUi = struct {
                 }
 
                 var pin_buf: [8]u8 = undefined;
-                const pin_lbl = std.fmt.bufPrint(&pin_buf, "{d}", .{pin}) catch "";
+                const pin_lbl = std.fmt.bufPrint(&pin_buf, "{d}", .{item.header_pin}) catch "";
                 const tw = c.measureText(11.0, pin_lbl);
                 _ = c.drawText(
                     11.0,
@@ -2635,10 +2655,10 @@ pub const BoardUi = struct {
         } else {
             const num_st: canvas_mod.Style = .{ .font = &self.font, .size = 11.0 };
             for (0..self.gpio_input_count) |idx| {
-                const pin = self.gpio_input_pins[idx];
+                const item = self.gpio_input_pins[idx];
                 const cell = self.gpioInputSwitchRect(idx);
                 const cx = @round(cell.x + cell.w * 0.5);
-                const high = gpio_hw.getPinLevel(pin);
+                const high = gpio_hw.getPinLevel(item.bcm);
                 const hovered = (self.hovered_gpio_input_idx == idx);
 
                 const sw_w: f32 = 16.0;
@@ -2664,7 +2684,7 @@ pub const BoardUi = struct {
                 c.fillCircle(.{ cx, knob_cy }, 5.5, knob_col);
 
                 var pin_buf: [8]u8 = undefined;
-                const pin_lbl = std.fmt.bufPrint(&pin_buf, "{d}", .{pin}) catch "";
+                const pin_lbl = std.fmt.bufPrint(&pin_buf, "{d}", .{item.header_pin}) catch "";
                 const tw = c.measureText(11.0, pin_lbl);
                 _ = c.drawText(
                     11.0,
@@ -4241,13 +4261,6 @@ pub fn drawGpioRibbonCable(
         c.fillRect(rib_r, surface_bg);
         c.fillRect(rib_r, if (hovered) accent.withAlpha(0.20) else ink.withAlpha(0.12));
 
-        // Pin-1 red edge stripe on the left conductor of the ribbon cable
-        const stripe_w = @max(1.5, ribbon_w / 24.0);
-        c.fillRect(
-            .{ .x = rib_r.x + line_w, .y = rib_r.y, .w = stripe_w, .h = rib_r.h },
-            red.withAlpha(if (hovered) 0.85 else 0.72),
-        );
-
         // Vertical conductor grooves across the flat ribbon cable
         const grooves: usize = 19;
         for (1..grooves) |gi| {
@@ -4286,9 +4299,6 @@ pub fn drawGpioRibbonCable(
         .h = key_h,
     };
     c.fillRect(key_r, ink.withAlpha(0.45));
-
-    // Pin-1 triangle marker on the left side of the IDC housing
-    c.fillCircle(.{ conn_r.x + 2.0 * s, conn_r.y + conn_r.h - 1.4 * s }, @max(1.2, 0.55 * s), red.withAlpha(0.85));
 }
 
 /// Parsed XKB v1 keymap mapping Linux evdev keycodes (`0..127`) across 4 shift levels
@@ -5202,17 +5212,22 @@ test "GPIO ribbon cable connector and GPIO box outputs LEDs and input switches" 
     try testing.expectEqual(@as(f32, @floatFromInt(BoardUi.gpio_panel_height)), ui.gpio_box_rect.h);
     try testing.expectEqual(@as(f32, 764.0), ui.gpio_box_rect.y);
 
-    // 3. Hardware reset defaults: all 28 header pins (0..27) are inputs ordered low-to-high;
-    //    pins 0..8 default high (pulled up) and pins 9..27 default low (pulled down).
+    // 3. Hardware reset defaults: all 28 GPIO pins on the 40-pin header are inputs ordered
+    //    low-to-high by RPi physical header pin number (3, 5, 7, 8, 10, ..., 40);
+    //    power (1, 2, 4, 17) and ground (6, 9, 14, 20, 25, 30, 34, 39) pins never appear.
     try testing.expectEqual(@as(usize, 0), ui.gpio_output_count);
     try testing.expectEqual(@as(usize, 28), ui.gpio_input_count);
+    const expected_header_pins = [28]u8{
+        3,  5,  7,  8,  10, 11, 12, 13, 15, 16, 18, 19, 21, 22,
+        23, 24, 26, 27, 28, 29, 31, 32, 33, 35, 36, 37, 38, 40,
+    };
     for (0..28) |idx| {
-        const pin = ui.gpio_input_pins[idx];
-        try testing.expectEqual(@as(u6, @intCast(idx)), pin);
-        if (pin <= 8) {
-            try testing.expect(hw.getPinLevel(pin));
+        const item = ui.gpio_input_pins[idx];
+        try testing.expectEqual(expected_header_pins[idx], item.header_pin);
+        if (item.bcm <= 8) {
+            try testing.expect(hw.getPinLevel(item.bcm));
         } else {
-            try testing.expect(!hw.getPinLevel(pin));
+            try testing.expect(!hw.getPinLevel(item.bcm));
         }
     }
 
@@ -5220,51 +5235,56 @@ test "GPIO ribbon cable connector and GPIO box outputs LEDs and input switches" 
     ui.sheet_open = false;
     ui.updateLayout(win_w, win_h_connected, status, &hw);
 
-    // Toggle GPIO 4 (default high -> low) and GPIO 17 (default low -> high)
-    const sw4 = ui.gpioInputSwitchRect(4);
-    hw.write32(0x4C, 1 << 17); // GPREN0: rising edge detect on GPIO 17
-    hw.write32(0x58, 1 << 4); // GPFEN0: falling edge detect on GPIO 4
-    _ = ui.pointerButton(sw4.x + sw4.w * 0.5, sw4.y + sw4.h * 0.5, true, status, &hw);
-    try testing.expectEqual(Action.consumed, ui.pointerButton(sw4.x + sw4.w * 0.5, sw4.y + sw4.h * 0.5, false, status, &hw));
+    // Toggle header pin 7 (GPIO 4, index 2: default high -> low) and header pin 11 (GPIO 17, index 5: default low -> high)
+    try testing.expectEqual(@as(u8, 7), ui.gpio_input_pins[2].header_pin);
+    try testing.expectEqual(@as(u6, 4), ui.gpio_input_pins[2].bcm);
+    try testing.expectEqual(@as(u8, 11), ui.gpio_input_pins[5].header_pin);
+    try testing.expectEqual(@as(u6, 17), ui.gpio_input_pins[5].bcm);
+
+    const sw_pin7 = ui.gpioInputSwitchRect(2);
+    hw.write32(0x4C, 1 << 17); // GPREN0: rising edge detect on GPIO 17 (header pin 11)
+    hw.write32(0x58, 1 << 4); // GPFEN0: falling edge detect on GPIO 4 (header pin 7)
+    _ = ui.pointerButton(sw_pin7.x + sw_pin7.w * 0.5, sw_pin7.y + sw_pin7.h * 0.5, true, status, &hw);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(sw_pin7.x + sw_pin7.w * 0.5, sw_pin7.y + sw_pin7.h * 0.5, false, status, &hw));
     try testing.expect(!hw.getPinLevel(4));
 
-    const sw17 = ui.gpioInputSwitchRect(17);
-    _ = ui.pointerButton(sw17.x + sw17.w * 0.5, sw17.y + sw17.h * 0.5, true, status, &hw);
-    try testing.expectEqual(Action.consumed, ui.pointerButton(sw17.x + sw17.w * 0.5, sw17.y + sw17.h * 0.5, false, status, &hw));
+    const sw_pin11 = ui.gpioInputSwitchRect(5);
+    _ = ui.pointerButton(sw_pin11.x + sw_pin11.w * 0.5, sw_pin11.y + sw_pin11.h * 0.5, true, status, &hw);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(sw_pin11.x + sw_pin11.w * 0.5, sw_pin11.y + sw_pin11.h * 0.5, false, status, &hw));
     try testing.expect(hw.getPinLevel(17));
     try testing.expect(hw.irqPending());
     try testing.expect(hw.takeUiDirty());
 
     // 5. Guest OS reconfigures GPIO pins via MMIO (GPFSEL, GPSET, GPCLR, GPPUD, GPPUDCLK):
-    //    Configure GPIO 21, GPIO 5, and GPIO 18 as outputs (0b001).
-    //    Notice GPFSEL0 also contains GPIO 4 (currently overridden low by switch): read-modify-write
+    //    Configure GPIO 21 (header pin 40), GPIO 5 (header pin 29), and GPIO 18 (header pin 12) as outputs (0b001).
+    //    Notice GPFSEL0 also contains GPIO 4 (header pin 7, currently overridden low by switch): read-modify-write
     //    of GPFSEL0 to set GPIO 5 as output must NOT clobber GPIO 4's input switch override!
     const gpfsel0_prev = hw.read32(0x00);
-    hw.write32(0x00, gpfsel0_prev | (0b001 << 15)); // GPIO 5 -> output
-    hw.write32(0x04, 0b001 << 24); // GPIO 18 -> output
-    hw.write32(0x08, 0b001 << 3); // GPIO 21 -> output
+    hw.write32(0x00, gpfsel0_prev | (0b001 << 15)); // GPIO 5 (header pin 29) -> output
+    hw.write32(0x04, 0b001 << 24); // GPIO 18 (header pin 12) -> output
+    hw.write32(0x08, 0b001 << 3); // GPIO 21 (header pin 40) -> output
     hw.write32(0x1C, (1 << 5) | (1 << 21)); // GPSET0: set GPIO 5 and GPIO 21 high
     try testing.expect(hw.takeUiDirty());
 
     ui.paint(pixels, win_w, win_h_connected, 1, status, &hw);
 
-    // Outputs section has 3 pins ordered low-to-high: [5, 18, 21]
+    // Outputs section has 3 pins ordered low-to-high by RPi header pin number: [12 (GPIO 18), 29 (GPIO 5), 40 (GPIO 21)]
     try testing.expectEqual(@as(usize, 3), ui.gpio_output_count);
-    try testing.expectEqual(@as(u6, 5), ui.gpio_output_pins[0]);
-    try testing.expectEqual(@as(u6, 18), ui.gpio_output_pins[1]);
-    try testing.expectEqual(@as(u6, 21), ui.gpio_output_pins[2]);
-    try testing.expect(hw.getPinLevel(5));
+    try testing.expectEqual(BoardUi.HeaderGpioPin{ .header_pin = 12, .bcm = 18 }, ui.gpio_output_pins[0]);
+    try testing.expectEqual(BoardUi.HeaderGpioPin{ .header_pin = 29, .bcm = 5 }, ui.gpio_output_pins[1]);
+    try testing.expectEqual(BoardUi.HeaderGpioPin{ .header_pin = 40, .bcm = 21 }, ui.gpio_output_pins[2]);
     try testing.expect(!hw.getPinLevel(18));
+    try testing.expect(hw.getPinLevel(5));
     try testing.expect(hw.getPinLevel(21));
 
-    // Inputs section now has 25 pins ordered low-to-high (excluding 5, 18, 21), and GPIO 4 kept its switch override
+    // Inputs section now has 25 pins ordered low-to-high by RPi header pin number, and GPIO 4 (pin 7) kept its switch override
     try testing.expectEqual(@as(usize, 25), ui.gpio_input_count);
     for (1..ui.gpio_input_count) |i| {
-        try testing.expect(ui.gpio_input_pins[i - 1] < ui.gpio_input_pins[i]);
+        try testing.expect(ui.gpio_input_pins[i - 1].header_pin < ui.gpio_input_pins[i].header_pin);
     }
     try testing.expect(!hw.getPinLevel(4));
 
-    // Guest OS reconfigures pull-up on input pin 12 via GPPUD (0x94) + GPPUDCLK0 (0x98)
+    // Guest OS reconfigures pull-up on input pin 32 (GPIO 12) via GPPUD (0x94) + GPPUDCLK0 (0x98)
     try testing.expect(!hw.getPinLevel(12));
     hw.write32(0x94, 2); // Pull-up
     hw.write32(0x98, 1 << 12); // Clock pull into GPIO 12
@@ -5273,7 +5293,7 @@ test "GPIO ribbon cable connector and GPIO box outputs LEDs and input switches" 
     try testing.expect(hw.takeUiDirty());
     try testing.expect(hw.getPinLevel(12));
 
-    // Guest OS clears GPIO 21 via GPCLR0 (0x28)
+    // Guest OS clears GPIO 21 (header pin 40) via GPCLR0 (0x28)
     hw.write32(0x28, 1 << 21);
     try testing.expect(!hw.getPinLevel(21));
     ui.paint(pixels, win_w, win_h_connected, 1, status, &hw);
