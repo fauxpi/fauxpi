@@ -856,6 +856,196 @@ pub const PwmAudio = struct {
     }
 };
 
+/// BCM2835 I2S / PCM Audio Interface (`brcm,bcm2835-i2s`) at `0x20203000` (size `0x24`).
+/// Supports IRQ Bank 2 bit 23 (IRQ 55), DMA DREQ `PERMAP 2` (TX) / `PERMAP 3` (RX),
+/// `CS_A_SYNC` FIFO clear round-trip handshake, and packed 16-bit / unpacked 24/32-bit stereo PCM output.
+pub const I2sPcm = struct {
+    pub const BASE_ADDR: u32 = 0x20203000;
+    pub const SIZE: u32 = 0x24;
+
+    // Register offsets
+    pub const REG_CS_A: u32 = 0x00;
+    pub const REG_FIFO_A: u32 = 0x04;
+    pub const REG_MODE_A: u32 = 0x08;
+    pub const REG_RXC_A: u32 = 0x0c;
+    pub const REG_TXC_A: u32 = 0x10;
+    pub const REG_DREQ_A: u32 = 0x14;
+    pub const REG_INTEN_A: u32 = 0x18;
+    pub const REG_INTSTC_A: u32 = 0x1c;
+    pub const REG_GRAY: u32 = 0x20;
+
+    // CS_A bits
+    pub const CS_STBY: u32 = 1 << 25;
+    pub const CS_SYNC: u32 = 1 << 24;
+    pub const CS_RXSEX: u32 = 1 << 23;
+    pub const CS_RXF: u32 = 1 << 22;
+    pub const CS_TXE: u32 = 1 << 21;
+    pub const CS_RXD: u32 = 1 << 20;
+    pub const CS_TXD: u32 = 1 << 19;
+    pub const CS_RXR: u32 = 1 << 18;
+    pub const CS_TXW: u32 = 1 << 17;
+    pub const CS_RXERR: u32 = 1 << 16;
+    pub const CS_TXERR: u32 = 1 << 15;
+    pub const CS_RXSYNC: u32 = 1 << 14;
+    pub const CS_TXSYNC: u32 = 1 << 13;
+    pub const CS_DMAEN: u32 = 1 << 9;
+    pub const CS_RXCLR: u32 = 1 << 4;
+    pub const CS_TXCLR: u32 = 1 << 3;
+    pub const CS_TXON: u32 = 1 << 2;
+    pub const CS_RXON: u32 = 1 << 1;
+    pub const CS_EN: u32 = 1 << 0;
+
+    // MODE_A bits
+    pub const MODE_CLKDIS: u32 = 1 << 28;
+    pub const MODE_FRXP: u32 = 1 << 25;
+    pub const MODE_FTXP: u32 = 1 << 24;
+
+    // INTEN_A / INTSTC_A bits
+    pub const INT_RXERR: u32 = 1 << 3;
+    pub const INT_TXERR: u32 = 1 << 2;
+    pub const INT_RXR: u32 = 1 << 1;
+    pub const INT_TXW: u32 = 1 << 0;
+
+    cs_a: u32 = 0,
+    mode_a: u32 = 0,
+    rxc_a: u32 = 0,
+    txc_a: u32 = 0,
+    dreq_a: u32 = 0x10303020,
+    inten_a: u32 = 0,
+    intstc_a: u32 = 0,
+    gray: u32 = 0,
+
+    sample_rate: u32 = 48_000,
+    pending_left: i16 = 0,
+    has_pending_left: bool = false,
+
+    rx_fifo: [64]u32 = [_]u32{0} ** 64,
+    rx_head: u6 = 0,
+    rx_tail: u6 = 0,
+    rx_count: u7 = 0,
+
+    pub fn pushRxSample(self: *I2sPcm, word: u32) void {
+        if (self.rx_count >= 64) return;
+        self.rx_fifo[self.rx_tail] = word;
+        self.rx_tail +%= 1;
+        self.rx_count += 1;
+    }
+
+    fn popRxSample(self: *I2sPcm) u32 {
+        if (self.rx_count == 0) return 0;
+        const w = self.rx_fifo[self.rx_head];
+        self.rx_head +%= 1;
+        self.rx_count -= 1;
+        return w;
+    }
+
+    pub fn rxDreqReady(self: *const I2sPcm) bool {
+        return (self.cs_a & CS_EN) != 0 and (self.cs_a & CS_DMAEN) != 0 and (self.cs_a & CS_RXON) != 0 and self.rx_count > 0;
+    }
+
+    pub fn irqPending(self: *const I2sPcm) bool {
+        if ((self.cs_a & CS_EN) == 0) return false;
+        var active = self.intstc_a;
+        if ((self.cs_a & CS_TXON) != 0) active |= INT_TXW;
+        if ((self.cs_a & CS_RXON) != 0 and self.rx_count > 0) active |= INT_RXR;
+        return (active & self.inten_a) != 0;
+    }
+
+    fn extractUnpackedChannelSample(self: *const I2sPcm, val: u32) i16 {
+        // Channel 1 format is in bits [31:16], Channel 2 in bits [15:0]; bcm2835-i2s sets both identically
+        const ch_fmt = self.txc_a & 0xffff;
+        const chwex: u32 = if ((ch_fmt & (1 << 15)) != 0) 16 else 0;
+        const chwid: u32 = ch_fmt & 0x0f;
+        const data_bits: u32 = if (ch_fmt != 0) (8 + chwex + chwid) else 16;
+        if (data_bits >= 32) {
+            return @bitCast(@as(u16, @truncate(val >> 16)));
+        } else if (data_bits >= 24) {
+            return @bitCast(@as(u16, @truncate(val >> 8)));
+        }
+        return @bitCast(@as(u16, @truncate(val)));
+    }
+
+    pub fn read32(self: *I2sPcm, offset: u32) u32 {
+        return switch (offset) {
+            REG_CS_A => blk: {
+                const ro_mask: u32 = CS_RXF | CS_TXE | CS_RXD | CS_TXD | CS_RXR | CS_TXW | CS_RXSYNC | CS_TXSYNC | CS_RXCLR | CS_TXCLR;
+                var cs = (self.cs_a & ~ro_mask) | CS_TXE | CS_TXD | CS_TXW | CS_RXSYNC | CS_TXSYNC;
+                if (self.rx_count > 0) cs |= CS_RXD | CS_RXR;
+                if (self.rx_count >= 64) cs |= CS_RXF;
+                break :blk cs;
+            },
+            REG_FIFO_A => self.popRxSample(),
+            REG_MODE_A => self.mode_a,
+            REG_RXC_A => self.rxc_a,
+            REG_TXC_A => self.txc_a,
+            REG_DREQ_A => self.dreq_a,
+            REG_INTEN_A => self.inten_a,
+            REG_INTSTC_A => blk: {
+                var st = self.intstc_a;
+                if ((self.cs_a & CS_TXON) != 0) st |= INT_TXW;
+                if ((self.cs_a & CS_RXON) != 0 and self.rx_count > 0) st |= INT_RXR;
+                break :blk st;
+            },
+            REG_GRAY => self.gray,
+            else => 0,
+        };
+    }
+
+    pub fn write32(
+        self: *I2sPcm,
+        offset: u32,
+        val: u32,
+        audio_fifo: *AudioFifo,
+        audio_connected: bool,
+    ) void {
+        switch (offset) {
+            REG_CS_A => {
+                if ((val & CS_TXCLR) != 0) {
+                    self.has_pending_left = false;
+                }
+                if ((val & CS_RXCLR) != 0) {
+                    self.rx_head = 0;
+                    self.rx_tail = 0;
+                    self.rx_count = 0;
+                }
+                // W1C error flags
+                const w1c_err = val & (CS_RXERR | CS_TXERR);
+                const writable_mask: u32 = CS_STBY | CS_SYNC | CS_RXSEX | CS_DMAEN | (0x0f << 5) | CS_TXON | CS_RXON | CS_EN;
+                self.cs_a = ((self.cs_a & ~w1c_err) & ~writable_mask) | (val & writable_mask);
+            },
+            REG_FIFO_A => {
+                if ((self.mode_a & MODE_FTXP) != 0) {
+                    // Frame-packed 16-bit stereo: low 16 bits = Left, high 16 bits = Right
+                    const left: i16 = @bitCast(@as(u16, @truncate(val)));
+                    const right: i16 = @bitCast(@as(u16, @truncate(val >> 16)));
+                    if (audio_connected) {
+                        audio_fifo.pushStereoSample(left, right, self.sample_rate);
+                    }
+                } else {
+                    const sample = self.extractUnpackedChannelSample(val);
+                    if (!self.has_pending_left) {
+                        self.pending_left = sample;
+                        self.has_pending_left = true;
+                    } else {
+                        self.has_pending_left = false;
+                        if (audio_connected) {
+                            audio_fifo.pushStereoSample(self.pending_left, sample, self.sample_rate);
+                        }
+                    }
+                }
+            },
+            REG_MODE_A => self.mode_a = val,
+            REG_RXC_A => self.rxc_a = val,
+            REG_TXC_A => self.txc_a = val,
+            REG_DREQ_A => self.dreq_a = val,
+            REG_INTEN_A => self.inten_a = val & 0x0f,
+            REG_INTSTC_A => self.intstc_a &= ~(val & 0x0f),
+            REG_GRAY => self.gray = val,
+            else => {},
+        }
+    }
+};
+
 test "AudioFifo push and pop stereo samples with 44.1kHz to 48kHz resampling" {
     var fifo = AudioFifo{};
     // Push 4 frames at 48 kHz (1:1)

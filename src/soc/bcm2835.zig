@@ -16,6 +16,7 @@ const pv_mod = @import("../vc4/pixelvalve.zig");
 const hdmi_mod = @import("../vc4/hdmi.zig");
 const audio_mod = @import("audio.zig");
 const local_intc_mod = @import("local_intc.zig");
+const spi_mod = @import("spi.zig");
 
 /// Complete BCM2835 / BCM2837 SoC Bus & Peripherals.
 /// Directly satisfies the `Bus` concept required by `Arm1176(Bcm2835)`.
@@ -61,6 +62,8 @@ pub const Bcm2835 = struct {
     audio_fifo: audio_mod.AudioFifo = .{},
     vchiq: audio_mod.Vchiq = .{},
     pwm: audio_mod.PwmAudio = .{},
+    i2s: audio_mod.I2sPcm = .{},
+    spi0: spi_mod.Spi0 = .{},
 
     display_width: u16 = 1280,
     display_height: u16 = 720,
@@ -118,13 +121,14 @@ pub const Bcm2835 = struct {
 
     fn dmaDreqReady(ctx: *anyopaque, permap: u5) bool {
         const self: *Bcm2835 = @ptrCast(@alignCast(ctx));
-        if (permap == 13) { // SDHOST DREQ
-            return self.sdhost.dreqReady();
-        }
-        if (permap == 11) { // EMMC / Arasan SDHCI DREQ
-            return self.sdhci.dreqReady();
-        }
-        return true;
+        return switch (permap) {
+            3 => self.i2s.rxDreqReady(), // PCM / I2S RX
+            6 => self.spi0.txDreqReady(), // SPI0 TX
+            7 => self.spi0.rxDreqReady(), // SPI0 RX
+            11 => self.sdhci.dreqReady(), // EMMC / Arasan SDHCI
+            13 => self.sdhost.dreqReady(), // SDHOST
+            else => true,
+        };
     }
 
     pub fn syncSdRoutingFromGpio(self: *Bcm2835) void {
@@ -183,15 +187,21 @@ pub const Bcm2835 = struct {
         // GPIO -> Bank 2 bits 17..20
         if (self.gpio.irqPending()) b2 |= (1 << 20);
 
-        // I2C BSC0/1/2 -> Bank 2 bit 21
+        // I2C BSC0/1/2 -> Bank 2 bit 21 (IRQ 53)
         if (self.bsc0.irqPending() or self.bsc1.irqPending() or self.bsc2.irqPending()) {
             b2 |= (1 << 21);
         }
 
-        // SDHOST -> Bank 2 bit 24
+        // SPI0 -> Bank 2 bit 22 (IRQ 54)
+        if (self.spi0.irqPending()) b2 |= (1 << 22);
+
+        // PCM / I2S -> Bank 2 bit 23 (IRQ 55)
+        if (self.i2s.irqPending()) b2 |= (1 << 23);
+
+        // SDHOST -> Bank 2 bit 24 (IRQ 56)
         if (self.sdhost.irqPending()) b2 |= (1 << 24);
 
-        // PL011 UART0 -> Bank 2 bit 25
+        // PL011 UART0 -> Bank 2 bit 25 (IRQ 57)
         if (self.uart0.irqPending()) b2 |= (1 << 25);
 
         // Arasan SDHCI (mmc@7e300000 / mmcnr@7e300000) -> Bank 2 bit 30 (IRQ 62)
@@ -435,6 +445,12 @@ pub const Bcm2835 = struct {
         if (addr >= sdhost_mod.SdHost.BASE_ADDR and addr < sdhost_mod.SdHost.BASE_ADDR + sdhost_mod.SdHost.SIZE) {
             return self.sdhost.read32(addr - sdhost_mod.SdHost.BASE_ADDR);
         }
+        if (addr >= audio_mod.I2sPcm.BASE_ADDR and addr < audio_mod.I2sPcm.BASE_ADDR + audio_mod.I2sPcm.SIZE) {
+            return self.i2s.read32(addr - audio_mod.I2sPcm.BASE_ADDR);
+        }
+        if (addr >= spi_mod.Spi0.BASE_ADDR and addr < spi_mod.Spi0.BASE_ADDR + spi_mod.Spi0.SIZE) {
+            return self.spi0.read32(addr - spi_mod.Spi0.BASE_ADDR);
+        }
         if (addr >= i2c_mod.BscController.BSC0_BASE and addr < i2c_mod.BscController.BSC0_BASE + i2c_mod.BscController.SIZE) {
             return self.bsc0.read32(addr - i2c_mod.BscController.BSC0_BASE);
         }
@@ -522,6 +538,16 @@ pub const Bcm2835 = struct {
             const offset = addr - sdhost_mod.SdHost.BASE_ADDR;
             self.sdhost.write32(offset, val);
             if (offset == 0x00 and self.sdhost.dreqReady()) {
+                self.dma.stepAllActive(self.ram, self.dmaMmio());
+            }
+        } else if (addr >= audio_mod.I2sPcm.BASE_ADDR and addr < audio_mod.I2sPcm.BASE_ADDR + audio_mod.I2sPcm.SIZE) {
+            self.i2s.write32(addr - audio_mod.I2sPcm.BASE_ADDR, val, &self.audio_fifo, self.audio_connected);
+            if (self.i2s.rxDreqReady()) {
+                self.dma.stepAllActive(self.ram, self.dmaMmio());
+            }
+        } else if (addr >= spi_mod.Spi0.BASE_ADDR and addr < spi_mod.Spi0.BASE_ADDR + spi_mod.Spi0.SIZE) {
+            self.spi0.write32(addr - spi_mod.Spi0.BASE_ADDR, val);
+            if (self.spi0.txDreqReady() or self.spi0.rxDreqReady()) {
                 self.dma.stepAllActive(self.ram, self.dmaMmio());
             }
         } else if (addr >= i2c_mod.BscController.BSC0_BASE and addr < i2c_mod.BscController.BSC0_BASE + i2c_mod.BscController.SIZE) {
@@ -702,5 +728,140 @@ test "Bcm2835 GPIO 48..53 ALT3 routes SD card to Arasan SDHCI with DMA PERMAP 11
     try std.testing.expect(soc.dma.channelIrqPending(0));
     try std.testing.expect((soc.read32(0x20300030) & sdhost_mod.ArasanSdhci.SDHCI_INT_DATA_END) != 0);
 }
+
+test "Bcm2835 SPI0 DMA bidirectional and TX-only clear_rx_desc transfers (PERMAP 6 TX / PERMAP 7 RX)" {
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    var soc = Bcm2835.init(ram, 1280, 720);
+    soc.spi0.loopback = true;
+
+    // 1. Bidirectional 16-byte DMA transfer (matches Linux spi-bcm2835 order: DLEN -> CS(TA|DMAEN) -> TX DMA -> RX DMA)
+    std.mem.writeInt(u32, ram[0x1000..0x1004], 0x11223344, .little);
+    std.mem.writeInt(u32, ram[0x1004..0x1008], 0x55667788, .little);
+    std.mem.writeInt(u32, ram[0x1008..0x100c], 0x99AABBCC, .little);
+    std.mem.writeInt(u32, ram[0x100c..0x1010], 0xDDEEFF00, .little);
+
+    // TX CB at 0x200 (Channel 0, PERMAP 6 = SPI TX, D_DREQ, S_INC)
+    const tx_cb: u32 = 0x200;
+    const tx_ti: u32 = dma_mod.DmaController.TI_S_INC | (1 << 6) | (6 << 16);
+    std.mem.writeInt(u32, ram[tx_cb + 0 ..][0..4], tx_ti, .little);
+    std.mem.writeInt(u32, ram[tx_cb + 4 ..][0..4], 0xc0001000, .little);
+    std.mem.writeInt(u32, ram[tx_cb + 8 ..][0..4], 0x7e204004, .little); // SPI_FIFO
+    std.mem.writeInt(u32, ram[tx_cb + 12 ..][0..4], 16, .little);
+    std.mem.writeInt(u32, ram[tx_cb + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[tx_cb + 20 ..][0..4], 0, .little);
+
+    // RX CB at 0x240 (Channel 1, PERMAP 7 = SPI RX, S_DREQ, D_INC, INT_EN)
+    const rx_cb: u32 = 0x240;
+    const rx_ti: u32 = dma_mod.DmaController.TI_D_INC | dma_mod.DmaController.TI_INT_EN | (1 << 10) | (7 << 16);
+    std.mem.writeInt(u32, ram[rx_cb + 0 ..][0..4], rx_ti, .little);
+    std.mem.writeInt(u32, ram[rx_cb + 4 ..][0..4], 0x7e204004, .little); // SPI_FIFO
+    std.mem.writeInt(u32, ram[rx_cb + 8 ..][0..4], 0xc0002000, .little);
+    std.mem.writeInt(u32, ram[rx_cb + 12 ..][0..4], 16, .little);
+    std.mem.writeInt(u32, ram[rx_cb + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[rx_cb + 20 ..][0..4], 0, .little);
+
+    soc.write32(0x2020400c, 16); // SPI_DLEN = 16
+    soc.write32(0x20204000, spi_mod.Spi0.CS_TA | spi_mod.Spi0.CS_DMAEN); // SPI_CS = TA | DMAEN
+    soc.write32(0x20007004, 0xc0000200); // Ch0 CONBLK_AD (TX)
+    soc.write32(0x20007000, dma_mod.DmaController.CS_ACTIVE);
+    soc.write32(0x20007104, 0xc0000240); // Ch1 CONBLK_AD (RX)
+    soc.write32(0x20007100, dma_mod.DmaController.CS_ACTIVE);
+
+    try std.testing.expect(soc.dma.channelIrqPending(1));
+    try std.testing.expectEqual(@as(u32, 0x11223344), std.mem.readInt(u32, ram[0x2000..0x2004], .little));
+    try std.testing.expectEqual(@as(u32, 0x55667788), std.mem.readInt(u32, ram[0x2004..0x2008], .little));
+    try std.testing.expectEqual(@as(u32, 0x99AABBCC), std.mem.readInt(u32, ram[0x2008..0x200c], .little));
+    try std.testing.expectEqual(@as(u32, 0xDDEEFF00), std.mem.readInt(u32, ram[0x200c..0x2010], .little));
+    try std.testing.expect((soc.read32(0x20204000) & spi_mod.Spi0.CS_DONE) != 0);
+
+    // 2. TX-only DMA transfer with cyclic clear_rx_desc writing CLEAR_RX to SPI_CS (matches bcm2835_spi_setup_dma)
+    const clear_rx_cs: u32 = spi_mod.Spi0.CS_TA | spi_mod.Spi0.CS_DMAEN | spi_mod.Spi0.CS_CLEAR_RX;
+    std.mem.writeInt(u32, ram[0x3000..0x3004], clear_rx_cs, .little);
+    const clr_cb: u32 = 0x280;
+    const clr_ti: u32 = (1 << 6) | (7 << 16); // PERMAP 7 (SPI RX), D_DREQ
+    std.mem.writeInt(u32, ram[clr_cb + 0 ..][0..4], clr_ti, .little);
+    std.mem.writeInt(u32, ram[clr_cb + 4 ..][0..4], 0xc0003000, .little);
+    std.mem.writeInt(u32, ram[clr_cb + 8 ..][0..4], 0x7e204000, .little); // SPI_CS
+    std.mem.writeInt(u32, ram[clr_cb + 12 ..][0..4], 4, .little);
+    std.mem.writeInt(u32, ram[clr_cb + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[clr_cb + 20 ..][0..4], 0xc0000280, .little); // cyclic
+
+    soc.write32(0x2020400c, 16); // SPI_DLEN = 16
+    soc.write32(0x20204000, spi_mod.Spi0.CS_TA | spi_mod.Spi0.CS_DMAEN);
+    soc.write32(0x20007004, 0xc0000200);
+    soc.write32(0x20007000, dma_mod.DmaController.CS_ACTIVE);
+    soc.write32(0x20007104, 0xc0000280);
+    soc.write32(0x20007100, dma_mod.DmaController.CS_ACTIVE);
+
+    try std.testing.expectEqual(@as(usize, 0), soc.spi0.rx_count);
+    try std.testing.expect((soc.read32(0x20204000) & spi_mod.Spi0.CS_DONE) != 0);
+}
+
+test "Bcm2835 AUX SPI1/SPI2 and I2S PCM (PERMAP 2) audio streaming" {
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    var soc = Bcm2835.init(ram, 1280, 720);
+    soc.aux_uart.spi1.loopback = true;
+
+    // 1. Enable AUX SPI1 (bit 1 of AUX_ENABLES at 0x20215004) and verify AUX_IRQ (IRQ 29)
+    soc.write32(0x20215004, uart_mod.AuxMiniUart.AUX_ENABLE_MU | uart_mod.AuxMiniUart.AUX_ENABLE_SPI1);
+    soc.write32(0x20215080, spi_mod.AuxSpi.CNTL0_ENABLE | spi_mod.AuxSpi.CNTL0_VAR_WIDTH | spi_mod.AuxSpi.CNTL0_MSBF_OUT);
+    soc.write32(0x20215084, spi_mod.AuxSpi.CNTL1_IDLE);
+    try std.testing.expectEqual(@as(u32, uart_mod.AuxMiniUart.AUX_ENABLE_SPI1), soc.read32(0x20215000));
+    try std.testing.expect((soc.intc.raw_level[1] & (1 << 29)) != 0);
+
+    soc.write32(0x202150a0, (16 << 24) | (0xBE << 16) | (0xEF << 8));
+    try std.testing.expectEqual(@as(u32, 0x0000BEEF), soc.read32(0x202150a0));
+
+    // 2. Verify I2S CS_A_SYNC round-trip (used by bcm2835_i2s_clear_fifos)
+    const sync0 = soc.read32(0x20203000) & audio_mod.I2sPcm.CS_SYNC;
+    try std.testing.expectEqual(@as(u32, 0), sync0);
+    soc.write32(0x20203000, audio_mod.I2sPcm.CS_EN | audio_mod.I2sPcm.CS_STBY | audio_mod.I2sPcm.CS_SYNC);
+    try std.testing.expect((soc.read32(0x20203000) & audio_mod.I2sPcm.CS_SYNC) != 0);
+
+    // 3. Configure I2S for Frame-Packed S16_LE stereo (MODE_FTXP) and stream 2 frames via cyclic DMA PERMAP 2
+    soc.write32(0x20203008, audio_mod.I2sPcm.MODE_FTXP | (31 << 10) | 16);
+    soc.write32(0x20203000, audio_mod.I2sPcm.CS_EN | audio_mod.I2sPcm.CS_STBY | audio_mod.I2sPcm.CS_DMAEN | audio_mod.I2sPcm.CS_TXON);
+
+    // 2 packed stereo S16_LE frames (8 bytes) at RAM 0x4000:
+    // Frame 0: L = 0x1357, R = -0x1357
+    // Frame 1: L = 0x2468, R = -0x2468
+    std.mem.writeInt(i16, ram[0x4000..0x4002], 0x1357, .little);
+    std.mem.writeInt(i16, ram[0x4002..0x4004], -0x1357, .little);
+    std.mem.writeInt(i16, ram[0x4004..0x4006], 0x2468, .little);
+    std.mem.writeInt(i16, ram[0x4006..0x4008], -0x2468, .little);
+
+    const i2s_cb: u32 = 0x500;
+    const i2s_ti: u32 = dma_mod.DmaController.TI_S_INC | dma_mod.DmaController.TI_INT_EN | (1 << 6) | (2 << 16);
+    std.mem.writeInt(u32, ram[i2s_cb + 0 ..][0..4], i2s_ti, .little);
+    std.mem.writeInt(u32, ram[i2s_cb + 4 ..][0..4], 0xc0004000, .little);
+    std.mem.writeInt(u32, ram[i2s_cb + 8 ..][0..4], 0x7e203004, .little); // BCM2835_I2S_FIFO_A_REG
+    std.mem.writeInt(u32, ram[i2s_cb + 12 ..][0..4], 8, .little);
+    std.mem.writeInt(u32, ram[i2s_cb + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[i2s_cb + 20 ..][0..4], 0xc0000500, .little); // cyclic
+
+    soc.write32(0x20007004, 0xc0000500);
+    soc.write32(0x20007000, dma_mod.DmaController.CS_ACTIVE);
+    try std.testing.expectEqual(@as(u32, 0), soc.audio_fifo.availableFrames());
+
+    soc.advanceAudio(22); // 8 bytes at 384 KB/s = 20.83 us
+    try std.testing.expect(soc.dma.channelIrqPending(0));
+    try std.testing.expectEqual(@as(u32, 2), soc.audio_fifo.availableFrames());
+
+    var samples: [4]i16 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), soc.audio_fifo.popFrames(&samples));
+    try std.testing.expectEqual(@as(i16, 0x1357), samples[0]);
+    try std.testing.expectEqual(@as(i16, -0x1357), samples[1]);
+    try std.testing.expectEqual(@as(i16, 0x2468), samples[2]);
+    try std.testing.expectEqual(@as(i16, -0x2468), samples[3]);
+}
+
 
 

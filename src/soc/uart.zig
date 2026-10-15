@@ -1,4 +1,5 @@
 const std = @import("std");
+const spi_mod = @import("spi.zig");
 
 /// ARM PrimeCell PL011 UART0 (`0x20201000`, size `0x1000` for AMBA PeriphID at `0xfe0..0xffc`).
 pub const Pl011Uart = struct {
@@ -111,12 +112,20 @@ pub const Pl011Uart = struct {
     }
 };
 
-/// BCM2835 AUX & Mini-UART1 (`0x20215000`, size `0x100`).
+/// BCM2835 AUX Peripherals (`brcm,bcm2835-aux` at `0x20215000`, size `0x100`):
+/// - `0x00..0x07`: `AUX_IRQ` and `AUX_ENABLES` (bit 0 = Mini-UART, bit 1 = SPI1, bit 2 = SPI2)
+/// - `0x40..0x6b`: Mini-UART1 (`brcm,bcm2835-aux-uart`)
+/// - `0x80..0xbf`: Auxiliary SPI1 (`brcm,bcm2835-aux-spi`)
+/// - `0xc0..0xff`: Auxiliary SPI2 (`brcm,bcm2835-aux-spi`)
 pub const AuxMiniUart = struct {
     pub const BASE_ADDR: u32 = 0x20215000;
     pub const SIZE: u32 = 0x100;
 
-    enables: u32 = 1, // Mini-UART enabled
+    pub const AUX_ENABLE_MU: u32 = 1 << 0;
+    pub const AUX_ENABLE_SPI1: u32 = 1 << 1;
+    pub const AUX_ENABLE_SPI2: u32 = 1 << 2;
+
+    enables: u32 = AUX_ENABLE_MU, // Mini-UART enabled by default
     ier: u32 = 0,
     lcr: u32 = 3,
     mcr: u32 = 0,
@@ -132,17 +141,39 @@ pub const AuxMiniUart = struct {
     rx_tail: u6 = 0,
     rx_count: u7 = 0,
 
+    spi1: spi_mod.AuxSpi = .{},
+    spi2: spi_mod.AuxSpi = .{},
+
     stdout_enabled: bool = true,
 
-    pub fn irqPending(self: *const AuxMiniUart) bool {
+    fn muIrqPending(self: *const AuxMiniUart) bool {
+        if ((self.enables & AUX_ENABLE_MU) == 0) return false;
         const rx_irq = (self.ier & 1) != 0 and self.rx_count > 0;
         const tx_irq = (self.ier & 2) != 0 and self.tx_irq_pending;
         return rx_irq or tx_irq;
     }
 
+    pub fn auxIrqStatus(self: *const AuxMiniUart) u32 {
+        var irq: u32 = 0;
+        if (self.muIrqPending()) irq |= AUX_ENABLE_MU;
+        if ((self.enables & AUX_ENABLE_SPI1) != 0 and self.spi1.irqPending()) irq |= AUX_ENABLE_SPI1;
+        if ((self.enables & AUX_ENABLE_SPI2) != 0 and self.spi2.irqPending()) irq |= AUX_ENABLE_SPI2;
+        return irq;
+    }
+
+    pub fn irqPending(self: *const AuxMiniUart) bool {
+        return self.auxIrqStatus() != 0;
+    }
+
     pub fn read32(self: *AuxMiniUart, offset: u32) u32 {
+        if (offset >= 0x80 and offset < 0xc0) {
+            return self.spi1.read32(offset - 0x80);
+        }
+        if (offset >= 0xc0 and offset < 0x100) {
+            return self.spi2.read32(offset - 0xc0);
+        }
         return switch (offset) {
-            0x00 => if (self.irqPending()) 1 else 0, // AUX_IRQ
+            0x00 => self.auxIrqStatus(), // AUX_IRQ
             0x04 => self.enables, // AUX_ENABLES
             0x40 => blk: { // AUX_MU_IO_REG
                 if ((self.lcr & 0x80) != 0) break :blk self.dll;
@@ -174,8 +205,16 @@ pub const AuxMiniUart = struct {
     }
 
     pub fn write32(self: *AuxMiniUart, offset: u32, val: u32) void {
+        if (offset >= 0x80 and offset < 0xc0) {
+            self.spi1.write32(offset - 0x80, val);
+            return;
+        }
+        if (offset >= 0xc0 and offset < 0x100) {
+            self.spi2.write32(offset - 0xc0, val);
+            return;
+        }
         switch (offset) {
-            0x04 => self.enables = val,
+            0x04 => self.enables = val & 0x07,
             0x40 => {
                 if ((self.lcr & 0x80) != 0) {
                     self.dll = val & 0xff;
@@ -212,3 +251,4 @@ pub const AuxMiniUart = struct {
         }
     }
 };
+

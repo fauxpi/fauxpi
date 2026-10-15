@@ -138,8 +138,8 @@ pub const DmaController = struct {
     }
 
     fn isPacedAudioPermap(permap: u5) bool {
-        // PERMAP 5 = PWM audio, PERMAP 17 = VC4 HDMI MAI audio-rx
-        return permap == 5 or permap == 17;
+        // PERMAP 2 = I2S PCM TX, PERMAP 5 = PWM audio, PERMAP 17 = VC4 HDMI MAI audio-rx
+        return permap == 2 or permap == 5 or permap == 17;
     }
 
     fn loadCbHeader(c: *Channel, ram: []const u8) bool {
@@ -165,7 +165,7 @@ pub const DmaController = struct {
         defer self.stepping = false;
 
         var c = &self.channels[ch];
-        var max_cbs: usize = 1024;
+        var max_cbs: usize = 16384;
 
         while ((c.cs & CS_ACTIVE) != 0 and c.conblk_ad != 0 and max_cbs > 0) : (max_cbs -= 1) {
             if (!c.cb_loaded) {
