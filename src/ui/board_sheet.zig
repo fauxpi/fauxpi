@@ -4326,9 +4326,9 @@ pub const XkbKeymap = struct {
     }
 
     const KeyNameMap = struct {
-        names: [160][8]u8 = @splat(@splat(0)),
-        lens: [160]u8 = @splat(0),
-        evdevs: [160]u8 = @splat(0),
+        names: [256][8]u8 = @splat(@splat(0)),
+        lens: [256]u8 = @splat(0),
+        evdevs: [256]u8 = @splat(0),
         count: usize = 0,
 
         fn initDefault() KeyNameMap {
@@ -4433,6 +4433,51 @@ pub const XkbKeymap = struct {
         }
     };
 
+    /// Extracts the Group 1 `[ sym1, sym2, ... ]` list from a `key <NAME> { ... }` body,
+    /// skipping group subscripts like `type[1]`, `type[group1]`, `symbols[1]`, or `symbols[Group1]`.
+    fn extractKeySymbolsSlice(body: []const u8) ?[]const u8 {
+        // 1. Look for explicit `symbols[Group1] = [ ... ]` / `symbols[1] = [ ... ]` / `symbols = [ ... ]`
+        var search_pos: usize = 0;
+        while (std.mem.indexOfPos(u8, body, search_pos, "symbols")) |sym_kw| {
+            search_pos = sym_kw + "symbols".len;
+            if (sym_kw > 0) {
+                const prev = body[sym_kw - 1];
+                if (std.ascii.isAlphanumeric(prev) or prev == '_') continue;
+            }
+            var cur = search_pos;
+            while (cur < body.len and (body[cur] == ' ' or body[cur] == '\t' or body[cur] == '\r' or body[cur] == '\n')) : (cur += 1) {}
+            if (cur < body.len and body[cur] == '[') {
+                const sub_close = std.mem.indexOfScalarPos(u8, body, cur + 1, ']') orelse return null;
+                cur = sub_close + 1;
+                while (cur < body.len and (body[cur] == ' ' or body[cur] == '\t' or body[cur] == '\r' or body[cur] == '\n')) : (cur += 1) {}
+            }
+            if (cur >= body.len or body[cur] != '=') continue;
+            cur += 1;
+            const list_open = std.mem.indexOfScalarPos(u8, body, cur, '[') orelse return null;
+            const list_close = std.mem.indexOfScalarPos(u8, body, list_open + 1, ']') orelse return null;
+            return body[list_open + 1 .. list_close];
+        }
+
+        // 2. Shorthand syntax: `key <NAME> { [ sym1, sym2 ] };` or `key <NAME> { type[1]= "...", [ sym1, sym2 ] };`
+        var scan: usize = 0;
+        while (std.mem.indexOfScalarPos(u8, body, scan, '[')) |open_idx| {
+            const close_idx = std.mem.indexOfScalarPos(u8, body, open_idx + 1, ']') orelse return null;
+            scan = close_idx + 1;
+
+            // Skip array subscripts like `type[1]` where `[` is preceded by an identifier or `]` is followed by `=`
+            var before = open_idx;
+            while (before > 0 and (body[before - 1] == ' ' or body[before - 1] == '\t' or body[before - 1] == '\r' or body[before - 1] == '\n')) : (before -= 1) {}
+            if (before > 0 and body[before - 1] != ',') continue;
+
+            var after = close_idx + 1;
+            while (after < body.len and (body[after] == ' ' or body[after] == '\t' or body[after] == '\r' or body[after] == '\n')) : (after += 1) {}
+            if (after < body.len and body[after] == '=') continue;
+
+            return body[open_idx + 1 .. close_idx];
+        }
+        return null;
+    }
+
     pub fn parse(text: []const u8) XkbKeymap {
         var km = defaultUs();
         var key_names = KeyNameMap.initDefault();
@@ -4474,7 +4519,9 @@ pub const XkbKeymap = struct {
 
         // 2. Parse `key <NAME> { ... };` entries in `xkb_symbols` (or full text)
         const sym_start = std.mem.indexOf(u8, text, "xkb_symbols") orelse 0;
-        const sym_section = text[sym_start..];
+        const sym_body = text[sym_start..];
+        const sym_end = std.mem.indexOf(u8, sym_body, "xkb_geometry") orelse sym_body.len;
+        const sym_section = sym_body[0..sym_end];
         var pos: usize = 0;
         while (pos < sym_section.len) {
             const k_idx = std.mem.indexOfPos(u8, sym_section, pos, "key") orelse break;
@@ -4500,9 +4547,7 @@ pub const XkbKeymap = struct {
 
             const evdev = key_names.get(key_name) orelse continue;
             const body = sym_section[brace_open + 1 .. brace_close];
-            const bracket_open = std.mem.indexOfScalar(u8, body, '[') orelse continue;
-            const bracket_close = std.mem.indexOfScalarPos(u8, body, bracket_open + 1, ']') orelse continue;
-            const syms_str = body[bracket_open + 1 .. bracket_close];
+            const syms_str = extractKeySymbolsSlice(body) orelse continue;
 
             var parsed_levels: [4]u8 = @splat(0);
             var level: usize = 0;
@@ -5235,6 +5280,7 @@ test "XkbKeymap parsing, modifiers, Caps Lock, AltGr, and non-US layout input" {
     defer ui.deinit();
 
     // French AZERTY XKB keymap snippet (`<AD01>` = a/A, `<AC01>` = q/Q, `<AE01>` = &/1, `<AE03>` = "/3/#)
+    // including libxkbcommon `type[1]= ..., symbols[1]= [ ... ]` and `type[group1]= ..., symbols[Group1]= [ ... ]` syntax
     const azerty_xkb =
         \\xkb_keymap {
         \\xkb_keycodes "evdev+aliases(azerty)" {
@@ -5245,10 +5291,20 @@ test "XkbKeymap parsing, modifiers, Caps Lock, AltGr, and non-US layout input" {
         \\    alias <LatA> = <AD01>;
         \\};
         \\xkb_symbols "pc+fr(oss)" {
-        \\    key <AE01> { [ ampersand, 1, onesuperior, exclamdown ] };
+        \\    key <AE01> {
+        \\        type[group1]= "FOUR_LEVEL",
+        \\        symbols[Group1]= [ ampersand, 1, onesuperior, exclamdown ]
+        \\    };
         \\    key <AE03> { [ quotedbl, 3, numbersign, sterling ] };
-        \\    key <LatA> { [ a, A, ae, AE ] };
-        \\    key <AC01> { [ q, Q, at, Greek_OMEGA ] };
+        \\    key <LatA> {
+        \\        type[1]= "FOUR_LEVEL_ALPHABETIC",
+        \\        symbols[1]= [ a, A, ae, AE ]
+        \\    };
+        \\    key <AC01> {
+        \\        type[1]= "FOUR_LEVEL_ALPHABETIC",
+        \\        actions[1]= [ NoAction(), NoAction() ],
+        \\        symbols[1]= [ q, Q, at, Greek_OMEGA ]
+        \\    };
         \\};
         \\};
     ;
