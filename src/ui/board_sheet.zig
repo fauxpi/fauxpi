@@ -30,6 +30,8 @@ const heavy_w: f32 = 1.75;
 pub const BoardModel = enum {
     pi_1_a_plus,
     pi_1_b_plus,
+    pi_3_a_plus,
+    pi_3_b_plus,
     pi_zero,
     pi_zero_w,
     pi_zero_2_w,
@@ -37,6 +39,8 @@ pub const BoardModel = enum {
     pub const all = [_]BoardModel{
         .pi_1_a_plus,
         .pi_1_b_plus,
+        .pi_3_a_plus,
+        .pi_3_b_plus,
         .pi_zero,
         .pi_zero_w,
         .pi_zero_2_w,
@@ -46,6 +50,8 @@ pub const BoardModel = enum {
         return switch (self) {
             .pi_1_a_plus => "Raspberry Pi 1 Model A+",
             .pi_1_b_plus => "Raspberry Pi 1 Model B+",
+            .pi_3_a_plus => "Raspberry Pi 3 Model A+",
+            .pi_3_b_plus => "Raspberry Pi 3 Model B+",
             .pi_zero => "Raspberry Pi Zero",
             .pi_zero_w => "Raspberry Pi Zero W",
             .pi_zero_2_w => "Raspberry Pi Zero 2 W",
@@ -56,6 +62,8 @@ pub const BoardModel = enum {
         return switch (self) {
             .pi_1_a_plus => "Raspberry Pi Model A Plus Rev 1.1",
             .pi_1_b_plus => "Raspberry Pi Model B Plus Rev 1.2",
+            .pi_3_a_plus => "Raspberry Pi 3 Model A Plus Rev 1.0",
+            .pi_3_b_plus => "Raspberry Pi 3 Model B Plus Rev 1.3",
             .pi_zero => "Raspberry Pi Zero Rev 1.3",
             .pi_zero_w => "Raspberry Pi Zero W Rev 1.1",
             .pi_zero_2_w => "Raspberry Pi Zero 2 W Rev 1.0",
@@ -66,6 +74,8 @@ pub const BoardModel = enum {
         return switch (self) {
             .pi_1_a_plus => 0x00900021,
             .pi_1_b_plus => 0x00900032,
+            .pi_3_a_plus => 0x009020e0,
+            .pi_3_b_plus => 0x00a020d3,
             .pi_zero => 0x00900093,
             .pi_zero_w => 0x009000c1,
             .pi_zero_2_w => 0x00902120,
@@ -75,20 +85,22 @@ pub const BoardModel = enum {
     pub fn hasWireless(self: BoardModel) bool {
         return switch (self) {
             .pi_1_a_plus, .pi_1_b_plus, .pi_zero => false,
-            .pi_zero_w, .pi_zero_2_w => true,
+            .pi_3_a_plus, .pi_3_b_plus, .pi_zero_w, .pi_zero_2_w => true,
         };
     }
 
     pub fn usesExternalUsbHub(self: BoardModel) bool {
         return switch (self) {
-            .pi_1_b_plus => false,
-            .pi_1_a_plus, .pi_zero, .pi_zero_w, .pi_zero_2_w => true,
+            .pi_1_b_plus, .pi_3_b_plus => false,
+            .pi_1_a_plus, .pi_3_a_plus, .pi_zero, .pi_zero_w, .pi_zero_2_w => true,
         };
     }
 
     pub fn fromModel(model: []const u8) BoardModel {
         if (std.mem.indexOf(u8, model, "Zero 2 W") != null) return .pi_zero_2_w;
         if (std.mem.indexOf(u8, model, "Zero W") != null) return .pi_zero_w;
+        if (std.mem.indexOf(u8, model, "3 Model B Plus") != null or std.mem.indexOf(u8, model, "3 Model B+") != null) return .pi_3_b_plus;
+        if (std.mem.indexOf(u8, model, "3 Model A Plus") != null or std.mem.indexOf(u8, model, "3 Model A+") != null) return .pi_3_a_plus;
         if (std.mem.indexOf(u8, model, "Model B Plus") != null or std.mem.indexOf(u8, model, "Model B+") != null) return .pi_1_b_plus;
         if (std.mem.indexOf(u8, model, "Model A Plus") != null or std.mem.indexOf(u8, model, "Model A+") != null) return .pi_1_a_plus;
         return .pi_zero;
@@ -2681,12 +2693,44 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(InteractiveTarget.ethernet, BoardUi.targetAt(&board.pi1_b_plus, .{ 92.0, 45.75 }, true).?);
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
 
-    // Select item 3 (Raspberry Pi Zero W) from the popup menu
+    // Select item 2 (Raspberry Pi 3 Model A+): A+ board with wireless and external USB hub
+    _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
+    _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, false, status, &hw);
+    const item2_y = ui.board_menu_rect.y + 4.0 + 2.0 * 32.0 + 16.0;
+    _ = ui.pointerButton(ui.board_menu_rect.x + 20, item2_y, true, status, &hw);
+    try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item2_y, false, status, &hw));
+    try testing.expectEqual(BoardModel.pi_3_a_plus, ui.selected_board_model);
+    status.board_model = ui.selected_board_model;
+    status.model = status.board_model.dtModel();
+    ui.updateLayout(win_w, win_h, status, &hw);
+    try testing.expectEqualStrings("Raspberry Pi 3 Model A+", ui.title);
+    try testing.expect(board.forModel(status.model).? == &board.pi3_a_plus);
+    try testing.expect(status.board_model.usesExternalUsbHub());
+    try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+
+    // Select item 3 (Raspberry Pi 3 Model B+): B+ board with wireless and direct USB/Ethernet ports
     _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
     _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, false, status, &hw);
     const item3_y = ui.board_menu_rect.y + 4.0 + 3.0 * 32.0 + 16.0;
     _ = ui.pointerButton(ui.board_menu_rect.x + 20, item3_y, true, status, &hw);
     try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item3_y, false, status, &hw));
+    try testing.expectEqual(BoardModel.pi_3_b_plus, ui.selected_board_model);
+    status.board_model = ui.selected_board_model;
+    status.model = status.board_model.dtModel();
+    ui.updateLayout(win_w, win_h, status, &hw);
+    try testing.expectEqualStrings("Raspberry Pi 3 Model B+", ui.title);
+    try testing.expect(board.forModel(status.model).? == &board.pi3_b_plus);
+    try testing.expect(!status.board_model.usesExternalUsbHub());
+    try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+
+    // Select item 5 (Raspberry Pi Zero W) from the popup menu
+    _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
+    _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, false, status, &hw);
+    const item5_y = ui.board_menu_rect.y + 4.0 + 5.0 * 32.0 + 16.0;
+    _ = ui.pointerButton(ui.board_menu_rect.x + 20, item5_y, true, status, &hw);
+    try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item5_y, false, status, &hw));
     try testing.expectEqual(BoardModel.pi_zero_w, ui.selected_board_model);
     status.board_model = ui.selected_board_model;
     status.model = status.board_model.dtModel();
@@ -2696,12 +2740,12 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     // Wireless MAC row is now visible
     try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
 
-    // Open menu again and select item 4 (Raspberry Pi Zero 2 W)
+    // Open menu again and select item 6 (Raspberry Pi Zero 2 W)
     _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
     _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, false, status, &hw);
-    const item4_y = ui.board_menu_rect.y + 4.0 + 4.0 * 32.0 + 16.0;
-    _ = ui.pointerButton(ui.board_menu_rect.x + 20, item4_y, true, status, &hw);
-    try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item4_y, false, status, &hw));
+    const item6_y = ui.board_menu_rect.y + 4.0 + 6.0 * 32.0 + 16.0;
+    _ = ui.pointerButton(ui.board_menu_rect.x + 20, item6_y, true, status, &hw);
+    try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item6_y, false, status, &hw));
     try testing.expectEqual(BoardModel.pi_zero_2_w, ui.selected_board_model);
     status.board_model = ui.selected_board_model;
     status.model = status.board_model.dtModel();

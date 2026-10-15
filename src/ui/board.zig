@@ -211,7 +211,7 @@ const pi3_b: Board = .{ .width = 85, .height = 56, .holes = &b_plus_holes, .part
     at(.antenna, 1.6, 9.5, 2, 7),
 }) };
 
-const pi3_b_plus: Board = .{ .width = 85, .height = 56, .holes = &b_plus_holes, .parts = &bPlus(&.{
+pub const pi3_b_plus: Board = .{ .width = 85, .height = 56, .holes = &b_plus_holes, .parts = &bPlus(&.{
     lidded(chip(.soc, "BCM2837B0", 27, 24.6, 14)),
     under(chip(.ram, "1 GB LPDDR2", 27, 24.6, 12)),
     chip(.usb_ethernet, "LAN7515", 60, 22.3, 9),
@@ -272,7 +272,7 @@ pub const pi1_a_plus: Board = .{ .width = 65, .height = 56, .holes = &b_plus_hol
     chip(.soc_with_ram, "BCM2835", 27, 24.6, 12),
 }) };
 
-const pi3_a_plus: Board = .{ .width = 65, .height = 56, .holes = &b_plus_holes, .parts = &aPlus(&.{
+pub const pi3_a_plus: Board = .{ .width = 65, .height = 56, .holes = &b_plus_holes, .parts = &aPlus(&.{
     lidded(chip(.soc, "BCM2837B0", 27, 24.6, 14)),
     under(chip(.ram, "512 MB LPDDR2", 27, 24.6, 12)),
     at(.wireless_can, 13.5, 11.5, 12, 10),
@@ -407,8 +407,8 @@ pub fn forModel(model: []const u8) ?*const Board {
     if (has(model, "Zero")) return &pi_zero;
     if (has(model, "5 Model B")) return &pi5_b;
     if (has(model, "4 Model B")) return &pi4_b;
-    if (has(model, "3 Model B Plus")) return &pi3_b_plus;
-    if (has(model, "3 Model A Plus")) return &pi3_a_plus;
+    if (has(model, "3 Model B Plus") or has(model, "3 Model B+")) return &pi3_b_plus;
+    if (has(model, "3 Model A Plus") or has(model, "3 Model A+")) return &pi3_a_plus;
     if (has(model, "3 Model B")) return &pi3_b;
     // The 2 B v1.2 has the Pi 3's chip.
     if (has(model, "2 Model B")) return if (has(model, "Rev 1.2")) &pi2_b_v12 else &pi2_b;
