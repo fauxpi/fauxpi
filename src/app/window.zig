@@ -22,8 +22,11 @@ pub const WaylandWindow = struct {
     seat: ?client.Proxy = null,
     pointer: ?client.Proxy = null,
     keyboard: ?client.Proxy = null,
+    cursor_shape_mgr: ?client.Proxy = null,
+    cursor_shape_dev: ?client.Proxy = null,
 
     surface: client.Proxy,
+    cursor_surface: client.Proxy,
     xdg_surface: client.Proxy,
     toplevel: client.Proxy,
 
@@ -43,6 +46,7 @@ pub const WaylandWindow = struct {
     shm_fd: linux.fd_t = -1,
     shm_map: []align(std.heap.page_size_min) u8 = &.{},
     buffers: [2]client.Proxy = undefined,
+    cursor_buffers: [2]client.Proxy = undefined,
     has_buffers: bool = false,
     cur_buf: u1 = 0,
 
@@ -63,6 +67,8 @@ pub const WaylandWindow = struct {
     last_mouse_x: ?f64 = null,
     last_mouse_y: ?f64 = null,
     last_button_serial: u32 = 0,
+    pointer_enter_serial: u32 = 0,
+    cursor_mode: enum { unknown, ui_arrow, hdmi_crosshair } = .unknown,
 
     hid: ?*UsbHidComposite = null,
     gpio: *Gpio,
@@ -108,6 +114,7 @@ pub const WaylandWindow = struct {
             .shm = shm,
             .wm_base = wm_base,
             .surface = undefined,
+            .cursor_surface = undefined,
             .xdg_surface = undefined,
             .toplevel = undefined,
             .display_width = display_width,
@@ -137,12 +144,23 @@ pub const WaylandWindow = struct {
             }
         }
 
+        win.cursor_shape_mgr = try globals.bind(
+            registry,
+            protocol.wp_cursor_shape_manager_v1.name,
+            protocol.wp_cursor_shape_manager_v1.version,
+            null,
+        );
         win.seat = try globals.bind(registry, protocol.wl_seat.name, protocol.wl_seat.version, .{ .ptr = win, .handler = seatEvent });
 
         win.surface = try display.newObject(.{ .ptr = win, .handler = surfaceEvent });
         {
             var m = try compositor.request(protocol.wl_compositor.request.create_surface);
             m.uint(win.surface.id).end();
+        }
+        win.cursor_surface = try display.newObject(null);
+        {
+            var m = try compositor.request(protocol.wl_compositor.request.create_surface);
+            m.uint(win.cursor_surface.id).end();
         }
 
         win.xdg_surface = try display.newObject(.{ .ptr = win, .handler = xdgSurfaceEvent });
@@ -289,6 +307,11 @@ pub const WaylandWindow = struct {
                     m.end();
                 } else |_| {}
                 self.display.forget(self.buffers[i].id);
+                if (self.cursor_buffers[i].request(protocol.wl_buffer.request.destroy)) |req| {
+                    var m = req;
+                    m.end();
+                } else |_| {}
+                self.display.forget(self.cursor_buffers[i].id);
             }
             self.has_buffers = false;
         }
@@ -302,6 +325,88 @@ pub const WaylandWindow = struct {
         }
     }
 
+    const cursor_logical_dim: u32 = 24;
+    const crosshair_logical_hot: i32 = 12;
+
+    fn paintFaintCrosshairCursor(pixels: []u32, sc: u32) void {
+        const dim: usize = @as(usize, cursor_logical_dim) * @as(usize, sc);
+        @memset(pixels, 0x00000000);
+
+        const c: i32 = @intCast(crosshair_logical_hot);
+        // Premultiplied ARGB8888: faint ~22% white core with subtle ~11% dark halo
+        // so the crosshair is subtly visible on both dark and light HDMI frames without
+        // doubling up with the guest OS cursor.
+        const core_px: u32 = 0x38383838;
+        const halo_px: u32 = 0x1C000000;
+
+        var d: i32 = -5;
+        while (d <= 5) : (d += 1) {
+            if (d >= -1 and d <= 1) continue; // 3x3 gap around center tip
+            // Horizontal arm (y = c, x = c + d) + 1px halo above/below
+            fillScaledCursorPixel(pixels, dim, sc, c + d, c - 1, halo_px);
+            fillScaledCursorPixel(pixels, dim, sc, c + d, c, core_px);
+            fillScaledCursorPixel(pixels, dim, sc, c + d, c + 1, halo_px);
+            // Vertical arm (x = c, y = c + d) + 1px halo left/right
+            fillScaledCursorPixel(pixels, dim, sc, c - 1, c + d, halo_px);
+            fillScaledCursorPixel(pixels, dim, sc, c, c + d, core_px);
+            fillScaledCursorPixel(pixels, dim, sc, c + 1, c + d, halo_px);
+        }
+        // Subtle center dot
+        fillScaledCursorPixel(pixels, dim, sc, c, c, core_px);
+    }
+
+    fn paintArrowCursor(pixels: []u32, sc: u32) void {
+        const dim: usize = @as(usize, cursor_logical_dim) * @as(usize, sc);
+        @memset(pixels, 0x00000000);
+        const arrow_rows = [_][]const u8{
+            "X",
+            "XX",
+            "X.X",
+            "X..X",
+            "X...X",
+            "X....X",
+            "X.....X",
+            "X......X",
+            "X.......X",
+            "X........X",
+            "X.....XXXXX",
+            "X..X..X",
+            "X.X X..X",
+            "XX  X..X",
+            "X    X..X",
+            "     X..X",
+            "      XX",
+        };
+        for (arrow_rows, 0..) |row, ly| {
+            for (row, 0..) |ch, lx| {
+                const color: u32 = switch (ch) {
+                    'X' => 0xFF000000,
+                    '.' => 0xFFFFFFFF,
+                    else => continue,
+                };
+                fillScaledCursorPixel(pixels, dim, sc, @intCast(lx + 1), @intCast(ly + 1), color);
+            }
+        }
+    }
+
+    fn fillScaledCursorPixel(pixels: []u32, dim: usize, sc: u32, lx: i32, ly: i32, color: u32) void {
+        if (lx < 0 or ly < 0) return;
+        const x0: usize = @as(usize, @intCast(lx)) * @as(usize, sc);
+        const y0: usize = @as(usize, @intCast(ly)) * @as(usize, sc);
+        const s: usize = sc;
+        var dy: usize = 0;
+        while (dy < s) : (dy += 1) {
+            const py = y0 + dy;
+            if (py >= dim) break;
+            var dx: usize = 0;
+            while (dx < s) : (dx += 1) {
+                const px = x0 + dx;
+                if (px >= dim) break;
+                pixels[py * dim + px] = color;
+            }
+        }
+    }
+
     fn initShmBuffers(self: *WaylandWindow) !void {
         self.freeShmBuffers();
 
@@ -310,7 +415,11 @@ pub const WaylandWindow = struct {
         const buf_h = self.height * sc;
         const stride = buf_w * 4;
         const single_size = @as(usize, stride) * @as(usize, buf_h);
-        const pool_size = single_size * 2;
+
+        const cur_dim = cursor_logical_dim * sc;
+        const cur_stride = cur_dim * 4;
+        const cur_size = @as(usize, cur_stride) * @as(usize, cur_dim);
+        const pool_size = single_size * 2 + cur_size * 2;
 
         const fd_rc = linux.memfd_create("fauxpi-hdmi-shm", linux.MFD.CLOEXEC);
         if (linux.errno(fd_rc) != .SUCCESS) return error.SystemError;
@@ -343,8 +452,29 @@ pub const WaylandWindow = struct {
                 .uint(protocol.wl_shm.format.xrgb8888)
                 .end();
         }
+
+        for (0..2) |i| {
+            const byte_off = single_size * 2 + i * cur_size;
+            const cur_px: []u32 = @alignCast(std.mem.bytesAsSlice(u32, self.shm_map[byte_off .. byte_off + cur_size]));
+            if (i == 0) {
+                paintFaintCrosshairCursor(cur_px, sc);
+            } else {
+                paintArrowCursor(cur_px, sc);
+            }
+            self.cursor_buffers[i] = try self.display.newObject(null);
+            var m = try pool.request(protocol.wl_shm_pool.request.create_buffer);
+            m.uint(self.cursor_buffers[i].id)
+                .int(@intCast(byte_off))
+                .int(@intCast(cur_dim))
+                .int(@intCast(cur_dim))
+                .int(@intCast(cur_stride))
+                .uint(protocol.wl_shm.format.argb8888)
+                .end();
+        }
+
         self.has_buffers = true;
         self.cur_buf = 0;
+        self.cursor_mode = .unknown;
 
         {
             var m = try pool.request(protocol.wl_shm_pool.request.destroy);
@@ -521,6 +651,15 @@ pub const WaylandWindow = struct {
                         var m = req;
                         m.uint(p.id).end();
                     } else |_| {}
+                    if (self.cursor_shape_mgr) |mgr| {
+                        if (d.newObject(null)) |dev| {
+                            self.cursor_shape_dev = dev;
+                            if (mgr.request(protocol.wp_cursor_shape_manager_v1.request.get_pointer)) |sreq| {
+                                var sm = sreq;
+                                sm.uint(dev.id).uint(p.id).end();
+                            } else |_| {}
+                        } else |_| {}
+                    }
                 } else |_| {}
             }
             if ((caps & protocol.wl_seat.capability.keyboard) != 0 and self.keyboard == null) {
@@ -533,6 +672,50 @@ pub const WaylandWindow = struct {
                 } else |_| {}
             }
         }
+    }
+
+    fn updateCursorShape(self: *WaylandWindow, over_ui: bool) void {
+        const ptr = self.pointer orelse return;
+        if (!self.has_buffers) return;
+        const target: @TypeOf(self.cursor_mode) = if (over_ui) .ui_arrow else .hdmi_crosshair;
+        if (self.cursor_mode == target) return;
+        self.cursor_mode = target;
+
+        if (over_ui) {
+            if (self.cursor_shape_dev) |dev| {
+                if (dev.request(protocol.wp_cursor_shape_device_v1.request.set_shape)) |req| {
+                    var m = req;
+                    m.uint(self.pointer_enter_serial).uint(protocol.wp_cursor_shape_device_v1.shape.default).end();
+                    return;
+                } else |_| {}
+            }
+        }
+
+        const sc = @max(self.scale, 1);
+        const buf_idx: usize = if (over_ui) 1 else 0;
+        const hot_x: i32 = if (over_ui) 1 else crosshair_logical_hot;
+        const hot_y: i32 = if (over_ui) 1 else crosshair_logical_hot;
+
+        if (self.cursor_surface.request(protocol.wl_surface.request.set_buffer_scale)) |req| {
+            var m = req;
+            m.int(@intCast(sc)).end();
+        } else |_| {}
+        if (self.cursor_surface.request(protocol.wl_surface.request.attach)) |req| {
+            var m = req;
+            m.uint(self.cursor_buffers[buf_idx].id).int(0).int(0).end();
+        } else |_| {}
+        if (self.cursor_surface.request(protocol.wl_surface.request.damage)) |req| {
+            var m = req;
+            m.int(0).int(0).int(@intCast(cursor_logical_dim)).int(@intCast(cursor_logical_dim)).end();
+        } else |_| {}
+        if (self.cursor_surface.request(protocol.wl_surface.request.commit)) |req| {
+            var m = req;
+            m.end();
+        } else |_| {}
+        if (ptr.request(protocol.wl_pointer.request.set_cursor)) |req| {
+            var m = req;
+            m.uint(self.pointer_enter_serial).uint(self.cursor_surface.id).int(hot_x).int(hot_y).end();
+        } else |_| {}
     }
 
     fn updateGuestMouseTarget(self: *WaylandWindow, sx: f64, sy: f64) void {
@@ -554,13 +737,16 @@ pub const WaylandWindow = struct {
 
         switch (opcode) {
             protocol.wl_pointer.event.enter => {
-                _ = r.uint() catch return; // serial
+                const serial = r.uint() catch return;
                 _ = r.uint() catch return; // surface
                 const sx = r.fixed() catch return;
                 const sy = r.fixed() catch return;
+                self.pointer_enter_serial = serial;
+                self.cursor_mode = .unknown;
                 self.last_mouse_x = sx;
                 self.last_mouse_y = sy;
                 const in_ui = self.ui.pointerMotion(@floatCast(sx), @floatCast(sy), self.status, self.gpio);
+                self.updateCursorShape(in_ui);
                 if (!in_ui) {
                     self.updateGuestMouseTarget(sx, sy);
                 }
@@ -568,6 +754,7 @@ pub const WaylandWindow = struct {
             protocol.wl_pointer.event.leave => {
                 self.last_mouse_x = null;
                 self.last_mouse_y = null;
+                self.cursor_mode = .unknown;
                 self.ui.pointerLeave();
             },
             protocol.wl_pointer.event.motion => {
@@ -575,6 +762,7 @@ pub const WaylandWindow = struct {
                 const sx = r.fixed() catch return;
                 const sy = r.fixed() catch return;
                 const in_ui = self.ui.pointerMotion(@floatCast(sx), @floatCast(sy), self.status, self.gpio);
+                self.updateCursorShape(in_ui);
                 if (!in_ui) {
                     self.updateGuestMouseTarget(sx, sy);
                 }
@@ -596,6 +784,8 @@ pub const WaylandWindow = struct {
 
                 if (button == protocol.input.btn_left) {
                     const action = self.ui.pointerButton(sx, sy, pressed, self.status, self.gpio);
+                    const over_ui = self.ui.sheet_open or sy < @as(f32, @floatFromInt(board_sheet.BoardUi.title_bar_height));
+                    self.updateCursorShape(over_ui);
                     switch (action) {
                         .start_drag => {
                             self.startMove();
@@ -715,6 +905,8 @@ pub const WaylandWindow = struct {
                     // Escape (evdev key 1) closes the board sheet
                     if (key == 1 and pressed) {
                         self.ui.sheet_open = false;
+                        const sy: f64 = self.last_mouse_y orelse 0.0;
+                        self.updateCursorShape(sy < @as(f64, @floatFromInt(board_sheet.BoardUi.title_bar_height)));
                     }
                     return;
                 }

@@ -232,8 +232,31 @@ pub const wl_keyboard = struct {
     };
 };
 
+pub const wp_cursor_shape_manager_v1 = struct {
+    pub const name = "wp_cursor_shape_manager_v1";
+    pub const version = 1;
+    pub const request = struct {
+        pub const destroy = 0;
+        pub const get_pointer = 1;
+    };
+};
+
+pub const wp_cursor_shape_device_v1 = struct {
+    pub const name = "wp_cursor_shape_device_v1";
+    pub const request = struct {
+        pub const destroy = 0;
+        pub const set_shape = 1;
+    };
+    pub const shape = struct {
+        pub const default = 1;
+        pub const pointer = 4;
+        pub const crosshair = 8;
+    };
+};
+
 pub const input = struct {
     pub const btn_left = 0x110;
     pub const btn_right = 0x111;
     pub const btn_middle = 0x112;
 };
+
