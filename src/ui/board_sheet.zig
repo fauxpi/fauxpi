@@ -1370,13 +1370,13 @@ pub const BoardUi = struct {
         const cur_board = BoardModel.fromModel(status.model);
         const row0_y = self.board_menu_btn_rect.y;
         _ = c.drawText(14.0, pr.x + 16.0, row0_y + 15.0, "Board", row_title_col);
-        _ = c.drawText(11.5, pr.x + 16.0, row0_y + 30.0, "Hardware model & device tree (/model)", row_sub_col);
+        _ = c.drawText(11.5, pr.x + 16.0, row0_y + 30.0, "Hardware model", row_sub_col);
         self.paintMenuButton(c, self.board_menu_btn_rect, cur_board.windowTitle(), self.board_menu_open, self.board_menu_btn_hovered, boot_disabled);
 
         // Row 1: Serial Number
         const row1_y = self.serial_field_rect.y;
         _ = c.drawText(14.0, pr.x + 16.0, row1_y + 15.0, "Serial Number", row_title_col);
-        _ = c.drawText(11.5, pr.x + 16.0, row1_y + 30.0, "64-bit hex board ID (/system/linux,serial)", row_sub_col);
+        _ = c.drawText(11.5, pr.x + 16.0, row1_y + 30.0, "64-bit hex board ID", row_sub_col);
 
         var serial_disp_buf: [18]u8 = undefined;
         const serial_slice = self.serial_hex[0..self.serial_len];
@@ -1390,7 +1390,7 @@ pub const BoardUi = struct {
         // Row 2: USB Ethernet MAC Address
         const row2_y = self.mac_field_rect.y;
         _ = c.drawText(14.0, pr.x + 16.0, row2_y + 15.0, "USB Ethernet MAC", row_title_col);
-        _ = c.drawText(11.5, pr.x + 16.0, row2_y + 30.0, "CDC-ECM adapter hardware address (eth0)", row_sub_col);
+        _ = c.drawText(11.5, pr.x + 16.0, row2_y + 30.0, "External Ethernet hardware address", row_sub_col);
 
         var mac_disp_buf: [20]u8 = undefined;
         const mac_disp = formatMacDisplay(&mac_disp_buf, self.mac_hex[0..self.mac_len], !boot_disabled and self.focused_field == .mac);
@@ -1401,7 +1401,7 @@ pub const BoardUi = struct {
         if (cur_board.hasWireless()) {
             const row_wifi_y = self.wifi_mac_field_rect.y;
             _ = c.drawText(14.0, pr.x + 16.0, row_wifi_y + 15.0, "Wireless MAC", row_title_col);
-            _ = c.drawText(11.5, pr.x + 16.0, row_wifi_y + 30.0, "On-board Wi-Fi hardware address (wlan0)", row_sub_col);
+            _ = c.drawText(11.5, pr.x + 16.0, row_wifi_y + 30.0, "On-board Wi-Fi hardware address", row_sub_col);
 
             var wifi_disp_buf: [20]u8 = undefined;
             const wifi_disp = formatMacDisplay(&wifi_disp_buf, self.wifi_mac_hex[0..self.wifi_mac_len], !boot_disabled and self.focused_field == .wifi_mac);
