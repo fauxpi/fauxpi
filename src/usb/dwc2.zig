@@ -86,6 +86,8 @@ pub const Dwc2Controller = struct {
     hcfg: u32 = 0,
     hfir: u32 = 60000,
     hfnum: u16 = 0,
+    sof_base: u16 = 0,
+    pending_csplit_sof: bool = false,
     haintmsk: u32 = 0,
     hprt0: u32 = HPRT0_PRTCONNSTS | HPRT0_PRTSPD_HIGH,
     pcgcctl: u32 = 0,
@@ -142,7 +144,10 @@ pub const Dwc2Controller = struct {
 
     pub fn tickSof(self: *Dwc2Controller, ram: []u8) void {
         self.syncRootPortConnection();
-        self.hfnum +%= 1;
+        // 1 vblank at 60 Hz (~16.67 ms) corresponds to ~128 USB High-Speed microframes (16.0 ms)
+        self.sof_base = (self.sof_base + 128) & 0x3fff;
+        self.hfnum = self.sof_base;
+        self.pending_csplit_sof = false;
         if ((self.gintmsk & GINTSTS_SOF) != 0) {
             self.gintsts |= GINTSTS_SOF;
         }
@@ -234,7 +239,7 @@ pub const Dwc2Controller = struct {
             0x018 => self.gintmsk,
             0x024 => self.grxfsiz,
             0x028 => self.gnptxfsiz,
-            0x02c => (8 << 16) | 0x0400, // GNPTXSTS
+            0x02c => (8 << 16) | ((self.gnptxfsiz >> 16) & 0xffff), // GNPTXSTS
             0x040 => 0x4f54280a, // GSNPSID (DWC2 2.80a)
             0x044 => 0x00000000, // GHWCFG1
             0x048 => 0x228ddd50, // GHWCFG2 (Internal DMA, 8 host channels, dynamic FIFO)
@@ -244,11 +249,8 @@ pub const Dwc2Controller = struct {
             0x100 => self.hptxfsiz,
             0x400 => self.hcfg,
             0x404 => self.hfir,
-            0x408 => blk: { // HFNUM
-                self.hfnum +%= 1;
-                break :blk (@as(u32, 0x3fff) << 16) | self.hfnum;
-            },
-            0x410 => (8 << 16) | 0x0400, // HPTXSTS
+            0x408 => ((self.hfir & 0xffff) << 16) | self.hfnum, // HFNUM (FRREM = full frame interval remaining)
+            0x410 => (8 << 16) | ((self.hptxfsiz >> 16) & 0xffff), // HPTXSTS (FSPCAVAIL = full periodic FIFO size)
             0x414 => self.effectiveHaint(), // HAINT
             0x418 => self.haintmsk, // HAINTMSK
             0x440 => self.hprt0, // HPRT0
@@ -305,7 +307,18 @@ pub const Dwc2Controller = struct {
             0x100 => self.hptxfsiz = val,
             0x400 => self.hcfg = val,
             0x404 => self.hfir = val,
-            0x418 => self.haintmsk = val,
+            0x418 => {
+                self.haintmsk = val;
+                // When a periodic Start-Split (SSPLIT) finishes and its channel interrupt is masked,
+                // advance 2 microframes and assert SOF so the Complete-Split (CSPLIT) runs immediately.
+                if (self.pending_csplit_sof and (self.effectiveHaint() & val) == 0) {
+                    self.pending_csplit_sof = false;
+                    self.hfnum = (self.hfnum + 2) & 0x3fff;
+                    if ((self.gintmsk & GINTSTS_SOF) != 0) {
+                        self.gintsts |= GINTSTS_SOF;
+                    }
+                }
+            },
             0x440 => { // HPRT0
                 const prev = self.hprt0;
                 // Bits 1 (PRTCONNDET), 2 (PRTENA), 3 (PRTENCHNG), 5 (PRTOVRCURRCHNG) are W1C
@@ -370,7 +383,7 @@ pub const Dwc2Controller = struct {
             if ((ch.hcsplt & HCSPLT_COMPSPLT) == 0) {
                 // Start-Split (SSPLIT): consume SETUP/OUT payload now and halt with HCINT_ACK | HCINT_CHHLTD
                 ch.hcchar &= ~HCCHAR_CHEN;
-                if (epnum == 0 or eptype == 0) {
+                if (epnum == 0) {
                     if (pid == 3 and !epdir_in) {
                         if (dma_phys + 8 <= ram.len) {
                             var setup: [8]u8 = undefined;
@@ -389,12 +402,14 @@ pub const Dwc2Controller = struct {
                         ch.hcdma +%= xfersize;
                         ch.hcdmab = ch.hcdma;
                     }
+                } else {
+                    self.pending_csplit_sof = true;
                 }
                 ch.hcint |= HCINT_ACK | HCINT_CHHLTD;
                 return;
             } else {
                 // Complete-Split (CSPLIT): for SETUP stage, return the status of the SSPLIT setup
-                if ((epnum == 0 or eptype == 0) and pid == 3 and !epdir_in) {
+                if (epnum == 0 and pid == 3 and !epdir_in) {
                     ch.hcchar &= ~HCCHAR_CHEN;
                     if (self.hid.ctrl[@intFromEnum(target)].last_setup_ok) {
                         ch.hctsiz = (@as(u32, pid) << 29);
@@ -408,7 +423,7 @@ pub const Dwc2Controller = struct {
         }
 
         // Control endpoint 0
-        if (epnum == 0 or eptype == 0) {
+        if (epnum == 0) {
             ch.hcchar &= ~HCCHAR_CHEN;
             if (pid == 3 and !epdir_in) {
                 // SETUP stage (8 bytes)
@@ -498,7 +513,10 @@ pub const Dwc2Controller = struct {
         // - Ethernet (.eth): EP1 IN (CDC-ECM Notifications)
         // - Keyboard (.kbd): EP1 IN (8-byte Boot Keyboard Report)
         // - Mouse (.mouse): EP1 IN (4-byte Boot Mouse Report)
-        if (eptype == 3 and epdir_in) {
+        // Note: Raspberry Pi's downstream DWC2 driver (`linux-rpi/drivers/usb/dwc2/hcd.c`)
+        // masquerades Split Interrupt IN transfers as `USB_ENDPOINT_XFER_CONTROL` (`eptype == 0`)
+        // in `HCCHAR` so the hub uses its non-periodic TT handler.
+        if ((eptype == 3 or (eptype == 0 and (ch.hcsplt & HCSPLT_SPLTENA) != 0)) and epdir_in) {
             ch.hcchar &= ~HCCHAR_CHEN;
             switch (target) {
                 .hub => {
@@ -706,19 +724,19 @@ test "DWC2 multi-device USB Hub, Ethernet, Keyboard, and Mouse enumeration and t
     try std.testing.expect((dwc2.read32(0x528) & Dwc2Controller.HCINT_XFERCOMP) != 0);
     try std.testing.expectEqual(@as(u8, 0x04), ram[0x302]);
 
-    // 6. Inject mouse motion and poll Mouse (devaddr=5) EP1 IN on Channel 1 (using SSPLIT + CSPLIT)
+    // 6. Inject mouse motion and poll Mouse (devaddr=5) EP1 IN on Channel 1 (using SSPLIT + CSPLIT with eptype=0 as masqueraded by linux-rpi)
     dwc2.hid.handleMouseMotion(15, -10, 0);
     dwc2.write32(0x528, 0x7ff, &ram);
     dwc2.write32(0x524, Dwc2Controller.HCSPLT_SPLTENA, &ram);
     dwc2.write32(0x530, (0 << 29) | (1 << 19) | 0, &ram);
-    dwc2.write32(0x520, Dwc2Controller.HCCHAR_CHEN | (5 << 22) | (3 << 18) | (1 << 15) | (1 << 11) | 4, &ram);
+    dwc2.write32(0x520, Dwc2Controller.HCCHAR_CHEN | (5 << 22) | (0 << 18) | (1 << 15) | (1 << 11) | 4, &ram);
     try std.testing.expect((dwc2.read32(0x528) & Dwc2Controller.HCINT_ACK) != 0);
 
     dwc2.write32(0x528, 0x7ff, &ram);
     dwc2.write32(0x524, Dwc2Controller.HCSPLT_SPLTENA | Dwc2Controller.HCSPLT_COMPSPLT, &ram);
     dwc2.write32(0x530, (0 << 29) | (1 << 19) | 4, &ram);
     dwc2.write32(0x534, 0xc0000320, &ram);
-    dwc2.write32(0x520, Dwc2Controller.HCCHAR_CHEN | (5 << 22) | (3 << 18) | (1 << 15) | (1 << 11) | 4, &ram);
+    dwc2.write32(0x520, Dwc2Controller.HCCHAR_CHEN | (5 << 22) | (0 << 18) | (1 << 15) | (1 << 11) | 4, &ram);
     try std.testing.expect((dwc2.read32(0x528) & Dwc2Controller.HCINT_XFERCOMP) != 0);
     try std.testing.expectEqual(@as(i8, 15), @as(i8, @bitCast(ram[0x321])));
     try std.testing.expectEqual(@as(i8, -10), @as(i8, @bitCast(ram[0x322])));

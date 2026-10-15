@@ -282,12 +282,7 @@ pub const UsbHidComposite = struct {
             const cur_conn = (self.port_status[p] & PORT_STAT_CONNECTION) != 0;
             if (want_conn != cur_conn) {
                 if (want_conn) {
-                    self.port_status[p] |= PORT_STAT_CONNECTION;
-                    if (p == 0) {
-                        self.port_status[p] |= PORT_STAT_HIGH_SPEED;
-                    } else {
-                        self.port_status[p] &= ~(PORT_STAT_LOW_SPEED | PORT_STAT_HIGH_SPEED);
-                    }
+                    self.port_status[p] |= PORT_STAT_CONNECTION | if (p == 0) PORT_STAT_HIGH_SPEED else 0;
                 } else {
                     self.port_status[p] &= ~(PORT_STAT_CONNECTION | PORT_STAT_ENABLE | PORT_STAT_SUSPEND | PORT_STAT_RESET);
                     switch (p) {
@@ -695,12 +690,7 @@ pub const UsbHidComposite = struct {
                                     else => {},
                                 }
                                 if (self.isPortDeviceConnected(p)) {
-                                    self.port_status[p] |= PORT_STAT_CONNECTION | PORT_STAT_ENABLE | PORT_STAT_POWER;
-                                    if (p == 0) {
-                                        self.port_status[p] |= PORT_STAT_HIGH_SPEED;
-                                    } else {
-                                        self.port_status[p] &= ~(PORT_STAT_LOW_SPEED | PORT_STAT_HIGH_SPEED);
-                                    }
+                                    self.port_status[p] |= PORT_STAT_CONNECTION | PORT_STAT_ENABLE | PORT_STAT_POWER | if (p == 0) PORT_STAT_HIGH_SPEED else 0;
                                     self.port_status[p] &= ~PORT_STAT_RESET;
                                     self.port_change[p] |= PORT_CHANGE_RESET;
                                     self.latched_port_conn[p] = true;
@@ -713,12 +703,7 @@ pub const UsbHidComposite = struct {
                                 const conn = self.isPortDeviceConnected(p);
                                 if (conn) {
                                     if ((self.port_status[p] & PORT_STAT_CONNECTION) == 0) {
-                                        self.port_status[p] |= PORT_STAT_CONNECTION;
-                                        if (p == 0) {
-                                            self.port_status[p] |= PORT_STAT_HIGH_SPEED;
-                                        } else {
-                                            self.port_status[p] &= ~(PORT_STAT_LOW_SPEED | PORT_STAT_HIGH_SPEED);
-                                        }
+                                        self.port_status[p] |= PORT_STAT_CONNECTION | if (p == 0) PORT_STAT_HIGH_SPEED else 0;
                                         self.port_change[p] |= PORT_CHANGE_CONNECTION;
                                     }
                                 }
@@ -1114,7 +1099,7 @@ pub const UsbHidComposite = struct {
         9, 0x02, 25, 0, 1, 1, 0, 0xe0, 1,
         // Interface 0 Descriptor: USB Hub (9 bytes)
         9, 0x04, 0, 0, 1, 0x09, 0x00, 0x00, 0,
-        // Endpoint 1 IN Interrupt Descriptor: Status Change Bitmap (7 bytes)
+        // Endpoint 1 IN Interrupt Descriptor: Status Change Bitmap (7 bytes, bInterval = 12 -> 256ms)
         7, 0x05, 0x81, 0x03, 1, 0, 12,
     };
 
@@ -1129,8 +1114,8 @@ pub const UsbHidComposite = struct {
         5, 0x24, 0x06, 0, 1,
         // CDC Ethernet Networking Functional Descriptor: iMACAddress=4, wMaxSegmentSize=1514 (13 bytes)
         13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0,
-        // Endpoint 1 IN Interrupt Descriptor (7 bytes)
-        7, 0x05, 0x81, 0x03, 16, 0, 8,
+        // Endpoint 1 IN Interrupt Descriptor (7 bytes, bInterval = 11 -> 128ms)
+        7, 0x05, 0x81, 0x03, 16, 0, 11,
         // Interface 1 Alternate 0: CDC Data Idle (9 bytes)
         9, 0x04, 1, 0, 0, 0x0a, 0x00, 0x00, 0,
         // Interface 1 Alternate 1: CDC Data Active (9 bytes)
@@ -1247,7 +1232,7 @@ pub const UsbHidComposite = struct {
         9, 0x04, 0, 0, 1, 0x03, 0x01, 0x01, 0,
         // HID Descriptor (9 bytes, offset 18)
         9, 0x21, 0x11, 0x01, 0, 1, 0x22, KBD_REPORT_DESC.len, 0,
-        // Endpoint 1 IN Descriptor (7 bytes, offset 27)
+        // Endpoint 1 IN Descriptor (7 bytes, offset 27, bInterval = 10 -> 10ms)
         7, 0x05, 0x81, 0x03, 8, 0, 10,
     };
 
@@ -1258,7 +1243,7 @@ pub const UsbHidComposite = struct {
         9, 0x04, 0, 0, 1, 0x03, 0x01, 0x02, 0,
         // HID Descriptor (9 bytes, offset 18)
         9, 0x21, 0x11, 0x01, 0, 1, 0x22, MOUSE_REPORT_DESC.len, 0,
-        // Endpoint 1 IN Descriptor (7 bytes, offset 27)
+        // Endpoint 1 IN Descriptor (7 bytes, offset 27, bInterval = 10 -> 10ms)
         7, 0x05, 0x81, 0x03, 4, 0, 10,
     };
 
