@@ -22,11 +22,21 @@ pub const UsbHidComposite = struct {
 
     // Current Mouse button mask (bit 0 = left, bit 1 = right, bit 2 = middle)
     mouse_buttons: u8 = 0,
+    reported_buttons: u8 = 0,
     // Queued 4-byte mouse reports: [buttons, dx, dy, wheel]
     mouse_queue: [32][4]u8 = undefined,
     mouse_head: u5 = 0,
     mouse_tail: u5 = 0,
     mouse_count: u6 = 0,
+
+    // Target-tracking guest cursor position (in HDMI display pixel coordinates)
+    guest_x: i32 = 640,
+    guest_y: i32 = 360,
+    target_x: i32 = 640,
+    target_y: i32 = 360,
+    has_target: bool = false,
+    cursor_seen: bool = false,
+    idle_vblanks: u8 = 0,
 
     pub fn reset(self: *UsbHidComposite) void {
         self.address = 0;
@@ -87,6 +97,27 @@ pub const UsbHidComposite = struct {
         return r;
     }
 
+    /// Sets the desired HDMI display pixel coordinate `(x, y)` for the simulated cursor.
+    pub fn setMouseTarget(self: *UsbHidComposite, x: i32, y: i32) void {
+        self.target_x = x;
+        self.target_y = y;
+        self.has_target = true;
+    }
+
+    /// Anchors `guest_x` and `guest_y` to the actual HVS cursor plane hotspot on vblank.
+    pub fn syncCursorFeedback(self: *UsbHidComposite, actual: ?[2]i32) void {
+        if (self.idle_vblanks < 255) {
+            self.idle_vblanks += 1;
+        }
+        if (actual) |pos| {
+            if (!self.cursor_seen or self.idle_vblanks >= 4) {
+                self.cursor_seen = true;
+                self.guest_x = pos[0];
+                self.guest_y = pos[1];
+            }
+        }
+    }
+
     pub fn handleMouseMotion(self: *UsbHidComposite, dx: i8, dy: i8, wheel: i8) void {
         if (dx == 0 and dy == 0 and wheel == 0) return;
         self.enqueueMouseReport(.{
@@ -103,7 +134,12 @@ pub const UsbHidComposite = struct {
         } else {
             self.mouse_buttons &= ~button_bit;
         }
-        self.enqueueMouseReport(.{ self.mouse_buttons, 0, 0, 0 });
+        self.enqueueMouseReport(.{
+            self.mouse_buttons,
+            0,
+            0,
+            0,
+        });
     }
 
     pub fn enqueueMouseReport(self: *UsbHidComposite, report: [4]u8) void {
@@ -115,10 +151,30 @@ pub const UsbHidComposite = struct {
     }
 
     pub fn popMouseReport(self: *UsbHidComposite) ?[4]u8 {
+        if (self.has_target) {
+            const dx_i32 = std.math.clamp(self.target_x - self.guest_x, -127, 127);
+            const dy_i32 = std.math.clamp(self.target_y - self.guest_y, -127, 127);
+            if (dx_i32 != 0 or dy_i32 != 0) {
+                const dx: i8 = @intCast(dx_i32);
+                const dy: i8 = @intCast(dy_i32);
+                self.guest_x += dx_i32;
+                self.guest_y += dy_i32;
+                self.idle_vblanks = 0;
+                return .{
+                    self.reported_buttons,
+                    @bitCast(dx),
+                    @bitCast(dy),
+                    0,
+                };
+            }
+        }
         if (self.mouse_count == 0) return null;
         const r = self.mouse_queue[self.mouse_head];
         self.mouse_head +%= 1;
         self.mouse_count -= 1;
+        self.reported_buttons = r[0];
+        self.guest_x += @as(i8, @bitCast(r[1]));
+        self.guest_y += @as(i8, @bitCast(r[2]));
         return r;
     }
 
@@ -477,3 +533,30 @@ pub const UsbHidComposite = struct {
         };
     }
 };
+
+test "USB HID mouse target tracking and HVS hotspot sync" {
+    var hid = UsbHidComposite{};
+    // Move target from default (640, 360) to (400, 300) without needing cursor_seen
+    hid.setMouseTarget(400, 300);
+
+    // Step 1: clamped to (-127, -60) -> guest at (513, 300)
+    const r1 = hid.popMouseReport().?;
+    try std.testing.expectEqual(@as(i8, -127), @as(i8, @bitCast(r1[1])));
+    try std.testing.expectEqual(@as(i8, -60), @as(i8, @bitCast(r1[2])));
+
+    // Step 2: remaining (-113, 0) -> guest at (400, 300)
+    const r2 = hid.popMouseReport().?;
+    try std.testing.expectEqual(@as(i8, -113), @as(i8, @bitCast(r2[1])));
+    try std.testing.expectEqual(@as(i8, 0), @as(i8, @bitCast(r2[2])));
+    try std.testing.expectEqual(@as(?[4]u8, null), hid.popMouseReport());
+
+    // Simulate HVS cursor plane appearing at (640, 360) after guest boot:
+    // syncCursorFeedback anchors guest_x/guest_y to (640, 360) so popMouseReport re-sends deltas to reach (400, 300).
+    hid.syncCursorFeedback(.{ 640, 360 });
+    try std.testing.expectEqual(@as(i32, 640), hid.guest_x);
+    try std.testing.expectEqual(@as(i32, 360), hid.guest_y);
+    const r3 = hid.popMouseReport().?;
+    try std.testing.expectEqual(@as(i8, -127), @as(i8, @bitCast(r3[1])));
+    try std.testing.expectEqual(@as(i8, -60), @as(i8, @bitCast(r3[2])));
+}
+

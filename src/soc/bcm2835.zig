@@ -69,6 +69,10 @@ pub const Bcm2835 = struct {
         soc.mailbox.fb_height = display_height;
         soc.mailbox.fb_virt_width = display_width;
         soc.mailbox.fb_virt_height = display_height;
+        soc.usb.hid.guest_x = @divTrunc(@as(i32, display_width), 2);
+        soc.usb.hid.guest_y = @divTrunc(@as(i32, display_height), 2);
+        soc.usb.hid.target_x = soc.usb.hid.guest_x;
+        soc.usb.hid.target_y = soc.usb.hid.guest_y;
         return soc;
     }
 
@@ -167,6 +171,7 @@ pub const Bcm2835 = struct {
         self.pv1.triggerVblank();
         self.pv2.triggerVblank();
         self.hvs.notifyVblank();
+        self.usb.hid.syncCursorFeedback(self.hvs.getCursorHotspot(self.ram));
         self.usb.tickSof();
         self.updateIrqs();
     }

@@ -197,7 +197,9 @@ pub const Hvs = struct {
         const pos2_idx = if (unity) idx + 2 else idx + 3;
         const pos2 = self.dlist[pos2_idx];
         const src_w: u32 = pos2 & 0xfff;
-        const src_h: u32 = (pos2 >> 12) & 0xfff;
+        const raw_h16: u32 = (pos2 >> 16) & 0xfff;
+        const src_h: u32 = if (raw_h16 != 0) raw_h16 else ((pos2 >> 12) & 0xfff);
+        const premult = (pos2 & ((1 << 29) | (1 << 28))) != 0;
         const alpha_mode: u2 = @truncate((pos2 >> 30) & 3);
 
         const dst_w: u32 = if (unity) src_w else (self.dlist[idx + 2] & 0xfff);
@@ -209,10 +211,11 @@ pub const Hvs = struct {
         const ptr0 = self.dlist[ptr0_idx] & 0x1FFFFFFF;
         const pitch0 = self.dlist[ptr0_idx + 2];
 
-        const is_565 = (pix_fmt == 0);
+        const raw_pitch: u32 = pitch0 & 0xffff;
+        const is_565 = (pix_fmt == 0) or (pix_fmt == 4 and raw_pitch == src_w * 2);
         const fmt: format_mod.Format = if (is_565) .rgb565 else .argb8888;
         const cpp: u32 = if (is_565) 2 else 4;
-        const linear_pitch: u32 = if ((pitch0 & 0xffff) != 0) (pitch0 & 0xffff) else (src_w * cpp);
+        const linear_pitch: u32 = if (raw_pitch != 0) raw_pitch else (src_w * cpp);
         const tiled_w: u32 = if (tiling == 3 and (pitch0 >> 16) != 0)
             ((pitch0 >> 16) & 0xffff) * 32
         else
@@ -241,7 +244,8 @@ pub const Hvs = struct {
                     std.mem.readInt(u32, ram[off..][0..4], .little);
 
                 const out_idx = py * out_w + px;
-                if (alpha_mode == 0 or is_565) {
+                // SCALER_POS2_ALPHA_MODE_FIXED = 1 (opaque); SCALER_POS2_ALPHA_MODE_PIPELINE = 0 (per-pixel alpha)
+                if (alpha_mode == 1 or is_565) {
                     out_argb[out_idx] = src_color | 0xFF000000;
                 } else {
                     const a: u32 = (src_color >> 24) & 0xff;
@@ -250,14 +254,104 @@ pub const Hvs = struct {
                     } else if (a > 0) {
                         const dst_c = out_argb[out_idx];
                         const inv_a = 255 - a;
-                        const r = (((src_color >> 16) & 0xff) * a + ((dst_c >> 16) & 0xff) * inv_a) / 255;
-                        const g = (((src_color >> 8) & 0xff) * a + ((dst_c >> 8) & 0xff) * inv_a) / 255;
-                        const b = ((src_color & 0xff) * a + (dst_c & 0xff) * inv_a) / 255;
-                        out_argb[out_idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                        if (premult) {
+                            const r: u32 = @min(((src_color >> 16) & 0xff) + (((dst_c >> 16) & 0xff) * inv_a) / 255, @as(u32, 255));
+                            const g: u32 = @min(((src_color >> 8) & 0xff) + (((dst_c >> 8) & 0xff) * inv_a) / 255, @as(u32, 255));
+                            const b: u32 = @min((src_color & 0xff) + ((dst_c & 0xff) * inv_a) / 255, @as(u32, 255));
+                            out_argb[out_idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                        } else {
+                            const r = (((src_color >> 16) & 0xff) * a + ((dst_c >> 16) & 0xff) * inv_a) / 255;
+                            const g = (((src_color >> 8) & 0xff) * a + ((dst_c >> 8) & 0xff) * inv_a) / 255;
+                            const b = ((src_color & 0xff) * a + (dst_c & 0xff) * inv_a) / 255;
+                            out_argb[out_idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Inspects the active HVS display list for the 32x32 linear ARGB8888 cursor plane
+    /// and returns its current hotspot `(x, y)` in HDMI display coordinates if visible.
+    pub fn getCursorHotspot(self: *const Hvs, ram: []const u8) ?[2]i32 {
+        if ((self.dispctrl & (1 << 31)) == 0) return null;
+
+        var active_ch: ?usize = null;
+        for ([_]usize{ 1, 0, 2 }) |ch| {
+            const head = self.displact[ch] & 0x3ff;
+            const ctl0 = self.dlist[head];
+            if ((ctl0 & SCALER_CTL0_END) == 0 and (ctl0 & SCALER_CTL0_VALID) != 0) {
+                active_ch = ch;
+                break;
+            }
+        }
+        const ch = active_ch orelse return null;
+
+        var idx: usize = self.displact[ch] & 0x3ff;
+        var planes_seen: usize = 0;
+        var found: ?[2]i32 = null;
+
+        while (idx + 7 <= DLIST_WORDS and planes_seen < 32) {
+            const ctl0 = self.dlist[idx];
+            if ((ctl0 & SCALER_CTL0_END) != 0) break;
+            const entry_words: usize = (ctl0 >> 24) & 0x3f;
+            if (entry_words < 7 or idx + entry_words > DLIST_WORDS) break;
+
+            if ((ctl0 & SCALER_CTL0_VALID) != 0) {
+                const unity = (ctl0 & SCALER_CTL0_UNITY) != 0;
+                const tiling: u2 = @truncate((ctl0 >> 20) & 3);
+                const pos0 = self.dlist[idx + 1];
+                const dst_x: u32 = pos0 & 0xfff;
+                const dst_y: u32 = (pos0 >> 12) & 0xfff;
+
+                const pos2_idx = if (unity) idx + 2 else idx + 3;
+                const pos2 = self.dlist[pos2_idx];
+                const src_w: u32 = pos2 & 0xfff;
+                const raw_h16: u32 = (pos2 >> 16) & 0xfff;
+                const src_h: u32 = if (raw_h16 != 0) raw_h16 else ((pos2 >> 12) & 0xfff);
+
+                const ptr0_idx = if (unity) idx + 4 else idx + 5;
+                if (unity and tiling == 0 and src_w > 0 and src_w <= 32 and src_h > 0 and src_h <= 32 and ptr0_idx + 2 < DLIST_WORDS) {
+                    const ptr0 = self.dlist[ptr0_idx] & 0x1FFFFFFF;
+                    const pitch0 = self.dlist[ptr0_idx + 2] & 0xffff;
+                    if (pitch0 == 128) {
+                        const bo_base = ptr0 & ~@as(u32, 0xfff);
+                        const off_in_bo = ptr0 & 0xfff;
+                        const src_x: i32 = @intCast((off_in_bo % 128) / 4);
+                        const src_y: i32 = @intCast(off_in_bo / 128);
+                        const plane_x: i32 = @as(i32, @intCast(dst_x)) - src_x;
+                        const plane_y: i32 = @as(i32, @intCast(dst_y)) - src_y;
+
+                        if (bo_base + 4096 <= ram.len) {
+                            const px_arrow = std.mem.readInt(u32, ram[bo_base + (2 * 32 + 1) * 4 ..][0..4], .little);
+                            const px_hand = std.mem.readInt(u32, ram[bo_base + (3 * 32 + 9) * 4 ..][0..4], .little);
+                            if ((px_arrow >> 24) != 0 and (px_hand >> 24) == 0) {
+                                found = .{ plane_x + 1, plane_y + 1 };
+                            } else if ((px_hand >> 24) != 0 and (px_arrow >> 24) == 0) {
+                                found = .{ plane_x + 9, plane_y + 2 };
+                            } else {
+                                var any_alpha = false;
+                                for (0..32 * 32) |px_i| {
+                                    const px_val = std.mem.readInt(u32, ram[bo_base + px_i * 4 ..][0..4], .little);
+                                    if ((px_val >> 24) != 0) {
+                                        any_alpha = true;
+                                        break;
+                                    }
+                                }
+                                if (any_alpha) {
+                                    found = .{ plane_x + 16, plane_y + 16 };
+                                }
+                            }
+                        } else {
+                            found = .{ plane_x + 1, plane_y + 1 };
+                        }
+                    }
+                }
+                planes_seen += 1;
+            }
+            idx += entry_words;
+        }
+        return found;
     }
 };
 
@@ -296,3 +390,27 @@ test "HVS DLIST plane compositing" {
     try std.testing.expectEqual(@as(u32, 0xff00ff00), out[0]);
     try std.testing.expectEqual(@as(u32, 0xff00ff00), out[3]);
 }
+
+test "HVS cursor hotspot detection" {
+    var hvs = Hvs{};
+    var ram: [8192]u8 = [_]u8{0} ** 8192;
+
+    // Simulate arrow cursor buffer at page-aligned 0x1000 (pixel (1,2) opaque)
+    std.mem.writeInt(u32, ram[0x1000 + (2 * 32 + 1) * 4 ..][0..4], 0xffffffff, .little);
+
+    // Write cursor DLIST entry at slot 32 (dst_x=639, dst_y=359 -> hotspot (640, 360))
+    // Uses VC4_GEN_4 SCALER_POS2 layout: ALPHA_MODE_PIPELINE (0 << 30) | ALPHA_PREMULT (1 << 29) | (32 << 16) | 32
+    hvs.write32(Hvs.DLIST_OFFSET + 32 * 4, Hvs.SCALER_CTL0_VALID | Hvs.SCALER_CTL0_UNITY | (7 << 24) | 7);
+    hvs.write32(Hvs.DLIST_OFFSET + 33 * 4, (359 << 12) | 639);
+    hvs.write32(Hvs.DLIST_OFFSET + 34 * 4, (1 << 29) | (32 << 16) | 32);
+    hvs.write32(Hvs.DLIST_OFFSET + 35 * 4, 0);
+    hvs.write32(Hvs.DLIST_OFFSET + 36 * 4, 0xc0001000);
+    hvs.write32(Hvs.DLIST_OFFSET + 37 * 4, 0);
+    hvs.write32(Hvs.DLIST_OFFSET + 38 * 4, 128);
+    hvs.write32(Hvs.DLIST_OFFSET + 39 * 4, Hvs.SCALER_CTL0_END);
+    hvs.write32(0x0024, 32);
+
+    const hot = hvs.getCursorHotspot(&ram);
+    try std.testing.expectEqual(@as(?[2]i32, .{ 640, 360 }), hot);
+}
+

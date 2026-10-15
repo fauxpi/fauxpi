@@ -413,6 +413,19 @@ pub const WaylandWindow = struct {
         }
     }
 
+    fn updateGuestMouseTarget(self: *WaylandWindow, sx: f64, sy: f64) void {
+        const hid = self.hid orelse return;
+        const max_x = @max(@as(i32, @intCast(self.display_width)) - 1, 0);
+        const max_y = @max(@as(i32, @intCast(self.display_height)) - 1, 0);
+        const hdmi_x = std.math.clamp(@as(i32, @intFromFloat(@floor(sx))), 0, max_x);
+        const hdmi_y = std.math.clamp(
+            @as(i32, @intFromFloat(@floor(sy))) - @as(i32, board_sheet.BoardUi.title_bar_height),
+            0,
+            max_y,
+        );
+        hid.setMouseTarget(hdmi_x, hdmi_y);
+    }
+
     fn pointerEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
         const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
         const hid = self.hid orelse return;
@@ -425,7 +438,10 @@ pub const WaylandWindow = struct {
                 const sy = r.fixed() catch return;
                 self.last_mouse_x = sx;
                 self.last_mouse_y = sy;
-                _ = self.ui.pointerMotion(@floatCast(sx), @floatCast(sy), self.status, self.gpio);
+                const in_ui = self.ui.pointerMotion(@floatCast(sx), @floatCast(sy), self.status, self.gpio);
+                if (!in_ui) {
+                    self.updateGuestMouseTarget(sx, sy);
+                }
             },
             protocol.wl_pointer.event.leave => {
                 self.last_mouse_x = null;
@@ -437,12 +453,8 @@ pub const WaylandWindow = struct {
                 const sx = r.fixed() catch return;
                 const sy = r.fixed() catch return;
                 const in_ui = self.ui.pointerMotion(@floatCast(sx), @floatCast(sy), self.status, self.gpio);
-                if (!in_ui and self.last_mouse_x != null and self.last_mouse_y != null) {
-                    const dx_f = std.math.clamp(@round(sx - self.last_mouse_x.?), -127.0, 127.0);
-                    const dy_f = std.math.clamp(@round(sy - self.last_mouse_y.?), -127.0, 127.0);
-                    const dx: i8 = @intFromFloat(dx_f);
-                    const dy: i8 = @intFromFloat(dy_f);
-                    hid.handleMouseMotion(dx, dy, 0);
+                if (!in_ui) {
+                    self.updateGuestMouseTarget(sx, sy);
                 }
                 self.last_mouse_x = sx;
                 self.last_mouse_y = sy;
@@ -455,8 +467,10 @@ pub const WaylandWindow = struct {
                 const pressed = (state == protocol.wl_pointer.button_state.pressed);
                 self.last_button_serial = serial;
 
-                const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
-                const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
+                const sx_f64 = self.last_mouse_x orelse 0.0;
+                const sy_f64 = self.last_mouse_y orelse 0.0;
+                const sx: f32 = @floatCast(sx_f64);
+                const sy: f32 = @floatCast(sy_f64);
 
                 if (button == protocol.input.btn_left) {
                     const action = self.ui.pointerButton(sx, sy, pressed, self.status, self.gpio);
@@ -487,6 +501,7 @@ pub const WaylandWindow = struct {
                     else => 0,
                 };
                 if (bit != 0) {
+                    self.updateGuestMouseTarget(sx_f64, sy_f64);
                     hid.handleMouseButton(bit, pressed);
                 }
             },
