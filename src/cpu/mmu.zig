@@ -65,6 +65,8 @@ pub const Mmu = struct {
 
     /// Direct-mapped software TLB (4096 entries covering 4 KB pages)
     tlb: [tlb_size]TlbEntry = @splat(.{}),
+    /// Current TLB generation counter (incremented on full TLB flush to avoid 48 KB memset)
+    tlb_gen: u32 = 1,
 
     pub const tlb_bits = 12;
     pub const tlb_size = 1 << tlb_bits;
@@ -78,12 +80,12 @@ pub const Mmu = struct {
     pub const perm_user_x: u8 = 1 << 5;
 
     pub const TlbEntry = struct {
-        valid: bool = false,
+        gen: u32 = 0,
         vpn: u20 = 0,
-        ppn_base: u32 = 0, // Physical page base (top 20 bits, low 12 bits 0)
         perms: u8 = 0,
         domain: u4 = 0,
         is_page: bool = false,
+        ppn_base: u32 = 0, // Physical page base (top 20 bits, low 12 bits 0)
     };
 
     pub inline fn isMmuEnabled(self: *const Mmu) bool {
@@ -99,14 +101,18 @@ pub const Mmu = struct {
     }
 
     pub fn flushTlb(self: *Mmu) void {
-        @memset(&self.tlb, .{});
+        self.tlb_gen +%= 1;
+        if (self.tlb_gen == 0) {
+            @memset(&self.tlb, .{});
+            self.tlb_gen = 1;
+        }
     }
 
     pub fn flushTlbMva(self: *Mmu, mva: u32) void {
         const vpn: u20 = @truncate(mva >> 12);
         const idx = vpn & tlb_mask;
-        if (self.tlb[idx].valid and self.tlb[idx].vpn == vpn) {
-            self.tlb[idx].valid = false;
+        if (self.tlb[idx].gen == self.tlb_gen and self.tlb[idx].vpn == vpn) {
+            self.tlb[idx].gen = 0;
         }
     }
 
@@ -134,7 +140,7 @@ pub const Mmu = struct {
             .fetch => if (is_priv) perm_priv_x else perm_user_x,
         };
 
-        if (entry.valid and entry.vpn == vpn) {
+        if (entry.gen == self.tlb_gen and entry.vpn == vpn) {
             if ((entry.perms & req_perm) != 0) {
                 return entry.ppn_base | (vaddr & 0xfff);
             }
@@ -272,7 +278,7 @@ pub const Mmu = struct {
         // Fill software TLB entry
         const vpn: u20 = @truncate(vaddr >> 12);
         self.tlb[vpn & tlb_mask] = .{
-            .valid = true,
+            .gen = self.tlb_gen,
             .vpn = vpn,
             .ppn_base = phys_page_base,
             .perms = perms,
