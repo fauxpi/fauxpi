@@ -101,10 +101,24 @@ pub const Qcow2Disk = struct {
         virtual_size: u64,
         initial_image: []const u8,
     ) !Qcow2Disk {
+        return createFromSliceAtPath(allocator, virtual_size, initial_image, null);
+    }
+
+    /// Creates a new QCOW2 v3 disk of `virtual_size` bytes backed by `backing_path` (or a temporary
+    /// unlinked file if `backing_path` is null) and populates it with `initial_image`.
+    pub fn createFromSliceAtPath(
+        allocator: std.mem.Allocator,
+        virtual_size: u64,
+        initial_image: []const u8,
+        backing_path: ?[]const u8,
+    ) !Qcow2Disk {
         if (initial_image.len > virtual_size) return error.ImageTooLarge;
 
-        var disk = try initEmpty(allocator, virtual_size);
-        errdefer disk.deinit();
+        var disk = try initEmptyAtPath(allocator, virtual_size, backing_path);
+        errdefer {
+            disk.deinit();
+            if (backing_path) |bp| unlinkFileLinux(bp);
+        }
 
         var off: usize = 0;
         while (off < initial_image.len) : (off += CLUSTER_SIZE) {
@@ -143,6 +157,17 @@ pub const Qcow2Disk = struct {
         virtual_size: u64,
         image_path: []const u8,
     ) !Qcow2Disk {
+        return createFromImageFileAtPath(allocator, virtual_size, image_path, null);
+    }
+
+    /// Creates a new QCOW2 v3 disk of `virtual_size` bytes backed by `backing_path` (or a temporary
+    /// unlinked file if `backing_path` is null) by streaming `image_path` in 64 KiB clusters.
+    pub fn createFromImageFileAtPath(
+        allocator: std.mem.Allocator,
+        virtual_size: u64,
+        image_path: []const u8,
+        backing_path: ?[]const u8,
+    ) !Qcow2Disk {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         if (image_path.len >= path_buf.len) return error.NameTooLong;
         @memcpy(path_buf[0..image_path.len], image_path);
@@ -161,8 +186,11 @@ pub const Qcow2Disk = struct {
 
         _ = linux.lseek(src_fd, 0, linux.SEEK.SET);
 
-        var disk = try initEmpty(allocator, virtual_size);
-        errdefer disk.deinit();
+        var disk = try initEmptyAtPath(allocator, virtual_size, backing_path);
+        errdefer {
+            disk.deinit();
+            if (backing_path) |bp| unlinkFileLinux(bp);
+        }
 
         const io_buf = try allocator.alloc(u8, CLUSTER_SIZE);
         defer allocator.free(io_buf);
@@ -189,9 +217,20 @@ pub const Qcow2Disk = struct {
     }
 
     pub fn initEmpty(allocator: std.mem.Allocator, virtual_size: u64) !Qcow2Disk {
+        return initEmptyAtPath(allocator, virtual_size, null);
+    }
+
+    pub fn initEmptyAtPath(
+        allocator: std.mem.Allocator,
+        virtual_size: u64,
+        backing_path: ?[]const u8,
+    ) !Qcow2Disk {
         if (virtual_size == 0) return error.InvalidSize;
-        const fd = try createBackingFd();
-        errdefer _ = linux.close(fd);
+        const fd = if (backing_path) |bp| try createFileFd(bp) else try createBackingFd();
+        errdefer {
+            _ = linux.close(fd);
+            if (backing_path) |bp| unlinkFileLinux(bp);
+        }
 
         const l2_span: u64 = @as(u64, L2_ENTRIES) * CLUSTER_SIZE; // 512 MiB
         const l1_count: usize = @intCast((virtual_size + l2_span - 1) / l2_span);
@@ -211,6 +250,97 @@ pub const Qcow2Disk = struct {
             .cluster_cache = cluster_cache,
         };
         try disk.writeInitialHeaders();
+        return disk;
+    }
+
+    /// Opens an existing QCOW2 v3 image file from disk for read/write persistence.
+    pub fn openExistingFile(allocator: std.mem.Allocator, backing_path: []const u8) !Qcow2Disk {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (backing_path.len >= path_buf.len) return error.NameTooLong;
+        @memcpy(path_buf[0..backing_path.len], backing_path);
+        path_buf[backing_path.len] = 0;
+
+        const fd_rc = linux.openat(
+            linux.AT.FDCWD,
+            path_buf[0..backing_path.len :0],
+            .{ .ACCMODE = .RDWR, .CLOEXEC = true },
+            0,
+        );
+        if (linux.errno(fd_rc) != .SUCCESS) return error.FileOpenFailed;
+        const fd: linux.fd_t = @intCast(fd_rc);
+        errdefer _ = linux.close(fd);
+
+        var hdr: [104]u8 = undefined;
+        try preadAll(fd, &hdr, 0);
+
+        const magic = std.mem.readInt(u32, hdr[0..4], .big);
+        if (magic != QCOW2_MAGIC) return error.InvalidQcow2Header;
+        const version = std.mem.readInt(u32, hdr[4..8], .big);
+        if (version != 2 and version != QCOW2_VERSION) return error.UnsupportedQcow2Version;
+        const cluster_bits = std.mem.readInt(u32, hdr[20..24], .big);
+        if (cluster_bits != CLUSTER_BITS) return error.UnsupportedClusterSize;
+
+        const virtual_size = std.mem.readInt(u64, hdr[24..32], .big);
+        if (virtual_size == 0) return error.InvalidSize;
+        const hdr_l1_size = std.mem.readInt(u32, hdr[36..40], .big);
+        const l1_table_offset = std.mem.readInt(u64, hdr[40..48], .big);
+
+        const l2_span: u64 = @as(u64, L2_ENTRIES) * CLUSTER_SIZE; // 512 MiB
+        const l1_count: usize = @intCast((virtual_size + l2_span - 1) / l2_span);
+        const alloc_l1_count = @max(l1_count, @as(usize, hdr_l1_size));
+        const l1_table = try allocator.alloc(u64, alloc_l1_count);
+        errdefer allocator.free(l1_table);
+        @memset(l1_table, 0);
+
+        const read_l1_count: usize = @min(alloc_l1_count, @as(usize, hdr_l1_size));
+        if (read_l1_count > 0 and l1_table_offset != 0) {
+            const raw_l1 = std.mem.sliceAsBytes(l1_table[0..read_l1_count]);
+            try preadAll(fd, raw_l1, l1_table_offset);
+            for (l1_table[0..read_l1_count]) |*entry| {
+                entry.* = std.mem.bigToNative(u64, entry.*);
+            }
+        }
+
+        const cluster_cache = try allocator.create([CLUSTER_SIZE]u8);
+        errdefer allocator.destroy(cluster_cache);
+        @memset(cluster_cache, 0);
+
+        const end_rc = linux.lseek(fd, 0, linux.SEEK.END);
+        const file_size: u64 = if (linux.errno(end_rc) == .SUCCESS) @intCast(end_rc) else 4 * CLUSTER_SIZE;
+        var max_cluster: u64 = @max(4, (file_size + CLUSTER_SIZE - 1) / CLUSTER_SIZE);
+        var data_clusters: u64 = 0;
+
+        var disk: Qcow2Disk = .{
+            .allocator = allocator,
+            .fd = fd,
+            .virtual_size = virtual_size,
+            .next_cluster = max_cluster,
+            .allocated_data_clusters = 0,
+            .l1_table = l1_table,
+            .cluster_cache = cluster_cache,
+        };
+
+        for (l1_table) |l1_entry| {
+            const l2_off = l1_entry & OFFSET_MASK;
+            if (l2_off == 0) continue;
+            const l2_c = (l2_off / CLUSTER_SIZE) + 1;
+            if (l2_c > max_cluster) max_cluster = l2_c;
+
+            const raw_l2 = std.mem.sliceAsBytes(&disk.l2_cache);
+            preadAll(fd, raw_l2, l2_off) catch continue;
+            for (disk.l2_cache) |l2_be| {
+                const d_off = std.mem.bigToNative(u64, l2_be) & OFFSET_MASK;
+                if (d_off != 0) {
+                    data_clusters += 1;
+                    const d_c = (d_off / CLUSTER_SIZE) + 1;
+                    if (d_c > max_cluster) max_cluster = d_c;
+                }
+            }
+        }
+        @memset(&disk.l2_cache, 0);
+        disk.cached_l1_idx = std.math.maxInt(usize);
+        disk.next_cluster = max_cluster;
+        disk.allocated_data_clusters = data_clusters;
         return disk;
     }
 
@@ -463,6 +593,35 @@ fn isAllZero(buf: []const u8) bool {
     return true;
 }
 
+fn createFileFd(path: []const u8) !linux.fd_t {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= path_buf.len) return error.NameTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+
+    const rc = linux.openat(
+        linux.AT.FDCWD,
+        path_buf[0..path.len :0],
+        .{
+            .ACCMODE = .RDWR,
+            .CREAT = true,
+            .TRUNC = true,
+            .CLOEXEC = true,
+        },
+        0o644,
+    );
+    if (linux.errno(rc) != .SUCCESS) return error.FileOpenFailed;
+    return @intCast(rc);
+}
+
+pub fn unlinkFileLinux(path: []const u8) void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len >= path_buf.len) return;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    _ = linux.unlinkat(linux.AT.FDCWD, path_buf[0..path.len :0], 0);
+}
+
 fn createBackingFd() !linux.fd_t {
     // Prefer an unlinked O_TMPFILE on disk (/var/tmp or /tmp) so large SD cards
     // do not consume RAM; fall back to memfd_create if O_TMPFILE is unavailable.
@@ -561,4 +720,51 @@ test "QCOW2 sparse disk creation, size validation, and cluster allocation" {
     disk.writeByte(high_off, 0x42);
     try disk.flush();
     try testing.expectEqual(@as(u8, 0x42), disk.readByte(high_off));
+}
+
+test "QCOW2 persistent file creation and reopening via openExistingFile" {
+    const allocator = testing.allocator;
+
+    var rnd: [8]u8 = undefined;
+    _ = linux.getrandom(&rnd, rnd.len, 0);
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/fauxpi-test-{x}.qcow2", .{std.mem.readInt(u64, &rnd, .little)});
+    defer unlinkFileLinux(path);
+
+    const card_size = SdCardSize.gb_2.bytes();
+    var init_data: [1024]u8 = @splat(0);
+    init_data[510] = 0x55;
+    init_data[511] = 0xAA;
+
+    const high_off: u64 = 1 * 1024 * 1024 * 1024 + 123;
+    {
+        var disk = try Qcow2Disk.createFromSliceAtPath(allocator, card_size, &init_data, path);
+        defer disk.deinit();
+        disk.writeByte(high_off, 0x7E);
+        try disk.flush();
+    }
+
+    // Reopen from disk and verify virtual size, allocated clusters, and persisted bytes
+    {
+        var reopened = try Qcow2Disk.openExistingFile(allocator, path);
+        defer reopened.deinit();
+        try testing.expectEqual(card_size, reopened.virtual_size);
+        try testing.expectEqual(@as(u64, 2), reopened.allocated_data_clusters);
+        try testing.expectEqual(@as(u8, 0x55), reopened.readByte(510));
+        try testing.expectEqual(@as(u8, 0xAA), reopened.readByte(511));
+        try testing.expectEqual(@as(u8, 0x7E), reopened.readByte(high_off));
+
+        // Write another cluster after reopening and flush
+        reopened.writeByte(CLUSTER_SIZE * 5 + 7, 0x99);
+        try reopened.flush();
+    }
+
+    // Reopen a second time to verify new writes on reopened file also persist
+    {
+        var reopened2 = try Qcow2Disk.openExistingFile(allocator, path);
+        defer reopened2.deinit();
+        try testing.expectEqual(@as(u64, 3), reopened2.allocated_data_clusters);
+        try testing.expectEqual(@as(u8, 0x7E), reopened2.readByte(high_off));
+        try testing.expectEqual(@as(u8, 0x99), reopened2.readByte(CLUSTER_SIZE * 5 + 7));
+    }
 }

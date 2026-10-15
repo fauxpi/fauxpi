@@ -106,6 +106,15 @@ pub const WaylandWindow = struct {
         const total_width = display_width;
         const total_height = display_height + board_sheet.BoardUi.title_bar_height;
 
+        var status: board_sheet.SystemStatus = .{
+            .serial_u64 = ui.parsedSerial(),
+            .mac_address = ui.parsedMac(),
+            .wifi_mac_address = ui.parsedWifiMac(),
+            .hdmi_width = @intCast(display_width),
+            .hdmi_height = @intCast(display_height),
+        };
+        ui.configureXdgStorage(environ, &status);
+
         win.* = .{
             .gpa = gpa,
             .display = display,
@@ -125,14 +134,15 @@ pub const WaylandWindow = struct {
             .hid = hid,
             .gpio = gpio,
             .ui = ui,
-            .status = .{
-                .serial_u64 = ui.parsedSerial(),
-                .mac_address = ui.parsedMac(),
-                .wifi_mac_address = ui.parsedWifiMac(),
-                .hdmi_width = @intCast(display_width),
-                .hdmi_height = @intCast(display_height),
-            },
+            .status = status,
         };
+        gpio.setExternalPin(46, !win.status.hdmi_connected);
+        hid.setHubKind(@import("../usb/hid.zig").HubKind.fromModel(win.status.model));
+        hid.hub_connected = win.status.usb_hub_connected;
+        hid.keyboard_connected = win.status.usb_keyboard_connected;
+        hid.mouse_connected = win.status.usb_mouse_connected;
+        hid.ethernet_connected = win.status.ethernet_connected;
+        hid.net.dhcp_enabled = win.status.dhcp_enabled;
 
         // Bind all wl_output globals to receive output scale factor events
         for (globals.list[0..globals.len]) |gl| {
@@ -179,7 +189,7 @@ pub const WaylandWindow = struct {
         }
         {
             var m = try win.toplevel.request(protocol.xdg_toplevel.request.set_title);
-            m.string("Raspberry Pi Zero").end();
+            m.string(win.ui.title).end();
         }
         {
             var m = try win.toplevel.request(protocol.xdg_toplevel.request.set_app_id);
@@ -207,6 +217,7 @@ pub const WaylandWindow = struct {
             _ = linux.close(self.picker_fd);
             self.picker_fd = -1;
         }
+        self.ui.saveSettings(self.status) catch {};
         self.ui.deinit();
         self.gpa.free(self.hdmi_fb);
         self.freeShmBuffers();
@@ -601,6 +612,7 @@ pub const WaylandWindow = struct {
             h.setHubKind(@import("../usb/hid.zig").HubKind.fromModel(self.status.model));
             h.hub_connected = self.status.usb_hub_connected;
         }
+        self.ui.saveSettings(self.status) catch {};
         var m = self.toplevel.request(protocol.xdg_toplevel.request.set_title) catch return;
         m.string(self.ui.title).end();
     }
@@ -823,10 +835,12 @@ pub const WaylandWindow = struct {
                                 self.status.hdmi_active = false;
                             }
                             self.gpio.setExternalPin(46, !self.status.hdmi_connected);
+                            self.ui.saveSettings(self.status) catch {};
                             return;
                         },
                         .toggle_audio => {
                             self.status.audio_connected = !self.status.audio_connected;
+                            self.ui.saveSettings(self.status) catch {};
                             return;
                         },
                         .toggle_power => {
@@ -846,6 +860,7 @@ pub const WaylandWindow = struct {
                             } else {
                                 self.sd_disconnected = true;
                             }
+                            self.ui.saveSettings(self.status) catch {};
                             return;
                         },
                         .select_sd_image => {
@@ -854,26 +869,31 @@ pub const WaylandWindow = struct {
                         },
                         .select_sd_card => {
                             self.sd_image_chosen = true;
+                            self.ui.saveSettings(self.status) catch {};
                             return;
                         },
                         .toggle_usb_hub => {
                             self.status.usb_hub_connected = !self.status.usb_hub_connected;
                             hid.hub_connected = self.status.usb_hub_connected;
+                            self.ui.saveSettings(self.status) catch {};
                             return;
                         },
                         .toggle_usb_keyboard => {
                             self.status.usb_keyboard_connected = !self.status.usb_keyboard_connected;
                             hid.keyboard_connected = self.status.usb_keyboard_connected;
+                            self.ui.saveSettings(self.status) catch {};
                             return;
                         },
                         .toggle_usb_mouse => {
                             self.status.usb_mouse_connected = !self.status.usb_mouse_connected;
                             hid.mouse_connected = self.status.usb_mouse_connected;
+                            self.ui.saveSettings(self.status) catch {};
                             return;
                         },
                         .toggle_ethernet => {
                             self.status.ethernet_connected = !self.status.ethernet_connected;
                             hid.ethernet_connected = self.status.ethernet_connected;
+                            self.ui.saveSettings(self.status) catch {};
                             return;
                         },
                         .select_board => {
@@ -883,6 +903,7 @@ pub const WaylandWindow = struct {
                         .toggle_dhcp => {
                             self.status.dhcp_enabled = !self.status.dhcp_enabled;
                             hid.net.dhcp_enabled = self.status.dhcp_enabled;
+                            self.ui.saveSettings(self.status) catch {};
                             return;
                         },
                         .close => {
@@ -893,6 +914,7 @@ pub const WaylandWindow = struct {
                             self.status.serial_u64 = self.ui.parsedSerial();
                             self.status.mac_address = self.ui.parsedMac();
                             self.status.wifi_mac_address = self.ui.parsedWifiMac();
+                            self.ui.saveSettings(self.status) catch {};
                             return;
                         },
                         .none => {},
@@ -945,11 +967,13 @@ pub const WaylandWindow = struct {
                 const key = r.uint() catch return;
                 const state = r.uint() catch return;
                 const pressed = (state == protocol.wl_keyboard.key_state.pressed);
+                self.ui.updateModifierKey(key, pressed);
                 if (self.ui.sheet_open) {
                     if (pressed and self.ui.handleKey(key)) {
                         self.status.serial_u64 = self.ui.parsedSerial();
                         self.status.mac_address = self.ui.parsedMac();
                         self.status.wifi_mac_address = self.ui.parsedWifiMac();
+                        self.ui.saveSettings(self.status) catch {};
                         return;
                     }
                     // Escape (evdev key 1) closes any open SD popup/menu first, then the board sheet

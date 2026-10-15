@@ -59,7 +59,7 @@ const CliOptions = struct {
     dtb_path: ?[]const u8 = null,
     initramfs_path: ?[]const u8 = null,
     cmdline: ?[]const u8 = null,
-    board_model: ui_board_sheet.BoardModel = .pi_zero,
+    board_model: ?ui_board_sheet.BoardModel = null,
     width: u16 = 1280,
     height: u16 = 720,
     power: bool = false,
@@ -320,7 +320,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     var guest_booted = false;
 
     const initial_power = opts.power or opts.headless;
-    const initial_sd = (sd_image_buf != null);
 
     var wl_win: ?*window.WaylandWindow = null;
     defer if (wl_win) |w| w.destroy();
@@ -328,20 +327,25 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     if (!opts.headless) {
         wl_win = try window.WaylandWindow.create(gpa, environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
         wl_win.?.status.power_connected = opts.power;
-        wl_win.?.status.sd_connected = initial_sd;
         if (opts.sd_path) |sd_path| {
             const fsize = try qcow2.Qcow2Disk.getFileSizeLinux(sd_path);
             const card_sz = ui_board_sheet.SdCardSize.smallestFitting(@max(fsize, 256 * 1024 * 1024)) orelse .gb_32;
             _ = try wl_win.?.ui.addSdCardFromFile(sd_path, card_sz);
+            wl_win.?.status.sd_connected = true;
+            wl_win.?.ui.saveSettings(wl_win.?.status) catch {};
         }
-        if (opts.board_model != .pi_zero) {
-            wl_win.?.status.board_model = opts.board_model;
-            wl_win.?.status.model = opts.board_model.dtModel();
+        if (opts.board_model) |bm| {
+            wl_win.?.setBoardModel(bm);
         }
     }
 
+    const initial_sd = if (wl_win) |w|
+        (w.status.sd_connected and (w.ui.activeSdCard() != null or sd_image_buf != null))
+    else
+        (sd_image_buf != null);
+
     if (initial_power and (initial_sd or opts.kernel_path != null)) {
-        const bm = if (wl_win) |w| w.status.board_model else opts.board_model;
+        const bm = if (wl_win) |w| w.status.board_model else (opts.board_model orelse .pi_zero);
         const serial = if (wl_win) |w| w.status.serial_u64 else 0x00000000fa000001;
         const mac = if (wl_win) |w| w.status.mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
         const wifi_mac = if (wl_win) |w| w.status.wifi_mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 };

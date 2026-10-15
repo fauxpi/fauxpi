@@ -130,6 +130,25 @@ pub const BoardModel = enum {
         if (std.mem.indexOf(u8, model, "Model A Plus") != null or std.mem.indexOf(u8, model, "Model A+") != null) return .pi_1_a_plus;
         return .pi_zero;
     }
+
+    pub fn id(self: BoardModel) []const u8 {
+        return switch (self) {
+            .pi_1_a_plus => "pi_1_a_plus",
+            .pi_1_b_plus => "pi_1_b_plus",
+            .pi_3_a_plus => "pi_3_a_plus",
+            .pi_3_b_plus => "pi_3_b_plus",
+            .pi_zero => "pi_zero",
+            .pi_zero_w => "pi_zero_w",
+            .pi_zero_2_w => "pi_zero_2_w",
+        };
+    }
+
+    pub fn fromId(s: []const u8) ?BoardModel {
+        for (all) |bm| {
+            if (std.mem.eql(u8, s, bm.id()) or std.mem.eql(u8, s, bm.windowTitle())) return bm;
+        }
+        return null;
+    }
 };
 
 pub const SystemStatus = struct {
@@ -181,6 +200,7 @@ pub const FocusedSettingField = enum {
     serial,
     mac,
     wifi_mac,
+    sd_card_name,
 };
 
 pub const InteractiveTarget = enum {
@@ -329,12 +349,24 @@ pub const BoardUi = struct {
     wifi_mac_hex: [12]u8 = "B827EB654321".*,
     wifi_mac_len: usize = 12,
 
+    /// Persistent storage paths under `$XDG_DATA_HOME/fauxpi`.
+    data_dir_buf: [512]u8 = @splat(0),
+    data_dir_len: usize = 0,
+    images_dir_buf: [512]u8 = @splat(0),
+    images_dir_len: usize = 0,
+    settings_path_buf: [512]u8 = @splat(0),
+    settings_path_len: usize = 0,
+
     /// Virtual SD cards list, SD card selector menu, and Manage SD Cards popup states.
     sd_cards: std.ArrayListUnmanaged(SdCardEntry) = .empty,
     selected_sd_card_idx: ?usize = null,
     sd_card_menu_open: bool = false,
     hovered_sd_menu_idx: ?usize = null,
     sd_manage_open: bool = false,
+    new_card_name_buf: [64]u8 = @splat(0),
+    new_card_name_len: usize = 0,
+    sd_name_field_hovered: bool = false,
+    shift_held: bool = false,
     new_card_size: SdCardSize = .gb_4,
     hovered_sd_size_idx: ?usize = null,
     hovered_sd_card_row_idx: ?usize = null,
@@ -364,6 +396,7 @@ pub const BoardUi = struct {
     sd_card_menu_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_manage_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_manage_close_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    sd_name_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_size_btn_rects: [SdCardSize.all.len]Rect = @splat(.{ .x = 0, .y = 0, .w = 0, .h = 0 }),
     sd_browse_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_add_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -384,6 +417,7 @@ pub const BoardUi = struct {
             .cache = GlyphCache.init(gpa),
         };
         ui.randomizeIdentity();
+        ui.resetDefaultNewCardName();
         return ui;
     }
 
@@ -395,6 +429,367 @@ pub const BoardUi = struct {
         if (self.title_cache.len > 0) self.gpa.free(self.title_cache);
         if (self.board_cache.len > 0) self.gpa.free(self.board_cache);
         self.cache.deinit();
+    }
+
+    pub fn dataDir(self: *const BoardUi) []const u8 {
+        return self.data_dir_buf[0..self.data_dir_len];
+    }
+
+    pub fn imagesDir(self: *const BoardUi) []const u8 {
+        return self.images_dir_buf[0..self.images_dir_len];
+    }
+
+    pub fn settingsPath(self: *const BoardUi) []const u8 {
+        return self.settings_path_buf[0..self.settings_path_len];
+    }
+
+    pub fn newCardName(self: *const BoardUi) []const u8 {
+        return self.new_card_name_buf[0..self.new_card_name_len];
+    }
+
+    pub fn setNewCardName(self: *BoardUi, name: []const u8) void {
+        const n = @min(name.len, self.new_card_name_buf.len);
+        @memcpy(self.new_card_name_buf[0..n], name[0..n]);
+        self.new_card_name_len = n;
+    }
+
+    /// Sets `new_card_name_buf` to the first unused `"Card N"` (`"Card 1"`, `"Card 2"`, ...).
+    pub fn resetDefaultNewCardName(self: *BoardUi) void {
+        var n: usize = 1;
+        while (n < 10_000) : (n += 1) {
+            var cand_buf: [64]u8 = undefined;
+            const cand = std.fmt.bufPrint(&cand_buf, "Card {d}", .{n}) catch break;
+            if (!self.hasCardNamed(cand)) {
+                self.setNewCardName(cand);
+                return;
+            }
+        }
+        self.setNewCardName("Card 1");
+    }
+
+    pub fn hasCardNamed(self: *const BoardUi, candidate: []const u8) bool {
+        for (self.sd_cards.items) |*card| {
+            if (std.ascii.eqlIgnoreCase(card.name(), candidate)) return true;
+        }
+        return false;
+    }
+
+    /// Resolves `$XDG_DATA_HOME/fauxpi` (or `$HOME/.local/share/fauxpi` when `XDG_DATA_HOME` is unset/empty).
+    pub fn resolveXdgDataDir(buf: []u8, environ: std.process.Environ) ?[]const u8 {
+        const Environ = std.process.Environ;
+        if (Environ.getPosix(environ, "XDG_DATA_HOME")) |xdg| {
+            const trimmed = std.mem.trimEnd(u8, xdg, "/");
+            if (trimmed.len > 0) {
+                return std.fmt.bufPrint(buf, "{s}/fauxpi", .{trimmed}) catch null;
+            }
+        }
+        if (Environ.getPosix(environ, "HOME")) |home| {
+            const trimmed = std.mem.trimEnd(u8, home, "/");
+            if (trimmed.len > 0) {
+                return std.fmt.bufPrint(buf, "{s}/.local/share/fauxpi", .{trimmed}) catch null;
+            }
+        }
+        return null;
+    }
+
+    /// Configures persistent storage under `$XDG_DATA_HOME/fauxpi`, loading existing QCOW2 images
+    /// from `$XDG_DATA_HOME/fauxpi/images` and board settings from `$XDG_DATA_HOME/fauxpi/settings.json`.
+    pub fn configureXdgStorage(self: *BoardUi, environ: std.process.Environ, status: *SystemStatus) void {
+        var dir_buf: [512]u8 = undefined;
+        if (resolveXdgDataDir(&dir_buf, environ)) |dir| {
+            self.configureDataDir(dir, status);
+        }
+    }
+
+    /// Configures persistent storage under `data_dir` (`{data_dir}/images` and `{data_dir}/settings.json`),
+    /// loads existing `.qcow2` images, and loads or initializes `settings.json`.
+    pub fn configureDataDir(self: *BoardUi, data_dir: []const u8, status: *SystemStatus) void {
+        const dlen = @min(data_dir.len, self.data_dir_buf.len);
+        @memcpy(self.data_dir_buf[0..dlen], data_dir[0..dlen]);
+        self.data_dir_len = dlen;
+
+        const imgs = std.fmt.bufPrint(&self.images_dir_buf, "{s}/images", .{self.dataDir()}) catch "";
+        self.images_dir_len = imgs.len;
+
+        const spath = std.fmt.bufPrint(&self.settings_path_buf, "{s}/settings.json", .{self.dataDir()}) catch "";
+        self.settings_path_len = spath.len;
+
+        ensureDirPathLinux(self.dataDir());
+        if (self.images_dir_len > 0) {
+            ensureDirPathLinux(self.imagesDir());
+            self.loadImagesFromDir();
+        }
+        if (self.settings_path_len > 0) {
+            const loaded = self.loadSettings(status) catch false;
+            if (!loaded) {
+                self.saveSettings(status.*) catch {};
+            }
+        }
+    }
+
+    /// Scans `self.imagesDir()` (`$XDG_DATA_HOME/fauxpi/images`) for `.qcow2` files and opens them.
+    pub fn loadImagesFromDir(self: *BoardUi) void {
+        if (self.images_dir_len == 0) return;
+        const dir_path = self.imagesDir();
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (dir_path.len >= path_buf.len) return;
+        @memcpy(path_buf[0..dir_path.len], dir_path);
+        path_buf[dir_path.len] = 0;
+
+        const fd_rc = std.os.linux.openat(
+            std.os.linux.AT.FDCWD,
+            path_buf[0..dir_path.len :0],
+            .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true },
+            0,
+        );
+        if (std.os.linux.errno(fd_rc) != .SUCCESS) return;
+        const dir_fd: std.os.linux.fd_t = @intCast(fd_rc);
+        defer _ = std.os.linux.close(dir_fd);
+
+        var dents_buf: [4096]u8 align(8) = undefined;
+        while (true) {
+            const n = std.os.linux.getdents64(dir_fd, &dents_buf, dents_buf.len);
+            if (std.os.linux.errno(n) != .SUCCESS or n == 0) break;
+            var at: usize = 0;
+            while (at < n) {
+                const reclen = std.mem.readInt(u16, dents_buf[at + 16 ..][0..2], .little);
+                const d_name = std.mem.sliceTo(dents_buf[at + 19 .. at + reclen], 0);
+                at += reclen;
+                if (d_name.len <= ".qcow2".len or d_name[0] == '.') continue;
+                if (!std.mem.endsWith(u8, d_name, ".qcow2")) continue;
+
+                const card_name = d_name[0 .. d_name.len - ".qcow2".len];
+                if (self.hasCardNamed(card_name)) continue;
+
+                var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+                const full_path = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir_path, d_name }) catch continue;
+
+                var disk = Qcow2Disk.openExistingFile(self.gpa, full_path) catch continue;
+                const sz = SdCardSize.smallestFitting(disk.virtual_size) orelse .gb_32;
+                const entry = makeNamedSdCardEntry(card_name, full_path, disk.diskAllocatedBytes(), sz, disk);
+                self.sd_cards.append(self.gpa, entry) catch {
+                    disk.deinit();
+                    continue;
+                };
+            }
+        }
+
+        var i: usize = 1;
+        while (i < self.sd_cards.items.len) : (i += 1) {
+            var j = i;
+            while (j > 0 and std.mem.order(u8, self.sd_cards.items[j].name(), self.sd_cards.items[j - 1].name()) == .lt) : (j -= 1) {
+                std.mem.swap(SdCardEntry, &self.sd_cards.items[j], &self.sd_cards.items[j - 1]);
+            }
+        }
+
+        if (self.sd_cards.items.len > 0 and self.selected_sd_card_idx == null) {
+            self.selected_sd_card_idx = 0;
+        }
+        self.resetDefaultNewCardName();
+    }
+
+    const PersistedSettings = struct {
+        board_model: ?[]const u8 = null,
+        serial: ?[]const u8 = null,
+        mac_address: ?[]const u8 = null,
+        wifi_mac_address: ?[]const u8 = null,
+        dhcp_enabled: ?bool = null,
+        selected_sd_card: ?[]const u8 = null,
+        sd_connected: ?bool = null,
+        hdmi_connected: ?bool = null,
+        audio_connected: ?bool = null,
+        usb_hub_connected: ?bool = null,
+        usb_keyboard_connected: ?bool = null,
+        usb_mouse_connected: ?bool = null,
+        ethernet_connected: ?bool = null,
+    };
+
+    /// Writes the current board settings to `$XDG_DATA_HOME/fauxpi/settings.json`.
+    pub fn saveSettings(self: *const BoardUi, status: SystemStatus) !void {
+        if (self.settings_path_len == 0) return;
+        if (self.data_dir_len > 0) ensureDirPathLinux(self.dataDir());
+
+        const sel_name = if (self.selected_sd_card_idx) |idx|
+            (if (idx < self.sd_cards.items.len) self.sd_cards.items[idx].name() else "")
+        else
+            "";
+
+        var esc_name_buf: [140]u8 = undefined;
+        var esc_len: usize = 0;
+        for (sel_name) |ch| {
+            if (ch == '"' or ch == '\\') {
+                if (esc_len + 2 > esc_name_buf.len) break;
+                esc_name_buf[esc_len] = '\\';
+                esc_name_buf[esc_len + 1] = ch;
+                esc_len += 2;
+            } else if (ch >= 0x20) {
+                if (esc_len + 1 > esc_name_buf.len) break;
+                esc_name_buf[esc_len] = ch;
+                esc_len += 1;
+            }
+        }
+
+        var json_buf: [2048]u8 = undefined;
+        const json_str = try std.fmt.bufPrint(
+            &json_buf,
+            \\{{
+            \\  "board_model": "{s}",
+            \\  "serial": "{s}",
+            \\  "mac_address": "{s}",
+            \\  "wifi_mac_address": "{s}",
+            \\  "dhcp_enabled": {},
+            \\  "selected_sd_card": "{s}",
+            \\  "sd_connected": {},
+            \\  "hdmi_connected": {},
+            \\  "audio_connected": {},
+            \\  "usb_hub_connected": {},
+            \\  "usb_keyboard_connected": {},
+            \\  "usb_mouse_connected": {},
+            \\  "ethernet_connected": {}
+            \\}}
+            \\
+        ,
+            .{
+                status.board_model.id(),
+                self.serial_hex[0..self.serial_len],
+                self.mac_hex[0..self.mac_len],
+                self.wifi_mac_hex[0..self.wifi_mac_len],
+                status.dhcp_enabled,
+                esc_name_buf[0..esc_len],
+                status.sd_connected,
+                status.hdmi_connected,
+                status.audio_connected,
+                status.usb_hub_connected,
+                status.usb_keyboard_connected,
+                status.usb_mouse_connected,
+                status.ethernet_connected,
+            },
+        );
+
+        const path = self.settingsPath();
+        var path_z: [std.fs.max_path_bytes]u8 = undefined;
+        if (path.len >= path_z.len) return error.NameTooLong;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+
+        const fd_rc = std.os.linux.openat(
+            std.os.linux.AT.FDCWD,
+            path_z[0..path.len :0],
+            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
+            0o644,
+        );
+        if (std.os.linux.errno(fd_rc) != .SUCCESS) return error.FileOpenFailed;
+        const fd: std.os.linux.fd_t = @intCast(fd_rc);
+        defer _ = std.os.linux.close(fd);
+
+        var written: usize = 0;
+        while (written < json_str.len) {
+            const rc = std.os.linux.write(fd, json_str[written..].ptr, json_str.len - written);
+            if (std.os.linux.errno(rc) != .SUCCESS) return error.FileWriteFailed;
+            written += rc;
+        }
+    }
+
+    /// Reads board settings from `$XDG_DATA_HOME/fauxpi/settings.json` into `self` and `status`.
+    /// Returns `true` if `settings.json` existed and was parsed.
+    pub fn loadSettings(self: *BoardUi, status: *SystemStatus) !bool {
+        if (self.settings_path_len == 0) return false;
+        const path = self.settingsPath();
+
+        var path_z: [std.fs.max_path_bytes]u8 = undefined;
+        if (path.len >= path_z.len) return error.NameTooLong;
+        @memcpy(path_z[0..path.len], path);
+        path_z[path.len] = 0;
+
+        const fd_rc = std.os.linux.openat(
+            std.os.linux.AT.FDCWD,
+            path_z[0..path.len :0],
+            .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
+            0,
+        );
+        if (std.os.linux.errno(fd_rc) != .SUCCESS) return false;
+        const fd: std.os.linux.fd_t = @intCast(fd_rc);
+        defer _ = std.os.linux.close(fd);
+
+        var file_buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (total < file_buf.len) {
+            const rc = std.os.linux.read(fd, file_buf[total..].ptr, file_buf.len - total);
+            if (std.os.linux.errno(rc) != .SUCCESS) return error.FileReadFailed;
+            if (rc == 0) break;
+            total += rc;
+        }
+
+        const parsed = try std.json.parseFromSlice(
+            PersistedSettings,
+            self.gpa,
+            file_buf[0..total],
+            .{ .ignore_unknown_fields = true },
+        );
+        defer parsed.deinit();
+        const cfg = parsed.value;
+
+        if (cfg.board_model) |bm_str| {
+            if (BoardModel.fromId(bm_str)) |bm| {
+                self.selected_board_model = bm;
+                status.board_model = bm;
+                status.model = bm.dtModel();
+                self.title = bm.windowTitle();
+            }
+        }
+        if (cfg.serial) |ser| {
+            self.setHexField(&self.serial_hex, &self.serial_len, ser, false);
+        }
+        if (cfg.mac_address) |mac| {
+            self.setHexField(&self.mac_hex, &self.mac_len, mac, true);
+        }
+        if (cfg.wifi_mac_address) |wmac| {
+            self.setHexField(&self.wifi_mac_hex, &self.wifi_mac_len, wmac, true);
+        }
+        status.serial_u64 = self.parsedSerial();
+        status.mac_address = self.parsedMac();
+        status.wifi_mac_address = self.parsedWifiMac();
+
+        if (cfg.dhcp_enabled) |v| status.dhcp_enabled = v;
+        if (cfg.hdmi_connected) |v| status.hdmi_connected = v;
+        if (cfg.audio_connected) |v| status.audio_connected = v;
+        if (cfg.usb_hub_connected) |v| status.usb_hub_connected = v;
+        if (cfg.usb_keyboard_connected) |v| status.usb_keyboard_connected = v;
+        if (cfg.usb_mouse_connected) |v| status.usb_mouse_connected = v;
+        if (cfg.ethernet_connected) |v| status.ethernet_connected = v;
+        if (!status.board_model.usesExternalUsbHub()) {
+            status.usb_hub_connected = true;
+        }
+
+        if (cfg.selected_sd_card) |sel_name| {
+            if (sel_name.len > 0) {
+                for (self.sd_cards.items, 0..) |*card, idx| {
+                    if (std.mem.eql(u8, card.name(), sel_name)) {
+                        self.selected_sd_card_idx = idx;
+                        break;
+                    }
+                }
+            }
+        }
+        if (cfg.sd_connected) |v| {
+            status.sd_connected = v and (self.selected_sd_card_idx != null);
+        }
+        return true;
+    }
+
+    fn setHexField(self: *BoardUi, dst: []u8, dst_len: *usize, src: []const u8, uppercase: bool) void {
+        _ = self;
+        var out_i: usize = 0;
+        for (src) |ch| {
+            if (std.ascii.isHex(ch) and out_i < dst.len) {
+                dst[out_i] = if (uppercase) std.ascii.toUpper(ch) else std.ascii.toLower(ch);
+                out_i += 1;
+            }
+        }
+        if (out_i > 0) {
+            dst_len.* = out_i;
+        }
     }
 
     pub fn activeSdCard(self: *BoardUi) ?*SdCardEntry {
@@ -455,42 +850,121 @@ pub const BoardUi = struct {
         self.revalidatePendingSdImage();
     }
 
-    /// Creates a new QCOW2-backed SD card from an in-memory image slice.
-    /// Returns `error.ImageTooLarge` (and records the error message) if `image_bytes.len > size.bytes()`.
+    fn resolveNewCardName(self: *BoardUi, custom_name: ?[]const u8, buf: *[64]u8) []const u8 {
+        if (custom_name) |cn| {
+            const trimmed = std.mem.trim(u8, cn, " \t\r\n");
+            if (trimmed.len > 0) {
+                const n = @min(trimmed.len, buf.len);
+                @memcpy(buf[0..n], trimmed[0..n]);
+                return buf[0..n];
+            }
+        }
+        const cur_trimmed = std.mem.trim(u8, self.newCardName(), " \t\r\n");
+        if (cur_trimmed.len == 0) {
+            self.resetDefaultNewCardName();
+        }
+        const active = std.mem.trim(u8, self.newCardName(), " \t\r\n");
+        const n = @min(active.len, buf.len);
+        @memcpy(buf[0..n], active[0..n]);
+        return buf[0..n];
+    }
+
+    fn buildPersistentQcow2Path(self: *const BoardUi, card_name: []const u8, out_buf: *[std.fs.max_path_bytes]u8) ?[]const u8 {
+        if (self.images_dir_len == 0) return null;
+        ensureDirPathLinux(self.imagesDir());
+
+        var safe_buf: [64]u8 = undefined;
+        var safe_len: usize = 0;
+        for (card_name) |ch| {
+            if (safe_len >= safe_buf.len) break;
+            if (ch == '/' or ch == '\\' or ch < 0x20) {
+                safe_buf[safe_len] = '_';
+            } else {
+                safe_buf[safe_len] = ch;
+            }
+            safe_len += 1;
+        }
+        const stem = if (safe_len > 0) safe_buf[0..safe_len] else "Card";
+
+        var suffix: usize = 1;
+        while (suffix < 10_000) : (suffix += 1) {
+            const path = if (suffix == 1)
+                std.fmt.bufPrint(out_buf, "{s}/{s}.qcow2", .{ self.imagesDir(), stem }) catch return null
+            else
+                std.fmt.bufPrint(out_buf, "{s}/{s}-{d}.qcow2", .{ self.imagesDir(), stem, suffix }) catch return null;
+            if (!fileExistsLinux(path)) return path;
+        }
+        return null;
+    }
+
+    /// Creates a new QCOW2-backed SD card from an in-memory image slice using the current `newCardName()`
+    /// (defaulting to `"Card 1"`, `"Card 2"`, etc.).
     pub fn addSdCardFromSlice(self: *BoardUi, label_or_path: []const u8, size: SdCardSize, image_bytes: []const u8) !usize {
+        return self.addNamedSdCardFromSlice(null, label_or_path, size, image_bytes);
+    }
+
+    /// Creates a new QCOW2-backed SD card with an optional explicit `card_name` from an in-memory image slice.
+    pub fn addNamedSdCardFromSlice(
+        self: *BoardUi,
+        card_name_opt: ?[]const u8,
+        label_or_path: []const u8,
+        size: SdCardSize,
+        image_bytes: []const u8,
+    ) !usize {
         if (image_bytes.len > size.bytes()) {
             self.new_card_size = size;
             self.setPendingSdImageSlice(label_or_path, image_bytes);
             return error.ImageTooLarge;
         }
-        var disk = try Qcow2Disk.createFromSlice(self.gpa, size.bytes(), image_bytes);
+        var name_buf: [64]u8 = undefined;
+        const card_name = self.resolveNewCardName(card_name_opt, &name_buf);
+
+        var qcow2_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const qcow2_path = self.buildPersistentQcow2Path(card_name, &qcow2_path_buf);
+
+        var disk = try Qcow2Disk.createFromSliceAtPath(self.gpa, size.bytes(), image_bytes, qcow2_path);
         errdefer disk.deinit();
 
-        const entry = makeSdCardEntry(label_or_path, image_bytes.len, size, disk);
+        const entry_path = qcow2_path orelse label_or_path;
+        const entry = makeNamedSdCardEntry(card_name, entry_path, image_bytes.len, size, disk);
         try self.sd_cards.append(self.gpa, entry);
         const idx = self.sd_cards.items.len - 1;
         self.selected_sd_card_idx = idx;
         self.sd_error_len = 0;
+        self.resetDefaultNewCardName();
         return idx;
     }
 
-    /// Creates a new QCOW2-backed SD card by streaming an image file from disk.
-    /// Returns `error.ImageTooLarge` (and records the error message) if the image file exceeds `size.bytes()`.
+    /// Creates a new QCOW2-backed SD card by streaming an image file from disk using the current `newCardName()`
+    /// (defaulting to `"Card 1"`, `"Card 2"`, etc.).
     pub fn addSdCardFromFile(self: *BoardUi, path: []const u8, size: SdCardSize) !usize {
+        return self.addNamedSdCardFromFile(null, path, size);
+    }
+
+    /// Creates a new QCOW2-backed SD card with an optional explicit `card_name` by streaming an image file from disk.
+    pub fn addNamedSdCardFromFile(self: *BoardUi, card_name_opt: ?[]const u8, path: []const u8, size: SdCardSize) !usize {
         const file_size = try Qcow2Disk.getFileSizeLinux(path);
         if (file_size > size.bytes()) {
             self.new_card_size = size;
             self.setPendingSdImageFile(path, file_size);
             return error.ImageTooLarge;
         }
-        var disk = try Qcow2Disk.createFromImageFile(self.gpa, size.bytes(), path);
+        var name_buf: [64]u8 = undefined;
+        const card_name = self.resolveNewCardName(card_name_opt, &name_buf);
+
+        var qcow2_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const qcow2_path = self.buildPersistentQcow2Path(card_name, &qcow2_path_buf);
+
+        var disk = try Qcow2Disk.createFromImageFileAtPath(self.gpa, size.bytes(), path, qcow2_path);
         errdefer disk.deinit();
 
-        const entry = makeSdCardEntry(path, file_size, size, disk);
+        const entry_path = qcow2_path orelse path;
+        const entry = makeNamedSdCardEntry(card_name, entry_path, file_size, size, disk);
         try self.sd_cards.append(self.gpa, entry);
         const idx = self.sd_cards.items.len - 1;
         self.selected_sd_card_idx = idx;
         self.sd_error_len = 0;
+        self.resetDefaultNewCardName();
         return idx;
     }
 
@@ -524,7 +998,7 @@ pub const BoardUi = struct {
         return true;
     }
 
-    fn makeSdCardEntry(path: []const u8, img_size: u64, size: SdCardSize, disk: Qcow2Disk) SdCardEntry {
+    fn makeNamedSdCardEntry(card_name: []const u8, path: []const u8, img_size: u64, size: SdCardSize, disk: Qcow2Disk) SdCardEntry {
         var entry: SdCardEntry = .{
             .image_size_bytes = img_size,
             .size = size,
@@ -534,9 +1008,8 @@ pub const BoardUi = struct {
         @memcpy(entry.image_path_buf[0..plen], path[0..plen]);
         entry.image_path_len = plen;
 
-        const base = std.fs.path.basename(path);
-        const nlen = @min(base.len, entry.name_buf.len);
-        @memcpy(entry.name_buf[0..nlen], base[0..nlen]);
+        const nlen = @min(card_name.len, entry.name_buf.len);
+        @memcpy(entry.name_buf[0..nlen], card_name[0..nlen]);
         entry.name_len = nlen;
         return entry;
     }
@@ -788,10 +1261,27 @@ pub const BoardUi = struct {
         self.randomizeWifiMac();
     }
 
-    /// Handles an evdev key press when a Settings text field (`serial`, `mac`, or `wifi_mac`) is focused.
-    /// Returns true if the key was consumed by the Settings editor.
+    pub fn updateModifierKey(self: *BoardUi, evdev_key: u32, pressed: bool) void {
+        if (evdev_key == 42 or evdev_key == 54) {
+            self.shift_held = pressed;
+        }
+    }
+
+    /// Handles an evdev key press when a text field (`serial`, `mac`, `wifi_mac`, or `sd_card_name`) is focused.
+    /// Returns true if the key was consumed by the editor.
     pub fn handleKey(self: *BoardUi, evdev_key: u32) bool {
-        if (!self.sheet_open or !self.settings_open or self.focused_field == .none) return false;
+        if (!self.sheet_open or self.focused_field == .none) return false;
+        if (self.focused_field == .sd_card_name) {
+            if (!self.sd_manage_open) return false;
+        } else {
+            if (!self.settings_open) return false;
+        }
+
+        // Left Shift (42) or Right Shift (54)
+        if (evdev_key == 42 or evdev_key == 54) {
+            self.shift_held = true;
+            return true;
+        }
 
         // Enter (28) or Escape (1) unfocuses the text field
         if (evdev_key == 28 or evdev_key == 1) {
@@ -811,7 +1301,20 @@ pub const BoardUi = struct {
                 .wifi_mac => if (self.wifi_mac_len > 0) {
                     self.wifi_mac_len -= 1;
                 },
+                .sd_card_name => if (self.new_card_name_len > 0) {
+                    self.new_card_name_len -= 1;
+                },
                 .none => {},
+            }
+            return true;
+        }
+
+        if (self.focused_field == .sd_card_name) {
+            if (evdevKeyToCardNameChar(evdev_key, self.shift_held)) |ch| {
+                if (self.new_card_name_len < self.new_card_name_buf.len) {
+                    self.new_card_name_buf[self.new_card_name_len] = ch;
+                    self.new_card_name_len += 1;
+                }
             }
             return true;
         }
@@ -849,7 +1352,7 @@ pub const BoardUi = struct {
                     self.wifi_mac_hex[self.wifi_mac_len] = std.ascii.toUpper(ch);
                     self.wifi_mac_len += 1;
                 },
-                .none => {},
+                .sd_card_name, .none => {},
             }
             return true;
         }
@@ -862,7 +1365,7 @@ pub const BoardUi = struct {
         self.last_win_h = win_h;
         const cur_board = BoardModel.fromModel(status.model);
         self.title = cur_board.windowTitle();
-        if (status.power_connected) {
+        if (status.power_connected and self.focused_field != .sd_card_name) {
             self.focused_field = .none;
             self.board_menu_open = false;
         }
@@ -964,7 +1467,15 @@ pub const BoardUi = struct {
             @as(f32, @floatFromInt(self.sd_cards.items.len)) * 32.0;
 
         const add_y0: f32 = list_y0 + list_h + 16.0;
-        const size_row_y: f32 = add_y0 + 26.0;
+        const name_row_y: f32 = add_y0 + 24.0;
+        self.sd_name_field_rect = .{
+            .x = mg_x + 16.0,
+            .y = name_row_y,
+            .w = mg_w - 32.0,
+            .h = 32.0,
+        };
+
+        const size_row_y: f32 = name_row_y + 54.0;
         const size_gap: f32 = 6.0;
         const size_count: f32 = @floatFromInt(SdCardSize.all.len);
         const size_btn_w: f32 = @floor((mg_w - 32.0 - (size_count - 1.0) * size_gap) / size_count);
@@ -978,7 +1489,7 @@ pub const BoardUi = struct {
             };
         }
 
-        const img_row_y: f32 = size_row_y + 56.0;
+        const img_row_y: f32 = size_row_y + 52.0;
         self.sd_browse_btn_rect = .{
             .x = mg_x + mg_w - 16.0 - 116.0,
             .y = img_row_y,
@@ -1072,6 +1583,7 @@ pub const BoardUi = struct {
             self.hovered_sd_menu_idx = null;
             self.hovered_sd_size_idx = null;
             self.hovered_sd_card_row_idx = null;
+            self.sd_name_field_hovered = false;
             self.sd_browse_btn_hovered = false;
             self.sd_add_btn_hovered = false;
             self.sd_manage_close_hovered = false;
@@ -1081,6 +1593,7 @@ pub const BoardUi = struct {
         if (self.sd_manage_open) {
             self.hovered_target = null;
             self.sd_manage_close_hovered = self.sd_manage_close_rect.contains(pt);
+            self.sd_name_field_hovered = self.sd_name_field_rect.contains(pt);
             self.sd_browse_btn_hovered = self.sd_browse_btn_rect.contains(pt);
             self.sd_add_btn_hovered = self.sd_add_btn_rect.contains(pt);
             self.hovered_sd_size_idx = null;
@@ -1101,6 +1614,7 @@ pub const BoardUi = struct {
         } else {
             self.hovered_sd_size_idx = null;
             self.hovered_sd_card_row_idx = null;
+            self.sd_name_field_hovered = false;
             self.sd_browse_btn_hovered = false;
             self.sd_add_btn_hovered = false;
             self.sd_manage_close_hovered = false;
@@ -1183,6 +1697,7 @@ pub const BoardUi = struct {
         self.hovered_sd_menu_idx = null;
         self.hovered_sd_size_idx = null;
         self.hovered_sd_card_row_idx = null;
+        self.sd_name_field_hovered = false;
         self.sd_browse_btn_hovered = false;
         self.sd_add_btn_hovered = false;
         self.sd_manage_close_hovered = false;
@@ -1259,6 +1774,11 @@ pub const BoardUi = struct {
 
             // 1. Modal Manage SD Cards popup handling
             if (self.sd_manage_open) {
+                if (self.sd_name_field_rect.contains(pt)) {
+                    self.focused_field = .sd_card_name;
+                    return .consumed;
+                }
+                self.focused_field = .none;
                 if (self.sd_manage_close_rect.contains(pt)) {
                     self.sd_manage_open = false;
                     return .consumed;
@@ -1307,6 +1827,7 @@ pub const BoardUi = struct {
                         self.sd_card_menu_open = false;
                         self.hovered_sd_menu_idx = null;
                         self.sd_manage_open = true;
+                        if (self.new_card_name_len == 0) self.resetDefaultNewCardName();
                         return .consumed;
                     }
                     return .consumed;
@@ -1398,6 +1919,7 @@ pub const BoardUi = struct {
                                 // Initial list is empty: skip the menu and show Manage Cards popup directly
                                 self.sd_card_menu_open = false;
                                 self.sd_manage_open = true;
+                                if (self.new_card_name_len == 0) self.resetDefaultNewCardName();
                             } else {
                                 self.sd_card_menu_open = !self.sd_card_menu_open;
                             }
@@ -1974,10 +2496,28 @@ pub const BoardUi = struct {
                 }
             }
 
-            // Add Card section: standard SD card sizes + image file selector
+            // Add Card section: Card Name + standard SD card sizes + image file selector
             const list_h: f32 = if (self.sd_cards.items.len == 0) 36.0 else @as(f32, @floatFromInt(self.sd_cards.items.len)) * 32.0;
             const add_y0: f32 = mr.y + 72.0 + list_h + 16.0;
-            _ = c.drawText(12.5, mr.x + 16.0, add_y0 + 18.0, "Add Card — Select Size", t.on_surface_variant);
+            _ = c.drawText(12.5, mr.x + 16.0, add_y0 + 18.0, "Add Card — Name", t.on_surface_variant);
+
+            var name_disp_buf: [68]u8 = undefined;
+            const name_slice = self.newCardName();
+            const name_disp = if (self.focused_field == .sd_card_name)
+                std.fmt.bufPrint(&name_disp_buf, "{s}|", .{name_slice}) catch name_slice
+            else
+                name_slice;
+            self.paintTextField(
+                c,
+                self.sd_name_field_rect,
+                name_disp,
+                self.focused_field == .sd_card_name,
+                self.sd_name_field_hovered,
+                false,
+            );
+
+            const size_row_y = self.sd_size_btn_rects[0].y;
+            _ = c.drawText(12.5, mr.x + 16.0, size_row_y - 6.0, "Card Size", t.on_surface_variant);
 
             const pill_st: canvas_mod.Style = .{ .font = &self.font, .size = 11.5 };
             for (SdCardSize.all, 0..) |sz, idx| {
@@ -3180,6 +3720,80 @@ fn drawUsbHubAndPeripherals(
     );
 }
 
+fn evdevKeyToCardNameChar(evdev_key: u32, shift: bool) ?u8 {
+    const lower: ?u8 = switch (evdev_key) {
+        2 => '1',
+        3 => '2',
+        4 => '3',
+        5 => '4',
+        6 => '5',
+        7 => '6',
+        8 => '7',
+        9 => '8',
+        10 => '9',
+        11 => '0',
+        12 => if (shift) '_' else '-',
+        16 => 'q',
+        17 => 'w',
+        18 => 'e',
+        19 => 'r',
+        20 => 't',
+        21 => 'y',
+        22 => 'u',
+        23 => 'i',
+        24 => 'o',
+        25 => 'p',
+        30 => 'a',
+        31 => 's',
+        32 => 'd',
+        33 => 'f',
+        34 => 'g',
+        35 => 'h',
+        36 => 'j',
+        37 => 'k',
+        38 => 'l',
+        44 => 'z',
+        45 => 'x',
+        46 => 'c',
+        47 => 'v',
+        48 => 'b',
+        49 => 'n',
+        50 => 'm',
+        52 => '.',
+        57 => ' ',
+        else => null,
+    };
+    if (lower) |ch| {
+        if (shift and std.ascii.isLower(ch)) return std.ascii.toUpper(ch);
+        return ch;
+    }
+    return null;
+}
+
+pub fn ensureDirPathLinux(path: []const u8) void {
+    if (path.len == 0 or path.len >= std.fs.max_path_bytes) return;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    @memcpy(buf[0..path.len], path);
+
+    var i: usize = 1;
+    while (i <= path.len) : (i += 1) {
+        if (i == path.len or buf[i] == '/') {
+            const saved = if (i < path.len) buf[i] else 0;
+            buf[i] = 0;
+            _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, buf[0..i :0], 0o755);
+            if (i < path.len) buf[i] = saved;
+        }
+    }
+}
+
+pub fn fileExistsLinux(path: []const u8) bool {
+    if (path.len == 0 or path.len >= std.fs.max_path_bytes) return false;
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    @memcpy(buf[0..path.len], path);
+    buf[path.len] = 0;
+    return std.os.linux.errno(std.os.linux.faccessat(std.os.linux.AT.FDCWD, buf[0..path.len :0], std.os.linux.F_OK, 0)) == .SUCCESS;
+}
+
 const testing = std.testing;
 
 test "TitleBar and BoardSheet toggle connectors and peripherals on the board diagram" {
@@ -3507,4 +4121,137 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(px_board_bg, px_inside_hdmi);
 }
 
+test "BoardUi persistent images and settings.json with custom and default card names" {
+    const os = std.os.linux;
 
+    const tmp_dir: [:0]const u8 = "/tmp/fauxpi-test-xdg-data";
+    const tmp_images_dir: [:0]const u8 = "/tmp/fauxpi-test-xdg-data/images";
+    const tmp_settings_path: [:0]const u8 = "/tmp/fauxpi-test-xdg-data/settings.json";
+    defer {
+        _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Card 1.qcow2", 0);
+        _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Card 2.qcow2", 0);
+        _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Custom OS.qcow2", 0);
+        _ = os.unlinkat(os.AT.FDCWD, tmp_settings_path, 0);
+        _ = os.unlinkat(os.AT.FDCWD, tmp_images_dir, os.AT.REMOVEDIR);
+        _ = os.unlinkat(os.AT.FDCWD, tmp_dir, os.AT.REMOVEDIR);
+    }
+    _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Card 1.qcow2", 0);
+    _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Card 2.qcow2", 0);
+    _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Custom OS.qcow2", 0);
+    _ = os.unlinkat(os.AT.FDCWD, tmp_settings_path, 0);
+    _ = os.unlinkat(os.AT.FDCWD, tmp_images_dir, os.AT.REMOVEDIR);
+    _ = os.unlinkat(os.AT.FDCWD, tmp_dir, os.AT.REMOVEDIR);
+
+    // 1. Initialize first BoardUi with tmp_dir and create cards + modify settings
+    {
+        var ui = try BoardUi.init(testing.allocator);
+        defer ui.deinit();
+
+        var status = SystemStatus{
+            .board_model = .pi_zero,
+            .model = BoardModel.pi_zero.dtModel(),
+        };
+        ui.configureDataDir(tmp_dir, &status);
+
+        // Default new card name starts as "Card 1"
+        try testing.expectEqualStrings("Card 1", ui.newCardName());
+
+        // Create first card ("Card 1") via Manage SD Cards dialog
+        var hw: Gpio = .{};
+        ui.sheet_open = true;
+        ui.sd_manage_open = true;
+        var valid_img: [512]u8 = @splat(0);
+        valid_img[510] = 0x55;
+        valid_img[511] = 0xAA;
+        ui.setPendingSdImageSlice("raspios-lite.img", &valid_img);
+        ui.updateLayout(1280, 764, status, &hw);
+
+        // Create button creates "Card 1", closes manage dialog, and advances default name to "Card 2"
+        _ = ui.pointerButton(ui.sd_add_btn_rect.x + 10, ui.sd_add_btn_rect.y + 10, true, status, &hw);
+        try testing.expectEqual(Action.select_sd_card, ui.pointerButton(ui.sd_add_btn_rect.x + 10, ui.sd_add_btn_rect.y + 10, false, status, &hw));
+        try testing.expectEqual(@as(usize, 1), ui.sd_cards.items.len);
+        try testing.expectEqualStrings("Card 1", ui.sd_cards.items[0].name());
+        try testing.expectEqualStrings("Card 2", ui.newCardName());
+
+        // Write bytes to Card 1 so we can verify its contents persist
+        ui.sd_cards.items[0].disk.writeByte(0, 0x42);
+        ui.sd_cards.items[0].disk.writeByte(511, 0x99);
+
+        // Reopen Manage SD Cards dialog and edit the card name field via pointer + keyboard to "Custom OS"
+        ui.sd_manage_open = true;
+        ui.setPendingSdImageSlice("custom-os.img", &valid_img);
+        ui.updateLayout(1280, 764, status, &hw);
+        _ = ui.pointerButton(ui.sd_name_field_rect.x + 10, ui.sd_name_field_rect.y + 10, true, status, &hw);
+        _ = ui.pointerButton(ui.sd_name_field_rect.x + 10, ui.sd_name_field_rect.y + 10, false, status, &hw);
+        try testing.expectEqual(FocusedSettingField.sd_card_name, ui.focused_field);
+
+        // Clear "Card 2" with backspaces and type "Custom OS" via evdev key codes
+        for (0..10) |_| {
+            _ = ui.handleKey(14);
+        }
+        try testing.expectEqualStrings("", ui.newCardName());
+        _ = ui.handleKey(42); // Left Shift down
+        _ = ui.handleKey(46); // 'C'
+        ui.updateModifierKey(42, false); // Left Shift up
+        _ = ui.handleKey(22); // 'u'
+        _ = ui.handleKey(31); // 's'
+        _ = ui.handleKey(20); // 't'
+        _ = ui.handleKey(24); // 'o'
+        _ = ui.handleKey(50); // 'm'
+        _ = ui.handleKey(57); // ' '
+        _ = ui.handleKey(42); // Left Shift down
+        _ = ui.handleKey(24); // 'O'
+        _ = ui.handleKey(31); // 'S'
+        ui.updateModifierKey(42, false); // Left Shift up
+        try testing.expectEqualStrings("Custom OS", ui.newCardName());
+
+        // Click Create button to create "Custom OS"
+        _ = ui.pointerButton(ui.sd_add_btn_rect.x + 10, ui.sd_add_btn_rect.y + 10, true, status, &hw);
+        try testing.expectEqual(Action.select_sd_card, ui.pointerButton(ui.sd_add_btn_rect.x + 10, ui.sd_add_btn_rect.y + 10, false, status, &hw));
+        try testing.expectEqual(@as(usize, 2), ui.sd_cards.items.len);
+        try testing.expectEqualStrings("Custom OS", ui.sd_cards.items[1].name());
+        // Next default card name should be "Card 2" since "Card 2" has not been taken yet
+        try testing.expectEqualStrings("Card 2", ui.newCardName());
+
+        // Customize board settings and save
+        status.board_model = .pi_zero_2_w;
+        status.model = status.board_model.dtModel();
+        ui.setHexField(&ui.serial_hex, &ui.serial_len, "00000000cafebabe", false);
+        ui.setHexField(&ui.mac_hex, &ui.mac_len, "B827EB112233", true);
+        ui.setHexField(&ui.wifi_mac_hex, &ui.wifi_mac_len, "B827EB445566", true);
+        status.dhcp_enabled = false;
+        status.sd_connected = true;
+        status.hdmi_connected = false;
+        ui.selected_sd_card_idx = 0; // select "Card 1"
+        try ui.saveSettings(status);
+    }
+
+    // 2. Initialize second BoardUi from the same tmp_dir and verify everything is restored
+    {
+        var ui2 = try BoardUi.init(testing.allocator);
+        defer ui2.deinit();
+
+        var status2 = SystemStatus{};
+        ui2.configureDataDir(tmp_dir, &status2);
+
+        try testing.expectEqual(BoardModel.pi_zero_2_w, status2.board_model);
+        try testing.expectEqual(BoardModel.pi_zero_2_w, ui2.selected_board_model);
+        try testing.expectEqual(@as(u64, 0x00000000CAFEBABE), status2.serial_u64);
+        try testing.expectEqualSlices(u8, &.{ 0xB8, 0x27, 0xEB, 0x11, 0x22, 0x33 }, &status2.mac_address);
+        try testing.expectEqualSlices(u8, &.{ 0xB8, 0x27, 0xEB, 0x44, 0x55, 0x66 }, &status2.wifi_mac_address);
+        try testing.expect(!status2.dhcp_enabled);
+        try testing.expect(status2.sd_connected);
+        try testing.expect(!status2.hdmi_connected);
+
+        try testing.expectEqual(@as(usize, 2), ui2.sd_cards.items.len);
+        try testing.expect(ui2.selected_sd_card_idx != null);
+        const sel = ui2.selected_sd_card_idx.?;
+        try testing.expectEqualStrings("Card 1", ui2.sd_cards.items[sel].name());
+
+        try testing.expectEqual(@as(u8, 0x42), ui2.sd_cards.items[sel].disk.readByte(0));
+        try testing.expectEqual(@as(u8, 0x99), ui2.sd_cards.items[sel].disk.readByte(511));
+
+        // Default name for next card should be "Card 2" since "Card 1" exists
+        try testing.expectEqualStrings("Card 2", ui2.newCardName());
+    }
+}
