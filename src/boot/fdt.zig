@@ -253,6 +253,20 @@ pub const Tree = struct {
         try self.root.setStringProp(self.allocator, "serial-number", sstr);
     }
 
+    pub fn setBoardModel(self: *Tree, model_str: []const u8, revision: u32) !void {
+        try self.root.setStringProp(self.allocator, "model", model_str);
+        const sys_node = try self.findOrCreateNode("/system");
+        try sys_node.setU32Prop(self.allocator, "linux,revision", revision);
+    }
+
+    pub fn setWirelessMac(self: *Tree, wifi_mac: [6]u8) !void {
+        for ([_][]const u8{ "/soc/mmc@7e300000/wifi@1", "/soc/mmcnr@7e300000/wifi@1", "wifi@1" }) |path| {
+            if (self.findNode(path)) |n| {
+                try n.setProp(self.allocator, "local-mac-address", &wifi_mac);
+            }
+        }
+    }
+
     pub fn patchForPiZero(
         self: *Tree,
         ram_size: u32,

@@ -176,19 +176,36 @@ pub fn loadDirect(
     };
 }
 
-/// Updates `/system/linux,serial` and `/serial-number` in the in-RAM DTB at `dtb_load_addr`.
-pub fn applyBoardSerialToRamDtb(allocator: std.mem.Allocator, ram: []u8, dtb_size: usize, serial: u64) !usize {
+/// Updates `/model`, `/system/linux,revision`, `/system/linux,serial`, `/serial-number`, and optional wireless MAC in the in-RAM DTB at `dtb_load_addr`.
+pub fn applyBoardConfigToRamDtb(
+    allocator: std.mem.Allocator,
+    ram: []u8,
+    dtb_size: usize,
+    model_str: []const u8,
+    revision: u32,
+    serial: u64,
+    wifi_mac: ?[6]u8,
+) !usize {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
     if (dtb_load_addr + dtb_size > ram.len) return error.DtbTooLarge;
     var tree = try fdt.Tree.parse(alloc, ram[dtb_load_addr .. dtb_load_addr + dtb_size]);
+    try tree.setBoardModel(model_str, revision);
     try tree.setBoardSerial(serial);
+    if (wifi_mac) |wmac| {
+        try tree.setWirelessMac(wmac);
+    }
     const updated_dtb = try tree.serialize(alloc);
     if (dtb_load_addr + updated_dtb.len > ram.len) return error.DtbTooLarge;
     @memcpy(ram[dtb_load_addr .. dtb_load_addr + updated_dtb.len], updated_dtb);
     return updated_dtb.len;
+}
+
+/// Updates `/system/linux,serial` and `/serial-number` in the in-RAM DTB at `dtb_load_addr`.
+pub fn applyBoardSerialToRamDtb(allocator: std.mem.Allocator, ram: []u8, dtb_size: usize, serial: u64) !usize {
+    return applyBoardConfigToRamDtb(allocator, ram, dtb_size, "Raspberry Pi Zero Rev 1.3", 0x00900093, serial, null);
 }
 
 

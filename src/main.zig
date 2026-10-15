@@ -208,14 +208,17 @@ fn loadGuestBoot(
     ram: []u8,
     soc: *Bcm2835,
     sd_image_buf: ?[]u8,
+    board_model: ui_board_sheet.BoardModel,
     board_serial: u64,
     mac_address: [6]u8,
+    wifi_mac_address: [6]u8,
 ) !loader.BootResult {
     soc.usb.hid.net.deinit();
     @memset(ram, 0);
     soc.* = Bcm2835.init(ram, opts.width, opts.height);
+    soc.mailbox.board_revision = board_model.boardRevision();
     soc.mailbox.board_serial = board_serial;
-    soc.mailbox.mac_address = mac_address;
+    soc.mailbox.mac_address = if (board_model.hasWireless()) wifi_mac_address else mac_address;
     soc.usb.hid.net.guest_mac = mac_address;
 
     const boot_res = if (sd_image_buf) |img| blk: {
@@ -237,7 +240,16 @@ fn loadGuestBoot(
         break :blk try loader.loadDirect(gpa, ram, k_bytes, d_bytes, rd_bytes, cmdline, true);
     };
 
-    _ = try loader.applyBoardSerialToRamDtb(gpa, ram, boot_res.r2, board_serial);
+    const wifi_mac_opt: ?[6]u8 = if (board_model.hasWireless()) wifi_mac_address else null;
+    _ = try loader.applyBoardConfigToRamDtb(
+        gpa,
+        ram,
+        boot_res.dtb_size,
+        board_model.dtModel(),
+        board_model.boardRevision(),
+        board_serial,
+        wifi_mac_opt,
+    );
     return boot_res;
 }
 
@@ -279,9 +291,11 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     }
 
     if (initial_power and (initial_sd or opts.kernel_path != null)) {
+        const bm = if (wl_win) |w| w.status.board_model else ui_board_sheet.BoardModel.pi_zero;
         const serial = if (wl_win) |w| w.status.serial_u64 else 0x00000000fa000001;
         const mac = if (wl_win) |w| w.status.mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
-        const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, if (initial_sd) sd_image_buf else null, serial, mac);
+        const wifi_mac = if (wl_win) |w| w.status.wifi_mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 };
+        const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, if (initial_sd) sd_image_buf else null, bm, serial, mac, wifi_mac);
         if (wl_win) |w| syncWindowPeripheralsToSoc(w, &soc);
         cpu.initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
         guest_booted = true;
@@ -336,7 +350,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 w.power_reconnected = false;
                 const active_sd = if (w.status.sd_connected) sd_image_buf else null;
                 if (active_sd != null or opts.kernel_path != null) {
-                    if (loadGuestBoot(gpa, opts, ram, &soc, active_sd, w.status.serial_u64, w.status.mac_address)) |reboot_res| {
+                    if (loadGuestBoot(gpa, opts, ram, &soc, active_sd, w.status.board_model, w.status.serial_u64, w.status.mac_address, w.status.wifi_mac_address)) |reboot_res| {
                         syncWindowPeripheralsToSoc(w, &soc);
                         cpu = .{};
                         cpu.initReset(reboot_res.entry_pc, reboot_res.r0, reboot_res.r1, reboot_res.r2);

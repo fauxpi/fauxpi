@@ -42,6 +42,7 @@ pub const Mailbox = struct {
     emmc_rate_hz: u32 = 250_000_000,
     pixel_rate_hz: u32 = 74_250_000,
 
+    board_revision: u32 = 0x00900093,
     board_serial: u64 = 0x00000000fa000001,
     mac_address: [6]u8 = .{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 },
 
@@ -180,8 +181,8 @@ pub const Mailbox = struct {
                     writeU32(ram, payload, 0, buf_size, 0);
                     resp_len = 4;
                 },
-                0x00010002 => { // Get board revision (Pi Zero v1.3 512MB)
-                    writeU32(ram, payload, 0, buf_size, 0x00900093);
+                0x00010002 => { // Get board revision (0x00900093 = Pi Zero v1.3, 0x00902120 = Pi Zero 2 W v1.0)
+                    writeU32(ram, payload, 0, buf_size, self.board_revision);
                     resp_len = 4;
                 },
                 0x00010003 => { // Get board MAC address

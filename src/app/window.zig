@@ -583,6 +583,14 @@ pub const WaylandWindow = struct {
         m.uint(seat.id).uint(self.last_button_serial).end();
     }
 
+    pub fn setBoardModel(self: *WaylandWindow, bm: board_sheet.BoardModel) void {
+        self.status.board_model = bm;
+        self.status.model = bm.dtModel();
+        self.ui.title = bm.windowTitle();
+        var m = self.toplevel.request(protocol.xdg_toplevel.request.set_title) catch return;
+        m.string(self.ui.title).end();
+    }
+
     fn toggleMaximized(self: *WaylandWindow) void {
         self.ui.maximized = !self.ui.maximized;
         const op: u16 = if (self.ui.maximized)
@@ -846,6 +854,10 @@ pub const WaylandWindow = struct {
                             hid.ethernet_connected = self.status.ethernet_connected;
                             return;
                         },
+                        .select_board => {
+                            self.setBoardModel(self.ui.selected_board_model);
+                            return;
+                        },
                         .toggle_dhcp => {
                             self.status.dhcp_enabled = !self.status.dhcp_enabled;
                             hid.net.dhcp_enabled = self.status.dhcp_enabled;
@@ -858,6 +870,7 @@ pub const WaylandWindow = struct {
                         .consumed => {
                             self.status.serial_u64 = self.ui.parsedSerial();
                             self.status.mac_address = self.ui.parsedMac();
+                            self.status.wifi_mac_address = self.ui.parsedWifiMac();
                             return;
                         },
                         .none => {},
@@ -914,6 +927,7 @@ pub const WaylandWindow = struct {
                     if (pressed and self.ui.handleKey(key)) {
                         self.status.serial_u64 = self.ui.parsedSerial();
                         self.status.mac_address = self.ui.parsedMac();
+                        self.status.wifi_mac_address = self.ui.parsedWifiMac();
                         return;
                     }
                     // Escape (evdev key 1) closes the board sheet when no text field is focused
