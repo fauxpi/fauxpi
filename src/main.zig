@@ -56,6 +56,7 @@ const CliOptions = struct {
     cmdline: ?[]const u8 = null,
     width: u16 = 1280,
     height: u16 = 720,
+    power: bool = false,
     headless: bool = false,
     max_steps: u64 = 0,
 };
@@ -100,7 +101,8 @@ fn printUsage() void {
         \\Usage: fauxpi [options]
         \\
         \\Options:
-        \\  --sd <path>         Boot from a Raspberry Pi SD card image (FAT32 + rootfs)
+        \\  --sd <path>         Insert a Raspberry Pi SD card image (FAT32 + rootfs)
+        \\  --power             Start with the 5V power supply connected
         \\  --kernel <path>     Boot kernel.img / zImage directly
         \\  --dtb <path>        Device Tree Blob (.dtb) when using --kernel
         \\  --initramfs <path>  Optional initramfs.cpio when using --kernel
@@ -130,6 +132,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 printUsage();
                 return 1;
             };
+        } else if (std.mem.eql(u8, arg, "--power")) {
+            opts.power = true;
         } else if (std.mem.eql(u8, arg, "--kernel")) {
             opts.kernel_path = args.next() orelse {
                 printUsage();
@@ -171,7 +175,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
-    if (opts.sd_path == null and opts.kernel_path == null) {
+    if (opts.headless and opts.sd_path == null and opts.kernel_path == null) {
         printUsage();
         return 1;
     }
@@ -213,9 +217,18 @@ fn loadGuestBoot(
     }
 }
 
+fn syncWindowPeripheralsToSoc(w: *const window.WaylandWindow, soc: *Bcm2835) void {
+    soc.setHdmiConnected(w.status.hdmi_connected);
+    soc.usb.hid.hub_connected = w.status.usb_hub_connected;
+    soc.usb.hid.keyboard_connected = w.status.usb_keyboard_connected;
+    soc.usb.hid.mouse_connected = w.status.usb_mouse_connected;
+    soc.usb.hid.ethernet_connected = w.status.ethernet_connected;
+}
+
 fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliOptions) !void {
     const ram = try gpa.alloc(u8, Bcm2835.RAM_SIZE);
     defer gpa.free(ram);
+    @memset(ram, 0);
 
     var sd_image_buf: ?[]u8 = null;
     defer if (sd_image_buf) |b| gpa.free(b);
@@ -223,17 +236,26 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         sd_image_buf = try readFileLinux(gpa, sd_path);
     }
 
-    var soc: Bcm2835 = undefined;
-    const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, sd_image_buf);
-
+    var soc = Bcm2835.init(ram, opts.width, opts.height);
     var cpu: Cpu = .{};
-    cpu.initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
+    var guest_booted = false;
+
+    const initial_power = opts.power or opts.headless;
+    const initial_sd = (sd_image_buf != null);
+
+    if (initial_power and (initial_sd or opts.kernel_path != null)) {
+        const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, if (initial_sd) sd_image_buf else null);
+        cpu.initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
+        guest_booted = true;
+    }
 
     var wl_win: ?*window.WaylandWindow = null;
     defer if (wl_win) |w| w.destroy();
 
     if (!opts.headless) {
         wl_win = try window.WaylandWindow.create(gpa, environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
+        wl_win.?.status.power_connected = opts.power;
+        wl_win.?.status.sd_connected = initial_sd;
         const disp_pixels = wl_win.?.displayPixels();
         @memset(disp_pixels, 0xFF101418);
         wl_win.?.compositeUi();
@@ -249,17 +271,57 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     while (true) {
         if (wl_win) |w| {
             if (w.closed) break;
-            if (w.power_reconnected) {
-                w.power_reconnected = false;
-                const reboot_res = try loadGuestBoot(gpa, opts, ram, &soc, sd_image_buf);
-                soc.setHdmiConnected(w.status.hdmi_connected);
-                cpu = .{};
-                cpu.initReset(reboot_res.entry_pc, reboot_res.r0, reboot_res.r1, reboot_res.r2);
-                last_guest_vblank_us = 0;
-                active_us_accum = 0;
-                idle_us_accum = 0;
+
+            if (w.sd_disconnected) {
+                w.sd_disconnected = false;
+                soc.sdhost.detach();
             }
+
+            if (w.sd_reconnected) {
+                w.sd_reconnected = false;
+                if (sd_image_buf) |img| {
+                    soc.sdhost.attachMutableSlice(img);
+                }
+            }
+
+            if (w.sd_image_chosen) {
+                w.sd_image_chosen = false;
+                if (readFileLinux(gpa, w.chosenSdPath())) |new_img| {
+                    if (sd_image_buf) |old| gpa.free(old);
+                    sd_image_buf = new_img;
+                    if (w.status.sd_connected) {
+                        soc.sdhost.attachMutableSlice(new_img);
+                    }
+                } else |err| {
+                    std.debug.print("fauxpi: failed to load SD image '{s}': {s}\n", .{ w.chosenSdPath(), @errorName(err) });
+                }
+            }
+
+            const has_boot_media = (w.status.sd_connected and sd_image_buf != null) or opts.kernel_path != null;
             if (!w.status.power_connected) {
+                guest_booted = false;
+            } else if (w.power_reconnected or (!guest_booted and has_boot_media)) {
+                w.power_reconnected = false;
+                const active_sd = if (w.status.sd_connected) sd_image_buf else null;
+                if (active_sd != null or opts.kernel_path != null) {
+                    if (loadGuestBoot(gpa, opts, ram, &soc, active_sd)) |reboot_res| {
+                        syncWindowPeripheralsToSoc(w, &soc);
+                        cpu = .{};
+                        cpu.initReset(reboot_res.entry_pc, reboot_res.r0, reboot_res.r1, reboot_res.r2);
+                        guest_booted = true;
+                        last_guest_vblank_us = 0;
+                        active_us_accum = 0;
+                        idle_us_accum = 0;
+                    } else |err| {
+                        std.debug.print("fauxpi: failed to boot SD image: {s}\n", .{@errorName(err)});
+                        guest_booted = false;
+                    }
+                } else {
+                    guest_booted = false;
+                }
+            }
+
+            if (!w.status.power_connected or !guest_booted) {
                 const now_ns = monotonicNs();
                 if (now_ns -| last_vblank_ns >= vblank_interval_ns) {
                     last_vblank_ns = now_ns;
@@ -269,6 +331,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     w.compositeUi();
                     try w.present();
                 } else {
+                    try w.pollEvents();
                     var req: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
                     _ = linux.nanosleep(&req, null);
                 }

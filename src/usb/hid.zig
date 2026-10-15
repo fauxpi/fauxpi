@@ -38,6 +38,12 @@ pub const UsbHidComposite = struct {
     cursor_seen: bool = false,
     idle_vblanks: u8 = 0,
 
+    // Peripheral connection states on the 3-port USB Hub with Ethernet
+    hub_connected: bool = true,
+    keyboard_connected: bool = true,
+    mouse_connected: bool = true,
+    ethernet_connected: bool = true,
+
     pub fn reset(self: *UsbHidComposite) void {
         self.address = 0;
         self.configured = false;
@@ -47,6 +53,7 @@ pub const UsbHidComposite = struct {
 
     /// Injects a Linux evdev key press/release (from Wayland wl_keyboard.key) into the USB HID keyboard queue.
     pub fn handleEvdevKey(self: *UsbHidComposite, evdev_key: u32, pressed: bool) void {
+        if (!self.hub_connected or !self.keyboard_connected) return;
         if (evdevToModifierBit(evdev_key)) |mod_bit| {
             if (pressed) {
                 self.kbd_state[0] |= mod_bit;
@@ -90,6 +97,7 @@ pub const UsbHidComposite = struct {
     }
 
     pub fn popKbdReport(self: *UsbHidComposite) ?[8]u8 {
+        if (!self.hub_connected or !self.keyboard_connected) return null;
         if (self.kbd_count == 0) return null;
         const r = self.kbd_queue[self.kbd_head];
         self.kbd_head +%= 1;
@@ -99,6 +107,7 @@ pub const UsbHidComposite = struct {
 
     /// Sets the desired HDMI display pixel coordinate `(x, y)` for the simulated cursor.
     pub fn setMouseTarget(self: *UsbHidComposite, x: i32, y: i32) void {
+        if (!self.hub_connected or !self.mouse_connected) return;
         self.target_x = x;
         self.target_y = y;
         self.has_target = true;
@@ -119,6 +128,7 @@ pub const UsbHidComposite = struct {
     }
 
     pub fn handleMouseMotion(self: *UsbHidComposite, dx: i8, dy: i8, wheel: i8) void {
+        if (!self.hub_connected or !self.mouse_connected) return;
         if (dx == 0 and dy == 0 and wheel == 0) return;
         self.enqueueMouseReport(.{
             self.mouse_buttons,
@@ -129,6 +139,7 @@ pub const UsbHidComposite = struct {
     }
 
     pub fn handleMouseButton(self: *UsbHidComposite, button_bit: u8, pressed: bool) void {
+        if (!self.hub_connected or !self.mouse_connected) return;
         if (pressed) {
             self.mouse_buttons |= button_bit;
         } else {
@@ -151,6 +162,7 @@ pub const UsbHidComposite = struct {
     }
 
     pub fn popMouseReport(self: *UsbHidComposite) ?[4]u8 {
+        if (!self.hub_connected or !self.mouse_connected) return null;
         if (self.has_target) {
             const dx_i32 = std.math.clamp(self.target_x - self.guest_x, -127, 127);
             const dy_i32 = std.math.clamp(self.target_y - self.guest_y, -127, 127);

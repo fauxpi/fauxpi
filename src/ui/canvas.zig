@@ -109,9 +109,11 @@ pub const Radii = struct {
 
 /// Material Icons codepoints in `MaterialIcons-Regular.ttf`.
 pub const Icon = enum(u21) {
+    bolt = 0xea0b,
     check = 0xe5ca,
     close = 0xe5cd,
     crop_square = 0xe3c6,
+    desktop_windows = 0xe30c,
     developer_board = 0xe30d,
     device_hub = 0xe335,
     expand_less = 0xe5ce,
@@ -120,9 +122,13 @@ pub const Icon = enum(u21) {
     headphones = 0xf01f,
     keyboard = 0xe312,
     lan = 0xeb2f,
+    monitor = 0xef5b,
     mouse = 0xe323,
+    power = 0xe63c,
+    power_settings_new = 0xe8ac,
     print = 0xe8ad,
     sports_esports = 0xea28,
+    tv = 0xe333,
     usb = 0xe1e0,
     videocam = 0xe04b,
     wifi = 0xe63e,
@@ -407,6 +413,9 @@ test "canvas shapes and icons draw anti-aliased pixels at 1x and 2x scale" {
 
     c.strokeCircle(.{ 75, 30 }, 12, 2, Theme.dark.on_surface);
     try testing.expectEqual(@as(u32, 0xff141218), pixels[30 * 100 + 75]);
+
+    try testing.expect(ic.glyphIndex(@intFromEnum(Icon.bolt)) != 0);
+    try testing.expect(ic.glyphIndex(@intFromEnum(Icon.monitor)) != 0);
 
     c.drawIcon(.developer_board, 10, 34, 20, Theme.dark.on_surface);
     var icon_lit: usize = 0;

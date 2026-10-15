@@ -6,6 +6,9 @@ const UsbHidComposite = @import("../usb/hid.zig").UsbHidComposite;
 const Gpio = @import("../soc/gpio.zig").Gpio;
 const board_sheet = @import("../ui/board_sheet.zig");
 
+extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
+extern "c" fn _exit(status: c_int) noreturn;
+
 /// Wayland XDG-Shell desktop window with client-side TitleBar (`44px` logical),
 /// drop-down Board & GPIO Status Sheet, HiDPI buffer scale support (`1x`, `2x`, ...),
 /// pixel-multiplied HDMI display output, and USB HID keyboard & mouse forwarding.
@@ -46,6 +49,16 @@ pub const WaylandWindow = struct {
     configured: bool = false,
     closed: bool = false,
     power_reconnected: bool = false,
+    sd_disconnected: bool = false,
+    sd_reconnected: bool = false,
+    sd_image_chosen: bool = false,
+    chosen_sd_path_buf: [std.fs.max_path_bytes]u8 = undefined,
+    chosen_sd_path_len: usize = 0,
+
+    picker_fd: linux.fd_t = -1,
+    picker_pid: linux.pid_t = -1,
+    picker_buf: [std.fs.max_path_bytes]u8 = undefined,
+    picker_len: usize = 0,
 
     last_mouse_x: ?f64 = null,
     last_mouse_y: ?f64 = null,
@@ -169,11 +182,103 @@ pub const WaylandWindow = struct {
     }
 
     pub fn destroy(self: *WaylandWindow) void {
+        if (self.picker_fd >= 0) {
+            _ = linux.close(self.picker_fd);
+            self.picker_fd = -1;
+        }
         self.ui.deinit();
         self.gpa.free(self.hdmi_fb);
         self.freeShmBuffers();
         self.display.disconnect();
         self.gpa.destroy(self);
+    }
+
+    pub fn chosenSdPath(self: *const WaylandWindow) []const u8 {
+        return self.chosen_sd_path_buf[0..self.chosen_sd_path_len];
+    }
+
+    fn openSdImagePicker(self: *WaylandWindow) void {
+        if (self.picker_fd >= 0) return;
+
+        var fds: [2]linux.fd_t = undefined;
+        if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })) != .SUCCESS) {
+            return;
+        }
+
+        const fork_rc = linux.fork();
+        if (linux.errno(fork_rc) != .SUCCESS) {
+            _ = linux.close(fds[0]);
+            _ = linux.close(fds[1]);
+            return;
+        }
+
+        if (fork_rc == 0) {
+            // Child process: redirect stdout to pipe and exec native file chooser
+            _ = linux.dup2(fds[1], linux.STDOUT_FILENO);
+            _ = linux.close(fds[0]);
+            _ = linux.close(fds[1]);
+
+            const zenity_argv = [_:null]?[*:0]const u8{
+                "zenity",
+                "--file-selection",
+                "--title=Select SD Card Image",
+                "--file-filter=Disk Images (*.img, *.iso, *.bin, *.raw) | *.img *.iso *.bin *.raw",
+                "--file-filter=All files | *",
+            };
+            _ = execvp("zenity", &zenity_argv);
+
+            const kdialog_argv = [_:null]?[*:0]const u8{
+                "kdialog",
+                "--title",
+                "Select SD Card Image",
+                "--getopenfilename",
+                ".",
+                "*.img *.iso *.bin *.raw|Disk Images (*.img, *.iso, *.bin, *.raw)\n*|All Files",
+            };
+            _ = execvp("kdialog", &kdialog_argv);
+
+            _exit(127);
+        }
+
+        _ = linux.close(fds[1]);
+        self.picker_fd = fds[0];
+        self.picker_pid = @intCast(fork_rc);
+        self.picker_len = 0;
+    }
+
+    fn pollSdImagePicker(self: *WaylandWindow) void {
+        if (self.picker_fd < 0) return;
+
+        while (self.picker_len < self.picker_buf.len) {
+            const rc = linux.read(
+                self.picker_fd,
+                self.picker_buf[self.picker_len..].ptr,
+                self.picker_buf.len - self.picker_len,
+            );
+            const err = linux.errno(rc);
+            if (err == .AGAIN) return;
+            if (err != .SUCCESS) break;
+            if (rc == 0) {
+                // EOF: dialog closed
+                var wstatus: u32 = 0;
+                if (self.picker_pid > 0) {
+                    _ = linux.waitpid(self.picker_pid, &wstatus, 0);
+                }
+                _ = linux.close(self.picker_fd);
+                self.picker_fd = -1;
+                self.picker_pid = -1;
+
+                const trimmed = std.mem.trim(u8, self.picker_buf[0..self.picker_len], " \t\r\n");
+                if (trimmed.len > 0 and trimmed.len <= self.chosen_sd_path_buf.len) {
+                    @memcpy(self.chosen_sd_path_buf[0..trimmed.len], trimmed);
+                    self.chosen_sd_path_len = trimmed.len;
+                    self.sd_image_chosen = true;
+                }
+                self.picker_len = 0;
+                return;
+            }
+            self.picker_len += rc;
+        }
     }
 
     fn freeShmBuffers(self: *WaylandWindow) void {
@@ -320,10 +425,12 @@ pub const WaylandWindow = struct {
             m.end();
         }
         try self.display.pollAndDispatch();
+        self.pollSdImagePicker();
     }
 
     pub fn pollEvents(self: *WaylandWindow) !void {
         try self.display.pollAndDispatch();
+        self.pollSdImagePicker();
     }
 
     fn startMove(self: *WaylandWindow) void {
@@ -502,6 +609,39 @@ pub const WaylandWindow = struct {
                             }
                             return;
                         },
+                        .toggle_sd => {
+                            self.status.sd_connected = !self.status.sd_connected;
+                            if (self.status.sd_connected) {
+                                self.sd_reconnected = true;
+                            } else {
+                                self.sd_disconnected = true;
+                            }
+                            return;
+                        },
+                        .select_sd_image => {
+                            self.openSdImagePicker();
+                            return;
+                        },
+                        .toggle_usb_hub => {
+                            self.status.usb_hub_connected = !self.status.usb_hub_connected;
+                            hid.hub_connected = self.status.usb_hub_connected;
+                            return;
+                        },
+                        .toggle_usb_keyboard => {
+                            self.status.usb_keyboard_connected = !self.status.usb_keyboard_connected;
+                            hid.keyboard_connected = self.status.usb_keyboard_connected;
+                            return;
+                        },
+                        .toggle_usb_mouse => {
+                            self.status.usb_mouse_connected = !self.status.usb_mouse_connected;
+                            hid.mouse_connected = self.status.usb_mouse_connected;
+                            return;
+                        },
+                        .toggle_ethernet => {
+                            self.status.ethernet_connected = !self.status.ethernet_connected;
+                            hid.ethernet_connected = self.status.ethernet_connected;
+                            return;
+                        },
                         .close => {
                             self.closed = true;
                             return;
@@ -558,13 +698,9 @@ pub const WaylandWindow = struct {
                 const state = r.uint() catch return;
                 const pressed = (state == protocol.wl_keyboard.key_state.pressed);
                 if (self.ui.sheet_open) {
-                    // Escape (evdev key 1) closes the mode menu or the board sheet
+                    // Escape (evdev key 1) closes the board sheet
                     if (key == 1 and pressed) {
-                        if (self.ui.mode_menu_open) {
-                            self.ui.mode_menu_open = false;
-                        } else {
-                            self.ui.sheet_open = false;
-                        }
+                        self.ui.sheet_open = false;
                     }
                     return;
                 }

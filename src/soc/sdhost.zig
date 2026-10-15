@@ -80,6 +80,15 @@ pub const SdHost = struct {
         self.image_size = size;
     }
 
+    pub fn detach(self: *SdHost) void {
+        self.image_data = null;
+        self.image_const = null;
+        self.image_fd = null;
+        self.transfer_mode = .none;
+        self.data_remaining = 0;
+        self.sector_cache_lba = std.math.maxInt(u64);
+    }
+
     pub fn dreqReady(self: *const SdHost) bool {
         return self.transfer_mode != .none and self.data_remaining > 0;
     }
