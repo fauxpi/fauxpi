@@ -126,6 +126,9 @@ pub const WaylandWindow = struct {
             .gpio = gpio,
             .ui = ui,
             .status = .{
+                .serial_u64 = ui.parsedSerial(),
+                .mac_address = ui.parsedMac(),
+                .wifi_mac_address = ui.parsedWifiMac(),
                 .hdmi_width = @intCast(display_width),
                 .hdmi_height = @intCast(display_height),
             },
@@ -586,6 +589,9 @@ pub const WaylandWindow = struct {
     pub fn setBoardModel(self: *WaylandWindow, bm: board_sheet.BoardModel) void {
         self.status.board_model = bm;
         self.status.model = bm.dtModel();
+        self.status.serial_u64 = self.ui.parsedSerial();
+        self.status.mac_address = self.ui.parsedMac();
+        self.status.wifi_mac_address = self.ui.parsedWifiMac();
         self.ui.title = bm.windowTitle();
         if (!bm.usesExternalUsbHub()) {
             self.status.usb_hub_connected = true;

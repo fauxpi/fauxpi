@@ -275,11 +275,8 @@ pub const BoardUi = struct {
     hovered_board_menu_idx: ?usize = null,
     selected_board_model: BoardModel = .pi_zero,
     serial_field_hovered: bool = false,
-    serial_rand_hovered: bool = false,
     mac_field_hovered: bool = false,
-    mac_rand_hovered: bool = false,
     wifi_mac_field_hovered: bool = false,
-    wifi_mac_rand_hovered: bool = false,
     dhcp_toggle_hovered: bool = false,
     focused_field: FocusedSettingField = .none,
 
@@ -300,11 +297,8 @@ pub const BoardUi = struct {
     board_menu_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     board_menu_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     serial_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    serial_rand_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     mac_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    mac_rand_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     wifi_mac_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    wifi_mac_rand_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     dhcp_toggle_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
 
     /// Cached rasterized pixel buffers for TitleBar and Board diagram.
@@ -316,12 +310,14 @@ pub const BoardUi = struct {
     pub fn init(gpa: std.mem.Allocator) !BoardUi {
         const font = try Font.init(canvas_mod.fira_ttf);
         const icon_font = try Font.init(canvas_mod.icons_ttf);
-        return .{
+        var ui: BoardUi = .{
             .gpa = gpa,
             .font = font,
             .icon_font = icon_font,
             .cache = GlyphCache.init(gpa),
         };
+        ui.randomizeIdentity();
+        return ui;
     }
 
     pub fn deinit(self: *BoardUi) void {
@@ -563,6 +559,12 @@ pub const BoardUi = struct {
         self.wifi_mac_len = 12;
     }
 
+    pub fn randomizeIdentity(self: *BoardUi) void {
+        self.randomizeSerial();
+        self.randomizeMac();
+        self.randomizeWifiMac();
+    }
+
     /// Handles an evdev key press when a Settings text field (`serial`, `mac`, or `wifi_mac`) is focused.
     /// Returns true if the key was consumed by the Settings editor.
     pub fn handleKey(self: *BoardUi, evdev_key: u32) bool {
@@ -686,36 +688,30 @@ pub const BoardUi = struct {
         };
 
         const right_x = panel_x + panel_w - 16.0;
-        const rand_w: f32 = 76.0;
-        const field_w: f32 = 186.0;
+        const ctrl_w: f32 = 228.0;
         const ctrl_h: f32 = 32.0;
-        const menu_w: f32 = field_w + 8.0 + rand_w;
 
         const row0_y = panel_y + 44.0;
-        self.board_menu_btn_rect = .{ .x = right_x - menu_w, .y = row0_y, .w = menu_w, .h = ctrl_h };
+        self.board_menu_btn_rect = .{ .x = right_x - ctrl_w, .y = row0_y, .w = ctrl_w, .h = ctrl_h };
         const menu_item_h: f32 = 32.0;
         const menu_h: f32 = @as(f32, @floatFromInt(BoardModel.all.len)) * menu_item_h + 8.0;
         self.board_menu_rect = .{
             .x = self.board_menu_btn_rect.x,
             .y = row0_y + ctrl_h + 4.0,
-            .w = menu_w,
+            .w = ctrl_w,
             .h = menu_h,
         };
 
         const row1_y = panel_y + 94.0;
-        self.serial_rand_rect = .{ .x = right_x - rand_w, .y = row1_y, .w = rand_w, .h = ctrl_h };
-        self.serial_field_rect = .{ .x = right_x - rand_w - 8.0 - field_w, .y = row1_y, .w = field_w, .h = ctrl_h };
+        self.serial_field_rect = .{ .x = right_x - ctrl_w, .y = row1_y, .w = ctrl_w, .h = ctrl_h };
 
         const row2_y = panel_y + 144.0;
-        self.mac_rand_rect = .{ .x = right_x - rand_w, .y = row2_y, .w = rand_w, .h = ctrl_h };
-        self.mac_field_rect = .{ .x = right_x - rand_w - 8.0 - field_w, .y = row2_y, .w = field_w, .h = ctrl_h };
+        self.mac_field_rect = .{ .x = right_x - ctrl_w, .y = row2_y, .w = ctrl_w, .h = ctrl_h };
 
         if (has_wifi) {
             const row_wifi_y = panel_y + 194.0;
-            self.wifi_mac_rand_rect = .{ .x = right_x - rand_w, .y = row_wifi_y, .w = rand_w, .h = ctrl_h };
-            self.wifi_mac_field_rect = .{ .x = right_x - rand_w - 8.0 - field_w, .y = row_wifi_y, .w = field_w, .h = ctrl_h };
+            self.wifi_mac_field_rect = .{ .x = right_x - ctrl_w, .y = row_wifi_y, .w = ctrl_w, .h = ctrl_h };
         } else {
-            self.wifi_mac_rand_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
             self.wifi_mac_field_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         }
 
@@ -752,11 +748,8 @@ pub const BoardUi = struct {
             self.board_menu_btn_hovered = false;
             self.hovered_board_menu_idx = null;
             self.serial_field_hovered = false;
-            self.serial_rand_hovered = false;
             self.mac_field_hovered = false;
-            self.mac_rand_hovered = false;
             self.wifi_mac_field_hovered = false;
-            self.wifi_mac_rand_hovered = false;
             self.dhcp_toggle_hovered = false;
             return y < @as(f32, @floatFromInt(title_bar_height));
         }
@@ -778,21 +771,15 @@ pub const BoardUi = struct {
             const over_open_menu = self.board_menu_open and self.board_menu_rect.contains(pt);
             self.board_menu_btn_hovered = boot_editable and self.board_menu_btn_rect.contains(pt);
             self.serial_field_hovered = boot_editable and !over_open_menu and self.serial_field_rect.contains(pt);
-            self.serial_rand_hovered = boot_editable and !over_open_menu and self.serial_rand_rect.contains(pt);
             self.mac_field_hovered = boot_editable and !over_open_menu and self.mac_field_rect.contains(pt);
-            self.mac_rand_hovered = boot_editable and !over_open_menu and self.mac_rand_rect.contains(pt);
             self.wifi_mac_field_hovered = boot_editable and !over_open_menu and self.wifi_mac_field_rect.contains(pt);
-            self.wifi_mac_rand_hovered = boot_editable and !over_open_menu and self.wifi_mac_rand_rect.contains(pt);
             self.dhcp_toggle_hovered = !over_open_menu and self.dhcp_toggle_rect.contains(pt);
         } else {
             self.board_menu_btn_hovered = false;
             self.hovered_board_menu_idx = null;
             self.serial_field_hovered = false;
-            self.serial_rand_hovered = false;
             self.mac_field_hovered = false;
-            self.mac_rand_hovered = false;
             self.wifi_mac_field_hovered = false;
-            self.wifi_mac_rand_hovered = false;
             self.dhcp_toggle_hovered = false;
         }
 
@@ -819,11 +806,8 @@ pub const BoardUi = struct {
         self.board_menu_btn_hovered = false;
         self.hovered_board_menu_idx = null;
         self.serial_field_hovered = false;
-        self.serial_rand_hovered = false;
         self.mac_field_hovered = false;
-        self.mac_rand_hovered = false;
         self.wifi_mac_field_hovered = false;
-        self.wifi_mac_rand_hovered = false;
         self.dhcp_toggle_hovered = false;
         self.hovered_target = null;
     }
@@ -913,7 +897,11 @@ pub const BoardUi = struct {
                         if (rel_y >= 0.0) {
                             const idx: usize = @intFromFloat(@floor(rel_y / 32.0));
                             if (idx < BoardModel.all.len) {
-                                self.selected_board_model = BoardModel.all[idx];
+                                const chosen = BoardModel.all[idx];
+                                self.selected_board_model = chosen;
+                                if (chosen != BoardModel.fromModel(status.model)) {
+                                    self.randomizeIdentity();
+                                }
                                 return .select_board;
                             }
                         }
@@ -948,18 +936,6 @@ pub const BoardUi = struct {
                             return .consumed;
                         }
                         self.focused_field = .none;
-                        if (self.serial_rand_rect.contains(pt)) {
-                            self.randomizeSerial();
-                            return .consumed;
-                        }
-                        if (self.mac_rand_rect.contains(pt)) {
-                            self.randomizeMac();
-                            return .consumed;
-                        }
-                        if (self.wifi_mac_rand_rect.contains(pt)) {
-                            self.randomizeWifiMac();
-                            return .consumed;
-                        }
                     } else {
                         self.focused_field = .none;
                     }
@@ -1385,17 +1361,17 @@ pub const BoardUi = struct {
         else
             serial_slice;
         self.paintTextField(c, self.serial_field_rect, serial_disp, !boot_disabled and self.focused_field == .serial, self.serial_field_hovered, boot_disabled);
-        self.paintSmallButton(c, self.serial_rand_rect, "Random", self.serial_rand_hovered, boot_disabled);
 
-        // Row 2: USB Ethernet MAC Address
+        // Row 2: Ethernet MAC Address ("USB Ethernet MAC" on Zero/A+ models, "Ethernet MAC" on B models)
         const row2_y = self.mac_field_rect.y;
-        _ = c.drawText(14.0, pr.x + 16.0, row2_y + 15.0, "USB Ethernet MAC", row_title_col);
-        _ = c.drawText(11.5, pr.x + 16.0, row2_y + 30.0, "External Ethernet hardware address", row_sub_col);
+        const eth_title = if (cur_board.usesExternalUsbHub()) "USB Ethernet MAC" else "Ethernet MAC";
+        const eth_sub = if (cur_board.usesExternalUsbHub()) "External Ethernet hardware address" else "On-board Ethernet hardware address";
+        _ = c.drawText(14.0, pr.x + 16.0, row2_y + 15.0, eth_title, row_title_col);
+        _ = c.drawText(11.5, pr.x + 16.0, row2_y + 30.0, eth_sub, row_sub_col);
 
         var mac_disp_buf: [20]u8 = undefined;
         const mac_disp = formatMacDisplay(&mac_disp_buf, self.mac_hex[0..self.mac_len], !boot_disabled and self.focused_field == .mac);
         self.paintTextField(c, self.mac_field_rect, mac_disp, !boot_disabled and self.focused_field == .mac, self.mac_field_hovered, boot_disabled);
-        self.paintSmallButton(c, self.mac_rand_rect, "Random", self.mac_rand_hovered, boot_disabled);
 
         // Row 2b (optional): Wireless MAC Address (only shown when a board with wireless is selected)
         if (cur_board.hasWireless()) {
@@ -1406,7 +1382,6 @@ pub const BoardUi = struct {
             var wifi_disp_buf: [20]u8 = undefined;
             const wifi_disp = formatMacDisplay(&wifi_disp_buf, self.wifi_mac_hex[0..self.wifi_mac_len], !boot_disabled and self.focused_field == .wifi_mac);
             self.paintTextField(c, self.wifi_mac_field_rect, wifi_disp, !boot_disabled and self.focused_field == .wifi_mac, self.wifi_mac_field_hovered, boot_disabled);
-            self.paintSmallButton(c, self.wifi_mac_rand_rect, "Random", self.wifi_mac_rand_hovered, boot_disabled);
         }
 
         // Row 3: DHCP Server Toggle
@@ -1527,33 +1502,6 @@ pub const BoardUi = struct {
             @round(r.y + (r.h - st.lineHeight()) * 0.5 + st.ascent()),
             text,
             if (disabled) t.on_surface.withAlpha(0.42) else t.on_surface,
-        );
-    }
-
-    fn paintSmallButton(self: *const BoardUi, c: *Canvas, r: Rect, label: []const u8, hovered: bool, disabled: bool) void {
-        const t = &self.theme;
-        const bg = if (disabled)
-            t.surface_container_highest.withAlpha(0.4)
-        else if (hovered)
-            t.secondary_container
-        else
-            t.surface_container_highest;
-        const border = if (disabled)
-            t.outline_variant.withAlpha(0.4)
-        else if (hovered)
-            t.primary
-        else
-            t.outline_variant;
-        c.fillRoundedRect(r, .all(6.0), bg);
-        c.strokeRoundedRect(r, .all(6.0), 1.0, border);
-        const st: canvas_mod.Style = .{ .font = &self.font, .size = 12.5 };
-        const tw = c.measureText(12.5, label);
-        _ = c.drawText(
-            12.5,
-            @round(r.x + (r.w - tw) * 0.5),
-            @round(r.y + (r.h - st.lineHeight()) * 0.5 + st.ascent()),
-            label,
-            if (disabled) t.on_surface.withAlpha(0.38) else if (hovered) t.primary else t.on_surface,
         );
     }
 
