@@ -94,6 +94,33 @@ pub const BoardUi = struct {
     pub const title_bar_height: u32 = 44;
     pub const bar_btn_size: f32 = 34;
 
+    pub const TitleCacheKey = struct {
+        win_w: u32 = 0,
+        scale: u32 = 0,
+        maximized: bool = false,
+        sheet_open: bool = false,
+        board_btn_hovered: bool = false,
+        board_btn_pressed: bool = false,
+        max_btn_hovered: bool = false,
+        max_btn_pressed: bool = false,
+        close_btn_hovered: bool = false,
+        close_btn_pressed: bool = false,
+    };
+
+    pub const BoardCacheKey = struct {
+        w_px: u32 = 0,
+        h_px: u32 = 0,
+        scale: u32 = 0,
+        hovered_target: ?InteractiveTarget = null,
+        sd_connected: bool = false,
+        hdmi_connected: bool = false,
+        power_connected: bool = false,
+        usb_hub_connected: bool = false,
+        usb_keyboard_connected: bool = false,
+        usb_mouse_connected: bool = false,
+        ethernet_connected: bool = false,
+    };
+
     gpa: std.mem.Allocator,
     font: Font,
     icon_font: Font,
@@ -121,6 +148,12 @@ pub const BoardUi = struct {
     sheet_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     board_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
 
+    /// Cached rasterized pixel buffers for TitleBar and Board diagram.
+    title_cache: []u32 = &.{},
+    title_cache_key: TitleCacheKey = .{},
+    board_cache: []u32 = &.{},
+    board_cache_key: BoardCacheKey = .{},
+
     pub fn init(gpa: std.mem.Allocator) !BoardUi {
         const font = try Font.init(canvas_mod.fira_ttf);
         const icon_font = try Font.init(canvas_mod.icons_ttf);
@@ -133,6 +166,8 @@ pub const BoardUi = struct {
     }
 
     pub fn deinit(self: *BoardUi) void {
+        if (self.title_cache.len > 0) self.gpa.free(self.title_cache);
+        if (self.board_cache.len > 0) self.gpa.free(self.board_cache);
         self.cache.deinit();
     }
 
@@ -525,11 +560,35 @@ pub const BoardUi = struct {
     }
 
     fn paintTitleBar(self: *BoardUi, c: *Canvas, win_w: u32) void {
+        const sc: u32 = @intFromFloat(@max(c.scale, 1.0));
+        const bar_px_w = win_w * sc;
+        const bar_px_h = title_bar_height * sc;
+        const total_px = @as(usize, bar_px_w) * @as(usize, bar_px_h);
+        if (total_px == 0 or c.pixels.len < total_px) return;
+
+        const key: TitleCacheKey = .{
+            .win_w = win_w,
+            .scale = sc,
+            .maximized = self.maximized,
+            .sheet_open = self.sheet_open,
+            .board_btn_hovered = self.board_btn_hovered,
+            .board_btn_pressed = self.board_btn_pressed,
+            .max_btn_hovered = self.max_btn_hovered,
+            .max_btn_pressed = self.max_btn_pressed,
+            .close_btn_hovered = self.close_btn_hovered,
+            .close_btn_pressed = self.close_btn_pressed,
+        };
+
+        if (self.title_cache.len == total_px and std.meta.eql(self.title_cache_key, key)) {
+            @memcpy(c.pixels[0..total_px], self.title_cache);
+            return;
+        }
+
         const t = &self.theme;
         const w_f: f32 = @floatFromInt(win_w);
         const h_f: f32 = @floatFromInt(title_bar_height);
 
-        c.fillRect(.{ .x = 0, .y = 0, .w = w_f, .h = h_f }, t.surface_container);
+        @memset(c.pixels[0..total_px], t.surface_container.toArgb());
 
         // Centered window title (22px, as in dazzle/src/ui/title_bar.zig)
         const title_w = c.measureText(22.0, self.title);
@@ -568,6 +627,15 @@ pub const BoardUi = struct {
             self.close_btn_pressed,
             false,
         );
+
+        if (self.title_cache.len != total_px) {
+            if (self.title_cache.len > 0) self.gpa.free(self.title_cache);
+            self.title_cache = self.gpa.alloc(u32, total_px) catch &.{};
+        }
+        if (self.title_cache.len == total_px) {
+            @memcpy(self.title_cache, c.pixels[0..total_px]);
+            self.title_cache_key = key;
+        }
     }
 
     fn paintBarButton(
@@ -591,28 +659,114 @@ pub const BoardUi = struct {
         c.drawIcon(icon, @round(r.x + (r.w - s) * 0.5), @round(r.y + (r.h - s) * 0.5), s, icon_color);
     }
 
+    inline fn dimSpanSwar(span: []u32) void {
+        for (span) |*dst| {
+            const px = dst.*;
+            const rb = (((px & 0x00FF00FF) * 115) >> 8) & 0x00FF00FF;
+            const g = (((px & 0x0000FF00) * 115) >> 8) & 0x0000FF00;
+            dst.* = 0xFF000000 | rb | g;
+        }
+    }
+
     fn paintSheet(
         self: *BoardUi,
         c: *Canvas,
-        win_w: u32,
+        _: u32,
         win_h: u32,
         status: SystemStatus,
     ) void {
         const t = &self.theme;
-        const w_f: f32 = @floatFromInt(win_w);
+        const sc_f = @max(c.scale, 1.0);
+        const sc: u32 = @intFromFloat(sc_f);
         const h_f: f32 = @floatFromInt(win_h);
         const top_y: f32 = @floatFromInt(title_bar_height);
 
-        // Dim the HDMI display behind the drop-down sheet
+        const sr = self.sheet_rect;
+        // Dim the HDMI display behind the drop-down sheet using SWAR (skipping the opaque upper body of sheet_rect)
         if (h_f > top_y) {
-            c.fillRect(.{ .x = 0, .y = top_y, .w = w_f, .h = h_f - top_y }, Color.rgb(0x000000).withAlpha(0.55));
+            const py_start: u32 = title_bar_height * sc;
+            const py_end: u32 = @min(c.height, win_h * sc);
+            const sr_x0: u32 = @intFromFloat(@max(0.0, @ceil((sr.x + 2.0) * sc_f)));
+            const sr_x1: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(c.width)), @floor((sr.x + sr.w - 2.0) * sc_f)));
+            const sr_opaque_y1: u32 = @intFromFloat(@max(@as(f32, @floatFromInt(py_start)), @floor((sr.y + sr.h - 17.0) * sc_f)));
+
+            for (py_start..py_end) |py| {
+                const row = c.pixels[py * c.stride ..][0..c.width];
+                if (py < sr_opaque_y1 and sr_x0 < sr_x1) {
+                    dimSpanSwar(row[0..sr_x0]);
+                    dimSpanSwar(row[sr_x1..c.width]);
+                } else {
+                    dimSpanSwar(row);
+                }
+            }
         }
 
         // Drop-down sheet container (anchored to the bottom of the TitleBar)
-        const sr = self.sheet_rect;
         const sheet_radii: Radii = .{ .tl = 0, .tr = 0, .br = 16, .bl = 16 };
         c.fillRoundedRect(sr, sheet_radii, t.surface);
         c.strokeRoundedRect(sr, sheet_radii, 1.0, t.outline_variant);
+
+        // Cache the interior board diagram region (padded by 16px inside sheet_rect)
+        const pad_in: f32 = 16.0;
+        const cache_box_x = @max(@round(sr.x + 8.0), @round(self.board_rect.x - pad_in));
+        const cache_box_y = @max(@round(sr.y + 4.0), @round(self.board_rect.y - pad_in));
+        const cache_box_x1 = @min(@round(sr.x + sr.w - 8.0), @round(self.board_rect.x + self.board_rect.w + pad_in));
+        const cache_box_y1 = @min(@round(sr.y + sr.h - 16.0), @round(self.board_rect.y + self.board_rect.h + pad_in));
+
+        if (cache_box_x1 > cache_box_x and cache_box_y1 > cache_box_y) {
+            const box_x_px: u32 = @intFromFloat(cache_box_x * sc_f);
+            const box_y_px: u32 = @intFromFloat(cache_box_y * sc_f);
+            const box_w_px: u32 = @intFromFloat((cache_box_x1 - cache_box_x) * sc_f);
+            const box_h_px: u32 = @intFromFloat((cache_box_y1 - cache_box_y) * sc_f);
+            const total_board_px = @as(usize, box_w_px) * @as(usize, box_h_px);
+
+            const bkey: BoardCacheKey = .{
+                .w_px = box_w_px,
+                .h_px = box_h_px,
+                .scale = sc,
+                .hovered_target = self.hovered_target,
+                .sd_connected = status.sd_connected,
+                .hdmi_connected = status.hdmi_connected,
+                .power_connected = status.power_connected,
+                .usb_hub_connected = status.usb_hub_connected,
+                .usb_keyboard_connected = status.usb_keyboard_connected,
+                .usb_mouse_connected = status.usb_mouse_connected,
+                .ethernet_connected = status.ethernet_connected,
+            };
+
+            if (self.board_cache.len != total_board_px or !std.meta.eql(self.board_cache_key, bkey)) {
+                if (self.board_cache.len != total_board_px) {
+                    if (self.board_cache.len > 0) self.gpa.free(self.board_cache);
+                    self.board_cache = self.gpa.alloc(u32, total_board_px) catch &.{};
+                }
+                if (self.board_cache.len == total_board_px) {
+                    @memset(self.board_cache, t.surface.toArgb());
+                    var sub_c: Canvas = .{
+                        .pixels = self.board_cache,
+                        .width = box_w_px,
+                        .height = box_h_px,
+                        .stride = box_w_px,
+                        .scale = sc_f,
+                        .origin = .{ -cache_box_x, -cache_box_y },
+                        .font = &self.font,
+                        .icon_font = &self.icon_font,
+                        .cache = &self.cache,
+                    };
+                    const drawing = board.forModel(status.model) orelse &board.pi_zero;
+                    self.paintBoardDrawing(&sub_c, drawing, self.board_rect, status);
+                    self.board_cache_key = bkey;
+                }
+            }
+
+            if (self.board_cache.len == total_board_px and box_x_px + box_w_px <= c.width and box_y_px + box_h_px <= c.height) {
+                for (0..box_h_px) |ry| {
+                    const dst_row = c.pixels[(box_y_px + ry) * c.stride + box_x_px ..][0..box_w_px];
+                    const src_row = self.board_cache[ry * box_w_px ..][0..box_w_px];
+                    @memcpy(dst_row, src_row);
+                }
+                return;
+            }
+        }
 
         const drawing = board.forModel(status.model) orelse &board.pi_zero;
         self.paintBoardDrawing(c, drawing, self.board_rect, status);

@@ -382,20 +382,34 @@ pub const WaylandWindow = struct {
         const dw: usize = self.display_width;
         const dh: usize = self.display_height;
 
-        if (sc == 1) {
-            const dst = full[top_phys_rows * buf_w ..][0 .. dw * dh];
-            @memcpy(dst, self.hdmi_fb[0 .. dw * dh]);
-        } else {
-            for (0..dh) |sy| {
-                const src_row = self.hdmi_fb[sy * dw ..][0..dw];
-                const dst_y0 = top_phys_rows + sy * sc;
-                const first_dst_row = full[dst_y0 * buf_w ..][0 .. dw * sc];
-                for (src_row, 0..) |px, sx| {
-                    @memset(first_dst_row[sx * sc ..][0..sc], px);
-                }
-                for (1..sc) |ry| {
-                    const dup_dst_row = full[(dst_y0 + ry) * buf_w ..][0 .. dw * sc];
+        if (self.status.hdmi_connected and self.status.hdmi_active) {
+            if (sc == 1) {
+                const dst = full[top_phys_rows * buf_w ..][0 .. dw * dh];
+                @memcpy(dst, self.hdmi_fb[0 .. dw * dh]);
+            } else if (sc == 2) {
+                for (0..dh) |sy| {
+                    const src_row = self.hdmi_fb[sy * dw ..][0..dw];
+                    const dst_y0 = top_phys_rows + sy * 2;
+                    const first_dst_row = full[dst_y0 * buf_w ..][0 .. dw * 2];
+                    const dst_u64: [*]align(4) u64 = @ptrCast(first_dst_row.ptr);
+                    for (src_row, 0..) |px, sx| {
+                        dst_u64[sx] = (@as(u64, px) << 32) | px;
+                    }
+                    const dup_dst_row = full[(dst_y0 + 1) * buf_w ..][0 .. dw * 2];
                     @memcpy(dup_dst_row, first_dst_row);
+                }
+            } else {
+                for (0..dh) |sy| {
+                    const src_row = self.hdmi_fb[sy * dw ..][0..dw];
+                    const dst_y0 = top_phys_rows + sy * sc;
+                    const first_dst_row = full[dst_y0 * buf_w ..][0 .. dw * sc];
+                    for (src_row, 0..) |px, sx| {
+                        @memset(first_dst_row[sx * sc ..][0..sc], px);
+                    }
+                    for (1..sc) |ry| {
+                        const dup_dst_row = full[(dst_y0 + ry) * buf_w ..][0 .. dw * sc];
+                        @memcpy(dup_dst_row, first_dst_row);
+                    }
                 }
             }
         }

@@ -156,11 +156,9 @@ pub const Hvs = struct {
         }
         const ch = active_ch orelse return false;
 
-        const bkgnd = (self.chan_bkgnd[ch] & 0x00FFFFFF) | 0xFF000000;
-        @memset(out_argb[0 .. width * height], bkgnd);
-
         var idx: usize = self.displact[ch] & 0x3ff;
         var planes_drawn: usize = 0;
+        var bkgnd_cleared = false;
 
         while (idx + 7 <= DLIST_WORDS and planes_drawn < 32) {
             const ctl0 = self.dlist[idx];
@@ -169,12 +167,55 @@ pub const Hvs = struct {
             if (entry_words < 7 or idx + entry_words > DLIST_WORDS) break;
 
             if ((ctl0 & SCALER_CTL0_VALID) != 0) {
+                if (!bkgnd_cleared) {
+                    if (!self.planeCoversScreenOpaquely(idx, width, height)) {
+                        const bkgnd = (self.chan_bkgnd[ch] & 0x00FFFFFF) | 0xFF000000;
+                        @memset(out_argb[0 .. width * height], bkgnd);
+                    }
+                    bkgnd_cleared = true;
+                }
                 self.compositePlane(ram, out_argb, width, height, idx);
                 planes_drawn += 1;
             }
             idx += entry_words;
         }
         return planes_drawn > 0;
+    }
+
+    fn planeCoversScreenOpaquely(self: *const Hvs, idx: usize, out_w: u32, out_h: u32) bool {
+        const ctl0 = self.dlist[idx];
+        const pix_fmt: u4 = @truncate(ctl0 & 0x0f);
+        const unity = (ctl0 & SCALER_CTL0_UNITY) != 0;
+        const pos0 = self.dlist[idx + 1];
+        const dst_x: u32 = pos0 & 0xfff;
+        const dst_y: u32 = (pos0 >> 12) & 0xfff;
+        if (dst_x != 0 or dst_y != 0) return false;
+
+        const pos2_idx = if (unity) idx + 2 else idx + 3;
+        if (pos2_idx >= DLIST_WORDS) return false;
+        const pos2 = self.dlist[pos2_idx];
+        const src_w: u32 = pos2 & 0xfff;
+        const raw_h16: u32 = (pos2 >> 16) & 0xfff;
+        const src_h: u32 = if (raw_h16 != 0) raw_h16 else ((pos2 >> 12) & 0xfff);
+        const alpha_mode: u2 = @truncate((pos2 >> 30) & 3);
+        const dst_w: u32 = if (unity) src_w else (self.dlist[idx + 2] & 0xfff);
+        const dst_h: u32 = if (unity) src_h else ((self.dlist[idx + 2] >> 16) & 0xfff);
+        return dst_w >= out_w and dst_h >= out_h and (alpha_mode == 1 or pix_fmt == 0);
+    }
+
+    inline fn blendPixel(dst_c: u32, src_color: u32, a: u32, premult: bool) u32 {
+        const inv_a = 255 - a;
+        if (premult) {
+            const r: u32 = @min(((src_color >> 16) & 0xff) + (((dst_c >> 16) & 0xff) * inv_a) / 255, @as(u32, 255));
+            const g: u32 = @min(((src_color >> 8) & 0xff) + (((dst_c >> 8) & 0xff) * inv_a) / 255, @as(u32, 255));
+            const b: u32 = @min((src_color & 0xff) + ((dst_c & 0xff) * inv_a) / 255, @as(u32, 255));
+            return 0xFF000000 | (r << 16) | (g << 8) | b;
+        } else {
+            const r = (((src_color >> 16) & 0xff) * a + ((dst_c >> 16) & 0xff) * inv_a) / 255;
+            const g = (((src_color >> 8) & 0xff) * a + ((dst_c >> 8) & 0xff) * inv_a) / 255;
+            const b = ((src_color & 0xff) * a + (dst_c & 0xff) * inv_a) / 255;
+            return 0xFF000000 | (r << 16) | (g << 8) | b;
+        }
     }
 
     fn compositePlane(
@@ -225,6 +266,69 @@ pub const Hvs = struct {
         const max_dx = @min(dst_x + dst_w, out_w);
         if (dst_x >= max_dx or dst_y >= max_dy) return;
 
+        // Fast path 1: Unity 32-bit Linear plane
+        if (unity and tiling == 0 and !is_565) {
+            const span_w = max_dx - dst_x;
+            var py: u32 = dst_y;
+            while (py < max_dy) : (py += 1) {
+                const sy = py - dst_y;
+                const row_off = ptr0 + sy * linear_pitch;
+                if (row_off + span_w * 4 > ram.len) continue;
+                const dst_row = out_argb[py * out_w + dst_x ..][0..span_w];
+                const src_bytes = ram[row_off..][0 .. span_w * 4];
+                if (alpha_mode == 1) {
+                    @memcpy(std.mem.sliceAsBytes(dst_row), src_bytes);
+                    for (dst_row) |*p| p.* |= 0xFF000000;
+                } else {
+                    for (dst_row, 0..) |*dst_p, i| {
+                        const src_color = std.mem.readInt(u32, src_bytes[i * 4 ..][0..4], .little);
+                        const a = src_color >> 24;
+                        if (a == 255) {
+                            dst_p.* = src_color;
+                        } else if (a > 0) {
+                            dst_p.* = blendPixel(dst_p.*, src_color, a, premult);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Fast path 2: Unity 32-bit T-tiled / LT-tiled plane aligned to (0, 0)
+        if (unity and tiling != 0 and !is_565 and dst_x == 0 and dst_y == 0 and (max_dx & 3) == 0 and (max_dy & 3) == 0) {
+            const utiles_x = max_dx >> 2;
+            const utiles_y = max_dy >> 2;
+            var uy: u32 = 0;
+            while (uy < utiles_y) : (uy += 1) {
+                const py0 = uy << 2;
+                var ux: u32 = 0;
+                while (ux < utiles_x) : (ux += 1) {
+                    const px0 = ux << 2;
+                    const utile_off = ptr0 + texture.texelOffsetOf(.argb8888, tiled_w, src_h, px0, py0);
+                    if (utile_off + 64 > ram.len) continue;
+                    inline for (0..4) |ry| {
+                        const dst_row = out_argb[(py0 + @as(u32, @intCast(ry))) * out_w + px0 ..][0..4];
+                        const src_row_bytes = ram[utile_off + ry * 16 ..][0..16];
+                        if (alpha_mode == 1) {
+                            @memcpy(std.mem.sliceAsBytes(dst_row), src_row_bytes);
+                            inline for (0..4) |rx| dst_row[rx] |= 0xFF000000;
+                        } else {
+                            inline for (0..4) |rx| {
+                                const src_color = std.mem.readInt(u32, src_row_bytes[rx * 4 ..][0..4], .little);
+                                const a = src_color >> 24;
+                                if (a == 255) {
+                                    dst_row[rx] = src_color;
+                                } else if (a > 0) {
+                                    dst_row[rx] = blendPixel(dst_row[rx], src_color, a, premult);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
         var py: u32 = dst_y;
         while (py < max_dy) : (py += 1) {
             const sy: u32 = if (unity) (py - dst_y) else ((py - dst_y) * src_h) / dst_h;
@@ -244,7 +348,6 @@ pub const Hvs = struct {
                     std.mem.readInt(u32, ram[off..][0..4], .little);
 
                 const out_idx = py * out_w + px;
-                // SCALER_POS2_ALPHA_MODE_FIXED = 1 (opaque); SCALER_POS2_ALPHA_MODE_PIPELINE = 0 (per-pixel alpha)
                 if (alpha_mode == 1 or is_565) {
                     out_argb[out_idx] = src_color | 0xFF000000;
                 } else {
@@ -252,19 +355,7 @@ pub const Hvs = struct {
                     if (a == 255) {
                         out_argb[out_idx] = src_color;
                     } else if (a > 0) {
-                        const dst_c = out_argb[out_idx];
-                        const inv_a = 255 - a;
-                        if (premult) {
-                            const r: u32 = @min(((src_color >> 16) & 0xff) + (((dst_c >> 16) & 0xff) * inv_a) / 255, @as(u32, 255));
-                            const g: u32 = @min(((src_color >> 8) & 0xff) + (((dst_c >> 8) & 0xff) * inv_a) / 255, @as(u32, 255));
-                            const b: u32 = @min((src_color & 0xff) + ((dst_c & 0xff) * inv_a) / 255, @as(u32, 255));
-                            out_argb[out_idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
-                        } else {
-                            const r = (((src_color >> 16) & 0xff) * a + ((dst_c >> 16) & 0xff) * inv_a) / 255;
-                            const g = (((src_color >> 8) & 0xff) * a + ((dst_c >> 8) & 0xff) * inv_a) / 255;
-                            const b = ((src_color & 0xff) * a + (dst_c & 0xff) * inv_a) / 255;
-                            out_argb[out_idx] = 0xFF000000 | (r << 16) | (g << 8) | b;
-                        }
+                        out_argb[out_idx] = blendPixel(out_argb[out_idx], src_color, a, premult);
                     }
                 }
             }
