@@ -868,6 +868,7 @@ test "Bcm2835 AUX SPI1/SPI2 and I2S PCM (PERMAP 2) audio streaming" {
     try std.testing.expectEqual(@as(i16, -0x1357), samples[1]);
     try std.testing.expectEqual(@as(i16, 0x2468), samples[2]);
     try std.testing.expectEqual(@as(i16, -0x2468), samples[3]);
+    _ = pm_mod;
 }
 
 
