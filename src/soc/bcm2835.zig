@@ -121,7 +121,17 @@ pub const Bcm2835 = struct {
         if (permap == 13) { // SDHOST DREQ
             return self.sdhost.dreqReady();
         }
+        if (permap == 11) { // EMMC / Arasan SDHCI DREQ
+            return self.sdhci.dreqReady();
+        }
         return true;
+    }
+
+    pub fn syncSdRoutingFromGpio(self: *Bcm2835) void {
+        const sd_on_arasan = self.gpio.isSdCardOnArasanAlt3();
+        self.sdhost.pins_routed = !sd_on_arasan;
+        self.sdhci.routed_to_sd_card = sd_on_arasan;
+        self.sdhci.routed_to_wifi = !sd_on_arasan and self.gpio.isWifiOnArasanAlt3();
     }
 
     fn busRead32Opaque(ctx: *anyopaque, raw_addr: u32) u32 {
@@ -444,7 +454,7 @@ pub const Bcm2835 = struct {
             return self.aux_uart.read32(addr - uart_mod.AuxMiniUart.BASE_ADDR);
         }
         if (addr >= sdhost_mod.ArasanSdhci.BASE_ADDR and addr < sdhost_mod.ArasanSdhci.BASE_ADDR + sdhost_mod.ArasanSdhci.SIZE) {
-            return self.sdhci.read32(addr - sdhost_mod.ArasanSdhci.BASE_ADDR);
+            return self.sdhci.read32WithSd(addr - sdhost_mod.ArasanSdhci.BASE_ADDR, &self.sdhost);
         }
         if (addr >= hvs_mod.Hvs.BASE_ADDR and addr < hvs_mod.Hvs.BASE_ADDR + hvs_mod.Hvs.SIZE) {
             return self.hvs.read32(addr - hvs_mod.Hvs.BASE_ADDR);
@@ -505,6 +515,7 @@ pub const Bcm2835 = struct {
             self.rng.write32(addr - pm_mod.Rng.BASE_ADDR, val);
         } else if (addr >= gpio_mod.Gpio.BASE_ADDR and addr < gpio_mod.Gpio.BASE_ADDR + gpio_mod.Gpio.SIZE) {
             self.gpio.write32(addr - gpio_mod.Gpio.BASE_ADDR, val);
+            self.syncSdRoutingFromGpio();
         } else if (addr >= uart_mod.Pl011Uart.BASE_ADDR and addr < uart_mod.Pl011Uart.BASE_ADDR + uart_mod.Pl011Uart.SIZE) {
             self.uart0.write32(addr - uart_mod.Pl011Uart.BASE_ADDR, val);
         } else if (addr >= sdhost_mod.SdHost.BASE_ADDR and addr < sdhost_mod.SdHost.BASE_ADDR + sdhost_mod.SdHost.SIZE) {
@@ -526,7 +537,11 @@ pub const Bcm2835 = struct {
         } else if (addr >= uart_mod.AuxMiniUart.BASE_ADDR and addr < uart_mod.AuxMiniUart.BASE_ADDR + uart_mod.AuxMiniUart.SIZE) {
             self.aux_uart.write32(addr - uart_mod.AuxMiniUart.BASE_ADDR, val);
         } else if (addr >= sdhost_mod.ArasanSdhci.BASE_ADDR and addr < sdhost_mod.ArasanSdhci.BASE_ADDR + sdhost_mod.ArasanSdhci.SIZE) {
-            self.sdhci.write32(addr - sdhost_mod.ArasanSdhci.BASE_ADDR, val);
+            const offset = addr - sdhost_mod.ArasanSdhci.BASE_ADDR;
+            self.sdhci.write32WithSd(offset, val, &self.sdhost);
+            if (offset == 0x0c and self.sdhci.dreqReady()) {
+                self.dma.stepAllActive(self.ram, self.dmaMmio());
+            }
         } else if (addr >= hvs_mod.Hvs.BASE_ADDR and addr < hvs_mod.Hvs.BASE_ADDR + hvs_mod.Hvs.SIZE) {
             self.hvs.write32(addr - hvs_mod.Hvs.BASE_ADDR, val);
         } else if (addr >= i2c_mod.BscController.BSC1_BASE and addr < i2c_mod.BscController.BSC1_BASE + i2c_mod.BscController.SIZE) {
@@ -635,6 +650,57 @@ test "Bcm2835 cyclic vc4-hdmi audio DMA (PERMAP 17 -> HD_MAI_DATA) unpacks IEC95
     try std.testing.expectEqual(@as(i16, -0x2345), samples[1]);
     try std.testing.expectEqual(@as(i16, 0x1111), samples[2]);
     try std.testing.expectEqual(@as(i16, -0x1111), samples[3]);
+}
+
+test "Bcm2835 GPIO 48..53 ALT3 routes SD card to Arasan SDHCI with DMA PERMAP 11 block read/write" {
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    var disk: [1024]u8 = [_]u8{0} ** 1024;
+    var soc = Bcm2835.init(ram, 1280, 720);
+    soc.sdhost.attachMutableSlice(&disk);
+    soc.sdhci.wireless_enabled = true;
+
+    // Mux GPIO 48..53 to ALT3 (0b111 = 7) via GPFSEL4 (pins 48..49) and GPFSEL5 (pins 50..53)
+    soc.write32(0x20200010, (7 << 24) | (7 << 27)); // GPFSEL4: GPIO 48, 49 = ALT3
+    soc.write32(0x20200014, (7 << 0) | (7 << 3) | (7 << 6) | (7 << 9)); // GPFSEL5: GPIO 50..53 = ALT3
+    try std.testing.expect(soc.sdhci.routed_to_sd_card);
+    try std.testing.expect(!soc.sdhost.pins_routed);
+
+    // When GPIO 48..53 are on ALT3, SDHOST commands time out
+    soc.write32(0x20202004, 0x1aa);
+    soc.write32(0x20202000, sdhost_mod.SdHost.SDCMD_NEW_FLAG | 8);
+    try std.testing.expect((soc.read32(0x20202020) & sdhost_mod.SdHost.SDHSTS_CMD_TIME_OUT) != 0);
+
+    // Prepare 512-byte source buffer in RAM at 0x1000 and DMA CB at 0x200 with PERMAP=11 (Arasan EMMC)
+    std.mem.writeInt(u32, ram[0x1000..0x1004], 0x11223344, .little);
+    std.mem.writeInt(u32, ram[0x11fc..0x1200], 0x55667788, .little);
+
+    const cb: u32 = 0x200;
+    const ti: u32 = dma_mod.DmaController.TI_S_INC | dma_mod.DmaController.TI_INT_EN | (1 << 6) | (11 << 16);
+    std.mem.writeInt(u32, ram[cb + 0 ..][0..4], ti, .little);
+    std.mem.writeInt(u32, ram[cb + 4 ..][0..4], 0xc0001000, .little); // source_ad in RAM
+    std.mem.writeInt(u32, ram[cb + 8 ..][0..4], 0x7e300020, .little); // dest_ad = Arasan SDHCI_BUFFER
+    std.mem.writeInt(u32, ram[cb + 12 ..][0..4], 512, .little);
+    std.mem.writeInt(u32, ram[cb + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[cb + 20 ..][0..4], 0, .little);
+
+    // Issue CMD24 (WRITE_BLOCK) to sector 1 on Arasan SDHCI (0x20300000), then start DMA channel 0 (matches bcm2835-mmc order)
+    soc.write32(0x20300034, 0xffffffff); // INT_ENABLE
+    soc.write32(0x20300038, 0xffffffff); // SIGNAL_ENABLE
+    soc.write32(0x20300004, (1 << 16) | 512); // BLOCK_SIZE=512, BLOCK_COUNT=1
+    soc.write32(0x20300008, 1); // ARGUMENT = sector 1
+    soc.write32(0x2030000c, (24 << 24) | (0x3a << 16) | 0x0001); // CMD24 + DATA + DMA
+
+    soc.write32(0x20007004, 0xc0000200); // Ch0 CONBLK_AD
+    soc.write32(0x20007000, dma_mod.DmaController.CS_ACTIVE); // Ch0 CS = ACTIVE
+
+    try std.testing.expectEqual(@as(u32, 0x11223344), std.mem.readInt(u32, disk[512..516], .little));
+    try std.testing.expectEqual(@as(u32, 0x55667788), std.mem.readInt(u32, disk[1020..1024], .little));
+    try std.testing.expect(soc.dma.channelIrqPending(0));
+    try std.testing.expect((soc.read32(0x20300030) & sdhost_mod.ArasanSdhci.SDHCI_INT_DATA_END) != 0);
 }
 
 

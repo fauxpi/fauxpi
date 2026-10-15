@@ -107,6 +107,21 @@ pub const Gpio = struct {
         return ((self.effectiveLevels() >> pin) & 1) != 0;
     }
 
+    /// Returns true if GPIO 48..53 (`SD_CLK_R`, `SD_CMD_R`, `SD_DATA0..3_R`) are muxed to `ALT3` (`emmc_gpio48`),
+    /// routing the primary SD card slot to the Arasan SDHCI controller (`0x20300000`) instead of SDHOST (`0x20202000`).
+    pub fn isSdCardOnArasanAlt3(self: *const Gpio) bool {
+        // Check CLK (48) and CMD (49)
+        return self.getPinFunction(48) == .alt3 and self.getPinFunction(49) == .alt3;
+    }
+
+    /// Returns true if GPIO 34..39 (`emmc_gpio34`) are muxed to `ALT3` (or have not been reassigned to another alt function),
+    /// routing the onboard CYW43430 Wi-Fi SDIO bus to the Arasan SDHCI controller (`0x20300000`).
+    pub fn isWifiOnArasanAlt3(self: *const Gpio) bool {
+        const f34 = self.getPinFunction(34);
+        const f35 = self.getPinFunction(35);
+        return (f34 == .alt3 and f35 == .alt3) or (f34 == .input and f35 == .input);
+    }
+
     pub fn getPinMode(self: *const Gpio, pin: u6) ?Mode {
         if (pin >= 54) return null;
         return switch (self.getPinFunction(pin)) {

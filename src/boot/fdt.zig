@@ -347,9 +347,22 @@ pub const Tree = struct {
     }
 
     pub fn disableWireless(self: *Tree) !void {
-        for ([_][]const u8{ "/soc/mmcnr@7e300000", "/soc/mmc@7e300000", "mmcnr", "sdhci" }) |path| {
+        if (self.findNode("/soc/mmcnr@7e300000") orelse self.findNode("mmcnr")) |mmcnr| {
+            try mmcnr.setStringProp(self.allocator, "status", "disabled");
+        }
+        // Only disable /soc/mmc@7e300000 if it has a wifi@1 child or if sdhost (/soc/mmc@7e202000) is enabled,
+        // so upstream DTBs or dtoverlay=sdio that route the primary SD card to Arasan SDHCI continue to work.
+        const sdhost_node = self.findNode("sdhost") orelse self.findNode("/soc/mmc@7e202000") orelse self.findNode("/soc/sdhost@7e202000");
+        const sdhost_enabled = if (sdhost_node) |sh|
+            std.mem.eql(u8, sh.getStringProp("status") orelse "okay", "okay")
+        else
+            false;
+
+        for ([_][]const u8{ "/soc/mmc@7e300000", "sdhci" }) |path| {
             if (self.findNode(path)) |n| {
-                try n.setStringProp(self.allocator, "status", "disabled");
+                if (n.findChild("wifi@1") != null or sdhost_enabled) {
+                    try n.setStringProp(self.allocator, "status", "disabled");
+                }
             }
         }
     }
