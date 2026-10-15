@@ -226,9 +226,14 @@ pub const wl_keyboard = struct {
         pub const modifiers = 4;
         pub const repeat_info = 5;
     };
+    pub const keymap_format = struct {
+        pub const no_keymap: u32 = 0;
+        pub const xkb_v1: u32 = 1;
+    };
     pub const key_state = struct {
-        pub const released = 0;
-        pub const pressed = 1;
+        pub const released: u32 = 0;
+        pub const pressed: u32 = 1;
+        pub const repeated: u32 = 2;
     };
 };
 

@@ -396,6 +396,15 @@ pub const BoardUi = struct {
     new_card_name_len: usize = 0,
     sd_name_field_hovered: bool = false,
     shift_held: bool = false,
+    shift_mask: u2 = 0,
+    ctrl_mask: u2 = 0,
+    altgr_held: bool = false,
+    caps_lock: bool = false,
+    xkb_shift: bool = false,
+    xkb_ctrl: bool = false,
+    xkb_altgr: bool = false,
+    has_xkb_modifiers: bool = false,
+    keymap: XkbKeymap = XkbKeymap.defaultUs(),
     new_card_size: SdCardSize = .gb_4,
     hovered_sd_size_idx: ?usize = null,
     hovered_sd_card_row_idx: ?usize = null,
@@ -1322,9 +1331,69 @@ pub const BoardUi = struct {
     }
 
     pub fn updateModifierKey(self: *BoardUi, evdev_key: u32, pressed: bool) void {
-        if (evdev_key == 42 or evdev_key == 54) {
-            self.shift_held = pressed;
+        switch (evdev_key) {
+            42 => { // Left Shift
+                if (pressed) self.shift_mask |= 0b01 else self.shift_mask &= ~@as(u2, 0b01);
+            },
+            54 => { // Right Shift
+                if (pressed) self.shift_mask |= 0b10 else self.shift_mask &= ~@as(u2, 0b10);
+            },
+            29 => { // Left Ctrl
+                if (pressed) self.ctrl_mask |= 0b01 else self.ctrl_mask &= ~@as(u2, 0b01);
+            },
+            97 => { // Right Ctrl
+                if (pressed) self.ctrl_mask |= 0b10 else self.ctrl_mask &= ~@as(u2, 0b10);
+            },
+            100 => { // Right Alt (AltGr)
+                self.altgr_held = pressed;
+            },
+            58 => { // Caps Lock (fallback when compositor has not sent wl_keyboard.modifiers)
+                if (pressed and !self.has_xkb_modifiers) {
+                    self.caps_lock = !self.caps_lock;
+                }
+            },
+            else => {},
         }
+        self.shift_held = (self.shift_mask != 0) or self.xkb_shift;
+    }
+
+    /// Updates modifier state from Wayland `wl_keyboard.event.modifiers`.
+    pub fn updateModifiersFromXkb(self: *BoardUi, mods_depressed: u32, mods_latched: u32, mods_locked: u32) void {
+        self.has_xkb_modifiers = true;
+        const active = mods_depressed | mods_latched;
+        const eff = active ^ mods_locked;
+        self.xkb_shift = (active & (1 << 0)) != 0;
+        self.caps_lock = (eff & (1 << 1)) != 0;
+        self.xkb_ctrl = (active & (1 << 2)) != 0;
+        self.xkb_altgr = (active & (1 << 7)) != 0;
+        self.shift_held = (self.shift_mask != 0) or self.xkb_shift;
+    }
+
+    /// Clears all depressed modifier state (e.g. on `wl_keyboard.event.leave`).
+    pub fn clearModifiers(self: *BoardUi) void {
+        self.shift_mask = 0;
+        self.ctrl_mask = 0;
+        self.altgr_held = false;
+        self.xkb_shift = false;
+        self.xkb_ctrl = false;
+        self.xkb_altgr = false;
+        self.shift_held = false;
+    }
+
+    /// Parses an XKB v1 keymap string from `wl_keyboard.event.keymap`.
+    pub fn loadXkbKeymap(self: *BoardUi, text: []const u8) void {
+        self.keymap = XkbKeymap.parse(text);
+    }
+
+    /// Translates an evdev keycode using the active XKB keymap and modifier state.
+    pub fn lookupKeyChar(self: *const BoardUi, evdev_key: u32) ?u8 {
+        const shift = (self.shift_mask != 0) or self.xkb_shift or self.shift_held;
+        const altgr = self.altgr_held or self.xkb_altgr;
+        return self.keymap.lookup(evdev_key, shift, self.caps_lock, altgr);
+    }
+
+    pub fn ctrlHeld(self: *const BoardUi) bool {
+        return (self.ctrl_mask != 0) or self.xkb_ctrl;
     }
 
     /// Handles an evdev key press when a text field (`serial`, `mac`, `wifi_mac`, or `sd_card_name`) is focused.
@@ -1337,20 +1406,24 @@ pub const BoardUi = struct {
             if (!self.settings_open) return false;
         }
 
-        // Left Shift (42) or Right Shift (54)
-        if (evdev_key == 42 or evdev_key == 54) {
-            self.shift_held = true;
-            return true;
+        // Modifier keys
+        switch (evdev_key) {
+            42, 54, 29, 97, 100 => {
+                self.updateModifierKey(evdev_key, true);
+                return true;
+            },
+            56, 125, 126, 58, 69, 70 => return true,
+            else => {},
         }
 
-        // Enter (28) or Escape (1) unfocuses the text field
-        if (evdev_key == 28 or evdev_key == 1) {
+        // Enter (28), Keypad Enter (96), or Escape (1) unfocuses the text field
+        if (evdev_key == 28 or evdev_key == 96 or evdev_key == 1) {
             self.focused_field = .none;
             return true;
         }
 
-        // Backspace (14)
-        if (evdev_key == 14) {
+        // Backspace (14) or Delete (111)
+        if (evdev_key == 14 or evdev_key == 111) {
             switch (self.focused_field) {
                 .serial => if (self.serial_len > 0) {
                     self.serial_len -= 1;
@@ -1369,8 +1442,10 @@ pub const BoardUi = struct {
             return true;
         }
 
+        if (self.ctrlHeld()) return true;
+
         if (self.focused_field == .sd_card_name) {
-            if (evdevKeyToCardNameChar(evdev_key, self.shift_held)) |ch| {
+            if (self.lookupKeyChar(evdev_key)) |ch| {
                 if (self.new_card_name_len < self.new_card_name_buf.len) {
                     self.new_card_name_buf[self.new_card_name_len] = ch;
                     self.new_card_name_len += 1;
@@ -1379,40 +1454,23 @@ pub const BoardUi = struct {
             return true;
         }
 
-        const hex_ch: ?u8 = switch (evdev_key) {
-            2 => '1',
-            3 => '2',
-            4 => '3',
-            5 => '4',
-            6 => '5',
-            7 => '6',
-            8 => '7',
-            9 => '8',
-            10 => '9',
-            11 => '0',
-            30 => 'a',
-            48 => 'b',
-            46 => 'c',
-            32 => 'd',
-            18 => 'e',
-            33 => 'f',
-            else => null,
-        };
-        if (hex_ch) |ch| {
-            switch (self.focused_field) {
-                .serial => if (self.serial_len < 16) {
-                    self.serial_hex[self.serial_len] = ch;
-                    self.serial_len += 1;
-                },
-                .mac => if (self.mac_len < 12) {
-                    self.mac_hex[self.mac_len] = std.ascii.toUpper(ch);
-                    self.mac_len += 1;
-                },
-                .wifi_mac => if (self.wifi_mac_len < 12) {
-                    self.wifi_mac_hex[self.wifi_mac_len] = std.ascii.toUpper(ch);
-                    self.wifi_mac_len += 1;
-                },
-                .sd_card_name, .none => {},
+        if (self.lookupKeyChar(evdev_key)) |ch| {
+            if (std.ascii.isHex(ch)) {
+                switch (self.focused_field) {
+                    .serial => if (self.serial_len < 16) {
+                        self.serial_hex[self.serial_len] = std.ascii.toLower(ch);
+                        self.serial_len += 1;
+                    },
+                    .mac => if (self.mac_len < 12) {
+                        self.mac_hex[self.mac_len] = std.ascii.toUpper(ch);
+                        self.mac_len += 1;
+                    },
+                    .wifi_mac => if (self.wifi_mac_len < 12) {
+                        self.wifi_mac_hex[self.wifi_mac_len] = std.ascii.toUpper(ch);
+                        self.wifi_mac_len += 1;
+                    },
+                    .sd_card_name, .none => {},
+                }
             }
             return true;
         }
@@ -4237,55 +4295,385 @@ pub fn drawGpioRibbonCable(
     c.fillCircle(.{ conn_r.x + 2.0 * s, conn_r.y + conn_r.h - 1.4 * s }, @max(1.2, 0.55 * s), red.withAlpha(0.85));
 }
 
-fn evdevKeyToCardNameChar(evdev_key: u32, shift: bool) ?u8 {
-    const lower: ?u8 = switch (evdev_key) {
-        2 => '1',
-        3 => '2',
-        4 => '3',
-        5 => '4',
-        6 => '5',
-        7 => '6',
-        8 => '7',
-        9 => '8',
-        10 => '9',
-        11 => '0',
-        12 => if (shift) '_' else '-',
-        16 => 'q',
-        17 => 'w',
-        18 => 'e',
-        19 => 'r',
-        20 => 't',
-        21 => 'y',
-        22 => 'u',
-        23 => 'i',
-        24 => 'o',
-        25 => 'p',
-        30 => 'a',
-        31 => 's',
-        32 => 'd',
-        33 => 'f',
-        34 => 'g',
-        35 => 'h',
-        36 => 'j',
-        37 => 'k',
-        38 => 'l',
-        44 => 'z',
-        45 => 'x',
-        46 => 'c',
-        47 => 'v',
-        48 => 'b',
-        49 => 'n',
-        50 => 'm',
-        52 => '.',
-        57 => ' ',
-        else => null,
-    };
-    if (lower) |ch| {
-        if (shift and std.ascii.isLower(ch)) return std.ascii.toUpper(ch);
-        return ch;
+/// Parsed XKB v1 keymap mapping Linux evdev keycodes (`0..127`) across 4 shift levels
+/// (`[0]=base`, `[1]=Shift`, `[2]=AltGr`, `[3]=Shift+AltGr`) to printable ASCII characters.
+pub const XkbKeymap = struct {
+    entries: [128][4]u8 = @splat(@splat(0)),
+
+    pub fn defaultUs() XkbKeymap {
+        var km: XkbKeymap = .{};
+        const Pair = struct { evdev: u8, n: u8, s: u8 };
+        const pairs = [_]Pair{
+            .{ .evdev = 2, .n = '1', .s = '!' },
+            .{ .evdev = 3, .n = '2', .s = '@' },
+            .{ .evdev = 4, .n = '3', .s = '#' },
+            .{ .evdev = 5, .n = '4', .s = '$' },
+            .{ .evdev = 6, .n = '5', .s = '%' },
+            .{ .evdev = 7, .n = '6', .s = '^' },
+            .{ .evdev = 8, .n = '7', .s = '&' },
+            .{ .evdev = 9, .n = '8', .s = '*' },
+            .{ .evdev = 10, .n = '9', .s = '(' },
+            .{ .evdev = 11, .n = '0', .s = ')' },
+            .{ .evdev = 12, .n = '-', .s = '_' },
+            .{ .evdev = 13, .n = '=', .s = '+' },
+            .{ .evdev = 16, .n = 'q', .s = 'Q' },
+            .{ .evdev = 17, .n = 'w', .s = 'W' },
+            .{ .evdev = 18, .n = 'e', .s = 'E' },
+            .{ .evdev = 19, .n = 'r', .s = 'R' },
+            .{ .evdev = 20, .n = 't', .s = 'T' },
+            .{ .evdev = 21, .n = 'y', .s = 'Y' },
+            .{ .evdev = 22, .n = 'u', .s = 'U' },
+            .{ .evdev = 23, .n = 'i', .s = 'I' },
+            .{ .evdev = 24, .n = 'o', .s = 'O' },
+            .{ .evdev = 25, .n = 'p', .s = 'P' },
+            .{ .evdev = 26, .n = '[', .s = '{' },
+            .{ .evdev = 27, .n = ']', .s = '}' },
+            .{ .evdev = 30, .n = 'a', .s = 'A' },
+            .{ .evdev = 31, .n = 's', .s = 'S' },
+            .{ .evdev = 32, .n = 'd', .s = 'D' },
+            .{ .evdev = 33, .n = 'f', .s = 'F' },
+            .{ .evdev = 34, .n = 'g', .s = 'G' },
+            .{ .evdev = 35, .n = 'h', .s = 'H' },
+            .{ .evdev = 36, .n = 'j', .s = 'J' },
+            .{ .evdev = 37, .n = 'k', .s = 'K' },
+            .{ .evdev = 38, .n = 'l', .s = 'L' },
+            .{ .evdev = 39, .n = ';', .s = ':' },
+            .{ .evdev = 40, .n = '\'', .s = '"' },
+            .{ .evdev = 41, .n = '`', .s = '~' },
+            .{ .evdev = 43, .n = '\\', .s = '|' },
+            .{ .evdev = 44, .n = 'z', .s = 'Z' },
+            .{ .evdev = 45, .n = 'x', .s = 'X' },
+            .{ .evdev = 46, .n = 'c', .s = 'C' },
+            .{ .evdev = 47, .n = 'v', .s = 'V' },
+            .{ .evdev = 48, .n = 'b', .s = 'B' },
+            .{ .evdev = 49, .n = 'n', .s = 'N' },
+            .{ .evdev = 50, .n = 'm', .s = 'M' },
+            .{ .evdev = 51, .n = ',', .s = '<' },
+            .{ .evdev = 52, .n = '.', .s = '>' },
+            .{ .evdev = 53, .n = '/', .s = '?' },
+            .{ .evdev = 55, .n = '*', .s = '*' },
+            .{ .evdev = 57, .n = ' ', .s = ' ' },
+            .{ .evdev = 71, .n = '7', .s = '7' },
+            .{ .evdev = 72, .n = '8', .s = '8' },
+            .{ .evdev = 73, .n = '9', .s = '9' },
+            .{ .evdev = 74, .n = '-', .s = '-' },
+            .{ .evdev = 75, .n = '4', .s = '4' },
+            .{ .evdev = 76, .n = '5', .s = '5' },
+            .{ .evdev = 77, .n = '6', .s = '6' },
+            .{ .evdev = 78, .n = '+', .s = '+' },
+            .{ .evdev = 79, .n = '1', .s = '1' },
+            .{ .evdev = 80, .n = '2', .s = '2' },
+            .{ .evdev = 81, .n = '3', .s = '3' },
+            .{ .evdev = 82, .n = '0', .s = '0' },
+            .{ .evdev = 83, .n = '.', .s = '.' },
+            .{ .evdev = 86, .n = '\\', .s = '|' },
+            .{ .evdev = 98, .n = '/', .s = '/' },
+            .{ .evdev = 117, .n = '=', .s = '=' },
+        };
+        for (pairs) |p| {
+            km.entries[p.evdev] = .{ p.n, p.s, 0, 0 };
+        }
+        return km;
     }
-    return null;
-}
+
+    pub fn lookup(self: *const XkbKeymap, evdev_key: u32, shift: bool, caps_lock: bool, altgr: bool) ?u8 {
+        if (evdev_key >= 128) return null;
+        const syms = self.entries[evdev_key];
+        const is_alpha = std.ascii.isAlphabetic(syms[0]) and std.ascii.isAlphabetic(syms[1]);
+        const eff_shift = if (is_alpha) (shift != caps_lock) else shift;
+        const level: usize = (if (altgr) @as(usize, 2) else 0) | (if (eff_shift) @as(usize, 1) else 0);
+        var ch = syms[level];
+        if (ch == 0 and altgr) ch = syms[level & 1];
+        if (ch == 0 and eff_shift) ch = syms[0];
+        return if (ch >= 0x20 and ch <= 0x7e) ch else null;
+    }
+
+    const KeyNameMap = struct {
+        names: [160][8]u8 = @splat(@splat(0)),
+        lens: [160]u8 = @splat(0),
+        evdevs: [160]u8 = @splat(0),
+        count: usize = 0,
+
+        fn initDefault() KeyNameMap {
+            var m: KeyNameMap = .{};
+            const Std = struct { name: []const u8, evdev: u8 };
+            const defaults = [_]Std{
+                .{ .name = "TLDE", .evdev = 41 },
+                .{ .name = "AE01", .evdev = 2 },
+                .{ .name = "AE02", .evdev = 3 },
+                .{ .name = "AE03", .evdev = 4 },
+                .{ .name = "AE04", .evdev = 5 },
+                .{ .name = "AE05", .evdev = 6 },
+                .{ .name = "AE06", .evdev = 7 },
+                .{ .name = "AE07", .evdev = 8 },
+                .{ .name = "AE08", .evdev = 9 },
+                .{ .name = "AE09", .evdev = 10 },
+                .{ .name = "AE10", .evdev = 11 },
+                .{ .name = "AE11", .evdev = 12 },
+                .{ .name = "AE12", .evdev = 13 },
+                .{ .name = "AD01", .evdev = 16 },
+                .{ .name = "AD02", .evdev = 17 },
+                .{ .name = "AD03", .evdev = 18 },
+                .{ .name = "AD04", .evdev = 19 },
+                .{ .name = "AD05", .evdev = 20 },
+                .{ .name = "AD06", .evdev = 21 },
+                .{ .name = "AD07", .evdev = 22 },
+                .{ .name = "AD08", .evdev = 23 },
+                .{ .name = "AD09", .evdev = 24 },
+                .{ .name = "AD10", .evdev = 25 },
+                .{ .name = "AD11", .evdev = 26 },
+                .{ .name = "AD12", .evdev = 27 },
+                .{ .name = "AC01", .evdev = 30 },
+                .{ .name = "AC02", .evdev = 31 },
+                .{ .name = "AC03", .evdev = 32 },
+                .{ .name = "AC04", .evdev = 33 },
+                .{ .name = "AC05", .evdev = 34 },
+                .{ .name = "AC06", .evdev = 35 },
+                .{ .name = "AC07", .evdev = 36 },
+                .{ .name = "AC08", .evdev = 37 },
+                .{ .name = "AC09", .evdev = 38 },
+                .{ .name = "AC10", .evdev = 39 },
+                .{ .name = "AC11", .evdev = 40 },
+                .{ .name = "BKSL", .evdev = 43 },
+                .{ .name = "LSGT", .evdev = 86 },
+                .{ .name = "AB01", .evdev = 44 },
+                .{ .name = "AB02", .evdev = 45 },
+                .{ .name = "AB03", .evdev = 46 },
+                .{ .name = "AB04", .evdev = 47 },
+                .{ .name = "AB05", .evdev = 48 },
+                .{ .name = "AB06", .evdev = 49 },
+                .{ .name = "AB07", .evdev = 50 },
+                .{ .name = "AB08", .evdev = 51 },
+                .{ .name = "AB09", .evdev = 52 },
+                .{ .name = "AB10", .evdev = 53 },
+                .{ .name = "SPCE", .evdev = 57 },
+                .{ .name = "KPMU", .evdev = 55 },
+                .{ .name = "KP7", .evdev = 71 },
+                .{ .name = "KP8", .evdev = 72 },
+                .{ .name = "KP9", .evdev = 73 },
+                .{ .name = "KPSU", .evdev = 74 },
+                .{ .name = "KP4", .evdev = 75 },
+                .{ .name = "KP5", .evdev = 76 },
+                .{ .name = "KP6", .evdev = 77 },
+                .{ .name = "KPAD", .evdev = 78 },
+                .{ .name = "KP1", .evdev = 79 },
+                .{ .name = "KP2", .evdev = 80 },
+                .{ .name = "KP3", .evdev = 81 },
+                .{ .name = "KP0", .evdev = 82 },
+                .{ .name = "KPDL", .evdev = 83 },
+                .{ .name = "KPDV", .evdev = 98 },
+                .{ .name = "KPEQ", .evdev = 117 },
+            };
+            for (defaults) |d| {
+                m.put(d.name, d.evdev);
+            }
+            return m;
+        }
+
+        fn put(self: *KeyNameMap, name: []const u8, evdev: u8) void {
+            if (name.len == 0 or name.len > 8) return;
+            for (0..self.count) |i| {
+                if (self.lens[i] == name.len and std.mem.eql(u8, self.names[i][0..name.len], name)) {
+                    self.evdevs[i] = evdev;
+                    return;
+                }
+            }
+            if (self.count >= self.names.len) return;
+            const idx = self.count;
+            @memcpy(self.names[idx][0..name.len], name);
+            self.lens[idx] = @intCast(name.len);
+            self.evdevs[idx] = evdev;
+            self.count += 1;
+        }
+
+        fn get(self: *const KeyNameMap, name: []const u8) ?u8 {
+            for (0..self.count) |i| {
+                if (self.lens[i] == name.len and std.mem.eql(u8, self.names[i][0..name.len], name)) {
+                    return self.evdevs[i];
+                }
+            }
+            return null;
+        }
+    };
+
+    pub fn parse(text: []const u8) XkbKeymap {
+        var km = defaultUs();
+        var key_names = KeyNameMap.initDefault();
+
+        // 1. Parse xkb_keycodes section if present (`<NAME> = 10;` and `alias <A> = <B>;`)
+        if (std.mem.indexOf(u8, text, "xkb_keycodes")) |kc_start| {
+            const kc_body = text[kc_start..];
+            const kc_end = std.mem.indexOf(u8, kc_body, "xkb_types") orelse
+                std.mem.indexOf(u8, kc_body, "xkb_compatibility") orelse
+                std.mem.indexOf(u8, kc_body, "xkb_symbols") orelse kc_body.len;
+            const section = kc_body[0..kc_end];
+            var lines = std.mem.tokenizeAny(u8, section, ";\r\n");
+            while (lines.next()) |raw_line| {
+                const line = std.mem.trim(u8, raw_line, " \t");
+                if (std.mem.startsWith(u8, line, "//") or std.mem.startsWith(u8, line, "#")) continue;
+                if (std.mem.startsWith(u8, line, "alias ")) {
+                    const rest = line["alias ".len..];
+                    const a1 = std.mem.indexOfScalar(u8, rest, '<') orelse continue;
+                    const a2 = std.mem.indexOfScalarPos(u8, rest, a1 + 1, '>') orelse continue;
+                    const b1 = std.mem.indexOfScalarPos(u8, rest, a2 + 1, '<') orelse continue;
+                    const b2 = std.mem.indexOfScalarPos(u8, rest, b1 + 1, '>') orelse continue;
+                    const alias_name = rest[a1 + 1 .. a2];
+                    const target_name = rest[b1 + 1 .. b2];
+                    if (key_names.get(target_name)) |evdev| {
+                        key_names.put(alias_name, evdev);
+                    }
+                } else if (line.len > 0 and line[0] == '<') {
+                    const close = std.mem.indexOfScalar(u8, line, '>') orelse continue;
+                    const eq = std.mem.indexOfScalarPos(u8, line, close + 1, '=') orelse continue;
+                    const name = line[1..close];
+                    const num_str = std.mem.trim(u8, line[eq + 1 ..], " \t");
+                    const xkb_code = std.fmt.parseInt(u32, num_str, 10) catch continue;
+                    if (xkb_code >= 8 and xkb_code - 8 < 128) {
+                        key_names.put(name, @intCast(xkb_code - 8));
+                    }
+                }
+            }
+        }
+
+        // 2. Parse `key <NAME> { ... };` entries in `xkb_symbols` (or full text)
+        const sym_start = std.mem.indexOf(u8, text, "xkb_symbols") orelse 0;
+        const sym_section = text[sym_start..];
+        var pos: usize = 0;
+        while (pos < sym_section.len) {
+            const k_idx = std.mem.indexOfPos(u8, sym_section, pos, "key") orelse break;
+            // Ensure "key" is at a token boundary
+            if (k_idx > 0) {
+                const prev = sym_section[k_idx - 1];
+                if (std.ascii.isAlphanumeric(prev) or prev == '_') {
+                    pos = k_idx + 3;
+                    continue;
+                }
+            }
+            var cur = k_idx + 3;
+            while (cur < sym_section.len and (sym_section[cur] == ' ' or sym_section[cur] == '\t')) : (cur += 1) {}
+            if (cur >= sym_section.len or sym_section[cur] != '<') {
+                pos = cur;
+                continue;
+            }
+            const name_end = std.mem.indexOfScalarPos(u8, sym_section, cur + 1, '>') orelse break;
+            const key_name = sym_section[cur + 1 .. name_end];
+            const brace_open = std.mem.indexOfScalarPos(u8, sym_section, name_end + 1, '{') orelse break;
+            const brace_close = std.mem.indexOfScalarPos(u8, sym_section, brace_open + 1, '}') orelse break;
+            pos = brace_close + 1;
+
+            const evdev = key_names.get(key_name) orelse continue;
+            const body = sym_section[brace_open + 1 .. brace_close];
+            const bracket_open = std.mem.indexOfScalar(u8, body, '[') orelse continue;
+            const bracket_close = std.mem.indexOfScalarPos(u8, body, bracket_open + 1, ']') orelse continue;
+            const syms_str = body[bracket_open + 1 .. bracket_close];
+
+            var parsed_levels: [4]u8 = @splat(0);
+            var level: usize = 0;
+            var it = std.mem.splitScalar(u8, syms_str, ',');
+            while (it.next()) |raw_sym| {
+                if (level >= 4) break;
+                const sym = std.mem.trim(u8, raw_sym, " \t\r\n");
+                if (keysymToAscii(sym)) |ch| {
+                    parsed_levels[level] = ch;
+                }
+                level += 1;
+            }
+            if (parsed_levels[0] != 0 or parsed_levels[1] != 0) {
+                if (parsed_levels[1] == 0 and std.ascii.isLower(parsed_levels[0])) {
+                    parsed_levels[1] = std.ascii.toUpper(parsed_levels[0]);
+                }
+                km.entries[evdev] = parsed_levels;
+            }
+        }
+
+        return km;
+    }
+
+    pub fn keysymToAscii(sym: []const u8) ?u8 {
+        if (sym.len == 0 or std.mem.eql(u8, sym, "NoSymbol") or std.mem.eql(u8, sym, "VoidSymbol") or std.mem.eql(u8, sym, "any")) {
+            return null;
+        }
+        if (sym.len == 1 and sym[0] >= 0x20 and sym[0] <= 0x7e) {
+            return sym[0];
+        }
+        if (sym.len >= 5 and (sym[0] == 'U' or sym[0] == 'u')) {
+            if (std.fmt.parseInt(u32, sym[1..], 16)) |cp| {
+                if (cp >= 0x20 and cp <= 0x7e) return @intCast(cp);
+                return null;
+            } else |_| {}
+        }
+        if (std.mem.startsWith(u8, sym, "0x") or std.mem.startsWith(u8, sym, "0X")) {
+            if (std.fmt.parseInt(u32, sym[2..], 16)) |val| {
+                const cp = if (val >= 0x01000000) val - 0x01000000 else val;
+                if (cp >= 0x20 and cp <= 0x7e) return @intCast(cp);
+                return null;
+            } else |_| {}
+        }
+        const Named = struct { name: []const u8, ch: u8 };
+        const table = [_]Named{
+            .{ .name = "space", .ch = ' ' },
+            .{ .name = "exclam", .ch = '!' },
+            .{ .name = "quotedbl", .ch = '"' },
+            .{ .name = "numbersign", .ch = '#' },
+            .{ .name = "dollar", .ch = '$' },
+            .{ .name = "percent", .ch = '%' },
+            .{ .name = "ampersand", .ch = '&' },
+            .{ .name = "apostrophe", .ch = '\'' },
+            .{ .name = "quoteright", .ch = '\'' },
+            .{ .name = "parenleft", .ch = '(' },
+            .{ .name = "parenright", .ch = ')' },
+            .{ .name = "asterisk", .ch = '*' },
+            .{ .name = "plus", .ch = '+' },
+            .{ .name = "comma", .ch = ',' },
+            .{ .name = "minus", .ch = '-' },
+            .{ .name = "period", .ch = '.' },
+            .{ .name = "slash", .ch = '/' },
+            .{ .name = "colon", .ch = ':' },
+            .{ .name = "semicolon", .ch = ';' },
+            .{ .name = "less", .ch = '<' },
+            .{ .name = "equal", .ch = '=' },
+            .{ .name = "greater", .ch = '>' },
+            .{ .name = "question", .ch = '?' },
+            .{ .name = "at", .ch = '@' },
+            .{ .name = "bracketleft", .ch = '[' },
+            .{ .name = "backslash", .ch = '\\' },
+            .{ .name = "bracketright", .ch = ']' },
+            .{ .name = "asciicircum", .ch = '^' },
+            .{ .name = "dead_circumflex", .ch = '^' },
+            .{ .name = "underscore", .ch = '_' },
+            .{ .name = "grave", .ch = '`' },
+            .{ .name = "quoteleft", .ch = '`' },
+            .{ .name = "dead_grave", .ch = '`' },
+            .{ .name = "braceleft", .ch = '{' },
+            .{ .name = "bar", .ch = '|' },
+            .{ .name = "braceright", .ch = '}' },
+            .{ .name = "asciitilde", .ch = '~' },
+            .{ .name = "dead_tilde", .ch = '~' },
+            .{ .name = "KP_Space", .ch = ' ' },
+            .{ .name = "KP_Multiply", .ch = '*' },
+            .{ .name = "KP_Add", .ch = '+' },
+            .{ .name = "KP_Separator", .ch = ',' },
+            .{ .name = "KP_Subtract", .ch = '-' },
+            .{ .name = "KP_Decimal", .ch = '.' },
+            .{ .name = "KP_Divide", .ch = '/' },
+            .{ .name = "KP_0", .ch = '0' },
+            .{ .name = "KP_1", .ch = '1' },
+            .{ .name = "KP_2", .ch = '2' },
+            .{ .name = "KP_3", .ch = '3' },
+            .{ .name = "KP_4", .ch = '4' },
+            .{ .name = "KP_5", .ch = '5' },
+            .{ .name = "KP_6", .ch = '6' },
+            .{ .name = "KP_7", .ch = '7' },
+            .{ .name = "KP_8", .ch = '8' },
+            .{ .name = "KP_9", .ch = '9' },
+            .{ .name = "KP_Equal", .ch = '=' },
+        };
+        for (table) |entry| {
+            if (std.mem.eql(u8, sym, entry.name)) return entry.ch;
+        }
+        return null;
+    }
+};
 
 pub fn ensureDirPathLinux(path: []const u8) void {
     if (path.len == 0 or path.len >= std.fs.max_path_bytes) return;
@@ -4911,5 +5299,54 @@ test "GPIO ribbon cable connector and GPIO box outputs LEDs and input switches" 
     hw.write32(0x28, 1 << 21);
     try testing.expect(!hw.getPinLevel(21));
     ui.paint(pixels, win_w, win_h_connected, 1, status, &hw);
+}
+
+test "XkbKeymap parsing, modifiers, Caps Lock, AltGr, and non-US layout input" {
+    var ui = try BoardUi.init(testing.allocator);
+    defer ui.deinit();
+
+    // French AZERTY XKB keymap snippet (`<AD01>` = a/A, `<AC01>` = q/Q, `<AE01>` = &/1, `<AE03>` = "/3/#)
+    const azerty_xkb =
+        \\xkb_keymap {
+        \\xkb_keycodes "evdev+aliases(azerty)" {
+        \\    <AE01> = 10;
+        \\    <AE03> = 12;
+        \\    <AD01> = 24;
+        \\    <AC01> = 38;
+        \\    alias <LatA> = <AD01>;
+        \\};
+        \\xkb_symbols "pc+fr(oss)" {
+        \\    key <AE01> { [ ampersand, 1, onesuperior, exclamdown ] };
+        \\    key <AE03> { [ quotedbl, 3, numbersign, sterling ] };
+        \\    key <LatA> { [ a, A, ae, AE ] };
+        \\    key <AC01> { [ q, Q, at, Greek_OMEGA ] };
+        \\};
+        \\};
+    ;
+    ui.loadXkbKeymap(azerty_xkb);
+
+    // Verify unshifted, shifted, Caps Lock, and AltGr lookups
+    try testing.expectEqual(@as(?u8, '&'), ui.lookupKeyChar(2)); // AE01 unshifted
+    try testing.expectEqual(@as(?u8, 'a'), ui.lookupKeyChar(16)); // AD01 unshifted -> 'a' on AZERTY
+    try testing.expectEqual(@as(?u8, 'q'), ui.lookupKeyChar(30)); // AC01 unshifted -> 'q' on AZERTY
+
+    // Left + Right Shift independent bitmask tracking
+    ui.updateModifierKey(42, true); // Left Shift down
+    ui.updateModifierKey(54, true); // Right Shift down
+    ui.updateModifierKey(42, false); // Left Shift up while Right Shift remains held
+    try testing.expect(ui.shift_held);
+    try testing.expectEqual(@as(?u8, '1'), ui.lookupKeyChar(2)); // Shift+AE01 -> '1'
+    try testing.expectEqual(@as(?u8, 'A'), ui.lookupKeyChar(16)); // Shift+AD01 -> 'A'
+    ui.updateModifierKey(54, false);
+    try testing.expect(!ui.shift_held);
+
+    // XKB modifiers event: Caps Lock (bit 1) + AltGr / Mod5 (bit 7)
+    ui.updateModifiersFromXkb(0, 0, 1 << 1); // Caps Lock locked
+    try testing.expectEqual(@as(?u8, 'A'), ui.lookupKeyChar(16)); // Alphabetic inverted by Caps Lock
+    try testing.expectEqual(@as(?u8, '&'), ui.lookupKeyChar(2)); // Non-alphabetic unaffected by Caps Lock
+
+    ui.updateModifiersFromXkb(1 << 7, 0, 0); // AltGr depressed
+    try testing.expectEqual(@as(?u8, '#'), ui.lookupKeyChar(4)); // AltGr+AE03 -> '#'
+    try testing.expectEqual(@as(?u8, '@'), ui.lookupKeyChar(30)); // AltGr+AC01 -> '@'
 }
 

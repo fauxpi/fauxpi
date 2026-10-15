@@ -71,6 +71,12 @@ pub const WaylandWindow = struct {
     pointer_enter_serial: u32 = 0,
     cursor_mode: enum { unknown, ui_arrow, hdmi_crosshair } = .unknown,
 
+    /// Keyboard repeat configuration (`wl_keyboard.repeat_info`, 0 disables repeat) and repeat state.
+    repeat_rate: u32 = 25,
+    repeat_delay_ms: u32 = 600,
+    repeat: ?struct { key: u32, next_ns: u64 } = null,
+    keys_down: std.StaticBitSet(256) = .initEmpty(),
+
     hid: ?*UsbHidComposite = null,
     gpio: *Gpio,
     ui: board_sheet.BoardUi,
@@ -594,11 +600,13 @@ pub const WaylandWindow = struct {
         }
         try self.display.pollAndDispatch();
         self.pollSdImagePicker();
+        self.serviceRepeat(monotonicNs());
     }
 
     pub fn pollEvents(self: *WaylandWindow) !void {
         try self.display.pollAndDispatch();
         self.pollSdImagePicker();
+        self.serviceRepeat(monotonicNs());
     }
 
     pub fn waitEvents(self: *WaylandWindow, timeout_ms: i32) !void {
@@ -610,6 +618,8 @@ pub const WaylandWindow = struct {
         const was_dirty = self.ui_dirty;
         try self.display.pollAndDispatch();
         self.pollSdImagePicker();
+        const now_ns = monotonicNs();
+        self.serviceRepeat(now_ns);
         if (self.closed or (!was_dirty and self.ui_dirty)) return;
         if (self.hid) |h| {
             if (h.hasPendingInterruptIn()) return;
@@ -628,14 +638,42 @@ pub const WaylandWindow = struct {
             }
         }
 
-        const timeout_ms: i32 = if (timeout_us) |us|
+        var eff_timeout_ms: i32 = if (timeout_us) |us|
             @intCast(@min((us + 999) / 1000, @as(u64, std.math.maxInt(i32))))
         else
             -1;
-        const rc = linux.poll(&fds, @intCast(nfds), timeout_ms);
+        if (self.repeatTimeoutMs(now_ns)) |rep_ms| {
+            if (eff_timeout_ms < 0 or rep_ms < eff_timeout_ms) {
+                eff_timeout_ms = rep_ms;
+            }
+        }
+        const rc = linux.poll(&fds, @intCast(nfds), eff_timeout_ms);
         if (linux.errno(rc) == .SUCCESS and rc > 0) {
             try self.display.pollAndDispatch();
             self.pollSdImagePicker();
+        }
+        self.serviceRepeat(monotonicNs());
+    }
+
+    pub fn repeatTimeoutMs(self: *const WaylandWindow, now_ns: u64) ?i32 {
+        const rep = self.repeat orelse return null;
+        if (self.repeat_rate == 0 or !self.ui.sheet_open) return null;
+        if (now_ns >= rep.next_ns) return 0;
+        const rem_ms = std.math.divCeil(u64, rep.next_ns - now_ns, std.time.ns_per_ms) catch 0;
+        return @intCast(@min(rem_ms, @as(u64, std.math.maxInt(i32))));
+    }
+
+    pub fn serviceRepeat(self: *WaylandWindow, now_ns: u64) void {
+        const rep = &(self.repeat orelse return);
+        if (self.repeat_rate == 0) {
+            self.repeat = null;
+            return;
+        }
+        if (now_ns < rep.next_ns) return;
+        const step = std.time.ns_per_s / @as(u64, self.repeat_rate);
+        rep.next_ns = if (now_ns - rep.next_ns < step) rep.next_ns + step else now_ns + step;
+        if (self.ui.sheet_open) {
+            self.dispatchKey(rep.key, true, true);
         }
     }
 
@@ -880,7 +918,11 @@ pub const WaylandWindow = struct {
                 const sy: f32 = @floatCast(sy_f64);
 
                 if (button == protocol.input.btn_left) {
+                    const prev_sheet = self.ui.sheet_open;
                     const action = self.ui.pointerButton(sx, sy, pressed, self.status, self.gpio);
+                    if (!prev_sheet and self.ui.sheet_open) {
+                        hid.releaseAllKeys();
+                    }
                     const over_ui = self.ui.isPointInUi(sx, sy, self.status);
                     self.updateCursorShape(over_ui);
                     switch (action) {
@@ -1024,52 +1066,254 @@ pub const WaylandWindow = struct {
         }
     }
 
+    fn isModifierKey(evdev_key: u32) bool {
+        return switch (evdev_key) {
+            29, 97, 42, 54, 56, 100, 125, 126, 58, 69, 70 => true,
+            else => false,
+        };
+    }
+
+    pub fn dispatchKey(self: *WaylandWindow, key: u32, pressed: bool, is_repeat: bool) void {
+        self.ui.updateModifierKey(key, pressed);
+        if (self.ui.sheet_open) {
+            self.ui_dirty = true;
+            if (pressed and self.ui.handleKey(key)) {
+                self.status.serial_u64 = self.ui.parsedSerial();
+                self.status.mac_address = self.ui.parsedMac();
+                self.status.wifi_mac_address = self.ui.parsedWifiMac();
+                self.ui.saveSettings(self.status) catch {};
+                return;
+            }
+            // Escape (evdev key 1) closes any open SD popup/menu first, then the board sheet
+            if (key == 1 and pressed and !is_repeat) {
+                if (self.ui.sd_manage_open) {
+                    self.ui.sd_manage_open = false;
+                    return;
+                }
+                if (self.ui.sd_card_menu_open) {
+                    self.ui.sd_card_menu_open = false;
+                    return;
+                }
+                self.ui.sheet_open = false;
+                const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
+                const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
+                self.updateCursorShape(self.ui.isPointInUi(sx, sy, self.status));
+            }
+            return;
+        }
+        if (self.hid) |hid| {
+            hid.handleEvdevKey(key, pressed);
+        }
+    }
+
     fn keyboardEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
         const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
-        const hid = self.hid orelse return;
 
         switch (opcode) {
             protocol.wl_keyboard.event.keymap => {
-                _ = r.uint() catch return; // format
+                const format = r.uint() catch return;
                 const fd = r.fd() catch return;
-                _ = linux.close(fd);
+                defer _ = linux.close(fd);
+                const size = r.uint() catch return;
+                if (format == protocol.wl_keyboard.keymap_format.xkb_v1 and size > 0 and size <= 4 * 1024 * 1024) {
+                    const map = linux.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+                    if (linux.errno(map) == .SUCCESS) {
+                        defer _ = linux.munmap(@ptrFromInt(map), size);
+                        const bytes: [*]const u8 = @ptrFromInt(map);
+                        const len = if (bytes[size - 1] == 0) size - 1 else size;
+                        self.ui.loadXkbKeymap(bytes[0..len]);
+                    }
+                }
+            },
+            protocol.wl_keyboard.event.enter => {
+                _ = r.uint() catch return; // serial
+                _ = r.uint() catch return; // surface
+                const keys = r.array() catch return;
+                self.repeat = null;
+                self.keys_down = .initEmpty();
+                self.ui.clearModifiers();
+                var i: usize = 0;
+                while (i + 4 <= keys.len) : (i += 4) {
+                    const key = std.mem.readInt(u32, keys[i..][0..4], .little);
+                    if (key < 256) self.keys_down.set(key);
+                    self.ui.updateModifierKey(key, true);
+                    if (!self.ui.sheet_open) {
+                        if (self.hid) |hid| {
+                            hid.handleEvdevKey(key, true);
+                        }
+                    }
+                }
+            },
+            protocol.wl_keyboard.event.leave => {
+                _ = r.uint() catch return; // serial
+                _ = r.uint() catch return; // surface
+                self.repeat = null;
+                self.keys_down = .initEmpty();
+                self.ui.clearModifiers();
+                if (self.hid) |hid| {
+                    hid.releaseAllKeys();
+                }
             },
             protocol.wl_keyboard.event.key => {
                 _ = r.uint() catch return; // serial
                 _ = r.uint() catch return; // time
                 const key = r.uint() catch return;
                 const state = r.uint() catch return;
-                const pressed = (state == protocol.wl_keyboard.key_state.pressed);
-                self.ui.updateModifierKey(key, pressed);
-                if (self.ui.sheet_open) {
-                    self.ui_dirty = true;
-                    if (pressed and self.ui.handleKey(key)) {
-                        self.status.serial_u64 = self.ui.parsedSerial();
-                        self.status.mac_address = self.ui.parsedMac();
-                        self.status.wifi_mac_address = self.ui.parsedWifiMac();
-                        self.ui.saveSettings(self.status) catch {};
-                        return;
-                    }
-                    // Escape (evdev key 1) closes any open SD popup/menu first, then the board sheet
-                    if (key == 1 and pressed) {
-                        if (self.ui.sd_manage_open) {
-                            self.ui.sd_manage_open = false;
-                            return;
-                        }
-                        if (self.ui.sd_card_menu_open) {
-                            self.ui.sd_card_menu_open = false;
-                            return;
-                        }
-                        self.ui.sheet_open = false;
-                        const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
-                        const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
-                        self.updateCursorShape(self.ui.isPointInUi(sx, sy, self.status));
-                    }
-                    return;
+                const pressed = switch (state) {
+                    protocol.wl_keyboard.key_state.released => false,
+                    protocol.wl_keyboard.key_state.pressed, protocol.wl_keyboard.key_state.repeated => true,
+                    else => return,
+                };
+                const is_repeat = (state == protocol.wl_keyboard.key_state.repeated);
+                if (key < 256) {
+                    if (pressed) self.keys_down.set(key) else self.keys_down.unset(key);
                 }
-                hid.handleEvdevKey(key, pressed);
+                if (pressed) {
+                    if (!isModifierKey(key) and self.repeat_rate > 0 and !is_repeat) {
+                        const delay_ns = @as(u64, self.repeat_delay_ms) * std.time.ns_per_ms;
+                        self.repeat = .{ .key = key, .next_ns = monotonicNs() + delay_ns };
+                    }
+                } else {
+                    if (self.repeat) |rep| {
+                        if (rep.key == key) self.repeat = null;
+                    }
+                }
+                self.dispatchKey(key, pressed, is_repeat);
+            },
+            protocol.wl_keyboard.event.modifiers => {
+                _ = r.uint() catch return; // serial
+                const mods_depressed = r.uint() catch return;
+                const mods_latched = r.uint() catch return;
+                const mods_locked = r.uint() catch return;
+                _ = r.uint() catch return; // group
+                self.ui.updateModifiersFromXkb(mods_depressed, mods_latched, mods_locked);
+            },
+            protocol.wl_keyboard.event.repeat_info => {
+                const rate = r.int() catch return;
+                const delay = r.int() catch return;
+                self.repeat_rate = if (rate > 0) @intCast(rate) else 0;
+                self.repeat_delay_ms = if (delay > 0) @intCast(delay) else 0;
+                if (self.repeat_rate == 0) self.repeat = null;
             },
             else => {},
         }
     }
 };
+
+fn monotonicNs() u64 {
+    var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = linux.clock_gettime(.MONOTONIC, &ts);
+    const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
+    const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
+    return sec * std.time.ns_per_s + nsec;
+}
+
+test "WaylandWindow keyboard repeat_info, serviceRepeat, keymap fd mmap, and leave release" {
+    const testing = std.testing;
+    var gpio: Gpio = .{};
+    var hid: UsbHidComposite = .{};
+    var ui = try board_sheet.BoardUi.init(testing.allocator);
+    defer ui.deinit();
+
+    var win: WaylandWindow = .{
+        .gpa = testing.allocator,
+        .display = undefined,
+        .registry = undefined,
+        .compositor = undefined,
+        .surface = undefined,
+        .cursor_surface = undefined,
+        .xdg_surface = undefined,
+        .toplevel = undefined,
+        .wm_base = undefined,
+        .shm = undefined,
+        .width = 1280,
+        .height = 764,
+        .display_width = 1280,
+        .display_height = 720,
+        .hdmi_fb = &.{},
+        .gpio = &gpio,
+        .hid = &hid,
+        .ui = ui,
+    };
+
+    var conn: client.Connection = .{ .fd = -1 };
+
+    // 1. Test repeat_info event (rate = 25 Hz -> 40ms step, delay = 200ms)
+    var repeat_payload: [8]u8 = undefined;
+    std.mem.writeInt(i32, repeat_payload[0..4], 25, .little);
+    std.mem.writeInt(i32, repeat_payload[4..8], 200, .little);
+    var r_info: client.Reader = .{ .data = &repeat_payload, .c = &conn };
+    WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.repeat_info, &r_info);
+    try testing.expectEqual(@as(u32, 25), win.repeat_rate);
+    try testing.expectEqual(@as(u32, 200), win.repeat_delay_ms);
+
+    // 2. Test keymap event via memfd
+    const keymap_str =
+        \\xkb_keymap {
+        \\xkb_keycodes "evdev" { <AD01> = 24; };
+        \\xkb_symbols "pc" { key <AD01> { [ z, Z ] }; };
+        \\};
+    ;
+    const mfd_rc = linux.memfd_create("test-keymap", 0);
+    if (linux.errno(mfd_rc) == .SUCCESS) {
+        const mfd: linux.fd_t = @intCast(mfd_rc);
+        _ = linux.write(mfd, keymap_str.ptr, keymap_str.len);
+        var km_payload: [8]u8 = undefined;
+        std.mem.writeInt(u32, km_payload[0..4], protocol.wl_keyboard.keymap_format.xkb_v1, .little);
+        std.mem.writeInt(u32, km_payload[4..8], @intCast(keymap_str.len), .little);
+        conn.in_fds[0] = mfd;
+        conn.in_fds_start = 0;
+        conn.in_fds_end = 1;
+        var r_km: client.Reader = .{ .data = &km_payload, .c = &conn };
+        WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.keymap, &r_km);
+        try testing.expectEqual(@as(?u8, 'z'), win.ui.lookupKeyChar(16));
+    }
+
+    // 3. Open Manage SD Cards text field, press key 16 ('z' in our custom keymap), and verify key repeat
+    win.ui.sheet_open = true;
+    win.ui.sd_manage_open = true;
+    win.ui.focused_field = .sd_card_name;
+    win.ui.new_card_name_len = 0;
+
+    var key_down_payload: [16]u8 = undefined;
+    std.mem.writeInt(u32, key_down_payload[0..4], 1, .little); // serial
+    std.mem.writeInt(u32, key_down_payload[4..8], 100, .little); // time
+    std.mem.writeInt(u32, key_down_payload[8..12], 16, .little); // key AD01
+    std.mem.writeInt(u32, key_down_payload[12..16], protocol.wl_keyboard.key_state.pressed, .little);
+    var r_down: client.Reader = .{ .data = &key_down_payload, .c = &conn };
+    WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.key, &r_down);
+    try testing.expectEqualStrings("z", win.ui.newCardName());
+    try testing.expect(win.repeat != null);
+
+    const first_due = win.repeat.?.next_ns;
+    // Before delay expires: no repeat
+    win.serviceRepeat(first_due - 1);
+    try testing.expectEqualStrings("z", win.ui.newCardName());
+
+    // At delay expiry: 2nd 'z'
+    win.serviceRepeat(first_due);
+    try testing.expectEqualStrings("zz", win.ui.newCardName());
+
+    // 40ms later (25 Hz): 3rd 'z'
+    win.serviceRepeat(first_due + 40 * std.time.ns_per_ms);
+    try testing.expectEqualStrings("zzz", win.ui.newCardName());
+
+    // Release key 16 -> repeat stops
+    var key_up_payload = key_down_payload;
+    std.mem.writeInt(u32, key_up_payload[12..16], protocol.wl_keyboard.key_state.released, .little);
+    var r_up: client.Reader = .{ .data = &key_up_payload, .c = &conn };
+    WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.key, &r_up);
+    try testing.expect(win.repeat == null);
+
+    // 4. Test guest USB HID key press + wl_keyboard.leave releases held keys
+    win.ui.sheet_open = false;
+    r_down = .{ .data = &key_down_payload, .c = &conn };
+    WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.key, &r_down);
+    try testing.expectEqual(@as(u8, 0x14), hid.kbd_state[2]);
+
+    var leave_payload: [8]u8 = @splat(0);
+    var r_leave: client.Reader = .{ .data = &leave_payload, .c = &conn };
+    WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.leave, &r_leave);
+    try testing.expectEqual(@as(u8, 0), hid.kbd_state[2]);
+}
+

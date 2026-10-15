@@ -430,18 +430,22 @@ pub const UsbHidComposite = struct {
     pub fn handleEvdevKey(self: *UsbHidComposite, evdev_key: u32, pressed: bool) void {
         if (!self.isHubPresent() or !self.keyboard_connected) return;
         if (evdevToModifierBit(evdev_key)) |mod_bit| {
+            const prev = self.kbd_state[0];
             if (pressed) {
                 self.kbd_state[0] |= mod_bit;
             } else {
                 self.kbd_state[0] &= ~mod_bit;
             }
-            self.enqueueKbdReport(self.kbd_state);
+            if (self.kbd_state[0] != prev) {
+                self.enqueueKbdReport(self.kbd_state);
+            }
             return;
         }
 
         const usage = evdevToHidUsage(evdev_key);
         if (usage == 0) return;
 
+        var changed = false;
         if (pressed) {
             for (self.kbd_state[2..8]) |k| {
                 if (k == usage) return;
@@ -449,6 +453,7 @@ pub const UsbHidComposite = struct {
             for (self.kbd_state[2..8]) |*k| {
                 if (k.* == 0) {
                     k.* = usage;
+                    changed = true;
                     break;
                 }
             }
@@ -456,10 +461,29 @@ pub const UsbHidComposite = struct {
             for (self.kbd_state[2..8]) |*k| {
                 if (k.* == usage) {
                     k.* = 0;
+                    changed = true;
                 }
             }
         }
-        self.enqueueKbdReport(self.kbd_state);
+        if (changed) {
+            self.enqueueKbdReport(self.kbd_state);
+        }
+    }
+
+    /// Releases any currently held keys or modifiers in the USB HID keyboard state.
+    pub fn releaseAllKeys(self: *UsbHidComposite) void {
+        var any_held = false;
+        for (self.kbd_state) |b| {
+            if (b != 0) {
+                any_held = true;
+                break;
+            }
+        }
+        if (!any_held) return;
+        self.kbd_state = @splat(0);
+        if (self.isHubPresent() and self.keyboard_connected) {
+            self.enqueueKbdReport(self.kbd_state);
+        }
     }
 
     pub fn enqueueKbdReport(self: *UsbHidComposite, report: [8]u8) void {
@@ -1215,10 +1239,10 @@ pub const UsbHidComposite = struct {
         0x95, 0x06, //   Report Count (6)
         0x75, 0x08, //   Report Size (8)
         0x15, 0x00, //   Logical Minimum (0)
-        0x25, 0x65, //   Logical Maximum (101)
+        0x25, 0x67, //   Logical Maximum (103)
         0x05, 0x07, //   Usage Page (Key Codes)
         0x19, 0x00, //   Usage Minimum (0)
-        0x29, 0x65, //   Usage Maximum (101)
+        0x29, 0x67, //   Usage Maximum (103)
         0x81, 0x00, //   Input (Data, Array) - Key arrays (6 bytes)
         0xc0, // End Collection
     };
@@ -1342,11 +1366,31 @@ pub const UsbHidComposite = struct {
             51 => 0x36, // ,
             52 => 0x37, // .
             53 => 0x38, // /
+            55 => 0x55, // Keypad *
             57 => 0x2c, // Space
             58 => 0x39, // CapsLock
             59...68 => @intCast(0x3a + (evdev_key - 59)), // F1..F10
+            69 => 0x53, // NumLock
+            70 => 0x47, // ScrollLock
+            71 => 0x5f, // Keypad 7
+            72 => 0x60, // Keypad 8
+            73 => 0x61, // Keypad 9
+            74 => 0x56, // Keypad -
+            75 => 0x5c, // Keypad 4
+            76 => 0x5d, // Keypad 5
+            77 => 0x5e, // Keypad 6
+            78 => 0x57, // Keypad +
+            79 => 0x59, // Keypad 1
+            80 => 0x5a, // Keypad 2
+            81 => 0x5b, // Keypad 3
+            82 => 0x62, // Keypad 0
+            83 => 0x63, // Keypad .
+            86 => 0x64, // KEY_102ND (Non-US \ and |)
             87 => 0x44, // F11
             88 => 0x45, // F12
+            96 => 0x58, // Keypad Enter
+            98 => 0x54, // Keypad /
+            99 => 0x46, // SysRq / PrintScreen
             102 => 0x4a, // Home
             103 => 0x52, // Up
             104 => 0x4b, // PageUp
@@ -1357,6 +1401,9 @@ pub const UsbHidComposite = struct {
             109 => 0x4e, // PageDown
             110 => 0x49, // Insert
             111 => 0x4c, // Delete
+            117 => 0x67, // Keypad =
+            119 => 0x48, // Pause
+            127 => 0x65, // Compose / Application
             else => 0,
         };
     }
