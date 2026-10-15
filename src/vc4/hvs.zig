@@ -8,9 +8,13 @@ pub const Hvs = struct {
     pub const BASE_ADDR: u32 = 0x20400000;
     pub const SIZE: u32 = 0x6000;
     pub const DLIST_OFFSET: u32 = 0x2000;
-    pub const DLIST_WORDS: usize = 1024;
+    pub const DLIST_WORDS: usize = 4096;
+    pub const DLIST_MASK: u32 = DLIST_WORDS - 1;
 
     pub const SCALER_DISPSTATX_EMPTY: u32 = 1 << 28;
+    pub const SCALER_DISPSTATX_MODE_RUN: u32 = 2 << 30;
+    pub const SCALER_DISPCTRLX_ENABLE: u32 = 1 << 31;
+    pub const SCALER_DISPCTRLX_RESET: u32 = 1 << 30;
     pub const SCALER_CTL0_END: u32 = 1 << 31;
     pub const SCALER_CTL0_VALID: u32 = 1 << 30;
     pub const SCALER_CTL0_UNITY: u32 = 1 << 4;
@@ -43,10 +47,56 @@ pub const Hvs = struct {
         return self.dispstat != 0;
     }
 
+    fn computeChanStat(self: *const Hvs, ch: usize) u32 {
+        const enabled = (self.chan_ctrl[ch] & SCALER_DISPCTRLX_ENABLE) != 0;
+        const mode: u32 = if (enabled) SCALER_DISPSTATX_MODE_RUN else 0;
+        const fc: u32 = self.frame_count;
+        const frcnt_bits: u32 = switch (ch) {
+            0 => 0,
+            // VC4_GEN_4 stores FRCNT0 in DISPSTAT1[23:18] and FRCNT1 in DISPSTAT1[17:12]
+            1 => (fc << 18) | (fc << 12),
+            // VC4_GEN_4 stores FRCNT2 in DISPSTAT2[17:12]
+            2 => (fc << 12),
+            else => 0,
+        };
+        return mode | SCALER_DISPSTATX_EMPTY | frcnt_bits;
+    }
+
+    fn updateDispstatSummaryBits(self: *Hvs) void {
+        // SCALER_DISPSTAT_IRQDISP(ch) is BIT(1 + ch), active when any flag in
+        // SCALER_DISPSTAT_IRQMASK(ch) (bits [13 + ch*8 : 8 + ch*8]) is set and
+        // SCALER_DISPCTRL_DISPEIRQ(ch) (BIT(1 + ch)) is enabled.
+        self.dispstat &= ~@as(u32, 0x0e);
+        inline for (0..3) |ch| {
+            const chan_mask: u32 = @as(u32, 0x3f) << (8 + ch * 8);
+            const disp_ie: u32 = @as(u32, 1) << (1 + ch);
+            if ((self.dispstat & chan_mask) != 0 and (self.dispctrl & disp_ie) != 0) {
+                self.dispstat |= disp_ie;
+            }
+        }
+    }
+
     pub fn notifyVblank(self: *Hvs) void {
         self.frame_count +%= 1;
         for (0..3) |ch| {
-            self.chan_stat[ch] = SCALER_DISPSTATX_EMPTY | (@as(u32, self.frame_count) << 18);
+            self.chan_stat[ch] = self.computeChanStat(ch);
+        }
+        if ((self.dispctrl & (1 << 31)) != 0) {
+            inline for (0..3) |ch| {
+                // SCALER_DISPCTRL_DSPEIEOF(ch) is BIT(7 + ch * 2)
+                const eof_ie: u32 = @as(u32, 1) << (7 + ch * 2);
+                // SCALER_DISPCTRL_DSPEIEOLN(ch) is BIT(8 + ch * 2)
+                const eoln_ie: u32 = @as(u32, 1) << (8 + ch * 2);
+                if ((self.dispctrl & eof_ie) != 0) {
+                    // SCALER_DISPSTAT_EOF(ch) is BIT(8 + ch * 8)
+                    self.dispstat |= (@as(u32, 1) << (8 + ch * 8));
+                }
+                if ((self.dispctrl & eoln_ie) != 0) {
+                    // SCALER_DISPSTAT_EOLN(ch) is BIT(12 + ch * 8)
+                    self.dispstat |= (@as(u32, 1) << (12 + ch * 8));
+                }
+            }
+            self.updateDispstatSummaryBits();
         }
     }
 
@@ -71,15 +121,15 @@ pub const Hvs = struct {
             0x0038 => self.displact[2],
             0x0040 => self.chan_ctrl[0],
             0x0044 => self.chan_bkgnd[0],
-            0x0048 => self.chan_stat[0] | SCALER_DISPSTATX_EMPTY,
+            0x0048 => self.computeChanStat(0),
             0x004c => self.chan_base[0],
             0x0050 => self.chan_ctrl[1],
             0x0054 => self.chan_bkgnd[1],
-            0x0058 => self.chan_stat[1] | SCALER_DISPSTATX_EMPTY,
+            0x0058 => self.computeChanStat(1),
             0x005c => self.chan_base[1],
             0x0060 => self.chan_ctrl[2],
             0x0064 => self.chan_bkgnd[2],
-            0x0068 => self.chan_stat[2] | SCALER_DISPSTATX_EMPTY,
+            0x0068 => self.computeChanStat(2),
             0x006c => self.chan_base[2],
             else => 0,
         };
@@ -91,8 +141,14 @@ pub const Hvs = struct {
             return;
         }
         switch (offset) {
-            0x0000 => self.dispctrl = val,
-            0x0004 => self.dispstat &= ~val,
+            0x0000 => {
+                self.dispctrl = val;
+                self.updateDispstatSummaryBits();
+            },
+            0x0004 => {
+                self.dispstat &= ~val;
+                self.updateDispstatSummaryBits();
+            },
             0x000c => self.dispectrl = val,
             0x0010 => self.dispprof = val,
             0x0014 => self.dispdither = val,
@@ -112,17 +168,26 @@ pub const Hvs = struct {
                 self.displact[2] = val;
                 self.dlist_updated = true;
             },
-            0x0040 => self.chan_ctrl[0] = val,
+            0x0040 => {
+                self.chan_ctrl[0] = val & ~SCALER_DISPCTRLX_RESET;
+                self.chan_stat[0] = self.computeChanStat(0);
+            },
             0x0044 => self.chan_bkgnd[0] = val,
-            0x0048 => self.chan_stat[0] = (self.chan_stat[0] & ~val) | SCALER_DISPSTATX_EMPTY,
+            0x0048 => self.chan_stat[0] = self.computeChanStat(0),
             0x004c => self.chan_base[0] = val,
-            0x0050 => self.chan_ctrl[1] = val,
+            0x0050 => {
+                self.chan_ctrl[1] = val & ~SCALER_DISPCTRLX_RESET;
+                self.chan_stat[1] = self.computeChanStat(1);
+            },
             0x0054 => self.chan_bkgnd[1] = val,
-            0x0058 => self.chan_stat[1] = (self.chan_stat[1] & ~val) | SCALER_DISPSTATX_EMPTY,
+            0x0058 => self.chan_stat[1] = self.computeChanStat(1),
             0x005c => self.chan_base[1] = val,
-            0x0060 => self.chan_ctrl[2] = val,
+            0x0060 => {
+                self.chan_ctrl[2] = val & ~SCALER_DISPCTRLX_RESET;
+                self.chan_stat[2] = self.computeChanStat(2);
+            },
             0x0064 => self.chan_bkgnd[2] = val,
-            0x0068 => self.chan_stat[2] = (self.chan_stat[2] & ~val) | SCALER_DISPSTATX_EMPTY,
+            0x0068 => self.chan_stat[2] = self.computeChanStat(2),
             0x006c => self.chan_base[2] = val,
             else => {},
         }
@@ -132,7 +197,7 @@ pub const Hvs = struct {
     pub fn isActive(self: *const Hvs) bool {
         if ((self.dispctrl & (1 << 31)) == 0) return false;
         for (0..3) |ch| {
-            const head = self.displact[ch] & 0x3ff;
+            const head = self.displact[ch] & DLIST_MASK;
             if ((self.dlist[head] & SCALER_CTL0_END) == 0 and (self.dlist[head] & SCALER_CTL0_VALID) != 0) {
                 return true;
             }
@@ -147,7 +212,7 @@ pub const Hvs = struct {
         // Find active channel (HDMI on BCM2835 uses channel 1, fallback to 0 or 2)
         var active_ch: ?usize = null;
         for ([_]usize{ 1, 0, 2 }) |ch| {
-            const head = self.displact[ch] & 0x3ff;
+            const head = self.displact[ch] & DLIST_MASK;
             const ctl0 = self.dlist[head];
             if ((ctl0 & SCALER_CTL0_END) == 0 and (ctl0 & SCALER_CTL0_VALID) != 0) {
                 active_ch = ch;
@@ -156,7 +221,7 @@ pub const Hvs = struct {
         }
         const ch = active_ch orelse return false;
 
-        var idx: usize = self.displact[ch] & 0x3ff;
+        var idx: usize = self.displact[ch] & DLIST_MASK;
         var planes_drawn: usize = 0;
         var bkgnd_cleared = false;
 
@@ -369,7 +434,7 @@ pub const Hvs = struct {
 
         var active_ch: ?usize = null;
         for ([_]usize{ 1, 0, 2 }) |ch| {
-            const head = self.displact[ch] & 0x3ff;
+            const head = self.displact[ch] & DLIST_MASK;
             const ctl0 = self.dlist[head];
             if ((ctl0 & SCALER_CTL0_END) == 0 and (ctl0 & SCALER_CTL0_VALID) != 0) {
                 active_ch = ch;
@@ -378,7 +443,7 @@ pub const Hvs = struct {
         }
         const ch = active_ch orelse return null;
 
-        var idx: usize = self.displact[ch] & 0x3ff;
+        var idx: usize = self.displact[ch] & DLIST_MASK;
         var planes_seen: usize = 0;
         var found: ?[2]i32 = null;
 
@@ -504,4 +569,31 @@ test "HVS cursor hotspot detection" {
     const hot = hvs.getCursorHotspot(&ram);
     try std.testing.expectEqual(@as(?[2]i32, .{ 640, 360 }), hot);
 }
+
+test "HVS EOF interrupt and per-channel frame counters for DLIST reclamation" {
+    var hvs = Hvs{};
+
+    // Enable channel 1 and configure SCALER_DISPCTRL = 0xaa0c020e
+    // (ENABLE | DSPEIEOF(1) [0x200] | DISPEIRQ(0..2) [0x0e])
+    hvs.write32(0x0050, Hvs.SCALER_DISPCTRLX_ENABLE);
+    hvs.write32(0x0000, 0xaa0c020e);
+    try std.testing.expect(!hvs.irqPending());
+
+    // Vblank increments frame_count and asserts EOF(1) (bit 16) + IRQDISP(1) (bit 2)
+    hvs.notifyVblank();
+    try std.testing.expect(hvs.irqPending());
+    const stat = hvs.read32(0x0004);
+    try std.testing.expect((stat & (1 << 16)) != 0); // SCALER_DISPSTAT_EOF(1)
+    try std.testing.expect((stat & (1 << 2)) != 0); // SCALER_DISPSTAT_IRQDISP(1)
+
+    // Verify VC4_GEN_4 FRCNT0 (bits 23:18) and FRCNT1 (bits 17:12) in SCALER_DISPSTAT1
+    const dispstat1 = hvs.read32(0x0058);
+    try std.testing.expectEqual(@as(u32, 1), (dispstat1 >> 18) & 0x3f);
+    try std.testing.expectEqual(@as(u32, 1), (dispstat1 >> 12) & 0x3f);
+
+    // Clearing SCALER_DISPSTAT_IRQMASK(0..2) (0x3f3f3f00) clears both EOF(1) and summary IRQDISP(1)
+    hvs.write32(0x0004, 0x3f3f3f00);
+    try std.testing.expect(!hvs.irqPending());
+}
+
 
