@@ -423,7 +423,16 @@ pub const UsbHidComposite = struct {
                     1 => return self.writeUtf16String("FauxPi", wLength),
                     2 => return self.writeUtf16String("FauxPi USB Keyboard & Mouse", wLength),
                     3 => return self.writeUtf16String("0001", wLength),
-                    4 => return self.writeUtf16String("B827EB123456", wLength),
+                    4 => {
+                        var mac_str_buf: [12]u8 = undefined;
+                        const m = self.net.guest_mac;
+                        const mac_str = std.fmt.bufPrint(
+                            &mac_str_buf,
+                            "{X:0>2}{X:0>2}{X:0>2}{X:0>2}{X:0>2}{X:0>2}",
+                            .{ m[0], m[1], m[2], m[3], m[4], m[5] },
+                        ) catch "B827EB123456";
+                        return self.writeUtf16String(mac_str, wLength);
+                    },
                     else => return false,
                 }
             },

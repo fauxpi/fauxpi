@@ -42,6 +42,9 @@ pub const Mailbox = struct {
     emmc_rate_hz: u32 = 250_000_000,
     pixel_rate_hz: u32 = 74_250_000,
 
+    board_serial: u64 = 0x00000000fa000001,
+    mac_address: [6]u8 = .{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 },
+
     pub fn irqPending(self: *const Mailbox) bool {
         return (self.config & MBOX_IHAVEDATAIRQEN) != 0 and self.fifo_count > 0;
     }
@@ -183,14 +186,13 @@ pub const Mailbox = struct {
                 },
                 0x00010003 => { // Get board MAC address
                     if (buf_size >= 6) {
-                        const mac = [_]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
-                        @memcpy(ram[payload .. payload + 6], &mac);
+                        @memcpy(ram[payload .. payload + 6], &self.mac_address);
                     }
                     resp_len = 6;
                 },
                 0x00010004 => { // Get board serial
-                    writeU32(ram, payload, 0, buf_size, 0x12345678);
-                    writeU32(ram, payload, 4, buf_size, 0x00000000);
+                    writeU32(ram, payload, 0, buf_size, @truncate(self.board_serial));
+                    writeU32(ram, payload, 4, buf_size, @truncate(self.board_serial >> 32));
                     resp_len = 8;
                 },
                 0x00010005 => { // Get ARM memory

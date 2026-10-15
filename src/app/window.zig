@@ -846,11 +846,20 @@ pub const WaylandWindow = struct {
                             hid.ethernet_connected = self.status.ethernet_connected;
                             return;
                         },
+                        .toggle_dhcp => {
+                            self.status.dhcp_enabled = !self.status.dhcp_enabled;
+                            hid.net.dhcp_enabled = self.status.dhcp_enabled;
+                            return;
+                        },
                         .close => {
                             self.closed = true;
                             return;
                         },
-                        .consumed => return,
+                        .consumed => {
+                            self.status.serial_u64 = self.ui.parsedSerial();
+                            self.status.mac_address = self.ui.parsedMac();
+                            return;
+                        },
                         .none => {},
                     }
                 } else if (self.ui.sheet_open or sy < @as(f32, @floatFromInt(board_sheet.BoardUi.title_bar_height))) {
@@ -902,7 +911,12 @@ pub const WaylandWindow = struct {
                 const state = r.uint() catch return;
                 const pressed = (state == protocol.wl_keyboard.key_state.pressed);
                 if (self.ui.sheet_open) {
-                    // Escape (evdev key 1) closes the board sheet
+                    if (pressed and self.ui.handleKey(key)) {
+                        self.status.serial_u64 = self.ui.parsedSerial();
+                        self.status.mac_address = self.ui.parsedMac();
+                        return;
+                    }
+                    // Escape (evdev key 1) closes the board sheet when no text field is focused
                     if (key == 1 and pressed) {
                         self.ui.sheet_open = false;
                         const sy: f64 = self.last_mouse_y orelse 0.0;

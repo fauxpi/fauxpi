@@ -176,6 +176,22 @@ pub fn loadDirect(
     };
 }
 
+/// Updates `/system/linux,serial` and `/serial-number` in the in-RAM DTB at `dtb_load_addr`.
+pub fn applyBoardSerialToRamDtb(allocator: std.mem.Allocator, ram: []u8, dtb_size: usize, serial: u64) !usize {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    if (dtb_load_addr + dtb_size > ram.len) return error.DtbTooLarge;
+    var tree = try fdt.Tree.parse(alloc, ram[dtb_load_addr .. dtb_load_addr + dtb_size]);
+    try tree.setBoardSerial(serial);
+    const updated_dtb = try tree.serialize(alloc);
+    if (dtb_load_addr + updated_dtb.len > ram.len) return error.DtbTooLarge;
+    @memcpy(ram[dtb_load_addr .. dtb_load_addr + updated_dtb.len], updated_dtb);
+    return updated_dtb.len;
+}
+
+
 test "parse config.txt" {
     const sample =
         \\# Dazzle config.txt

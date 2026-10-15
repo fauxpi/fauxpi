@@ -208,17 +208,22 @@ fn loadGuestBoot(
     ram: []u8,
     soc: *Bcm2835,
     sd_image_buf: ?[]u8,
+    board_serial: u64,
+    mac_address: [6]u8,
 ) !loader.BootResult {
     soc.usb.hid.net.deinit();
     @memset(ram, 0);
     soc.* = Bcm2835.init(ram, opts.width, opts.height);
+    soc.mailbox.board_serial = board_serial;
+    soc.mailbox.mac_address = mac_address;
+    soc.usb.hid.net.guest_mac = mac_address;
 
-    if (sd_image_buf) |img| {
+    const boot_res = if (sd_image_buf) |img| blk: {
         soc.sdhost.attachMutableSlice(img);
         const k_override = if (opts.kernel_path) |kp| try readFileLinux(gpa, kp) else null;
         defer if (k_override) |ko| gpa.free(ko);
-        return try loader.loadFromSdImage(gpa, ram, img, opts.cmdline, k_override);
-    } else {
+        break :blk try loader.loadFromSdImage(gpa, ram, img, opts.cmdline, k_override);
+    } else blk: {
         const k_path = opts.kernel_path orelse return error.MissingKernel;
         const d_path = opts.dtb_path orelse return error.MissingDtb;
         const k_bytes = try readFileLinux(gpa, k_path);
@@ -229,8 +234,11 @@ fn loadGuestBoot(
         defer if (rd_bytes) |rd| gpa.free(rd);
 
         const cmdline = opts.cmdline orelse "console=ttyAMA0,115200 earlycon=pl011,0x20201000";
-        return try loader.loadDirect(gpa, ram, k_bytes, d_bytes, rd_bytes, cmdline, true);
-    }
+        break :blk try loader.loadDirect(gpa, ram, k_bytes, d_bytes, rd_bytes, cmdline, true);
+    };
+
+    _ = try loader.applyBoardSerialToRamDtb(gpa, ram, boot_res.r2, board_serial);
+    return boot_res;
 }
 
 fn syncWindowPeripheralsToSoc(w: *const window.WaylandWindow, soc: *Bcm2835) void {
@@ -239,6 +247,7 @@ fn syncWindowPeripheralsToSoc(w: *const window.WaylandWindow, soc: *Bcm2835) voi
     soc.usb.hid.keyboard_connected = w.status.usb_keyboard_connected;
     soc.usb.hid.mouse_connected = w.status.usb_mouse_connected;
     soc.usb.hid.ethernet_connected = w.status.ethernet_connected;
+    soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
 }
 
 fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliOptions) !void {
@@ -260,12 +269,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     const initial_power = opts.power or opts.headless;
     const initial_sd = (sd_image_buf != null);
 
-    if (initial_power and (initial_sd or opts.kernel_path != null)) {
-        const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, if (initial_sd) sd_image_buf else null);
-        cpu.initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
-        guest_booted = true;
-    }
-
     var wl_win: ?*window.WaylandWindow = null;
     defer if (wl_win) |w| w.destroy();
 
@@ -273,10 +276,22 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         wl_win = try window.WaylandWindow.create(gpa, environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
         wl_win.?.status.power_connected = opts.power;
         wl_win.?.status.sd_connected = initial_sd;
-        const disp_pixels = wl_win.?.displayPixels();
+    }
+
+    if (initial_power and (initial_sd or opts.kernel_path != null)) {
+        const serial = if (wl_win) |w| w.status.serial_u64 else 0x00000000fa000001;
+        const mac = if (wl_win) |w| w.status.mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
+        const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, if (initial_sd) sd_image_buf else null, serial, mac);
+        if (wl_win) |w| syncWindowPeripheralsToSoc(w, &soc);
+        cpu.initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
+        guest_booted = true;
+    }
+
+    if (wl_win) |w| {
+        const disp_pixels = w.displayPixels();
         @memset(disp_pixels, 0xFF101418);
-        wl_win.?.compositeUi();
-        try wl_win.?.present();
+        w.compositeUi();
+        try w.present();
     }
 
     const vblank_interval_ns: u64 = 16_666_667; // 60 Hz
@@ -321,7 +336,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 w.power_reconnected = false;
                 const active_sd = if (w.status.sd_connected) sd_image_buf else null;
                 if (active_sd != null or opts.kernel_path != null) {
-                    if (loadGuestBoot(gpa, opts, ram, &soc, active_sd)) |reboot_res| {
+                    if (loadGuestBoot(gpa, opts, ram, &soc, active_sd, w.status.serial_u64, w.status.mac_address)) |reboot_res| {
                         syncWindowPeripheralsToSoc(w, &soc);
                         cpu = .{};
                         cpu.initReset(reboot_res.entry_pc, reboot_res.r0, reboot_res.r1, reboot_res.r2);
@@ -337,6 +352,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     guest_booted = false;
                 }
             }
+
+            soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
 
             if (!w.status.power_connected or !guest_booted) {
                 const now_ns = monotonicNs();
@@ -406,6 +423,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 idle_us_accum = 0;
 
                 soc.setHdmiConnected(w.status.hdmi_connected);
+                soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
                 const disp_pixels = w.displayPixels();
                 w.status.hdmi_active = soc.renderDisplayFrame(disp_pixels, opts.width, opts.height);
                 w.compositeUi();

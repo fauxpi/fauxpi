@@ -29,7 +29,10 @@ const heavy_w: f32 = 1.75;
 
 pub const SystemStatus = struct {
     model: []const u8 = "Raspberry Pi Zero Rev 1.3",
-    serial: []const u8 = "0000000012345678",
+    serial: []const u8 = "00000000fa000001",
+    serial_u64: u64 = 0x00000000fa000001,
+    mac_address: [6]u8 = .{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 },
+    dhcp_enabled: bool = true,
     cpu_busy_percent: f32 = 0.0,
     temperature_c: f32 = 42.0,
     mem_total_mb: u32 = 512,
@@ -58,7 +61,14 @@ pub const Action = enum {
     toggle_usb_keyboard,
     toggle_usb_mouse,
     toggle_ethernet,
+    toggle_dhcp,
     close,
+};
+
+pub const FocusedSettingField = enum {
+    none,
+    serial,
+    mac,
 };
 
 pub const InteractiveTarget = enum {
@@ -130,6 +140,7 @@ pub const BoardUi = struct {
     title: []const u8 = "Raspberry Pi Zero",
     maximized: bool = false,
     sheet_open: bool = true,
+    settings_open: bool = false,
 
     /// Currently hovered connector/peripheral button in the board diagram.
     hovered_target: ?InteractiveTarget = null,
@@ -142,11 +153,33 @@ pub const BoardUi = struct {
     close_btn_hovered: bool = false,
     close_btn_pressed: bool = false,
 
+    /// Expandable Settings panel states & editable buffers.
+    settings_btn_hovered: bool = false,
+    settings_btn_pressed: bool = false,
+    serial_field_hovered: bool = false,
+    serial_rand_hovered: bool = false,
+    mac_field_hovered: bool = false,
+    mac_rand_hovered: bool = false,
+    dhcp_toggle_hovered: bool = false,
+    focused_field: FocusedSettingField = .none,
+
+    serial_hex: [16]u8 = "00000000fa000001".*,
+    serial_len: usize = 16,
+    mac_hex: [12]u8 = "B827EB123456".*,
+    mac_len: usize = 12,
+
     /// Last computed geometry for hit-testing.
     last_win_w: u32 = 1280,
     last_win_h: u32 = 764,
     sheet_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     board_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    settings_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    settings_panel_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    serial_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    serial_rand_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    mac_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    mac_rand_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    dhcp_toggle_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
 
     /// Cached rasterized pixel buffers for TitleBar and Board diagram.
     title_cache: []u32 = &.{},
@@ -305,10 +338,103 @@ pub const BoardUi = struct {
         return null;
     }
 
+    pub fn parsedSerial(self: *const BoardUi) u64 {
+        if (self.serial_len == 0) return 0;
+        return std.fmt.parseInt(u64, self.serial_hex[0..self.serial_len], 16) catch 0x00000000fa000001;
+    }
+
+    pub fn parsedMac(self: *const BoardUi) [6]u8 {
+        var out: [6]u8 = .{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
+        if (self.mac_len < 12) return out;
+        for (0..6) |i| {
+            out[i] = std.fmt.parseInt(u8, self.mac_hex[i * 2 .. i * 2 + 2], 16) catch out[i];
+        }
+        return out;
+    }
+
+    pub fn randomizeSerial(self: *BoardUi) void {
+        var rnd: [4]u8 = undefined;
+        _ = std.os.linux.getrandom(&rnd, rnd.len, 0);
+        const low = std.mem.readInt(u32, &rnd, .big);
+        _ = std.fmt.bufPrint(&self.serial_hex, "00000000{x:0>8}", .{low}) catch {};
+        self.serial_len = 16;
+    }
+
+    pub fn randomizeMac(self: *BoardUi) void {
+        var rnd: [3]u8 = undefined;
+        _ = std.os.linux.getrandom(&rnd, rnd.len, 0);
+        _ = std.fmt.bufPrint(&self.mac_hex, "B827EB{X:0>2}{X:0>2}{X:0>2}", .{ rnd[0], rnd[1], rnd[2] }) catch {};
+        self.mac_len = 12;
+    }
+
+    /// Handles an evdev key press when a Settings text field (`serial` or `mac`) is focused.
+    /// Returns true if the key was consumed by the Settings editor.
+    pub fn handleKey(self: *BoardUi, evdev_key: u32) bool {
+        if (!self.sheet_open or !self.settings_open or self.focused_field == .none) return false;
+
+        // Enter (28) or Escape (1) unfocuses the text field
+        if (evdev_key == 28 or evdev_key == 1) {
+            self.focused_field = .none;
+            return true;
+        }
+
+        // Backspace (14)
+        if (evdev_key == 14) {
+            switch (self.focused_field) {
+                .serial => if (self.serial_len > 0) {
+                    self.serial_len -= 1;
+                },
+                .mac => if (self.mac_len > 0) {
+                    self.mac_len -= 1;
+                },
+                .none => {},
+            }
+            return true;
+        }
+
+        const hex_ch: ?u8 = switch (evdev_key) {
+            2 => '1',
+            3 => '2',
+            4 => '3',
+            5 => '4',
+            6 => '5',
+            7 => '6',
+            8 => '7',
+            9 => '8',
+            10 => '9',
+            11 => '0',
+            30 => 'a',
+            48 => 'b',
+            46 => 'c',
+            32 => 'd',
+            18 => 'e',
+            33 => 'f',
+            else => null,
+        };
+        if (hex_ch) |ch| {
+            switch (self.focused_field) {
+                .serial => if (self.serial_len < 16) {
+                    self.serial_hex[self.serial_len] = ch;
+                    self.serial_len += 1;
+                },
+                .mac => if (self.mac_len < 12) {
+                    self.mac_hex[self.mac_len] = std.ascii.toUpper(ch);
+                    self.mac_len += 1;
+                },
+                .none => {},
+            }
+            return true;
+        }
+        return true;
+    }
+
     /// Updates layout geometry for `(win_w, win_h)` so hit testing and painting match.
     pub fn updateLayout(self: *BoardUi, win_w: u32, win_h: u32, status: SystemStatus, _: *const Gpio) void {
         self.last_win_w = win_w;
         self.last_win_h = win_h;
+        if (status.power_connected) {
+            self.focused_field = .none;
+        }
 
         const w_f: f32 = @floatFromInt(win_w);
         const sheet_w = @min(@max(w_f - 32.0, 360.0), 740.0);
@@ -328,11 +454,53 @@ pub const BoardUi = struct {
         const y: f32 = sheet_y + pad;
         self.board_rect = .{ .x = board_x, .y = y, .w = actual_bw, .h = bh };
 
+        const btn_w: f32 = 128.0;
+        const btn_h: f32 = 30.0;
+        const btn_y: f32 = @round(y + bh + 12.0);
+        self.settings_btn_rect = .{
+            .x = @round(sheet_x + (sheet_w - btn_w) * 0.5),
+            .y = btn_y,
+            .w = btn_w,
+            .h = btn_h,
+        };
+
+        const panel_x: f32 = @round(sheet_x + pad);
+        const panel_w: f32 = @round(sheet_w - 2.0 * pad);
+        const panel_y: f32 = @round(btn_y + btn_h + 12.0);
+        const panel_h: f32 = 192.0;
+        self.settings_panel_rect = .{
+            .x = panel_x,
+            .y = panel_y,
+            .w = panel_w,
+            .h = panel_h,
+        };
+
+        const right_x = panel_x + panel_w - 16.0;
+        const rand_w: f32 = 76.0;
+        const field_w: f32 = 186.0;
+        const ctrl_h: f32 = 32.0;
+
+        const row1_y = panel_y + 44.0;
+        self.serial_rand_rect = .{ .x = right_x - rand_w, .y = row1_y, .w = rand_w, .h = ctrl_h };
+        self.serial_field_rect = .{ .x = right_x - rand_w - 8.0 - field_w, .y = row1_y, .w = field_w, .h = ctrl_h };
+
+        const row2_y = panel_y + 94.0;
+        self.mac_rand_rect = .{ .x = right_x - rand_w, .y = row2_y, .w = rand_w, .h = ctrl_h };
+        self.mac_field_rect = .{ .x = right_x - rand_w - 8.0 - field_w, .y = row2_y, .w = field_w, .h = ctrl_h };
+
+        const row3_y = panel_y + 146.0;
+        self.dhcp_toggle_rect = .{ .x = right_x - 52.0, .y = row3_y, .w = 52.0, .h = 28.0 };
+
+        const total_h: f32 = if (self.settings_open)
+            (panel_y + panel_h + 16.0) - sheet_y
+        else
+            (btn_y + btn_h + 14.0) - sheet_y;
+
         self.sheet_rect = .{
             .x = sheet_x,
             .y = sheet_y,
             .w = sheet_w,
-            .h = bh + 2.0 * pad,
+            .h = total_h,
         };
     }
 
@@ -348,7 +516,29 @@ pub const BoardUi = struct {
 
         if (!self.sheet_open) {
             self.hovered_target = null;
+            self.settings_btn_hovered = false;
+            self.serial_field_hovered = false;
+            self.serial_rand_hovered = false;
+            self.mac_field_hovered = false;
+            self.mac_rand_hovered = false;
+            self.dhcp_toggle_hovered = false;
             return y < @as(f32, @floatFromInt(title_bar_height));
+        }
+
+        self.settings_btn_hovered = self.settings_btn_rect.contains(pt);
+        if (self.settings_open) {
+            const boot_editable = !status.power_connected;
+            self.serial_field_hovered = boot_editable and self.serial_field_rect.contains(pt);
+            self.serial_rand_hovered = boot_editable and self.serial_rand_rect.contains(pt);
+            self.mac_field_hovered = boot_editable and self.mac_field_rect.contains(pt);
+            self.mac_rand_hovered = boot_editable and self.mac_rand_rect.contains(pt);
+            self.dhcp_toggle_hovered = self.dhcp_toggle_rect.contains(pt);
+        } else {
+            self.serial_field_hovered = false;
+            self.serial_rand_hovered = false;
+            self.mac_field_hovered = false;
+            self.mac_rand_hovered = false;
+            self.dhcp_toggle_hovered = false;
         }
 
         const drawing = board.forModel(status.model) orelse &board.pi_zero;
@@ -369,6 +559,13 @@ pub const BoardUi = struct {
         self.max_btn_pressed = false;
         self.close_btn_hovered = false;
         self.close_btn_pressed = false;
+        self.settings_btn_hovered = false;
+        self.settings_btn_pressed = false;
+        self.serial_field_hovered = false;
+        self.serial_rand_hovered = false;
+        self.mac_field_hovered = false;
+        self.mac_rand_hovered = false;
+        self.dhcp_toggle_hovered = false;
         self.hovered_target = null;
     }
 
@@ -408,6 +605,7 @@ pub const BoardUi = struct {
                 }
                 if (self.board_btn_pressed and self.boardBtnRect(self.last_win_w).contains(pt)) {
                     self.sheet_open = !self.sheet_open;
+                    if (!self.sheet_open) self.focused_field = .none;
                     return .consumed;
                 }
                 if (self.max_btn_pressed and maxBtnRect(self.last_win_w).contains(pt)) {
@@ -427,8 +625,49 @@ pub const BoardUi = struct {
         if (!self.sheet_open) return .none;
 
         if (pressed) {
+            if (self.settings_btn_rect.contains(pt)) {
+                self.settings_btn_pressed = true;
+            }
             return .consumed;
         } else {
+            defer self.settings_btn_pressed = false;
+
+            if (self.settings_btn_rect.contains(pt)) {
+                self.settings_open = !self.settings_open;
+                if (!self.settings_open) self.focused_field = .none;
+                return .consumed;
+            }
+
+            if (self.settings_open and self.settings_panel_rect.contains(pt)) {
+                if (!status.power_connected) {
+                    if (self.serial_field_rect.contains(pt)) {
+                        self.focused_field = .serial;
+                        return .consumed;
+                    }
+                    if (self.mac_field_rect.contains(pt)) {
+                        self.focused_field = .mac;
+                        return .consumed;
+                    }
+                    self.focused_field = .none;
+                    if (self.serial_rand_rect.contains(pt)) {
+                        self.randomizeSerial();
+                        return .consumed;
+                    }
+                    if (self.mac_rand_rect.contains(pt)) {
+                        self.randomizeMac();
+                        return .consumed;
+                    }
+                } else {
+                    self.focused_field = .none;
+                }
+                if (self.dhcp_toggle_rect.contains(pt)) {
+                    return .toggle_dhcp;
+                }
+                return .consumed;
+            }
+
+            self.focused_field = .none;
+
             const drawing = board.forModel(status.model) orelse &board.pi_zero;
             if (self.board_rect.contains(pt)) {
                 const tr = boardTransform(drawing, self.board_rect);
@@ -449,6 +688,7 @@ pub const BoardUi = struct {
             // Release outside the sheet card (on the dimmed HDMI area) dismisses the sheet
             if (!self.sheet_rect.contains(pt)) {
                 self.sheet_open = false;
+                self.focused_field = .none;
             }
             return .consumed;
         }
@@ -764,12 +1004,171 @@ pub const BoardUi = struct {
                     const src_row = self.board_cache[ry * box_w_px ..][0..box_w_px];
                     @memcpy(dst_row, src_row);
                 }
+                self.paintSettingsSection(c, status);
                 return;
             }
         }
 
         const drawing = board.forModel(status.model) orelse &board.pi_zero;
         self.paintBoardDrawing(c, drawing, self.board_rect, status);
+        self.paintSettingsSection(c, status);
+    }
+
+    fn paintSettingsSection(self: *const BoardUi, c: *Canvas, status: SystemStatus) void {
+        const t = &self.theme;
+        const btn = self.settings_btn_rect;
+        const btn_bg = if (self.settings_open)
+            t.secondary_container
+        else if (self.settings_btn_hovered)
+            t.surface_container_highest
+        else
+            t.surface_container;
+
+        c.fillRoundedRect(btn, .all(btn.h * 0.5), btn_bg);
+        c.strokeRoundedRect(btn, .all(btn.h * 0.5), 1.0, if (self.settings_btn_hovered or self.settings_open) t.primary else t.outline_variant);
+
+        const icon: Icon = if (self.settings_open) .expand_less else .expand_more;
+        const icon_s: f32 = 18.0;
+        const label = "Settings";
+        const label_style: canvas_mod.Style = .{ .font = &self.font, .size = 13.5 };
+        const label_w = c.measureText(13.5, label);
+        const total_w = icon_s + 6.0 + label_w;
+        const start_x = @round(btn.x + (btn.w - total_w) * 0.5);
+        const fg = if (self.settings_open) t.primary else t.on_surface;
+
+        c.drawIcon(icon, start_x, @round(btn.y + (btn.h - icon_s) * 0.5), icon_s, fg);
+        _ = c.drawText(
+            13.5,
+            start_x + icon_s + 6.0,
+            @round(btn.y + (btn.h - label_style.lineHeight()) * 0.5 + label_style.ascent()),
+            label,
+            fg,
+        );
+
+        if (!self.settings_open) return;
+
+        const pr = self.settings_panel_rect;
+        c.fillRoundedRect(pr, .all(12.0), t.surface_container);
+        c.strokeRoundedRect(pr, .all(12.0), 1.0, t.outline_variant);
+
+        // Top boot-time notice banner
+        const boot_disabled = status.power_connected;
+        const note = "Power down board to set serial number and MAC address";
+        _ = c.drawText(12.5, pr.x + 16.0, pr.y + 23.0, note, t.on_surface_variant);
+        c.fillRect(.{ .x = pr.x + 16.0, .y = pr.y + 33.0, .w = pr.w - 32.0, .h = 1.0 }, t.outline_variant.withAlpha(0.6));
+
+        const row_title_col = if (boot_disabled) t.on_surface.withAlpha(0.42) else t.on_surface;
+        const row_sub_col = if (boot_disabled) t.on_surface_variant.withAlpha(0.42) else t.on_surface_variant;
+
+        // Row 1: Serial Number
+        const row1_y = self.serial_field_rect.y;
+        _ = c.drawText(14.0, pr.x + 16.0, row1_y + 15.0, "Serial Number", row_title_col);
+        _ = c.drawText(11.5, pr.x + 16.0, row1_y + 30.0, "64-bit hex board ID (/system/linux,serial)", row_sub_col);
+
+        var serial_disp_buf: [18]u8 = undefined;
+        const serial_slice = self.serial_hex[0..self.serial_len];
+        const serial_disp = if (!boot_disabled and self.focused_field == .serial)
+            std.fmt.bufPrint(&serial_disp_buf, "{s}|", .{serial_slice}) catch serial_slice
+        else
+            serial_slice;
+        self.paintTextField(c, self.serial_field_rect, serial_disp, !boot_disabled and self.focused_field == .serial, self.serial_field_hovered, boot_disabled);
+        self.paintSmallButton(c, self.serial_rand_rect, "Random", self.serial_rand_hovered, boot_disabled);
+
+        // Row 2: USB Ethernet MAC Address
+        const row2_y = self.mac_field_rect.y;
+        _ = c.drawText(14.0, pr.x + 16.0, row2_y + 15.0, "USB Ethernet MAC", row_title_col);
+        _ = c.drawText(11.5, pr.x + 16.0, row2_y + 30.0, "CDC-ECM adapter hardware address (eth0)", row_sub_col);
+
+        var mac_disp_buf: [20]u8 = undefined;
+        var mac_disp_len: usize = 0;
+        for (self.mac_hex[0..self.mac_len], 0..) |ch, idx| {
+            if (idx > 0 and (idx % 2) == 0 and mac_disp_len < mac_disp_buf.len) {
+                mac_disp_buf[mac_disp_len] = ':';
+                mac_disp_len += 1;
+            }
+            if (mac_disp_len < mac_disp_buf.len) {
+                mac_disp_buf[mac_disp_len] = ch;
+                mac_disp_len += 1;
+            }
+        }
+        if (!boot_disabled and self.focused_field == .mac and mac_disp_len < mac_disp_buf.len) {
+            mac_disp_buf[mac_disp_len] = '|';
+            mac_disp_len += 1;
+        }
+        self.paintTextField(c, self.mac_field_rect, mac_disp_buf[0..mac_disp_len], !boot_disabled and self.focused_field == .mac, self.mac_field_hovered, boot_disabled);
+        self.paintSmallButton(c, self.mac_rand_rect, "Random", self.mac_rand_hovered, boot_disabled);
+
+        // Row 3: DHCP Server Toggle
+        const row3_y = self.dhcp_toggle_rect.y;
+        _ = c.drawText(14.0, pr.x + 16.0, row3_y + 13.0, "DHCP Server", t.on_surface);
+        _ = c.drawText(11.5, pr.x + 16.0, row3_y + 28.0, "Lease 10.0.2.15/24 · Gateway & DNS 10.0.2.2", t.on_surface_variant);
+
+        const sw = self.dhcp_toggle_rect;
+        const sw_bg = if (status.dhcp_enabled) t.primary else t.surface_container_highest;
+        c.fillRoundedRect(sw, .all(sw.h * 0.5), sw_bg);
+        c.strokeRoundedRect(
+            sw,
+            .all(sw.h * 0.5),
+            1.2,
+            if (self.dhcp_toggle_hovered) t.on_surface else if (status.dhcp_enabled) t.primary else t.outline,
+        );
+        const knob_r: f32 = if (status.dhcp_enabled) 10.0 else 8.0;
+        const knob_x: f32 = if (status.dhcp_enabled) (sw.x + sw.w - 14.0) else (sw.x + 14.0);
+        const knob_col = if (status.dhcp_enabled) t.on_primary else t.outline;
+        c.fillCircle(.{ knob_x, sw.y + sw.h * 0.5 }, knob_r, knob_col);
+
+        const state_txt = if (status.dhcp_enabled) "Enabled" else "Disabled";
+        const st_w = c.measureText(13.0, state_txt);
+        _ = c.drawText(13.0, sw.x - 10.0 - st_w, row3_y + 19.0, state_txt, if (status.dhcp_enabled) t.primary else t.on_surface_variant);
+    }
+
+    fn paintTextField(self: *const BoardUi, c: *Canvas, r: Rect, text: []const u8, focused: bool, hovered: bool, disabled: bool) void {
+        const t = &self.theme;
+        c.fillRoundedRect(r, .all(6.0), if (disabled) t.surface.withAlpha(0.45) else t.surface);
+        const border_col = if (disabled)
+            t.outline_variant.withAlpha(0.4)
+        else if (focused)
+            t.primary
+        else if (hovered)
+            t.on_surface_variant
+        else
+            t.outline_variant;
+        c.strokeRoundedRect(r, .all(6.0), if (focused and !disabled) 1.8 else 1.0, border_col);
+        const st: canvas_mod.Style = .{ .font = &self.font, .size = 13.5 };
+        _ = c.drawText(
+            13.5,
+            r.x + 10.0,
+            @round(r.y + (r.h - st.lineHeight()) * 0.5 + st.ascent()),
+            text,
+            if (disabled) t.on_surface.withAlpha(0.42) else t.on_surface,
+        );
+    }
+
+    fn paintSmallButton(self: *const BoardUi, c: *Canvas, r: Rect, label: []const u8, hovered: bool, disabled: bool) void {
+        const t = &self.theme;
+        const bg = if (disabled)
+            t.surface_container_highest.withAlpha(0.4)
+        else if (hovered)
+            t.secondary_container
+        else
+            t.surface_container_highest;
+        const border = if (disabled)
+            t.outline_variant.withAlpha(0.4)
+        else if (hovered)
+            t.primary
+        else
+            t.outline_variant;
+        c.fillRoundedRect(r, .all(6.0), bg);
+        c.strokeRoundedRect(r, .all(6.0), 1.0, border);
+        const st: canvas_mod.Style = .{ .font = &self.font, .size = 12.5 };
+        const tw = c.measureText(12.5, label);
+        _ = c.drawText(
+            12.5,
+            @round(r.x + (r.w - tw) * 0.5),
+            @round(r.y + (r.h - st.lineHeight()) * 0.5 + st.ascent()),
+            label,
+            if (disabled) t.on_surface.withAlpha(0.38) else if (hovered) t.primary else t.on_surface,
+        );
     }
 
     fn paintBoardDrawing(
@@ -1703,8 +2102,37 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
 
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
 
-    // 7. Clicking outside the sheet (near bottom of window) closes the sheet
+    // 7. Clicking the bottom Settings button expands the sheet downward and exposes
+    //    Serial Number, USB Ethernet MAC, and DHCP Server controls.
+    const collapsed_h = ui.sheet_rect.h;
+    const sbtn = ui.settings_btn_rect;
+    _ = ui.pointerButton(sbtn.x + 10, sbtn.y + 10, true, status, &hw);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(sbtn.x + 10, sbtn.y + 10, false, status, &hw));
+    try testing.expect(ui.settings_open);
+    ui.updateLayout(win_w, win_h, status, &hw);
+    try testing.expect(ui.sheet_rect.h > collapsed_h);
+
+    // While status.power_connected == true, Serial Number and MAC fields are disabled
+    const ser_r = ui.serial_field_rect;
+    _ = ui.pointerButton(ser_r.x + 10, ser_r.y + 10, true, status, &hw);
+    _ = ui.pointerButton(ser_r.x + 10, ser_r.y + 10, false, status, &hw);
+    try testing.expectEqual(@as(@TypeOf(ui.focused_field), .none), ui.focused_field);
+
+    // Powering down the board enables focusing and editing Serial Number and MAC
+    status.power_connected = false;
+    _ = ui.pointerButton(ser_r.x + 10, ser_r.y + 10, true, status, &hw);
+    _ = ui.pointerButton(ser_r.x + 10, ser_r.y + 10, false, status, &hw);
+    try testing.expectEqual(@as(@TypeOf(ui.focused_field), .serial), ui.focused_field);
+
+    const dhcp_r = ui.dhcp_toggle_rect;
+    _ = ui.pointerButton(dhcp_r.x + 10, dhcp_r.y + 10, true, status, &hw);
+    try testing.expectEqual(Action.toggle_dhcp, ui.pointerButton(dhcp_r.x + 10, dhcp_r.y + 10, false, status, &hw));
+    status.dhcp_enabled = false;
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+
+    // 8. Clicking outside the sheet (near bottom of window) closes the sheet
     _ = ui.pointerButton(640, 740, true, status, &hw);
     _ = ui.pointerButton(640, 740, false, status, &hw);
     try testing.expect(!ui.sheet_open);
 }
+

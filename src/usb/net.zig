@@ -52,6 +52,7 @@ pub const VirtualNetwork = struct {
 
     guest_mac: [6]u8 = DEFAULT_GUEST_MAC,
     guest_ip: [4]u8 = DEFAULT_GUEST_IP,
+    dhcp_enabled: bool = true,
     ip_id: u16 = 1,
     tick_count: u64 = 0,
     dns_resolved: bool = false,
@@ -214,7 +215,9 @@ pub const VirtualNetwork = struct {
 
         // DHCP (client port 68 -> server port 67)
         if (src_port == 68 and dst_port == 67) {
-            self.handleDhcp(data);
+            if (self.dhcp_enabled) {
+                self.handleDhcp(data);
+            }
             return;
         }
 

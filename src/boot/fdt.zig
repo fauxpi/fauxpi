@@ -242,6 +242,17 @@ pub const Tree = struct {
         end: u32,
     };
 
+    pub fn setBoardSerial(self: *Tree, serial: u64) !void {
+        const sys_node = try self.findOrCreateNode("/system");
+        try sys_node.setCellsProp(self.allocator, "linux,serial", &.{
+            @truncate(serial >> 32),
+            @truncate(serial),
+        });
+        var sbuf: [16]u8 = undefined;
+        const sstr = std.fmt.bufPrint(&sbuf, "{x:0>16}", .{serial}) catch "00000000fa000001";
+        try self.root.setStringProp(self.allocator, "serial-number", sstr);
+    }
+
     pub fn patchForPiZero(
         self: *Tree,
         ram_size: u32,
@@ -269,7 +280,7 @@ pub const Tree = struct {
         // 2b. /system board revision (0x00900093 = Raspberry Pi Zero v1.3, 512MB) and serial
         const sys_node = try self.findOrCreateNode("/system");
         try sys_node.setU32Prop(self.allocator, "linux,revision", 0x00900093);
-        try sys_node.setCellsProp(self.allocator, "linux,serial", &.{ 0x00000000, 0xfa000001 });
+        try self.setBoardSerial(0x00000000fa000001);
 
         // 3. Ensure USB controller uses mainline dwc2 compatible string
         if (self.findNode("usb") orelse self.findNode("/soc/usb@7e980000")) |usb| {
