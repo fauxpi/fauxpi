@@ -36,6 +36,7 @@ pub const Bcm2835 = struct {
     intc: intc_mod.IntController = .{},
     local_intc: local_intc_mod.LocalIntc = .{},
     timer: timer_mod.SystemTimer = .{},
+    arm_timer: timer_mod.ArmTimer = .{},
     mailbox: mailbox_mod.Mailbox = .{},
     cprman: cprman_mod.Cprman = .{},
     pm: pm_mod.PowerManager = .{},
@@ -154,6 +155,7 @@ pub const Bcm2835 = struct {
         var b1: u32 = 0;
         var b2: u32 = 0;
 
+        if (self.arm_timer.irqPending()) b0 |= (1 << 0); // Basic bit 0 = ARM Timer (SP804)
         if (self.mailbox.irqPending()) b0 |= (1 << 1); // Basic bit 1 = ARM Mailbox
         if (self.vchiq.irqPending()) b0 |= (1 << 2); // Basic bit 2 = ARM Doorbell 0 (VCHIQ)
 
@@ -421,6 +423,9 @@ pub const Bcm2835 = struct {
             self.updateIrqs();
             return self.intc.read32(addr - INTC_BASE);
         }
+        if (addr >= timer_mod.ArmTimer.BASE_ADDR and addr < timer_mod.ArmTimer.BASE_ADDR + timer_mod.ArmTimer.SIZE) {
+            return self.arm_timer.read32(addr - timer_mod.ArmTimer.BASE_ADDR);
+        }
         if (addr >= audio_mod.Vchiq.BASE_ADDR and addr < audio_mod.Vchiq.BASE_ADDR + audio_mod.Vchiq.SIZE) {
             return self.vchiq.read32(addr - audio_mod.Vchiq.BASE_ADDR);
         }
@@ -512,6 +517,8 @@ pub const Bcm2835 = struct {
             self.asb.write32(addr - pm_mod.AsbBridge.BASE_ADDR, val);
         } else if (addr >= INTC_BASE and addr < INTC_BASE + INTC_SIZE) {
             self.intc.write32(addr - INTC_BASE, val);
+        } else if (addr >= timer_mod.ArmTimer.BASE_ADDR and addr < timer_mod.ArmTimer.BASE_ADDR + timer_mod.ArmTimer.SIZE) {
+            self.arm_timer.write32(addr - timer_mod.ArmTimer.BASE_ADDR, val, &self.intc);
         } else if (addr >= audio_mod.Vchiq.BASE_ADDR and addr < audio_mod.Vchiq.BASE_ADDR + audio_mod.Vchiq.SIZE) {
             self.vchiq.write32(
                 addr - audio_mod.Vchiq.BASE_ADDR,

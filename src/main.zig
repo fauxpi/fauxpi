@@ -563,11 +563,12 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
         }
 
-        // Advance 1 MHz system timer proportionally to instructions executed (~256 instructions per us)
+        // Advance 1 MHz system timer and ARM timer proportionally to instructions executed (~256 instructions per us)
         const ran_per_core = if (active_cores > 0) total_ran / active_cores else 0;
         const timer_ticks: u64 = if (ran_per_core > 0) @max(ran_per_core / 256, 1) else 1;
         active_us_accum += timer_ticks;
         soc.timer.advance(timer_ticks, &soc.intc);
+        soc.arm_timer.advance(timer_ticks, &soc.intc);
         soc.advanceAudio(timer_ticks);
         for (0..num_cores) |i| {
             if (!cpus[i].halted_spin) {
@@ -607,7 +608,10 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         if (all_wfi) {
             if (guest_ready_for_realtime_sleep) {
                 const w = wl_win.?;
-                var timer_wait_us = soc.timer.usUntilNextMatch(1_000_000);
+                var timer_wait_us = @min(
+                    soc.timer.usUntilNextMatch(1_000_000),
+                    soc.arm_timer.usUntilNextMatch(1_000_000),
+                );
                 for (0..num_cores) |i| {
                     if (!cpus[i].halted_spin) {
                         timer_wait_us = @min(timer_wait_us, cpus[i].mmu.usUntilNextGenericTimer(1_000_000));
@@ -654,6 +658,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     @max(elapsed_sleep_us, sleep_us);
                 idle_us_accum += jump;
                 soc.timer.advance(jump, &soc.intc);
+                soc.arm_timer.advance(jump, &soc.intc);
                 soc.advanceAudio(jump);
                 soc.usb.pollNetwork(soc.ram);
                 soc.usb.wakeIfPending();
@@ -665,8 +670,11 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 }
                 soc.updateIrqs();
             } else {
-                // Fast-forward timer to next compare match or core generic timer during boot / headless mode
-                var jump = soc.timer.usUntilNextMatch(2000);
+                // Fast-forward timer to next compare match, ARM timer, or core generic timer during boot / headless mode
+                var jump = @min(
+                    soc.timer.usUntilNextMatch(2000),
+                    soc.arm_timer.usUntilNextMatch(2000),
+                );
                 for (0..num_cores) |i| {
                     if (!cpus[i].halted_spin) {
                         jump = @min(jump, cpus[i].mmu.usUntilNextGenericTimer(2000));
@@ -675,6 +683,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 jump = @max(jump, 1);
                 idle_us_accum += jump;
                 soc.timer.advance(jump, &soc.intc);
+                soc.arm_timer.advance(jump, &soc.intc);
                 soc.advanceAudio(jump);
                 for (0..num_cores) |i| {
                     if (!cpus[i].halted_spin) {
