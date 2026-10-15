@@ -249,6 +249,10 @@ pub const Canvas = struct {
         return c.drawTextWithFont(c.font, size, x, baseline, str, color);
     }
 
+    pub fn drawTextRotated90(c: *Canvas, size: f32, baseline_x: f32, y: f32, str: []const u8, color: Color) f32 {
+        return c.drawTextRotated90WithFont(c.font, size, baseline_x, y, str, color);
+    }
+
     pub fn drawIcon(c: *Canvas, icon: Icon, x: f32, y: f32, size: f32, color: Color) void {
         var buf: [4]u8 = undefined;
         _ = c.drawTextWithFont(c.icon_font, size, x, y + size, icon.text(&buf), color);
@@ -280,6 +284,34 @@ pub const Canvas = struct {
         };
         const end_phys = text_mod.draw(tc, c.cache, phys_style, ox, oy, str) catch (ox + logical_w * sc);
         return (end_phys / sc) - c.origin[0];
+    }
+
+    fn drawTextRotated90WithFont(c: *Canvas, f: *const Font, size: f32, baseline_x: f32, y: f32, str: []const u8, color: Color) f32 {
+        const sc = @max(c.scale, 1.0);
+        const logical_style: Style = .{
+            .font = f,
+            .size = size,
+            .color = color.toArgb(),
+        };
+        const logical_w = text_mod.measure(logical_style, str);
+        if (color.a <= 0 or str.len == 0) return y - logical_w;
+
+        const phys_style: Style = .{
+            .font = f,
+            .size = size * sc,
+            .color = color.toArgb(),
+        };
+        const ox = (baseline_x + c.origin[0]) * sc;
+        const oy = (y + c.origin[1]) * sc;
+
+        const tc: text_mod.Canvas = .{
+            .pixels = c.pixels,
+            .width = c.width,
+            .height = c.height,
+            .stride = c.stride,
+        };
+        const end_phys = text_mod.drawRotated90Ccw(tc, c.cache, phys_style, ox, oy, str) catch (oy - logical_w * sc);
+        return (end_phys / sc) - c.origin[1];
     }
 
     fn roundedRect(c: *Canvas, r_in: Rect, radii_in: Radii, stroke_in: f32, color: Color) void {

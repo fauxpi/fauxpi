@@ -52,6 +52,55 @@ pub const Canvas = struct {
             }
         }
     }
+
+    /// Blends `color` into the canvas through a coverage mask rotated 90 degrees
+    /// counter-clockwise around the glyph pen at `(base_x, pen_y)`, where `mask_left`
+    /// and `mask_top` are the unrotated bitmap's `left` and `top` offsets.
+    pub fn blendMaskRotated90Ccw(
+        c: Canvas,
+        base_x: i32,
+        pen_y: i32,
+        mask_left: i32,
+        mask_top: i32,
+        mask: []const u8,
+        mask_w: u32,
+        mask_h: u32,
+        color: u32,
+    ) void {
+        const color_alpha: u32 = color >> 24;
+        const x0: i32 = base_x + mask_top;
+        const y_bottom: i32 = pen_y - mask_left;
+
+        const my0: u32 = @intCast(std.math.clamp(-x0, 0, @as(i32, @intCast(mask_h))));
+        const my1: u32 = @intCast(std.math.clamp(@as(i32, @intCast(c.width)) - x0, 0, @as(i32, @intCast(mask_h))));
+        const mx0: u32 = @intCast(std.math.clamp(y_bottom - @as(i32, @intCast(c.height)) + 1, 0, @as(i32, @intCast(mask_w))));
+        const mx1: u32 = @intCast(std.math.clamp(y_bottom + 1, 0, @as(i32, @intCast(mask_w))));
+        if (mx0 >= mx1 or my0 >= my1) return;
+
+        for (my0..my1) |my| {
+            const cx: usize = @intCast(x0 + @as(i32, @intCast(my)));
+            const mask_row = mask[my * mask_w ..];
+            if (color_alpha == 255) {
+                for (mx0..mx1) |mx| {
+                    const cov = mask_row[mx];
+                    if (cov != 0) {
+                        const cy: usize = @intCast(y_bottom - @as(i32, @intCast(mx)));
+                        const dst = &c.pixels[cy * c.stride + cx];
+                        dst.* = blend(dst.*, color, cov);
+                    }
+                }
+            } else {
+                for (mx0..mx1) |mx| {
+                    const cov = mask_row[mx];
+                    if (cov != 0) {
+                        const cy: usize = @intCast(y_bottom - @as(i32, @intCast(mx)));
+                        const dst = &c.pixels[cy * c.stride + cx];
+                        dst.* = blend(dst.*, color, div255(@as(u32, cov) * color_alpha));
+                    }
+                }
+            }
+        }
+    }
 };
 
 /// `src` over `dst` with alpha `a` (0-255), per colour channel. The result
@@ -312,6 +361,38 @@ pub fn draw(canvas: Canvas, cache: *GlyphCache, style: Style, x: f32, baseline: 
     return l.x;
 }
 
+/// Draws `text` rotated 90 degrees counter-clockwise (reading bottom-to-top),
+/// with its vertical baseline at `base_x` (rounded to a pixel), starting at `y`
+/// and advancing upward (`-Y`). Returns the vertical pen position after the text.
+pub fn drawRotated90Ccw(canvas: Canvas, cache: *GlyphCache, style: Style, base_x: f32, y: f32, text: []const u8) !f32 {
+    const base: i32 = @intFromFloat(@round(base_x));
+    var l: Layout = .{ .style = style, .text = text, .x = 0 };
+    while (l.next()) |item| {
+        const pen_y_f = y - item.x;
+        const quarter: i32 = @intFromFloat(@round(pen_y_f * 4));
+        const subpixel: u2 = @intCast(@mod(-quarter, 4));
+        const pen_y = -@divFloor(-quarter, 4);
+        if (item.font.colorLayers(item.glyph)) |layers_init| {
+            const style_alpha = style.color >> 24;
+            var layers = layers_init;
+            while (layers.next()) |layer| {
+                const b = try cache.get(item.font, layer.glyph, style.size, subpixel);
+                if (b.width == 0) continue;
+                const color = if (layer.color) |c|
+                    (c & 0x00ffffff) | (div255((c >> 24) * style_alpha) << 24)
+                else
+                    style.color;
+                canvas.blendMaskRotated90Ccw(base, pen_y, b.left, b.top, b.mask, b.width, b.height, color);
+            }
+            continue;
+        }
+        const b = try cache.get(item.font, item.glyph, style.size, subpixel);
+        if (b.width == 0) continue;
+        canvas.blendMaskRotated90Ccw(base, pen_y, b.left, b.top, b.mask, b.width, b.height, style.color);
+    }
+    return y - l.x;
+}
+
 // --- Tests ------------------------------------------------------------------
 
 const testing = std.testing;
@@ -401,6 +482,15 @@ test "drawing text into a canvas" {
     const cached = cache.map.count();
     _ = try draw(canvas, &cache, style, 2, 28, "Dazzle AV");
     try testing.expectEqual(cached, cache.map.count());
+
+    // Drawing rotated 90 degrees CCW advances upward and draws the same number of lit pixels.
+    var rot_pixels: [40 * 200]u32 = @splat(0xff000000);
+    const rot_canvas: Canvas = .{ .pixels = &rot_pixels, .width = 40, .height = 200, .stride = 40 };
+    const end_y = try drawRotated90Ccw(rot_canvas, &cache, style, 28, 198, "Dazzle AV");
+    try testing.expectApproxEqAbs(198 - measure(style, "Dazzle AV"), end_y, 0.001);
+    var rot_lit: u32 = 0;
+    for (rot_pixels) |p| rot_lit += @intFromBool(p != 0xff000000);
+    try testing.expectEqual(lit, rot_lit);
 }
 
 test "invalid UTF-8 draws the replacement character" {

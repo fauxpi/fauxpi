@@ -219,7 +219,7 @@ pub const InteractiveTarget = enum {
 
 /// Geometry of the 3-port USB Hub with Ethernet and external cables in board millimetres (`mm`).
 pub const HubLayout = struct {
-    pub const sd_ext_left_mm: f32 = 17.5;
+    pub const sd_ext_left_mm: f32 = 21.5;
     pub const bottom_ext_mm: f32 = 18.0; // extends 18mm below board.height
     pub const right_ext_mm: f32 = 19.0; // extends 19mm past board.width on B boards
 
@@ -299,6 +299,7 @@ pub const BoardUi = struct {
         scale: u32 = 0,
         board_model: BoardModel = .pi_zero,
         hovered_target: ?InteractiveTarget = null,
+        sd_card_name_hash: u64 = 0,
         sd_connected: bool = false,
         hdmi_connected: bool = false,
         audio_connected: bool = false,
@@ -803,6 +804,12 @@ pub const BoardUi = struct {
         return &self.sd_cards.items[idx];
     }
 
+    pub fn activeSdCardName(self: *const BoardUi) []const u8 {
+        const idx = self.selected_sd_card_idx orelse return "";
+        if (idx >= self.sd_cards.items.len) return "";
+        return self.sd_cards.items[idx].name();
+    }
+
     pub fn sdErrorMessage(self: *const BoardUi) []const u8 {
         return self.sd_error_buf[0..self.sd_error_len];
     }
@@ -1126,7 +1133,7 @@ pub const BoardUi = struct {
         for (drawing.parts) |p| {
             switch (p.kind) {
                 .micro_sd, .sd => {
-                    const ext_w: f32 = if (sd_connected) 4.5 else HubLayout.sd_ext_left_mm;
+                    const ext_w: f32 = if (sd_connected) 9.0 else HubLayout.sd_ext_left_mm;
                     const sd_card_hit: board.Rect = .{
                         .x = p.rect.x - ext_w,
                         .y = p.rect.y,
@@ -2223,6 +2230,7 @@ pub const BoardUi = struct {
                 .scale = sc,
                 .board_model = BoardModel.fromModel(status.model),
                 .hovered_target = self.hovered_target,
+                .sd_card_name_hash = std.hash.Wyhash.hash(0, self.activeSdCardName()),
                 .sd_connected = status.sd_connected,
                 .hdmi_connected = status.hdmi_connected,
                 .audio_connected = status.audio_connected,
@@ -2758,18 +2766,22 @@ pub const BoardUi = struct {
         const max_x = tr.x + hl.right_cable_max_x * s;
 
         // 1. Micro-SD card (connected into slot or pulled out to the left)
+        const sd_card_name = self.activeSdCardName();
         for (b.parts) |part| {
             if (part.kind == .micro_sd or part.kind == .sd) {
                 const hovered = (self.hovered_target == .sd_card) or (status.sd_connected and self.hovered_target == .sd_connector);
                 drawSdCard(
                     c,
                     map(tr, part.rect),
+                    tr.y + HubLayout.top_cable_min_y * s,
+                    max_y,
                     s,
                     if (hovered) t.primary else ink,
                     t.primary,
                     t.surface,
                     status.sd_connected,
                     hovered,
+                    sd_card_name,
                 );
             }
         }
@@ -2998,23 +3010,30 @@ pub fn drawPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, ink: Color
 /// Draws the micro-SD card on a left-facing SD slot:
 /// - When `connected` is true: the card is seated inside the slot with its left tab protruding slightly.
 /// - When `connected` is false: the card is pulled out to the left of the slot with a gap and exposed contact pins.
+/// - When `card_name` is non-empty: draws the active image/card name rotated 90 degrees CCW along the left edge of the card.
 pub fn drawSdCard(
     c: *Canvas,
     slot_r: Rect,
+    min_y: f32,
+    max_y: f32,
     s: f32,
     ink: Color,
     accent: Color,
     surface_bg: Color,
     connected: bool,
     hovered: bool,
+    card_name: []const u8,
 ) void {
     const cy = slot_r.y + slot_r.h * 0.5;
     const card_h = slot_r.h * 0.80;
     const card_y = cy - card_h * 0.5;
+    const protrude_w = 4.2 * s;
+    const gap = 2.8 * s;
+    const card_w = 13.0 * s;
+    const card_left_x = if (connected) (slot_r.x - protrude_w) else (slot_r.x - gap - card_w);
 
     if (connected) {
         // Seated inside the slot: draw protruding left tab and subtle outline inside cage
-        const protrude_w = 4.2 * s;
         const tab_rect: Rect = .{
             .x = slot_r.x - protrude_w,
             .y = card_y,
@@ -3045,8 +3064,6 @@ pub fn drawSdCard(
         c.strokeRoundedRect(inner_rect, .{ .tl = 0, .bl = 0, .tr = 0.5 * s, .br = 0.5 * s }, line_w, ink.withAlpha(0.35));
     } else {
         // Pulled out to the left of the slot with exposed contact pads
-        const gap = 2.8 * s;
-        const card_w = 13.0 * s;
         const card_rect: Rect = .{
             .x = slot_r.x - gap - card_w,
             .y = card_y,
@@ -3088,6 +3105,23 @@ pub fn drawSdCard(
             lbl,
             ink,
         );
+    }
+
+    if (card_name.len > 0) {
+        var name_sz = 2.6 * s;
+        var name_w = c.measureText(name_sz, card_name);
+        const avail_h = @max(8.0 * s, (max_y - min_y) - 2.0 * s);
+        if (name_w > avail_h and name_w > 0) {
+            name_sz = @max(1.6 * s, name_sz * (avail_h / name_w));
+            name_w = c.measureText(name_sz, card_name);
+        }
+        const baseline_x = card_left_x - 1.3 * s;
+        const start_y = std.math.clamp(
+            cy + name_w * 0.5,
+            min_y + 1.0 * s + name_w,
+            max_y - 1.0 * s,
+        );
+        _ = c.drawTextRotated90(name_sz, baseline_x, start_y, card_name, ink);
     }
 }
 
@@ -3925,12 +3959,40 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.select_sd_card, ui.pointerButton(ui.sd_card_menu_rect.x + 20, sd_menu_item0_y, false, status, &hw));
     try testing.expect(!ui.sd_card_menu_open);
 
+    // Verify the active SD card name ("Card 1") is rendered rotated 90° beside the left edge of the unplugged SD card
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testing.expectEqual(std.hash.Wyhash.hash(0, "Card 1"), ui.board_cache_key.sd_card_name_hash);
+    const surface_argb = Theme.dark.surface.toArgb();
+    var unplugged_label_lit: usize = 0;
+    const unp_x0: usize = @intFromFloat(@round(tr.x + (-19.8) * tr.scale));
+    const unp_x1: usize = @intFromFloat(@round(tr.x + (-16.8) * tr.scale));
+    const lbl_y0: usize = @intFromFloat(@round(tr.y + 8.0 * tr.scale));
+    const lbl_y1: usize = @intFromFloat(@round(tr.y + 18.5 * tr.scale));
+    for (lbl_y0..lbl_y1) |py| {
+        for (unp_x0..unp_x1) |px| {
+            if (pixels[py * win_w + px] != surface_argb) unplugged_label_lit += 1;
+        }
+    }
+    try testing.expect(unplugged_label_lit > 20);
+
     // Clicking the SD card connector (on the board) returns .toggle_sd to insert it.
     // When inserted, clicking the SD card disconnects it (.toggle_sd).
     const sd_conn_x = tr.x + 6.75 * tr.scale;
     _ = ui.pointerButton(sd_conn_x, sd_y, true, status, &hw);
     try testing.expectEqual(Action.toggle_sd, ui.pointerButton(sd_conn_x, sd_y, false, status, &hw));
     status.sd_connected = true;
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+
+    // Verify the active SD card name ("Card 1") moves with the card and is rendered beside the protruding left edge when inserted
+    var inserted_label_lit: usize = 0;
+    const ins_x0: usize = @intFromFloat(@round(tr.x + (-8.2) * tr.scale));
+    const ins_x1: usize = @intFromFloat(@round(tr.x + (-5.2) * tr.scale));
+    for (lbl_y0..lbl_y1) |py| {
+        for (ins_x0..ins_x1) |px| {
+            if (pixels[py * win_w + px] != surface_argb) inserted_label_lit += 1;
+        }
+    }
+    try testing.expect(inserted_label_lit > 20);
 
     const sd_card_inserted_x = tr.x + (-2.0) * tr.scale;
     _ = ui.pointerButton(sd_card_inserted_x, sd_y, true, status, &hw);
