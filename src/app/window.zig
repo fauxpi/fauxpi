@@ -293,7 +293,8 @@ pub const WaylandWindow = struct {
                 if (trimmed.len > 0 and trimmed.len <= self.chosen_sd_path_buf.len) {
                     @memcpy(self.chosen_sd_path_buf[0..trimmed.len], trimmed);
                     self.chosen_sd_path_len = trimmed.len;
-                    self.sd_image_chosen = true;
+                    const fsize = board_sheet.Qcow2Disk.getFileSizeLinux(trimmed) catch 0;
+                    self.ui.setPendingSdImageFile(trimmed, fsize);
                 }
                 self.picker_len = 0;
                 return;
@@ -848,6 +849,10 @@ pub const WaylandWindow = struct {
                             self.openSdImagePicker();
                             return;
                         },
+                        .select_sd_card => {
+                            self.sd_image_chosen = true;
+                            return;
+                        },
                         .toggle_usb_hub => {
                             self.status.usb_hub_connected = !self.status.usb_hub_connected;
                             hid.hub_connected = self.status.usb_hub_connected;
@@ -944,8 +949,16 @@ pub const WaylandWindow = struct {
                         self.status.wifi_mac_address = self.ui.parsedWifiMac();
                         return;
                     }
-                    // Escape (evdev key 1) closes the board sheet when no text field is focused
+                    // Escape (evdev key 1) closes any open SD popup/menu first, then the board sheet
                     if (key == 1 and pressed) {
+                        if (self.ui.sd_manage_open) {
+                            self.ui.sd_manage_open = false;
+                            return;
+                        }
+                        if (self.ui.sd_card_menu_open) {
+                            self.ui.sd_card_menu_open = false;
+                            return;
+                        }
                         self.ui.sheet_open = false;
                         const sy: f64 = self.last_mouse_y orelse 0.0;
                         self.updateCursorShape(sy < @as(f64, @floatFromInt(board_sheet.BoardUi.title_bar_height)));

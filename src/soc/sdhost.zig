@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const qcow2 = @import("qcow2.zig");
 
 /// BCM2835 SDHOST Controller (`brcm,bcm2835-sdhost`) at `0x20202000` (size `0x100`).
 /// Simulates the controller and an attached SDHC card backed by an image buffer or file.
@@ -49,10 +50,11 @@ pub const SdHost = struct {
     app_cmd: bool = false,
     card_state: u4 = 4, // 0=idle, 1=ready, 2=ident, 3=stby, 4=tran
 
-    // Backing storage (either in-memory slice or pread/pwrite file descriptor)
+    // Backing storage (in-memory slice, pread/pwrite file descriptor, or QCOW2 virtual disk)
     image_data: ?[]u8 = null,
     image_const: ?[]const u8 = null,
     image_fd: ?std.posix.fd_t = null,
+    qcow2_disk: ?*qcow2.Qcow2Disk = null,
     image_size: u64 = 512 * 1024 * 1024,
 
     // Active data transfer state
@@ -65,25 +67,38 @@ pub const SdHost = struct {
     sector_cache_lba: u64 = std.math.maxInt(u64),
 
     pub fn attachSlice(self: *SdHost, data: []const u8) void {
+        self.detach();
         self.image_const = data;
         self.image_size = data.len;
     }
 
     pub fn attachMutableSlice(self: *SdHost, data: []u8) void {
+        self.detach();
         self.image_data = data;
         self.image_const = data;
         self.image_size = data.len;
     }
 
     pub fn attachFile(self: *SdHost, fd: std.posix.fd_t, size: u64) void {
+        self.detach();
         self.image_fd = fd;
         self.image_size = size;
     }
 
+    pub fn attachQcow2(self: *SdHost, disk: *qcow2.Qcow2Disk) void {
+        self.detach();
+        self.qcow2_disk = disk;
+        self.image_size = disk.virtual_size;
+    }
+
     pub fn detach(self: *SdHost) void {
+        if (self.qcow2_disk) |disk| {
+            disk.flush() catch {};
+        }
         self.image_data = null;
         self.image_const = null;
         self.image_fd = null;
+        self.qcow2_disk = null;
         self.transfer_mode = .none;
         self.data_remaining = 0;
         self.sector_cache_lba = std.math.maxInt(u64);
@@ -341,6 +356,9 @@ pub const SdHost = struct {
     }
 
     fn readImageByte(self: *SdHost, offset: u64) u8 {
+        if (self.qcow2_disk) |disk| {
+            return disk.readByte(offset);
+        }
         if (self.image_const) |slice| {
             if (offset < slice.len) return slice[@intCast(offset)];
             return 0;
@@ -359,6 +377,10 @@ pub const SdHost = struct {
     }
 
     fn writeImageByte(self: *SdHost, offset: u64, b: u8) void {
+        if (self.qcow2_disk) |disk| {
+            disk.writeByte(offset, b);
+            return;
+        }
         if (self.image_data) |slice| {
             if (offset < slice.len) slice[@intCast(offset)] = b;
             return;

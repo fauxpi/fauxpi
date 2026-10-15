@@ -18,6 +18,7 @@ pub const pm = @import("soc/pm.zig");
 pub const gpio = @import("soc/gpio.zig");
 pub const uart = @import("soc/uart.zig");
 pub const dma = @import("soc/dma.zig");
+pub const qcow2 = @import("soc/qcow2.zig");
 pub const sdhost = @import("soc/sdhost.zig");
 pub const i2c = @import("soc/i2c.zig");
 pub const bcm2835 = @import("soc/bcm2835.zig");
@@ -207,6 +208,7 @@ fn loadGuestBoot(
     opts: CliOptions,
     ram: []u8,
     soc: *Bcm2835,
+    sd_qcow2: ?*qcow2.Qcow2Disk,
     sd_image_buf: ?[]u8,
     board_model: ui_board_sheet.BoardModel,
     board_serial: u64,
@@ -221,7 +223,14 @@ fn loadGuestBoot(
     soc.mailbox.mac_address = if (board_model.hasWireless()) wifi_mac_address else mac_address;
     soc.usb.hid.net.guest_mac = mac_address;
 
-    const boot_res = if (sd_image_buf) |img| blk: {
+    const boot_res = if (sd_qcow2) |disk| blk: {
+        soc.sdhost.attachQcow2(disk);
+        const boot_vol = try disk.readBootVolumeAlloc(gpa);
+        defer gpa.free(boot_vol);
+        const k_override = if (opts.kernel_path) |kp| try readFileLinux(gpa, kp) else null;
+        defer if (k_override) |ko| gpa.free(ko);
+        break :blk try loader.loadFromSdImage(gpa, ram, boot_vol, opts.cmdline, k_override);
+    } else if (sd_image_buf) |img| blk: {
         soc.sdhost.attachMutableSlice(img);
         const k_override = if (opts.kernel_path) |kp| try readFileLinux(gpa, kp) else null;
         defer if (k_override) |ko| gpa.free(ko);
@@ -289,6 +298,11 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         wl_win = try window.WaylandWindow.create(gpa, environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
         wl_win.?.status.power_connected = opts.power;
         wl_win.?.status.sd_connected = initial_sd;
+        if (opts.sd_path) |sd_path| {
+            const fsize = try qcow2.Qcow2Disk.getFileSizeLinux(sd_path);
+            const card_sz = ui_board_sheet.SdCardSize.smallestFitting(@max(fsize, 256 * 1024 * 1024)) orelse .gb_32;
+            _ = try wl_win.?.ui.addSdCardFromFile(sd_path, card_sz);
+        }
     }
 
     if (initial_power and (initial_sd or opts.kernel_path != null)) {
@@ -296,7 +310,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         const serial = if (wl_win) |w| w.status.serial_u64 else 0x00000000fa000001;
         const mac = if (wl_win) |w| w.status.mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
         const wifi_mac = if (wl_win) |w| w.status.wifi_mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 };
-        const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, if (initial_sd) sd_image_buf else null, bm, serial, mac, wifi_mac);
+        const active_qcow2: ?*qcow2.Qcow2Disk = if (wl_win) |w| (if (initial_sd and w.ui.activeSdCard() != null) &w.ui.activeSdCard().?.disk else null) else null;
+        const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, if (initial_sd) sd_image_buf else null, bm, serial, mac, wifi_mac);
         if (wl_win) |w| syncWindowPeripheralsToSoc(w, &soc);
         cpu.initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
         guest_booted = true;
@@ -326,32 +341,32 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
             if (w.sd_reconnected) {
                 w.sd_reconnected = false;
-                if (sd_image_buf) |img| {
+                if (w.ui.activeSdCard()) |card| {
+                    soc.sdhost.attachQcow2(&card.disk);
+                } else if (sd_image_buf) |img| {
                     soc.sdhost.attachMutableSlice(img);
                 }
             }
 
             if (w.sd_image_chosen) {
                 w.sd_image_chosen = false;
-                if (readSdImageLinux(gpa, w.chosenSdPath())) |new_img| {
-                    if (sd_image_buf) |old| gpa.free(old);
-                    sd_image_buf = new_img;
+                if (w.ui.activeSdCard()) |card| {
                     if (w.status.sd_connected) {
-                        soc.sdhost.attachMutableSlice(new_img);
+                        soc.sdhost.attachQcow2(&card.disk);
                     }
-                } else |err| {
-                    std.debug.print("fauxpi: failed to load SD image '{s}': {s}\n", .{ w.chosenSdPath(), @errorName(err) });
                 }
             }
 
-            const has_boot_media = (w.status.sd_connected and sd_image_buf != null) or opts.kernel_path != null;
+            const has_sd_media = (w.ui.activeSdCard() != null) or (sd_image_buf != null);
+            const has_boot_media = (w.status.sd_connected and has_sd_media) or opts.kernel_path != null;
             if (!w.status.power_connected) {
                 guest_booted = false;
             } else if (w.power_reconnected or (!guest_booted and has_boot_media)) {
                 w.power_reconnected = false;
+                const active_qcow2: ?*qcow2.Qcow2Disk = if (w.status.sd_connected and w.ui.activeSdCard() != null) &w.ui.activeSdCard().?.disk else null;
                 const active_sd = if (w.status.sd_connected) sd_image_buf else null;
-                if (active_sd != null or opts.kernel_path != null) {
-                    if (loadGuestBoot(gpa, opts, ram, &soc, active_sd, w.status.board_model, w.status.serial_u64, w.status.mac_address, w.status.wifi_mac_address)) |reboot_res| {
+                if (active_qcow2 != null or active_sd != null or opts.kernel_path != null) {
+                    if (loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, active_sd, w.status.board_model, w.status.serial_u64, w.status.mac_address, w.status.wifi_mac_address)) |reboot_res| {
                         syncWindowPeripheralsToSoc(w, &soc);
                         cpu = .{};
                         cpu.initReset(reboot_res.entry_pc, reboot_res.r0, reboot_res.r1, reboot_res.r2);
