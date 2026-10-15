@@ -454,16 +454,58 @@ pub const SdHost = struct {
     }
 };
 
-/// BCM2835 Arasan SDHCI stub (`brcm,bcm2835-sdhci`) at `0x20300000` (size `0x100`).
-/// On Pi Zero 1, SD0 uses `bcm2835-sdhost` (`0x20202000`) and Arasan SDHCI has no card attached.
+/// BCM2835 Arasan SDHCI controller (`brcm,bcm2835-sdhci`) at `0x20300000` (size `0x100`).
+/// On Raspberry Pi Zero W and Zero 2 W, the onboard CYW43430 / BCM43430 Wi-Fi SDIO chip is attached here.
 pub const ArasanSdhci = struct {
     pub const BASE_ADDR: u32 = 0x20300000;
     pub const SIZE: u32 = 0x100;
+    pub const PIO_BUF_SIZE: usize = 32768;
+
+    // SDHCI_PRESENT_STATE (0x24) bits
+    pub const SDHCI_CMD_INHIBIT: u32 = 0x00000001;
+    pub const SDHCI_DATA_INHIBIT: u32 = 0x00000002;
+    pub const SDHCI_DOING_WRITE: u32 = 0x00000100;
+    pub const SDHCI_DOING_READ: u32 = 0x00000200;
+    pub const SDHCI_SPACE_AVAILABLE: u32 = 0x00000400;
+    pub const SDHCI_DATA_AVAILABLE: u32 = 0x00000800;
+    pub const SDHCI_CARD_PRESENT: u32 = 0x00010000;
+    pub const SDHCI_CARD_STATE_STABLE: u32 = 0x00020000;
+    pub const SDHCI_CD_LVL: u32 = 0x00040000;
+    pub const SDHCI_WRITE_PROTECT: u32 = 0x00080000;
+    pub const SDHCI_DATA_0_LVL_MASK: u32 = 0x00f00000;
+
+    // SDHCI_INT_STATUS (0x30) / INT_ENABLE (0x34) / SIGNAL_ENABLE (0x38) bits
+    pub const SDHCI_INT_RESPONSE: u32 = 0x00000001;
+    pub const SDHCI_INT_DATA_END: u32 = 0x00000002;
+    pub const SDHCI_INT_SPACE_AVAIL: u32 = 0x00000010;
+    pub const SDHCI_INT_DATA_AVAIL: u32 = 0x00000020;
+    pub const SDHCI_INT_CARD_INT: u32 = 0x00000100;
+    pub const SDHCI_INT_ERROR: u32 = 0x00008000;
+    pub const SDHCI_INT_TIMEOUT: u32 = 0x00010000;
+
+    wireless_enabled: bool = false,
+    wifi: @import("cyw43430.zig").Cyw43430 = .{},
 
     regs: [SIZE / 4]u32 = initRegs(),
+    int_status: u32 = 0,
+    int_enable: u32 = 0,
+    signal_enable: u32 = 0,
+
+    // Active PIO transfer state
+    pio_mode: enum { none, read, write } = .none,
+    pio_buf: [PIO_BUF_SIZE]u8 = [_]u8{0} ** PIO_BUF_SIZE,
+    pio_blksz: usize = 0,
+    pio_blocks_rem: usize = 0,
+    pio_block_pos: usize = 0,
+    pio_total_pos: usize = 0,
+    pio_total_len: usize = 0,
+    pio_func: u3 = 0,
+    pio_addr: u17 = 0,
+    pio_incr: bool = false,
 
     fn initRegs() [SIZE / 4]u32 {
         var r: [SIZE / 4]u32 = [_]u32{0} ** (SIZE / 4);
+        r[0x24 / 4] = SDHCI_CARD_PRESENT | SDHCI_CARD_STATE_STABLE | SDHCI_CD_LVL | SDHCI_WRITE_PROTECT | SDHCI_DATA_0_LVL_MASK;
         r[0x2c / 4] = 0x00000002; // CLOCK_CONTROL: SDHCI_CLOCK_INT_STABLE
         r[0x30 / 4] = 0x00000000; // INT_STATUS
         r[0x40 / 4] = 0x01e930b0; // CAPABILITIES
@@ -471,31 +513,250 @@ pub const ArasanSdhci = struct {
         return r;
     }
 
-    pub fn read32(self: *const ArasanSdhci, offset: u32) u32 {
+    fn effectiveIntStatus(self: *const ArasanSdhci) u32 {
+        var st = self.int_status & self.int_enable;
+        if (self.wireless_enabled and (self.int_enable & SDHCI_INT_CARD_INT) != 0 and self.wifi.cardIntPending()) {
+            st |= SDHCI_INT_CARD_INT;
+        }
+        if ((st & 0xffff0000) != 0) {
+            st |= SDHCI_INT_ERROR;
+        }
+        return st;
+    }
+
+    pub fn irqPending(self: *const ArasanSdhci) bool {
+        return (self.effectiveIntStatus() & self.signal_enable) != 0;
+    }
+
+    pub fn read32(self: *ArasanSdhci, offset: u32) u32 {
         if (offset >= SIZE) return 0;
-        return self.regs[offset / 4];
+        return switch (offset) {
+            0x20 => self.readPioBuffer(),
+            0x24 => blk: {
+                var pstate: u32 = SDHCI_CARD_PRESENT | SDHCI_CARD_STATE_STABLE | SDHCI_CD_LVL | SDHCI_WRITE_PROTECT | SDHCI_DATA_0_LVL_MASK;
+                if (self.pio_mode == .read and self.pio_blocks_rem > 0) {
+                    pstate |= SDHCI_DOING_READ | SDHCI_DATA_AVAILABLE;
+                } else if (self.pio_mode == .write and self.pio_blocks_rem > 0) {
+                    pstate |= SDHCI_DOING_WRITE | SDHCI_SPACE_AVAILABLE;
+                }
+                break :blk pstate;
+            },
+            0x30 => self.effectiveIntStatus(),
+            0x34 => self.int_enable,
+            0x38 => self.signal_enable,
+            else => self.regs[offset / 4],
+        };
     }
 
     pub fn write32(self: *ArasanSdhci, offset: u32, val: u32) void {
         if (offset >= SIZE) return;
-        if (offset == 0x2c) {
-            // CLOCK_CONTROL + TIMEOUT + SOFTWARE_RESET: clear reset bits [26:24], set INT_STABLE (bit 1)
-            var v = val & ~@as(u32, 0x07000000);
-            if ((v & 1) != 0) v |= 2;
-            self.regs[offset / 4] = v;
+        switch (offset) {
+            0x0c => {
+                self.regs[0x0c / 4] = val;
+                self.executeCommand(val);
+            },
+            0x20 => self.writePioBuffer(val),
+            0x2c => {
+                // CLOCK_CONTROL + TIMEOUT + SOFTWARE_RESET (bits 26:24 = RESET_ALL / RESET_CMD / RESET_DATA)
+                const rst = (val >> 24) & 0x07;
+                if ((rst & 0x01) != 0) {
+                    // SDHCI_RESET_ALL
+                    self.int_status = 0;
+                    self.int_enable = 0;
+                    self.signal_enable = 0;
+                    self.pio_mode = .none;
+                    self.pio_blocks_rem = 0;
+                } else {
+                    if ((rst & 0x02) != 0) {
+                        self.int_status &= ~@as(u32, 0x000f0001);
+                    }
+                    if ((rst & 0x04) != 0) {
+                        self.pio_mode = .none;
+                        self.pio_blocks_rem = 0;
+                        self.int_status &= ~@as(u32, 0x0070003e);
+                    }
+                }
+                var v = val & ~@as(u32, 0x07000000);
+                if ((v & 1) != 0) v |= 2; // SDHCI_CLOCK_INT_STABLE
+                self.regs[0x2c / 4] = v;
+            },
+            0x30 => {
+                // INT_STATUS W1C
+                self.int_status &= ~(val & ~SDHCI_INT_ERROR);
+            },
+            0x34 => self.int_enable = val,
+            0x38 => self.signal_enable = val,
+            else => self.regs[offset / 4] = val,
+        }
+    }
+
+    fn executeCommand(self: *ArasanSdhci, trns_cmd: u32) void {
+        if (!self.wireless_enabled) {
+            self.int_status |= SDHCI_INT_TIMEOUT;
             return;
         }
-        if (offset == 0x0c) {
-            // TRANSFER_MODE + COMMAND: immediately set command timeout in INT_STATUS (no card attached)
-            self.regs[0x30 / 4] |= 0x00018000; // ERR_INT | TIMEOUT_ERR
-            return;
+
+        const cmd_reg: u16 = @truncate(trns_cmd >> 16);
+        const trns_mode: u16 = @truncate(trns_cmd);
+        const opcode: u6 = @truncate((cmd_reg >> 8) & 0x3f);
+        const has_data = (cmd_reg & 0x0020) != 0;
+        const arg = self.regs[0x08 / 4];
+
+        switch (opcode) {
+            0 => {
+                // GO_IDLE_STATE
+                self.regs[0x10 / 4] = 0;
+                self.int_status |= SDHCI_INT_RESPONSE;
+            },
+            3 => {
+                // SD_SEND_RELATIVE_ADDR (R6): RCA = 0x0001
+                self.regs[0x10 / 4] = 0x00010000;
+                self.int_status |= SDHCI_INT_RESPONSE;
+            },
+            5 => {
+                // SD_IO_SEND_OP_COND (R4): C=1 (ready), 2 functions, 3.2-3.4V OCR
+                self.regs[0x10 / 4] = 0xa0ffff00;
+                self.int_status |= SDHCI_INT_RESPONSE;
+            },
+            7 => {
+                // MMC_SELECT_CARD (R1)
+                self.regs[0x10 / 4] = 0x00001e00;
+                self.int_status |= SDHCI_INT_RESPONSE;
+            },
+            52 => {
+                // SD_IO_RW_DIRECT (R5)
+                const is_write = ((arg >> 31) & 1) != 0;
+                const func: u3 = @truncate((arg >> 28) & 0x07);
+                const raw = ((arg >> 27) & 1) != 0;
+                const addr: u17 = @truncate((arg >> 9) & 0x1ffff);
+                const wr_byte: u8 = @truncate(arg & 0xff);
+
+                var rd_byte: u8 = 0;
+                if (is_write) {
+                    self.wifi.writeByte(func, addr, wr_byte);
+                    rd_byte = if (raw) self.wifi.readByte(func, addr) else wr_byte;
+                } else {
+                    rd_byte = self.wifi.readByte(func, addr);
+                }
+                self.regs[0x10 / 4] = 0x00001000 | @as(u32, rd_byte);
+                self.int_status |= SDHCI_INT_RESPONSE;
+            },
+            53 => {
+                // SD_IO_RW_EXTENDED (R5 + PIO data transfer)
+                const is_write = ((arg >> 31) & 1) != 0;
+                const func: u3 = @truncate((arg >> 28) & 0x07);
+                const blk_mode = ((arg >> 27) & 1) != 0;
+                const incr_addr = ((arg >> 26) & 1) != 0;
+                const addr: u17 = @truncate((arg >> 9) & 0x1ffff);
+                const raw_cnt: usize = arg & 0x1ff;
+
+                const blk_reg = self.regs[0x04 / 4];
+                const blksz_reg: usize = blk_reg & 0x0fff;
+                const blkcnt_reg: usize = blk_reg >> 16;
+
+                const blksz: usize = if (blksz_reg != 0)
+                    blksz_reg
+                else if (blk_mode)
+                    512
+                else if (raw_cnt == 0)
+                    512
+                else
+                    raw_cnt;
+
+                const blocks: usize = if ((trns_mode & 0x0020) != 0 and blkcnt_reg != 0)
+                    blkcnt_reg
+                else if (blk_mode and raw_cnt != 0)
+                    raw_cnt
+                else
+                    1;
+
+                const total_len = @min(blksz * blocks, PIO_BUF_SIZE);
+
+                self.regs[0x10 / 4] = 0x00001000;
+                self.int_status |= SDHCI_INT_RESPONSE;
+
+                if (has_data and total_len > 0) {
+                    self.pio_blksz = blksz;
+                    self.pio_blocks_rem = blocks;
+                    self.pio_block_pos = 0;
+                    self.pio_total_pos = 0;
+                    self.pio_total_len = total_len;
+                    self.pio_func = func;
+                    self.pio_addr = addr;
+                    self.pio_incr = incr_addr;
+
+                    if (!is_write) {
+                        self.pio_mode = .read;
+                        self.wifi.readExtended(func, addr, incr_addr, self.pio_buf[0..total_len]);
+                        self.int_status |= SDHCI_INT_DATA_AVAIL;
+                    } else {
+                        self.pio_mode = .write;
+                        @memset(self.pio_buf[0..total_len], 0);
+                        self.int_status |= SDHCI_INT_SPACE_AVAIL;
+                    }
+                }
+            },
+            else => {
+                // Non-SDIO commands (e.g. CMD8, CMD55, CMD1) time out so Linux probes exclusively as SDIO
+                self.int_status |= SDHCI_INT_TIMEOUT;
+            },
         }
-        if (offset == 0x30) {
-            // INT_STATUS W1C
-            self.regs[0x30 / 4] &= ~val;
-            return;
+    }
+
+    fn readPioBuffer(self: *ArasanSdhci) u32 {
+        if (self.pio_mode != .read or self.pio_blocks_rem == 0) return 0;
+
+        const chunk = @min(@as(usize, 4), self.pio_blksz - self.pio_block_pos);
+        var bytes: [4]u8 = [_]u8{0} ** 4;
+        for (0..chunk) |i| {
+            if (self.pio_total_pos < self.pio_total_len) {
+                bytes[i] = self.pio_buf[self.pio_total_pos];
+                self.pio_total_pos += 1;
+            }
         }
-        self.regs[offset / 4] = val;
+        self.pio_block_pos += chunk;
+
+        if (self.pio_block_pos >= self.pio_blksz) {
+            self.pio_block_pos = 0;
+            self.pio_blocks_rem -= 1;
+            if (self.pio_blocks_rem == 0) {
+                self.pio_mode = .none;
+                self.int_status &= ~SDHCI_INT_DATA_AVAIL;
+                self.int_status |= SDHCI_INT_DATA_END;
+            }
+        }
+        return std.mem.readInt(u32, &bytes, .little);
+    }
+
+    fn writePioBuffer(self: *ArasanSdhci, val: u32) void {
+        if (self.pio_mode != .write or self.pio_blocks_rem == 0) return;
+
+        const chunk = @min(@as(usize, 4), self.pio_blksz - self.pio_block_pos);
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, val, .little);
+        for (0..chunk) |i| {
+            if (self.pio_total_pos < self.pio_total_len) {
+                self.pio_buf[self.pio_total_pos] = bytes[i];
+                self.pio_total_pos += 1;
+            }
+        }
+        self.pio_block_pos += chunk;
+
+        if (self.pio_block_pos >= self.pio_blksz) {
+            self.pio_block_pos = 0;
+            self.pio_blocks_rem -= 1;
+            if (self.pio_blocks_rem == 0) {
+                self.pio_mode = .none;
+                self.wifi.writeExtended(
+                    self.pio_func,
+                    self.pio_addr,
+                    self.pio_incr,
+                    self.pio_buf[0..self.pio_total_len],
+                );
+                self.int_status &= ~SDHCI_INT_SPACE_AVAIL;
+                self.int_status |= SDHCI_INT_DATA_END;
+            }
+        }
     }
 };
 
@@ -524,3 +785,26 @@ test "SdHost identification and CMD17 block read" {
     try std.testing.expect(sd.dreqReady());
     try std.testing.expectEqual(@as(u32, 0xDEADBEEF), sd.read32(0x40));
 }
+
+test "ArasanSdhci SDIO CMD5, CMD52, and CMD53 PIO transfer" {
+    var sdhci = ArasanSdhci{ .wireless_enabled = true };
+    sdhci.write32(0x34, 0xffffffff); // INT_ENABLE
+    sdhci.write32(0x38, 0xffffffff); // SIGNAL_ENABLE
+
+    // CMD5 (SD_IO_SEND_OP_COND)
+    sdhci.write32(0x08, 0x00000000);
+    sdhci.write32(0x0c, (5 << 24) | (2 << 16));
+    try std.testing.expectEqual(@as(u32, 0xa0ffff00), sdhci.read32(0x10));
+    try std.testing.expect(sdhci.irqPending());
+    sdhci.write32(0x30, 0xffffffff);
+
+    // CMD53 read 4 bytes from Function 1 ChipCommon chipid (0x18000000)
+    sdhci.write32(0x04, (1 << 16) | 4); // BLOCK_COUNT=1, BLOCK_SIZE=4
+    // arg: write=0, fn=1, blk_mode=0, incr=1, addr=0x08000, count=4
+    sdhci.write32(0x08, (1 << 28) | (1 << 26) | (0x08000 << 9) | 4);
+    sdhci.write32(0x0c, (53 << 24) | (0x20 << 16) | 0x10); // CMD53 + CMD_DATA + TRNS_READ
+    try std.testing.expect((sdhci.read32(0x24) & ArasanSdhci.SDHCI_DATA_AVAILABLE) != 0);
+    try std.testing.expectEqual(@as(u32, 0x1001a9a6), sdhci.read32(0x20));
+    try std.testing.expect((sdhci.read32(0x30) & ArasanSdhci.SDHCI_INT_DATA_END) != 0);
+}
+

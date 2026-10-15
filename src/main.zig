@@ -20,6 +20,7 @@ pub const uart = @import("soc/uart.zig");
 pub const dma = @import("soc/dma.zig");
 pub const qcow2 = @import("soc/qcow2.zig");
 pub const sdhost = @import("soc/sdhost.zig");
+pub const cyw43430 = @import("soc/cyw43430.zig");
 pub const i2c = @import("soc/i2c.zig");
 pub const bcm2835 = @import("soc/bcm2835.zig");
 
@@ -56,6 +57,7 @@ const CliOptions = struct {
     dtb_path: ?[]const u8 = null,
     initramfs_path: ?[]const u8 = null,
     cmdline: ?[]const u8 = null,
+    board_model: ui_board_sheet.BoardModel = .pi_zero,
     width: u16 = 1280,
     height: u16 = 720,
     power: bool = false,
@@ -170,6 +172,29 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 printUsage();
                 return 1;
             };
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            const m = args.next() orelse {
+                printUsage();
+                return 1;
+            };
+            if (std.mem.eql(u8, m, "zero") or std.mem.eql(u8, m, "pi_zero")) {
+                opts.board_model = .pi_zero;
+            } else if (std.mem.eql(u8, m, "zero-w") or std.mem.eql(u8, m, "pi_zero_w")) {
+                opts.board_model = .pi_zero_w;
+            } else if (std.mem.eql(u8, m, "zero-2-w") or std.mem.eql(u8, m, "pi_zero_2_w")) {
+                opts.board_model = .pi_zero_2_w;
+            } else if (std.mem.eql(u8, m, "1a+") or std.mem.eql(u8, m, "pi_1_a_plus")) {
+                opts.board_model = .pi_1_a_plus;
+            } else if (std.mem.eql(u8, m, "1b+") or std.mem.eql(u8, m, "pi_1_b_plus")) {
+                opts.board_model = .pi_1_b_plus;
+            } else if (std.mem.eql(u8, m, "3a+") or std.mem.eql(u8, m, "pi_3_a_plus")) {
+                opts.board_model = .pi_3_a_plus;
+            } else if (std.mem.eql(u8, m, "3b+") or std.mem.eql(u8, m, "pi_3_b_plus")) {
+                opts.board_model = .pi_3_b_plus;
+            } else {
+                std.debug.print("Unknown model: {s} (expected zero, zero-w, zero-2-w, 1a+, 1b+, 3a+, or 3b+)\n", .{m});
+                return 1;
+            }
         } else if (std.mem.eql(u8, arg, "--width")) {
             const s = args.next() orelse return 1;
             opts.width = std.fmt.parseInt(u16, s, 10) catch return 1;
@@ -223,6 +248,8 @@ fn loadGuestBoot(
     soc.mailbox.mac_address = if (board_model.hasWireless()) wifi_mac_address else mac_address;
     soc.usb.hid.setHubKind(hid.HubKind.fromModel(board_model.dtModel()));
     soc.usb.hid.net.guest_mac = mac_address;
+    soc.sdhci.wireless_enabled = board_model.hasWireless();
+    soc.sdhci.wifi.mac_address = wifi_mac_address;
 
     const boot_res = if (sd_qcow2) |disk| blk: {
         soc.sdhost.attachQcow2(disk);
@@ -305,10 +332,14 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             const card_sz = ui_board_sheet.SdCardSize.smallestFitting(@max(fsize, 256 * 1024 * 1024)) orelse .gb_32;
             _ = try wl_win.?.ui.addSdCardFromFile(sd_path, card_sz);
         }
+        if (opts.board_model != .pi_zero) {
+            wl_win.?.status.board_model = opts.board_model;
+            wl_win.?.status.model = opts.board_model.dtModel();
+        }
     }
 
     if (initial_power and (initial_sd or opts.kernel_path != null)) {
-        const bm = if (wl_win) |w| w.status.board_model else ui_board_sheet.BoardModel.pi_zero;
+        const bm = if (wl_win) |w| w.status.board_model else opts.board_model;
         const serial = if (wl_win) |w| w.status.serial_u64 else 0x00000000fa000001;
         const mac = if (wl_win) |w| w.status.mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
         const wifi_mac = if (wl_win) |w| w.status.wifi_mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 };

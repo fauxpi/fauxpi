@@ -161,6 +161,9 @@ pub const Bcm2835 = struct {
         // PL011 UART0 -> Bank 2 bit 25
         if (self.uart0.irqPending()) b2 |= (1 << 25);
 
+        // Arasan SDHCI (mmc@7e300000 / mmcnr@7e300000) -> Bank 2 bit 30 (IRQ 62)
+        if (self.sdhci.irqPending()) b2 |= (1 << 30);
+
         self.intc.raw_level[0] = b0;
         self.intc.raw_level[1] = b1;
         self.intc.raw_level[2] = b2;

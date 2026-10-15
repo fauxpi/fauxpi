@@ -274,9 +274,40 @@ pub const Tree = struct {
     }
 
     pub fn setWirelessMac(self: *Tree, wifi_mac: [6]u8) !void {
-        for ([_][]const u8{ "/soc/mmc@7e300000/wifi@1", "/soc/mmcnr@7e300000/wifi@1", "wifi@1" }) |path| {
+        const mmcnr = self.findNode("/soc/mmcnr@7e300000") orelse self.findNode("mmcnr");
+        const mmc = self.findNode("/soc/mmc@7e300000") orelse self.findNode("sdhci") orelse self.findNode("mmc");
+        const target = mmcnr orelse mmc;
+
+        if (target) |sdhci_node| {
+            // If both mmcnr@7e300000 and mmc@7e300000 exist, keep the non-selected clone disabled
+            if (mmcnr != null and mmc != null and mmc.? != sdhci_node) {
+                try mmc.?.setStringProp(self.allocator, "status", "disabled");
+            }
+            try sdhci_node.setStringProp(self.allocator, "status", "okay");
+            try sdhci_node.setProp(self.allocator, "non-removable", &.{});
+            try sdhci_node.setU32Prop(self.allocator, "bus-width", 4);
+            try sdhci_node.setU32Prop(self.allocator, "#address-cells", 1);
+            try sdhci_node.setU32Prop(self.allocator, "#size-cells", 0);
+
+            const wifi = try sdhci_node.findOrCreateChild(self.allocator, "wifi@1");
+            try wifi.setU32Prop(self.allocator, "reg", 1);
+            try wifi.setStringProp(self.allocator, "compatible", "brcm,bcm4329-fmac");
+            try wifi.setProp(self.allocator, "local-mac-address", &wifi_mac);
+
+            if (self.findNode("/aliases")) |aliases| {
+                const alias_path = if (std.mem.eql(u8, sdhci_node.name, "mmcnr@7e300000"))
+                    "/soc/mmcnr@7e300000"
+                else
+                    "/soc/mmc@7e300000";
+                try aliases.setStringProp(self.allocator, "mmc1", alias_path);
+            }
+        }
+    }
+
+    pub fn disableWireless(self: *Tree) !void {
+        for ([_][]const u8{ "/soc/mmcnr@7e300000", "/soc/mmc@7e300000", "mmcnr", "sdhci" }) |path| {
             if (self.findNode(path)) |n| {
-                try n.setProp(self.allocator, "local-mac-address", &wifi_mac);
+                try n.setStringProp(self.allocator, "status", "disabled");
             }
         }
     }
@@ -471,8 +502,11 @@ test "FDT roundtrip and Pi Zero patching" {
     try usb.setStringProp(alloc, "compatible", "brcm,bcm2708-usb");
     const hvs = try soc.findOrCreateChild(alloc, "hvs@7e400000");
     try hvs.setStringProp(alloc, "status", "disabled");
+    const mmcnr = try soc.findOrCreateChild(alloc, "mmcnr@7e300000");
+    try mmcnr.setStringProp(alloc, "status", "disabled");
 
     try tree.patchForPiZero(512 * 1024 * 1024, "console=ttyAMA0,115200", .{ .start = 0x02000000, .end = 0x02500000 }, true);
+    try tree.setWirelessMac(.{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 });
 
     const blob = try tree.serialize(alloc);
     var parsed = try Tree.parse(alloc, blob);
@@ -495,4 +529,10 @@ test "FDT roundtrip and Pi Zero patching" {
     // And removed for boards with an external hub (e.g. Pi Zero)
     try parsed.setBoardModel("Raspberry Pi Zero Rev 1.3", 0x00900093);
     try std.testing.expect(parsed.findNode("/soc/usb@7e980000/usb1@1") == null);
+
+    const mmcnr_parsed = parsed.findNode("/soc/mmcnr@7e300000").?;
+    try std.testing.expectEqualStrings("okay", mmcnr_parsed.getStringProp("status").?);
+    const wifi_parsed = parsed.findNode("/soc/mmcnr@7e300000/wifi@1").?;
+    try std.testing.expectEqualStrings("brcm,bcm4329-fmac", wifi_parsed.getStringProp("compatible").?);
+    try std.testing.expectEqualSlices(u8, &.{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 }, wifi_parsed.getProp("local-mac-address").?);
 }

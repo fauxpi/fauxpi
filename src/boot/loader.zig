@@ -196,6 +196,8 @@ pub fn applyBoardConfigToRamDtb(
     try tree.setBoardSerial(serial);
     if (wifi_mac) |wmac| {
         try tree.setWirelessMac(wmac);
+    } else {
+        try tree.disableWireless();
     }
     const updated_dtb = try tree.serialize(alloc);
     if (dtb_load_addr + updated_dtb.len > ram.len) return error.DtbTooLarge;
