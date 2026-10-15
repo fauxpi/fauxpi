@@ -342,14 +342,14 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         if (opts.max_steps != 0 and cpu.cycles >= opts.max_steps) break;
 
         const batch: usize = if (opts.max_steps != 0)
-            @intCast(@min(@as(u64, 16384), opts.max_steps - cpu.cycles))
+            @intCast(@min(@as(u64, 65536), opts.max_steps - cpu.cycles))
         else
-            16384;
+            65536;
 
         const ran = cpu.runSteps(&soc, batch);
 
-        // Advance 1 MHz system timer proportionally to instructions executed (~4 instructions per us at 1 GHz -> min 1 us)
-        const timer_ticks: u64 = if (ran > 0) @max(ran / 16, 1) else 1;
+        // Advance 1 MHz system timer proportionally to instructions executed (~256 instructions per us on ARM1176)
+        const timer_ticks: u64 = if (ran > 0) @max(ran / 256, 1) else 1;
         active_us_accum += timer_ticks;
         soc.timer.advance(timer_ticks, &soc.intc);
         soc.updateIrqs();
@@ -371,6 +371,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         const now_ns = monotonicNs();
         if (now_ns -| last_vblank_ns >= vblank_interval_ns) {
             last_vblank_ns = now_ns;
+            last_guest_vblank_us = soc.timer.counter;
             soc.triggerVblank();
 
             if (wl_win) |w| {
