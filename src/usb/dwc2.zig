@@ -117,11 +117,64 @@ pub const Dwc2Controller = struct {
         return (self.effectiveGintsts() & self.gintmsk) != 0;
     }
 
-    pub fn tickSof(self: *Dwc2Controller) void {
+    pub fn tickSof(self: *Dwc2Controller, ram: []u8) void {
         self.hfnum +%= 1;
         if ((self.gintmsk & GINTSTS_SOF) != 0) {
             self.gintsts |= GINTSTS_SOF;
         }
+        self.pollNetwork(ram);
+    }
+
+    pub fn pollNetwork(self: *Dwc2Controller, ram: []u8) void {
+        if (self.hid.isEthernetLinkUp()) {
+            self.hid.net.poll();
+            if (self.hid.hasEthBulkIn()) {
+                self.servicePendingBulkIn(ram);
+            }
+        }
+    }
+
+    pub fn servicePendingBulkIn(self: *Dwc2Controller, ram: []u8) void {
+        for (0..NUM_CHANNELS) |ch_idx| {
+            const ch = &self.channels[ch_idx];
+            if ((ch.hcchar & HCCHAR_CHEN) != 0) {
+                const epnum: u4 = @truncate((ch.hcchar >> 11) & 0xf);
+                const epdir_in = ((ch.hcchar >> 15) & 1) != 0;
+                const eptype: u2 = @truncate((ch.hcchar >> 18) & 3);
+                if (eptype == 2 and epdir_in and epnum == 4) {
+                    if (!self.tryCompleteBulkIn(ch_idx, ram)) break;
+                }
+            }
+        }
+    }
+
+    fn tryCompleteBulkIn(self: *Dwc2Controller, ch_idx: usize, ram: []u8) bool {
+        const ch = &self.channels[ch_idx];
+        const xfersize: u32 = ch.hctsiz & 0x7ffff;
+        const pid: u2 = @truncate((ch.hctsiz >> 29) & 3);
+        const dma_phys: u32 = ch.hcdma & 0x1FFFFFFF;
+
+        if (dma_phys + xfersize > ram.len) {
+            ch.hcchar &= ~HCCHAR_CHEN;
+            ch.hcint |= HCINT_AHBERR | HCINT_CHHLTD;
+            return false;
+        }
+
+        if (self.hid.popEthBulkIn(ram[dma_phys .. dma_phys + xfersize])) |copy_len| {
+            ch.hcchar &= ~HCCHAR_CHEN;
+            const rem: u32 = xfersize - @as(u32, @intCast(copy_len));
+            const pkt_transferred: usize = if (copy_len == 0) 1 else (copy_len + 63) / 64;
+            const next_pid: u32 = if ((pkt_transferred & 1) != 0)
+                (if (pid == 0) @as(u32, 2) else 0)
+            else
+                pid;
+            ch.hctsiz = (next_pid << 29) | rem;
+            ch.hcdma +%= @intCast(copy_len);
+            ch.hcdmab = ch.hcdma;
+            ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
+            return true;
+        }
+        return false;
     }
 
     pub fn read32(self: *Dwc2Controller, offset: u32) u32 {
@@ -271,17 +324,16 @@ pub const Dwc2Controller = struct {
         const pid: u2 = @truncate((ch.hctsiz >> 29) & 3);
         const dma_phys: u32 = ch.hcdma & 0x1FFFFFFF;
 
-        // Clear CHEN since transfer completes synchronously
-        ch.hcchar &= ~HCCHAR_CHEN;
-
         // Check device address (respond to address 0 before SET_ADDRESS or matching address)
         if (devaddr != self.hid.address and devaddr != 0) {
+            ch.hcchar &= ~HCCHAR_CHEN;
             ch.hcint |= HCINT_XACTERR | HCINT_CHHLTD;
             return;
         }
 
         // Control endpoint 0
         if (epnum == 0 or eptype == 0) {
+            ch.hcchar &= ~HCCHAR_CHEN;
             if (pid == 3 and !epdir_in) {
                 // SETUP stage (8 bytes)
                 if (dma_phys + 8 <= ram.len) {
@@ -307,8 +359,11 @@ pub const Dwc2Controller = struct {
                 } else if (dma_phys + xfersize <= ram.len) {
                     const n = self.hid.readControlData(ram[dma_phys .. dma_phys + xfersize]);
                     const rem: u32 = xfersize - @as(u32, @intCast(n));
-                    // Toggle DATA0 (0) <-> DATA1 (2)
-                    const next_pid: u32 = if (pid == 0) 2 else 0;
+                    const pkt_transferred: usize = if (n == 0) 1 else (n + 63) / 64;
+                    const next_pid: u32 = if ((pkt_transferred & 1) != 0)
+                        (if (pid == 0) @as(u32, 2) else 0)
+                    else
+                        pid;
                     ch.hctsiz = (next_pid << 29) | rem;
                     ch.hcdma +%= @intCast(n);
                     ch.hcdmab = ch.hcdma;
@@ -326,8 +381,45 @@ pub const Dwc2Controller = struct {
             return;
         }
 
-        // Interrupt IN endpoints: EP1 (Keyboard) and EP2 (Mouse)
+        // Bulk endpoints (EP4 IN / OUT for CDC-ECM Ethernet)
+        if (eptype == 2 and epnum == 4) {
+            if (epdir_in) {
+                // In DWC2 DMA mode, Bulk IN channels stay enabled (HCCHAR_CHEN) until an RX frame arrives
+                // or the host driver aborts the channel with HCCHAR_CHDIS.
+                if (!self.tryCompleteBulkIn(ch_idx, ram)) {
+                    self.pollNetwork(ram);
+                }
+                return;
+            } else {
+                // Bulk OUT: transmit Ethernet frame from guest to VirtualNetwork
+                ch.hcchar &= ~HCCHAR_CHEN;
+                if (dma_phys + xfersize <= ram.len) {
+                    if (xfersize >= 14) {
+                        self.hid.handleEthBulkOut(ram[dma_phys .. dma_phys + xfersize]);
+                    }
+                    const pkt_transferred: u32 = if (xfersize == 0) 1 else (xfersize + 63) / 64;
+                    const next_pid: u32 = if ((pkt_transferred & 1) != 0)
+                        (if (pid == 0) @as(u32, 2) else 0)
+                    else
+                        pid;
+                    ch.hctsiz = (next_pid << 29);
+                    ch.hcdma +%= xfersize;
+                    ch.hcdmab = ch.hcdma;
+                    ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
+                    // Service any waiting Bulk IN channel immediately if an RX reply was generated
+                    if (self.hid.hasEthBulkIn()) {
+                        self.servicePendingBulkIn(ram);
+                    }
+                } else {
+                    ch.hcint |= HCINT_AHBERR | HCINT_CHHLTD;
+                }
+                return;
+            }
+        }
+
+        // Interrupt IN endpoints: EP1 (Keyboard), EP2 (Mouse), EP3 (CDC-ECM Status)
         if (eptype == 3 and epdir_in) {
+            ch.hcchar &= ~HCCHAR_CHEN;
             if (epnum == 1) {
                 if (self.hid.popKbdReport()) |report| {
                     const copy_len = @min(@as(usize, xfersize), 8);
@@ -360,16 +452,32 @@ pub const Dwc2Controller = struct {
                     ch.hcint |= HCINT_NAK | HCINT_CHHLTD;
                 }
                 return;
+            } else if (epnum == 3) {
+                if (dma_phys + xfersize <= ram.len) {
+                    if (self.hid.popCdcNotification(ram[dma_phys .. dma_phys + xfersize])) |copy_len| {
+                        const rem: u32 = xfersize - @as(u32, @intCast(copy_len));
+                        const next_pid: u32 = if (pid == 0) 2 else 0;
+                        ch.hctsiz = (next_pid << 29) | rem;
+                        ch.hcdma +%= @intCast(copy_len);
+                        ch.hcdmab = ch.hcdma;
+                        ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
+                        return;
+                    }
+                }
+                ch.hcint |= HCINT_NAK | HCINT_CHHLTD;
+                return;
             }
         }
 
+        ch.hcchar &= ~HCCHAR_CHEN;
         ch.hcint |= HCINT_STALL | HCINT_CHHLTD;
     }
 };
 
-test "DWC2 enumeration and USB HID keyboard report" {
+test "DWC2 enumeration, USB HID keyboard report, and CDC-ECM Ethernet" {
     var dwc2 = Dwc2Controller{};
-    var ram: [1024]u8 = [_]u8{0} ** 1024;
+    defer dwc2.hid.net.deinit();
+    var ram: [4096]u8 = [_]u8{0} ** 4096;
 
     // Verify Synopsis ID
     try std.testing.expectEqual(@as(u32, 0x4f54280a), dwc2.read32(0x040));
@@ -406,4 +514,51 @@ test "DWC2 enumeration and USB HID keyboard report" {
     dwc2.write32(0x520, Dwc2Controller.HCCHAR_CHEN | (3 << 18) | (1 << 15) | (1 << 11) | 8, &ram); // EP1 IN Interrupt
     try std.testing.expect((dwc2.read32(0x528) & Dwc2Controller.HCINT_XFERCOMP) != 0);
     try std.testing.expectEqual(@as(u8, 0x04), ram[0x302]);
+
+    // Poll CDC-ECM EP3 IN Interrupt on Channel 2 -> expect SPEED_CHANGE (16 bytes) then NETWORK_CONNECTION (8 bytes)
+    dwc2.write32(0x550, (0 << 29) | (1 << 19) | 16, &ram);
+    dwc2.write32(0x554, 0xc0000400, &ram);
+    dwc2.write32(0x540, Dwc2Controller.HCCHAR_CHEN | (3 << 18) | (1 << 15) | (3 << 11) | 16, &ram);
+    try std.testing.expect((dwc2.read32(0x548) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+    try std.testing.expectEqual(@as(u8, 0x2a), ram[0x401]); // USB_CDC_NOTIFY_SPEED_CHANGE
+
+    dwc2.write32(0x548, 0x7ff, &ram);
+    dwc2.write32(0x550, (2 << 29) | (1 << 19) | 16, &ram);
+    dwc2.write32(0x554, 0xc0000420, &ram);
+    dwc2.write32(0x540, Dwc2Controller.HCCHAR_CHEN | (3 << 18) | (1 << 15) | (3 << 11) | 16, &ram);
+    try std.testing.expect((dwc2.read32(0x548) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+    try std.testing.expectEqual(@as(u8, 0x00), ram[0x421]); // USB_CDC_NOTIFY_NETWORK_CONNECTION
+    try std.testing.expectEqual(@as(u8, 0x01), ram[0x422]); // Connected = 1
+
+    // Arm Bulk IN (EP4 IN) on Channel 3 before any RX frame exists -> stays enabled (HCCHAR_CHEN set)
+    dwc2.write32(0x570, (0 << 29) | (24 << 19) | 1536, &ram);
+    dwc2.write32(0x574, 0xc0000800, &ram);
+    dwc2.write32(0x560, Dwc2Controller.HCCHAR_CHEN | (2 << 18) | (1 << 15) | (4 << 11) | 64, &ram);
+    try std.testing.expect((dwc2.read32(0x560) & Dwc2Controller.HCCHAR_CHEN) != 0);
+    try std.testing.expectEqual(@as(u32, 0), dwc2.read32(0x568));
+
+    // Transmit ARP Request on Bulk OUT (EP4 OUT) on Channel 4 -> automatically completes waiting Channel 3 Bulk IN!
+    var arp_req = ram[0x500 .. 0x500 + 42];
+    @memset(arp_req[0..6], 0xff);
+    @memcpy(arp_req[6..12], &[_]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 });
+    std.mem.writeInt(u16, arp_req[12..14], 0x0806, .big);
+    std.mem.writeInt(u16, arp_req[14..16], 1, .big);
+    std.mem.writeInt(u16, arp_req[16..18], 0x0800, .big);
+    arp_req[18] = 6;
+    arp_req[19] = 4;
+    std.mem.writeInt(u16, arp_req[20..22], 1, .big);
+    @memcpy(arp_req[22..28], &[_]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 });
+    @memcpy(arp_req[28..32], &[_]u8{ 10, 0, 2, 15 });
+    @memcpy(arp_req[38..42], &[_]u8{ 10, 0, 2, 2 });
+
+    dwc2.write32(0x590, (0 << 29) | (1 << 19) | 42, &ram);
+    dwc2.write32(0x594, 0xc0000500, &ram);
+    dwc2.write32(0x580, Dwc2Controller.HCCHAR_CHEN | (2 << 18) | (0 << 15) | (4 << 11) | 64, &ram);
+    try std.testing.expect((dwc2.read32(0x588) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+
+    // Verify Channel 3 Bulk IN completed with the 42-byte ARP Reply
+    try std.testing.expect((dwc2.read32(0x568) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+    try std.testing.expectEqual(@as(u32, 1536 - 42), dwc2.read32(0x570) & 0x7ffff);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, ram[0x800 + 20 ..][0..2], .big));
 }
+

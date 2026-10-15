@@ -23,6 +23,7 @@ pub const i2c = @import("soc/i2c.zig");
 pub const bcm2835 = @import("soc/bcm2835.zig");
 
 pub const hid = @import("usb/hid.zig");
+pub const usb_net = @import("usb/net.zig");
 pub const dwc2 = @import("usb/dwc2.zig");
 
 pub const vc4_format = @import("vc4/format.zig");
@@ -62,6 +63,16 @@ const CliOptions = struct {
 };
 
 fn readFileLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    return readFileWithMinSizeLinux(allocator, path, 0);
+}
+
+fn readSdImageLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    // Ensure simulated SD card is at least 256 MiB so guest OSes (like Dazzle) have room
+    // to grow the boot partition and format a /data partition.
+    return readFileWithMinSizeLinux(allocator, path, 256 * 1024 * 1024);
+}
+
+fn readFileWithMinSizeLinux(allocator: std.mem.Allocator, path: []const u8, min_size: usize) ![]u8 {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     if (path.len >= path_buf.len) return error.NameTooLong;
     @memcpy(path_buf[0..path.len], path);
@@ -77,7 +88,8 @@ fn readFileLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const file_size: usize = @intCast(end_rc);
     _ = linux.lseek(fd, 0, linux.SEEK.SET);
 
-    const buf = try allocator.alloc(u8, file_size);
+    const alloc_size = @max(file_size, min_size);
+    const buf = try allocator.alloc(u8, alloc_size);
     errdefer allocator.free(buf);
 
     var off: usize = 0;
@@ -87,7 +99,10 @@ fn readFileLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
         if (rc == 0) break;
         off += rc;
     }
-    return buf[0..off];
+    if (alloc_size > off) {
+        @memset(buf[off..alloc_size], 0);
+    }
+    return buf[0..alloc_size];
 }
 
 fn monotonicNs() u64 {
@@ -194,6 +209,7 @@ fn loadGuestBoot(
     soc: *Bcm2835,
     sd_image_buf: ?[]u8,
 ) !loader.BootResult {
+    soc.usb.hid.net.deinit();
     @memset(ram, 0);
     soc.* = Bcm2835.init(ram, opts.width, opts.height);
 
@@ -233,10 +249,11 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     var sd_image_buf: ?[]u8 = null;
     defer if (sd_image_buf) |b| gpa.free(b);
     if (opts.sd_path) |sd_path| {
-        sd_image_buf = try readFileLinux(gpa, sd_path);
+        sd_image_buf = try readSdImageLinux(gpa, sd_path);
     }
 
     var soc = Bcm2835.init(ram, opts.width, opts.height);
+    defer soc.usb.hid.net.deinit();
     var cpu: Cpu = .{};
     var guest_booted = false;
 
@@ -286,7 +303,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
             if (w.sd_image_chosen) {
                 w.sd_image_chosen = false;
-                if (readFileLinux(gpa, w.chosenSdPath())) |new_img| {
+                if (readSdImageLinux(gpa, w.chosenSdPath())) |new_img| {
                     if (sd_image_buf) |old| gpa.free(old);
                     sd_image_buf = new_img;
                     if (w.status.sd_connected) {
@@ -354,6 +371,10 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         soc.timer.advance(timer_ticks, &soc.intc);
         soc.updateIrqs();
 
+        if (cpu.mmu.halted_wfi and !soc.hasPendingIrq() and !soc.hasPendingFiq()) {
+            soc.usb.pollNetwork(soc.ram);
+            soc.updateIrqs();
+        }
         if (cpu.mmu.halted_wfi and !soc.hasPendingIrq() and !soc.hasPendingFiq()) {
             // Fast-forward timer to next compare match (capped at 2000 us so vblank/UI stays responsive)
             const jump = @max(soc.timer.usUntilNextMatch(2000), 1);

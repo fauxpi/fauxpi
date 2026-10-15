@@ -1,11 +1,18 @@
 const std = @import("std");
+const net_mod = @import("net.zig");
 
-/// Virtual Composite USB HID Device (Interface 0 = Boot Keyboard on EP1 IN, Interface 1 = Boot Mouse on EP2 IN).
+/// Virtual Composite USB Device:
+/// - Interface 0: HID Boot Keyboard (EP1 IN Interrupt `0x81`)
+/// - Interface 1: HID Boot Mouse (EP2 IN Interrupt `0x82`)
+/// - Interface 2: CDC-ECM Communications Control (EP3 IN Interrupt `0x83`)
+/// - Interface 3: CDC-ECM Ethernet Data (EP4 IN Bulk `0x84`, EP4 OUT Bulk `0x04`)
 pub const UsbHidComposite = struct {
     address: u7 = 0,
     configured: bool = false,
     idle_rate: [2]u8 = [_]u8{ 0, 0 },
     protocol: [2]u8 = [_]u8{ 1, 1 }, // 1 = Report protocol, 0 = Boot protocol
+    cdc_alt_setting: u8 = 0,
+    cdc_packet_filter: u16 = 0,
 
     // Control transfer response buffer
     ctrl_buf: [256]u8 = [_]u8{0} ** 256,
@@ -44,11 +51,94 @@ pub const UsbHidComposite = struct {
     mouse_connected: bool = true,
     ethernet_connected: bool = true,
 
+    // CDC-ECM Interrupt IN notification queue (EP3 IN)
+    reported_link_up: ?bool = null,
+    cdc_notif_queue: [8][16]u8 = undefined,
+    cdc_notif_lens: [8]u8 = [_]u8{0} ** 8,
+    cdc_notif_head: u3 = 0,
+    cdc_notif_tail: u3 = 0,
+    cdc_notif_count: u4 = 0,
+
+    // User-mode NAT / SLIRP network stack
+    net: net_mod.VirtualNetwork = .{},
+
     pub fn reset(self: *UsbHidComposite) void {
         self.address = 0;
         self.configured = false;
+        self.cdc_alt_setting = 0;
         self.ctrl_len = 0;
         self.ctrl_pos = 0;
+        self.reported_link_up = null;
+        self.cdc_notif_head = 0;
+        self.cdc_notif_tail = 0;
+        self.cdc_notif_count = 0;
+    }
+
+    pub fn isEthernetLinkUp(self: *const UsbHidComposite) bool {
+        return self.hub_connected and self.ethernet_connected;
+    }
+
+    fn enqueueCdcNotif(self: *UsbHidComposite, data: []const u8) void {
+        if (self.cdc_notif_count >= 8 or data.len > 16) return;
+        @memset(&self.cdc_notif_queue[self.cdc_notif_tail], 0);
+        @memcpy(self.cdc_notif_queue[self.cdc_notif_tail][0..data.len], data);
+        self.cdc_notif_lens[self.cdc_notif_tail] = @intCast(data.len);
+        self.cdc_notif_tail +%= 1;
+        self.cdc_notif_count += 1;
+    }
+
+    fn queueLinkNotifications(self: *UsbHidComposite, link_up: bool) void {
+        if (link_up) {
+            // USB_CDC_NOTIFY_SPEED_CHANGE (0x2a): 100 Mbps (100,000,000 bps = 0x05f5e100) DL & UL
+            const speed_notif = [16]u8{
+                0xa1, 0x2a, 0x00, 0x00, 0x02, 0x00, 0x08, 0x00,
+                0x00, 0xe1, 0xf5, 0x05, 0x00, 0xe1, 0xf5, 0x05,
+            };
+            self.enqueueCdcNotif(&speed_notif);
+        }
+        // USB_CDC_NOTIFY_NETWORK_CONNECTION (0x00): wValue = 1 (connected) or 0 (disconnected)
+        const conn_notif = [8]u8{
+            0xa1,
+            0x00,
+            if (link_up) 1 else 0,
+            0x00,
+            0x02,
+            0x00,
+            0x00,
+            0x00,
+        };
+        self.enqueueCdcNotif(&conn_notif);
+    }
+
+    pub fn popCdcNotification(self: *UsbHidComposite, dest: []u8) ?usize {
+        if (!self.hub_connected) return null;
+        const link_up = self.isEthernetLinkUp();
+        if (self.reported_link_up == null or self.reported_link_up.? != link_up) {
+            self.reported_link_up = link_up;
+            self.queueLinkNotifications(link_up);
+        }
+        if (self.cdc_notif_count == 0) return null;
+        const len: usize = self.cdc_notif_lens[self.cdc_notif_head];
+        const copy_len = @min(dest.len, len);
+        @memcpy(dest[0..copy_len], self.cdc_notif_queue[self.cdc_notif_head][0..copy_len]);
+        self.cdc_notif_head +%= 1;
+        self.cdc_notif_count -= 1;
+        return copy_len;
+    }
+
+    pub fn handleEthBulkOut(self: *UsbHidComposite, frame: []const u8) void {
+        if (!self.isEthernetLinkUp()) return;
+        self.net.handleTxFrame(frame);
+    }
+
+    pub fn hasEthBulkIn(self: *const UsbHidComposite) bool {
+        if (!self.isEthernetLinkUp()) return false;
+        return self.net.hasRxFrame();
+    }
+
+    pub fn popEthBulkIn(self: *UsbHidComposite, dest: []u8) ?usize {
+        if (!self.isEthernetLinkUp()) return null;
+        return self.net.popRxFrame(dest);
     }
 
     /// Injects a Linux evdev key press/release (from Wayland wl_keyboard.key) into the USB HID keyboard queue.
@@ -231,21 +321,34 @@ pub const UsbHidComposite = struct {
                 },
                 0x09 => { // SET_CONFIGURATION
                     self.configured = (wValue & 0xff) != 0;
+                    self.reported_link_up = null;
                     return true;
                 },
                 0x0a => { // GET_INTERFACE
                     if (recipient == 1) {
-                        self.ctrl_buf[0] = 0;
+                        self.ctrl_buf[0] = if ((wIndex & 0xff) == 3) self.cdc_alt_setting else 0;
                         self.ctrl_len = @min(@as(usize, wLength), 1);
                         return true;
                     }
                 },
                 0x0b => { // SET_INTERFACE
+                    if ((wIndex & 0xff) == 3) {
+                        self.cdc_alt_setting = @truncate(wValue & 0xff);
+                        self.reported_link_up = null;
+                    }
                     return true;
                 },
                 else => {},
             }
-        } else if (req_type == 1) { // Class (HID) request
+        } else if (req_type == 1) { // Class (HID / CDC) request
+            if ((wIndex & 0xff) >= 2 or bRequest == 0x43) {
+                // CDC-ECM Class Request (e.g. USB_CDC_SET_ETHERNET_PACKET_FILTER = 0x43)
+                if (bRequest == 0x43) {
+                    self.cdc_packet_filter = wValue;
+                    self.reported_link_up = null;
+                }
+                return true;
+            }
             const iface = wIndex & 1;
             switch (bRequest) {
                 0x01 => { // GET_REPORT
@@ -320,10 +423,11 @@ pub const UsbHidComposite = struct {
                     1 => return self.writeUtf16String("FauxPi", wLength),
                     2 => return self.writeUtf16String("FauxPi USB Keyboard & Mouse", wLength),
                     3 => return self.writeUtf16String("0001", wLength),
+                    4 => return self.writeUtf16String("B827EB123456", wLength),
                     else => return false,
                 }
             },
-            0x06 => { // DEVICE_QUALIFIER (return STALL for Full-Speed-only or return valid qualifier)
+            0x06 => { // DEVICE_QUALIFIER (return STALL for Full-Speed-only)
                 return false;
             },
             0x21 => { // HID descriptor
@@ -442,9 +546,9 @@ pub const UsbHidComposite = struct {
         0xc0, // End Collection
     };
 
-    pub const CONFIG_DESC = [59]u8{
-        // Configuration Descriptor (9 bytes)
-        9, 0x02, 59, 0, 2, 1, 0, 0xa0, 50,
+    pub const CONFIG_DESC = [130]u8{
+        // Configuration Descriptor (9 bytes, wTotalLength = 130, bNumInterfaces = 4)
+        9, 0x02, 130, 0, 4, 1, 0, 0xa0, 50,
         // Interface 0 Descriptor: HID Boot Keyboard (9 bytes, offset 9)
         9, 0x04, 0, 0, 1, 0x03, 0x01, 0x01, 0,
         // HID Descriptor 0 (9 bytes, offset 18)
@@ -457,6 +561,24 @@ pub const UsbHidComposite = struct {
         9, 0x21, 0x11, 0x01, 0, 1, 0x22, MOUSE_REPORT_DESC.len, 0,
         // Endpoint 2 IN Descriptor (7 bytes, offset 52)
         7, 0x05, 0x82, 0x03, 4, 0, 10,
+        // Interface 2 Descriptor: CDC Communications Control (9 bytes, offset 59)
+        9, 0x04, 2, 0, 1, 0x02, 0x06, 0x00, 0,
+        // CDC Header Functional Descriptor (5 bytes, offset 68)
+        5, 0x24, 0x00, 0x10, 0x01,
+        // CDC Union Functional Descriptor: Master=2, Slave=3 (5 bytes, offset 73)
+        5, 0x24, 0x06, 2, 3,
+        // CDC Ethernet Networking Functional Descriptor: iMACAddress=4, wMaxSegmentSize=1514 (13 bytes, offset 78)
+        13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0,
+        // Endpoint 3 IN Interrupt Descriptor (7 bytes, offset 91)
+        7, 0x05, 0x83, 0x03, 16, 0, 32,
+        // Interface 3 Alternate 0: CDC Data Idle (9 bytes, offset 98)
+        9, 0x04, 3, 0, 0, 0x0a, 0x00, 0x00, 0,
+        // Interface 3 Alternate 1: CDC Data Active (9 bytes, offset 107)
+        9, 0x04, 3, 1, 2, 0x0a, 0x00, 0x00, 0,
+        // Endpoint 4 IN Bulk Descriptor (7 bytes, offset 116)
+        7, 0x05, 0x84, 0x02, 64, 0, 0,
+        // Endpoint 4 OUT Bulk Descriptor (7 bytes, offset 123)
+        7, 0x05, 0x04, 0x02, 64, 0, 0,
     };
 
     fn evdevToModifierBit(evdev_key: u32) ?u8 {

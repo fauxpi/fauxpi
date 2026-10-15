@@ -253,7 +253,7 @@ pub const Tree = struct {
         const mem_node = self.findNode("/memory@0") orelse self.findNode("/memory") orelse try self.findOrCreateNode("/memory@0");
         try mem_node.setCellsProp(self.allocator, "reg", &.{ 0, ram_size });
 
-        // 2. /chosen bootargs and initrd
+        // 2. /chosen bootargs, initrd, and rng-seed (initializes kernel CRNG immediately at boot)
         const chosen = try self.findOrCreateNode("/chosen");
         if (cmdline.len > 0) {
             try chosen.setStringProp(self.allocator, "bootargs", cmdline);
@@ -262,6 +262,9 @@ pub const Tree = struct {
             try chosen.setU32Prop(self.allocator, "linux,initrd-start", rd.start);
             try chosen.setU32Prop(self.allocator, "linux,initrd-end", rd.end);
         }
+        var rng_seed: [64]u8 = undefined;
+        _ = std.os.linux.getrandom(&rng_seed, rng_seed.len, 0);
+        try chosen.setProp(self.allocator, "rng-seed", &rng_seed);
 
         // 2b. /system board revision (0x00900093 = Raspberry Pi Zero v1.3, 512MB) and serial
         const sys_node = try self.findOrCreateNode("/system");

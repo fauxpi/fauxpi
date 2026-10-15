@@ -172,7 +172,7 @@ pub const Bcm2835 = struct {
         self.pv2.triggerVblank();
         self.hvs.notifyVblank();
         self.usb.hid.syncCursorFeedback(self.hvs.getCursorHotspot(self.ram));
-        self.usb.tickSof();
+        self.usb.tickSof(self.ram);
         self.updateIrqs();
     }
 
