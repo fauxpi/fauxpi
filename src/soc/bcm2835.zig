@@ -176,8 +176,19 @@ pub const Bcm2835 = struct {
         self.updateIrqs();
     }
 
+    /// Connects or disconnects the simulated HDMI monitor cable (updating HPD register, DDC EDID, and GPIO 46 HDMI_HPD_N).
+    pub fn setHdmiConnected(self: *Bcm2835, connected: bool) void {
+        if (self.hdmi.connected == connected) return;
+        self.hdmi.connected = connected;
+        self.bsc2.has_hdmi_edid = connected;
+        // GPIO 46 on Raspberry Pi Zero is HDMI_HPD_N (active-low: 0 = connected, 1 = disconnected)
+        self.gpio.setExternalPin(46, !connected);
+        self.updateIrqs();
+    }
+
     /// Composites the current HDMI frame (`width * height` pixels of `0xFFRRGGBB`) from HVS or Mailbox FB.
     pub fn renderDisplayFrame(self: *const Bcm2835, out_argb: []u32, width: u32, height: u32) bool {
+        if (!self.hdmi.connected) return false;
         if (self.hvs.compositeFrame(self.ram, out_argb, width, height)) {
             return true;
         }

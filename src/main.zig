@@ -283,6 +283,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 active_us_accum = 0;
                 idle_us_accum = 0;
 
+                soc.setHdmiConnected(w.status.hdmi_connected);
                 const disp_pixels = w.displayPixels();
                 w.status.hdmi_active = soc.renderDisplayFrame(disp_pixels, opts.width, opts.height);
                 w.compositeUi();

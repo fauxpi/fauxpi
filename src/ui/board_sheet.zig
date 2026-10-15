@@ -54,7 +54,8 @@ pub const SystemStatus = struct {
     mem_total_mb: u32 = 512,
     hdmi_width: u16 = 1280,
     hdmi_height: u16 = 720,
-    hdmi_active: bool = true,
+    hdmi_connected: bool = true,
+    hdmi_active: bool = false,
 };
 
 pub const Action = enum {
@@ -62,6 +63,7 @@ pub const Action = enum {
     consumed,
     start_drag,
     toggle_maximize,
+    toggle_hdmi,
     close,
 };
 
@@ -155,8 +157,37 @@ pub const BoardUi = struct {
         return 0;
     }
 
+    const hdmi_cable_ext_mm: f32 = 13.5;
+
+    fn boardBoundsWithCable(drawing: *const board.Board) board.Rect {
+        var r = drawing.bounds();
+        for (drawing.parts) |p| {
+            if ((p.kind == .mini_hdmi or p.kind == .hdmi or p.kind == .micro_hdmi) and p.faces == .bottom) {
+                const cable_bottom = p.rect.y + p.rect.h + hdmi_cable_ext_mm;
+                if (cable_bottom > r.y + r.h) {
+                    r.h = cable_bottom - r.y;
+                }
+            }
+        }
+        return r;
+    }
+
+    fn partOrCableAt(drawing: *const board.Board, pt: [2]f32) ?usize {
+        if (drawing.partAt(pt)) |idx| return idx;
+        for (drawing.parts, 0..) |p, i| {
+            if ((p.kind == .mini_hdmi or p.kind == .hdmi or p.kind == .micro_hdmi) and p.faces == .bottom) {
+                if (pt[0] >= p.rect.x and pt[0] <= p.rect.x + p.rect.w and
+                    pt[1] >= p.rect.y and pt[1] <= p.rect.y + p.rect.h + hdmi_cable_ext_mm)
+                {
+                    return i;
+                }
+            }
+        }
+        return null;
+    }
+
     fn boardTransform(drawing: *const board.Board, box: Rect) struct { scale: f32, x: f32, y: f32 } {
-        const r = drawing.bounds();
+        const r = boardBoundsWithCable(drawing);
         const scale = @min(box.w / r.w, box.h / r.h);
         const x = box.x + (box.w - r.w * scale) * 0.5 - r.x * scale;
         const y = box.y + (box.h - r.h * scale) * 0.5 - r.y * scale;
@@ -193,9 +224,9 @@ pub const BoardUi = struct {
         if (status.serial.len > 0) y += 22.0;
 
         const drawing = board.forModel(status.model) orelse &board.pi_zero;
-        const bounds = drawing.bounds();
+        const bounds = boardBoundsWithCable(drawing);
         const max_bw: f32 = 260.0;
-        const max_bh: f32 = 170.0;
+        const max_bh: f32 = 190.0;
         const bw = @min(sheet_w - 2 * pad, max_bw);
         const bh = @min(bw * bounds.h / bounds.w, max_bh);
         const actual_bw = bw * @min(1.0, bh / (bw * bounds.h / bounds.w));
@@ -320,11 +351,11 @@ pub const BoardUi = struct {
         }
         self.hovered_menu_item = null;
 
-        // Board drawing hover
+        // Board drawing hover (including HDMI cable/plug)
         const drawing = board.forModel(status.model) orelse &board.pi_zero;
         if (self.board_rect.contains(pt)) {
             const tr = boardTransform(drawing, self.board_rect);
-            self.hovered_part = drawing.partAt(.{ (x - tr.x) / tr.scale, (y - tr.y) / tr.scale });
+            self.hovered_part = partOrCableAt(drawing, .{ (x - tr.x) / tr.scale, (y - tr.y) / tr.scale });
         } else {
             self.hovered_part = null;
         }
@@ -463,13 +494,17 @@ pub const BoardUi = struct {
                 return .consumed;
             }
 
-            // Release inside board drawing
+            // Release inside board drawing (clicking the HDMI socket or plug toggles HDMI connection)
             const drawing = board.forModel(status.model) orelse &board.pi_zero;
             if (self.board_rect.contains(pt)) {
                 const tr = boardTransform(drawing, self.board_rect);
-                if (drawing.partAt(.{ (x - tr.x) / tr.scale, (y - tr.y) / tr.scale })) |part_idx| {
+                if (partOrCableAt(drawing, .{ (x - tr.x) / tr.scale, (y - tr.y) / tr.scale })) |part_idx| {
                     self.selected_part = part_idx;
                     self.mode_menu_open = false;
+                    const kind = drawing.parts[part_idx].kind;
+                    if (kind == .mini_hdmi or kind == .hdmi or kind == .micro_hdmi) {
+                        return .toggle_hdmi;
+                    }
                     return .consumed;
                 }
             }
@@ -525,10 +560,82 @@ pub const BoardUi = struct {
             .cache = &self.cache,
         };
 
+        if (!status.hdmi_connected or !status.hdmi_active) {
+            self.paintNoSignal(&c, win_w, win_h, status.hdmi_connected);
+        }
         self.paintTitleBar(&c, win_w);
         if (self.sheet_open) {
             self.paintSheet(&c, win_w, win_h, status, gpio_hw);
         }
+    }
+
+    fn paintNoSignal(self: *BoardUi, c: *Canvas, win_w: u32, win_h: u32, hdmi_connected: bool) void {
+        const w_f: f32 = @floatFromInt(win_w);
+        const h_f: f32 = @floatFromInt(win_h);
+        const top_y: f32 = @floatFromInt(title_bar_height);
+        if (h_f <= top_y) return;
+
+        // Monitor matte dark panel background
+        const disp_h = h_f - top_y;
+        c.fillRect(.{ .x = 0, .y = top_y, .w = w_f, .h = disp_h }, Color.rgb(0x0b0d11));
+
+        // Centered monitor On-Screen Display (OSD) dialog
+        const osd_w: f32 = 288.0;
+        const osd_h: f32 = 122.0;
+        const osd_x = @round((w_f - osd_w) * 0.5);
+        const osd_y = @round(top_y + (disp_h - osd_h) * 0.5);
+        const osd_rect: Rect = .{ .x = osd_x, .y = osd_y, .w = osd_w, .h = osd_h };
+
+        c.fillRoundedRect(osd_rect, .all(12.0), Color.rgb(0x161920).withAlpha(0.96));
+        c.strokeRoundedRect(osd_rect, .all(12.0), 1.5, Color.rgb(0x323846));
+
+        // Top HDMI input pill badge inside OSD
+        const badge_w: f32 = 64.0;
+        const badge_h: f32 = 22.0;
+        const badge_rect: Rect = .{
+            .x = @round(osd_x + (osd_w - badge_w) * 0.5),
+            .y = osd_y + 16.0,
+            .w = badge_w,
+            .h = badge_h,
+        };
+        c.fillRoundedRect(badge_rect, .all(6.0), Color.rgb(0x252a36));
+        c.strokeRoundedRect(badge_rect, .all(6.0), 1.0, Color.rgb(0x414858));
+        const badge_label = "HDMI";
+        const badge_tw = c.measureText(12.0, badge_label);
+        const badge_style: canvas_mod.Style = .{ .font = &self.font, .size = 12.0 };
+        _ = c.drawText(
+            12.0,
+            @round(badge_rect.x + (badge_w - badge_tw) * 0.5),
+            @round(badge_rect.y + (badge_h - badge_style.lineHeight()) * 0.5 + badge_style.ascent()),
+            badge_label,
+            Color.rgb(0xb8c0d0),
+        );
+
+        // Main "No signal detected" message
+        const msg = "No signal detected";
+        const msg_w = c.measureText(20.0, msg);
+        _ = c.drawText(
+            20.0,
+            @round(osd_x + (osd_w - msg_w) * 0.5),
+            osd_y + 68.0,
+            msg,
+            Color.rgb(0xe8ecf4),
+        );
+
+        // Subtitle with amber standby LED dot
+        const sub = if (hdmi_connected) "Standby  ·  Waiting for signal" else "HDMI cable disconnected";
+        const sub_w = c.measureText(13.0, sub);
+        const total_sub_w = 12.0 + sub_w;
+        const sub_x0 = @round(osd_x + (osd_w - total_sub_w) * 0.5);
+        const dot_color = if (hdmi_connected) orange else red;
+        c.fillCircle(.{ sub_x0 + 3.0, osd_y + 92.0 }, 3.5, dot_color);
+        _ = c.drawText(
+            13.0,
+            sub_x0 + 12.0,
+            osd_y + 96.0,
+            sub,
+            Color.rgb(0x8c94a6),
+        );
     }
 
     fn paintTitleBar(self: *BoardUi, c: *Canvas, win_w: u32) void {
@@ -639,7 +746,7 @@ pub const BoardUi = struct {
         // 2. Interactive BoardView drawing
         const drawing = board.forModel(status.model) orelse &board.pi_zero;
         const picked = self.resolvedPartIndex(drawing);
-        self.paintBoardDrawing(c, drawing, self.board_rect, picked);
+        self.paintBoardDrawing(c, drawing, self.board_rect, picked, status.hdmi_connected);
         y = self.board_rect.y + self.board_rect.h + 12.0;
 
         // 3. Picked part title & description
@@ -673,11 +780,13 @@ pub const BoardUi = struct {
                 _ = c.drawText(16.0, x0, y + 14.0, status_str, t.on_surface);
             },
             .mini_hdmi, .hdmi, .micro_hdmi => {
-                var hdmi_buf: [64]u8 = undefined;
-                const hdmi_str = if (status.hdmi_active)
-                    std.fmt.bufPrint(&hdmi_buf, "{d} × {d} at 60 Hz", .{ status.hdmi_width, status.hdmi_height }) catch "Connected"
+                var hdmi_buf: [96]u8 = undefined;
+                const hdmi_str = if (!status.hdmi_connected)
+                    "Disconnected — click socket to connect HDMI cable"
+                else if (status.hdmi_active)
+                    std.fmt.bufPrint(&hdmi_buf, "Connected  ·  {d} × {d} at 60 Hz (click socket to unplug)", .{ status.hdmi_width, status.hdmi_height }) catch "Connected"
                 else
-                    "No signal";
+                    "Connected  ·  No signal detected (click socket to unplug)";
                 _ = c.drawText(16.0, x0, y + 14.0, hdmi_str, t.on_surface);
             },
             .usb, .usb_double, .usb_otg => {
@@ -710,6 +819,7 @@ pub const BoardUi = struct {
         b: *const board.Board,
         box: Rect,
         selected: ?usize,
+        hdmi_connected: bool,
     ) void {
         const t = &self.theme;
         const tr = boardTransform(b, box);
@@ -764,6 +874,26 @@ pub const BoardUi = struct {
                 const r = map(tr, b.parts[i].rect);
                 c.fillRoundedRect(r, .all(0.6 * s), t.primary.withAlpha(0.35));
                 c.strokeRoundedRect(r, .all(0.6 * s), heavy_w, t.primary);
+            }
+        }
+
+        // Draw HDMI cable and plug (connected into socket or unplugged below socket)
+        for (b.parts, 0..) |part, i| {
+            if (part.kind == .mini_hdmi or part.kind == .hdmi or part.kind == .micro_hdmi) {
+                const is_hovered = (self.hovered_part == i);
+                const is_selected = (selected == i);
+                drawHdmiCable(
+                    c,
+                    &part,
+                    map(tr, part.rect),
+                    s,
+                    if (is_selected) t.primary else ink,
+                    t.primary,
+                    t.surface,
+                    hdmi_connected,
+                    is_hovered,
+                    is_selected,
+                );
             }
         }
     }
@@ -1010,6 +1140,119 @@ pub fn drawPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, ink: Color
     }
 }
 
+/// Draws the HDMI plug and cable below a bottom-facing HDMI socket:
+/// - When `connected` is true: the plug housing is seated flush against the bottom of the socket.
+/// - When `connected` is false: the plug is pulled out with a visible gap and exposed metal HDMI connector tip.
+pub fn drawHdmiCable(
+    c: *Canvas,
+    part: *const board.Part,
+    r: Rect,
+    s: f32,
+    ink: Color,
+    accent: Color,
+    surface_bg: Color,
+    connected: bool,
+    hovered: bool,
+    selected: bool,
+) void {
+    const e = part.faces orelse return;
+    if (e != .bottom) return;
+
+    const cx = r.x + r.w * 0.5;
+    const sock_bottom = r.y + r.h;
+    const max_y = sock_bottom + BoardUi.hdmi_cable_ext_mm * s;
+
+    const plug_w = r.w * 0.88;
+    const plug_h = 5.4 * s;
+    const tip_w = r.w * 0.56;
+    const tip_h = 2.4 * s;
+    const boot_w = r.w * 0.42;
+    const boot_h = 1.8 * s;
+    const cable_w = r.w * 0.24;
+
+    const gap: f32 = if (connected) 0.0 else 2.8 * s;
+    const body_y = if (connected) sock_bottom + 0.2 * s else sock_bottom + gap + tip_h;
+
+    // When unplugged, draw the exposed metal mini-HDMI connector tip above the plug housing
+    if (!connected) {
+        const tip_rect: Rect = .{
+            .x = cx - tip_w * 0.5,
+            .y = sock_bottom + gap,
+            .w = tip_w,
+            .h = tip_h,
+        };
+        c.fillRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, surface_bg);
+        if (hovered or selected) {
+            c.fillRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, accent.withAlpha(if (selected) 0.25 else 0.14));
+        }
+        c.strokeRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, line_w, ink);
+
+        // Two shield contact notches inside the metal tip
+        const notch_h = @max(1.0, tip_h * 0.45);
+        const notch_y = tip_rect.y + (tip_h - notch_h) * 0.5;
+        c.fillRect(.{ .x = cx - tip_w * 0.22 - line_w * 0.5, .y = notch_y, .w = line_w, .h = notch_h }, ink.withAlpha(0.75));
+        c.fillRect(.{ .x = cx + tip_w * 0.22 - line_w * 0.5, .y = notch_y, .w = line_w, .h = notch_h }, ink.withAlpha(0.75));
+    }
+
+    // Overmolded plug housing
+    const body_rect: Rect = .{
+        .x = cx - plug_w * 0.5,
+        .y = body_y,
+        .w = plug_w,
+        .h = plug_h,
+    };
+    const body_radii: Radii = .{
+        .tl = if (connected) 0.2 * s else 0.6 * s,
+        .tr = if (connected) 0.2 * s else 0.6 * s,
+        .br = 1.0 * s,
+        .bl = 1.0 * s,
+    };
+    c.fillRoundedRect(body_rect, body_radii, surface_bg);
+    c.fillRoundedRect(
+        body_rect,
+        body_radii,
+        if (selected) accent.withAlpha(0.30) else if (hovered) accent.withAlpha(0.18) else ink.withAlpha(0.08),
+    );
+    c.strokeRoundedRect(body_rect, body_radii, heavy_w, ink);
+
+    // Subtle grip ridges on the plug body
+    const grip_w = plug_w * 0.48;
+    const grip_x = cx - grip_w * 0.5;
+    c.fillRect(.{ .x = grip_x, .y = body_rect.y + plug_h * 0.36, .w = grip_w, .h = line_w }, ink.withAlpha(0.65));
+    c.fillRect(.{ .x = grip_x, .y = body_rect.y + plug_h * 0.64, .w = grip_w, .h = line_w }, ink.withAlpha(0.65));
+
+    // Strain relief boot below plug housing
+    const boot_y = body_rect.y + body_rect.h;
+    if (boot_y + boot_h <= max_y) {
+        const boot_rect: Rect = .{
+            .x = cx - boot_w * 0.5,
+            .y = boot_y,
+            .w = boot_w,
+            .h = boot_h,
+        };
+        c.fillRect(boot_rect, surface_bg);
+        if (selected or hovered) {
+            c.fillRect(boot_rect, accent.withAlpha(if (selected) 0.22 else 0.12));
+        }
+        c.strokeRect(boot_rect, line_w, ink);
+    }
+
+    // Cable extending to bottom of the board diagram
+    const cable_y = boot_y + boot_h;
+    if (cable_y < max_y) {
+        const cable_rect: Rect = .{
+            .x = cx - cable_w * 0.5,
+            .y = cable_y,
+            .w = cable_w,
+            .h = max_y - cable_y,
+        };
+        c.fillRect(cable_rect, surface_bg);
+        c.fillRect(cable_rect, if (selected) accent.withAlpha(0.25) else ink.withAlpha(0.14));
+        c.fillRect(.{ .x = cable_rect.x, .y = cable_rect.y, .w = line_w, .h = cable_rect.h }, ink);
+        c.fillRect(.{ .x = cable_rect.x + cable_rect.w - line_w, .y = cable_rect.y, .w = line_w, .h = cable_rect.h }, ink);
+    }
+}
+
 const testing = std.testing;
 
 test "TitleBar and BoardSheet toggle, select parts, and configure GPIO pins" {
@@ -1017,7 +1260,7 @@ test "TitleBar and BoardSheet toggle, select parts, and configure GPIO pins" {
     defer ui.deinit();
 
     var hw: Gpio = .{};
-    const status: SystemStatus = .{ .cpu_busy_percent = 34.0, .temperature_c = 45.2 };
+    var status: SystemStatus = .{ .cpu_busy_percent = 34.0, .temperature_c = 45.2 };
 
     const win_w: u32 = 1280;
     const win_h: u32 = 764;
@@ -1025,7 +1268,7 @@ test "TitleBar and BoardSheet toggle, select parts, and configure GPIO pins" {
     defer testing.allocator.free(pixels);
     @memset(pixels, 0xff000000);
 
-    // 1. Paint closed state (only TitleBar at top 44px)
+    // 1. Paint closed state (only TitleBar at top 44px + "No signal detected" OSD in display area)
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
     try testing.expect(!ui.sheet_open);
 
@@ -1065,6 +1308,15 @@ test "TitleBar and BoardSheet toggle, select parts, and configure GPIO pins" {
     try testing.expect(!ui.mode_menu_open);
     try testing.expectEqual(Gpio.Function.output, hw.getPinFunction(17));
     try testing.expect(hw.getPinLevel(17));
+
+    // Clicking the Mini HDMI socket on the board outline returns .toggle_hdmi
+    const tr = BoardUi.boardTransform(&board.pi_zero, ui.board_rect);
+    const hdmi_x = tr.x + 12.4 * tr.scale;
+    const hdmi_y = tr.y + 26.9 * tr.scale;
+    _ = ui.pointerButton(hdmi_x, hdmi_y, true, status, &hw);
+    try testing.expectEqual(Action.toggle_hdmi, ui.pointerButton(hdmi_x, hdmi_y, false, status, &hw));
+    status.hdmi_connected = false;
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
 
     // Clicking outside the sheet (near bottom of window) closes the sheet
     _ = ui.pointerButton(640, 740, true, status, &hw);

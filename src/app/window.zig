@@ -483,6 +483,14 @@ pub const WaylandWindow = struct {
                             self.toggleMaximized();
                             return;
                         },
+                        .toggle_hdmi => {
+                            self.status.hdmi_connected = !self.status.hdmi_connected;
+                            if (!self.status.hdmi_connected) {
+                                self.status.hdmi_active = false;
+                            }
+                            self.gpio.setExternalPin(46, !self.status.hdmi_connected);
+                            return;
+                        },
                         .close => {
                             self.closed = true;
                             return;

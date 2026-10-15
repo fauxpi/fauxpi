@@ -14,6 +14,7 @@ pub const Hdmi = struct {
     pub const HDMI_RAM_PACKET_STATUS: u32 = 0x0a4;
     pub const HDMI_SCHEDULER_CONTROL: u32 = 0x0c0;
 
+    connected: bool = true,
     hdmi_regs: [HDMI_SIZE / 4]u32 = initHdmiRegs(),
     hd_regs: [HD_SIZE / 4]u32 = [_]u32{0} ** (HD_SIZE / 4),
 
@@ -27,7 +28,7 @@ pub const Hdmi = struct {
 
     pub fn readHdmi32(self: *const Hdmi, offset: u32) u32 {
         if (offset >= HDMI_SIZE) return 0;
-        if (offset == HDMI_HOTPLUG) return 1; // VC4_HDMI_HOTPLUG_CONNECTED
+        if (offset == HDMI_HOTPLUG) return if (self.connected) 1 else 0; // VC4_HDMI_HOTPLUG_CONNECTED
         if (offset == HDMI_RAM_PACKET_STATUS) return self.hdmi_regs[HDMI_RAM_PACKET_CONFIG / 4];
         return self.hdmi_regs[offset / 4];
     }
