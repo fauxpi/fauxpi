@@ -39,6 +39,7 @@ pub const DmaController = struct {
     channels: [NUM_CHANNELS]Channel = [_]Channel{.{}} ** NUM_CHANNELS,
     int_status: u32 = 0,
     enable: u32 = 0x7fff,
+    stepping: bool = false,
 
     /// Callback interface for reading/writing peripheral MMIO addresses (such as SDDATA 0x7e202040)
     pub const MmioIo = struct {
@@ -131,6 +132,10 @@ pub const DmaController = struct {
     }
 
     fn stepChannel(self: *DmaController, ch: usize, ram: []u8, mmio: ?MmioIo) void {
+        if (self.stepping) return;
+        self.stepping = true;
+        defer self.stepping = false;
+
         var c = &self.channels[ch];
         var max_cbs: usize = 1024;
 

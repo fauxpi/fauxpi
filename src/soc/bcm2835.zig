@@ -396,8 +396,9 @@ pub const Bcm2835 = struct {
         } else if (addr >= uart_mod.Pl011Uart.BASE_ADDR and addr < uart_mod.Pl011Uart.BASE_ADDR + uart_mod.Pl011Uart.SIZE) {
             self.uart0.write32(addr - uart_mod.Pl011Uart.BASE_ADDR, val);
         } else if (addr >= sdhost_mod.SdHost.BASE_ADDR and addr < sdhost_mod.SdHost.BASE_ADDR + sdhost_mod.SdHost.SIZE) {
-            self.sdhost.write32(addr - sdhost_mod.SdHost.BASE_ADDR, val);
-            if (self.sdhost.dreqReady()) {
+            const offset = addr - sdhost_mod.SdHost.BASE_ADDR;
+            self.sdhost.write32(offset, val);
+            if (offset == 0x00 and self.sdhost.dreqReady()) {
                 self.dma.stepAllActive(self.ram, self.dmaMmio());
             }
         } else if (addr >= i2c_mod.BscController.BSC0_BASE and addr < i2c_mod.BscController.BSC0_BASE + i2c_mod.BscController.SIZE) {
@@ -432,3 +433,43 @@ pub const Bcm2835 = struct {
         self.updateIrqs();
     }
 };
+
+test "Bcm2835 DMA block write to SDHOST (CMD24) completes without recursion" {
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    var disk: [1024]u8 = [_]u8{0} ** 1024;
+    var soc = Bcm2835.init(ram, 1280, 720);
+    soc.sdhost.attachMutableSlice(&disk);
+
+    // Prepare 512-byte source buffer in RAM at 0x1000
+    std.mem.writeInt(u32, ram[0x1000..0x1004], 0xCAFEBABE, .little);
+    std.mem.writeInt(u32, ram[0x11fc..0x1200], 0xDEADBEEF, .little);
+
+    // Prepare DMA Control Block at 0x200: PERMAP=13 (SDHOST), D_DREQ (bit 6), S_INC, INT_EN
+    const cb: u32 = 0x200;
+    const ti: u32 = dma_mod.DmaController.TI_S_INC | dma_mod.DmaController.TI_INT_EN | (1 << 6) | (13 << 16);
+    std.mem.writeInt(u32, ram[cb + 0 ..][0..4], ti, .little);
+    std.mem.writeInt(u32, ram[cb + 4 ..][0..4], 0xc0001000, .little); // source_ad in RAM
+    std.mem.writeInt(u32, ram[cb + 8 ..][0..4], 0x7e202040, .little); // dest_ad = SDDATA
+    std.mem.writeInt(u32, ram[cb + 12 ..][0..4], 512, .little); // txfr_len = 512 bytes
+    std.mem.writeInt(u32, ram[cb + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[cb + 20 ..][0..4], 0, .little);
+
+    // Arm DMA channel 0 before issuing SDCMD (matches Linux bcm2835-sdhost driver order)
+    soc.write32(0x20007004, 0xc0000200); // CONBLK_AD
+    soc.write32(0x20007000, dma_mod.DmaController.CS_ACTIVE); // CS = ACTIVE (waits for SDHOST DREQ)
+
+    // Issue CMD24 (WRITE_BLOCK) to sector 1 (offset 512)
+    soc.write32(0x2020203c, 512); // SDHBCT
+    soc.write32(0x20202050, 1); // SDHBLC
+    soc.write32(0x20202004, 1); // SDARG = sector 1
+    soc.write32(0x20202000, sdhost_mod.SdHost.SDCMD_NEW_FLAG | sdhost_mod.SdHost.SDCMD_WRITE_CMD | 24);
+
+    try std.testing.expectEqual(@as(u32, 0xCAFEBABE), std.mem.readInt(u32, disk[512..516], .little));
+    try std.testing.expectEqual(@as(u32, 0xDEADBEEF), std.mem.readInt(u32, disk[1020..1024], .little));
+    try std.testing.expect(soc.dma.channelIrqPending(0));
+}
+
