@@ -57,6 +57,7 @@ pub const Bcm2835 = struct {
 
     display_width: u16 = 1280,
     display_height: u16 = 720,
+    audio_connected: bool = true,
 
     pub fn init(ram: []u8, display_width: u16, display_height: u16) Bcm2835 {
         var soc = Bcm2835{
@@ -184,6 +185,13 @@ pub const Bcm2835 = struct {
         // GPIO 46 on Raspberry Pi Zero is HDMI_HPD_N (active-low: 0 = connected, 1 = disconnected)
         self.gpio.setExternalPin(46, !connected);
         self.updateIrqs();
+    }
+
+    /// Connects or disconnects the simulated 3.5 mm audio/video jack.
+    /// Note: Physical Raspberry Pi boards do not wire a jack-detect switch to any SoC GPIO;
+    /// this state controls whether analog/PWM audio output is played on the host.
+    pub fn setAudioConnected(self: *Bcm2835, connected: bool) void {
+        self.audio_connected = connected;
     }
 
     /// Composites the current HDMI frame (`width * height` pixels of `0xFFRRGGBB`) from HVS or Mailbox FB.

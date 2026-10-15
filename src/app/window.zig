@@ -821,6 +821,10 @@ pub const WaylandWindow = struct {
                             self.gpio.setExternalPin(46, !self.status.hdmi_connected);
                             return;
                         },
+                        .toggle_audio => {
+                            self.status.audio_connected = !self.status.audio_connected;
+                            return;
+                        },
                         .toggle_power => {
                             self.status.power_connected = !self.status.power_connected;
                             if (self.status.power_connected) {

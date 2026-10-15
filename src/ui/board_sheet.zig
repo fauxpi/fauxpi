@@ -122,6 +122,7 @@ pub const SystemStatus = struct {
     hdmi_height: u16 = 720,
     hdmi_connected: bool = true,
     hdmi_active: bool = false,
+    audio_connected: bool = true,
     power_connected: bool = false,
     sd_connected: bool = false,
     usb_hub_connected: bool = true,
@@ -136,6 +137,7 @@ pub const Action = enum {
     start_drag,
     toggle_maximize,
     toggle_hdmi,
+    toggle_audio,
     toggle_power,
     toggle_sd,
     select_sd_image,
@@ -159,6 +161,7 @@ pub const InteractiveTarget = enum {
     sd_connector,
     sd_card,
     hdmi,
+    audio,
     power,
     usb_hub,
     usb_keyboard,
@@ -250,6 +253,7 @@ pub const BoardUi = struct {
         hovered_target: ?InteractiveTarget = null,
         sd_connected: bool = false,
         hdmi_connected: bool = false,
+        audio_connected: bool = false,
         power_connected: bool = false,
         usb_hub_connected: bool = false,
         usb_keyboard_connected: bool = false,
@@ -473,6 +477,15 @@ pub const BoardUi = struct {
                         .h = hl.bottom_cable_max_y - p.rect.y,
                     };
                     if (rectContainsMm(pwr_hit, pt)) return .power;
+                },
+                .audio => {
+                    const audio_hit: board.Rect = .{
+                        .x = p.rect.x,
+                        .y = p.rect.y,
+                        .w = p.rect.w,
+                        .h = hl.bottom_cable_max_y - p.rect.y,
+                    };
+                    if (rectContainsMm(audio_hit, pt)) return .audio;
                 },
                 .usb_otg => {
                     const usb_hit: board.Rect = .{
@@ -968,6 +981,7 @@ pub const BoardUi = struct {
                         .sd_connector => .toggle_sd,
                         .sd_card => if (status.sd_connected) .toggle_sd else .select_sd_image,
                         .hdmi => .toggle_hdmi,
+                        .audio => .toggle_audio,
                         .power => .toggle_power,
                         .usb_hub => .toggle_usb_hub,
                         .usb_keyboard => .toggle_usb_keyboard,
@@ -1261,6 +1275,7 @@ pub const BoardUi = struct {
                 .hovered_target = self.hovered_target,
                 .sd_connected = status.sd_connected,
                 .hdmi_connected = status.hdmi_connected,
+                .audio_connected = status.audio_connected,
                 .power_connected = status.power_connected,
                 .usb_hub_connected = status.usb_hub_connected,
                 .usb_keyboard_connected = status.usb_keyboard_connected,
@@ -1568,6 +1583,7 @@ pub const BoardUi = struct {
             const part_hovered = switch (part.kind) {
                 .micro_sd, .sd => self.hovered_target == .sd_connector or (status.sd_connected and self.hovered_target == .sd_card),
                 .mini_hdmi, .hdmi, .micro_hdmi => self.hovered_target == .hdmi,
+                .audio => self.hovered_target == .audio,
                 .power, .usb_c_power => self.hovered_target == .power,
                 .usb_otg => self.hovered_target == .usb_hub,
                 .usb => hl.has_external_hub and self.hovered_target == .usb_hub,
@@ -1667,12 +1683,25 @@ pub const BoardUi = struct {
             }
         }
 
-        // 3. HDMI and Power cables & plugs on the bottom edge
+        // 3. HDMI, Power, and 3.5 mm Audio cables & plugs on the bottom edge
         for (b.parts) |part| {
             const is_hdmi = (part.kind == .mini_hdmi or part.kind == .hdmi or part.kind == .micro_hdmi);
             const is_power = (part.kind == .power or part.kind == .usb_c_power);
-            if (is_hdmi or is_power) {
-                const hovered = if (is_power) (self.hovered_target == .power) else (self.hovered_target == .hdmi);
+            const is_audio = (part.kind == .audio);
+            if (is_hdmi or is_power or is_audio) {
+                const hovered = if (is_power)
+                    (self.hovered_target == .power)
+                else if (is_audio)
+                    (self.hovered_target == .audio)
+                else
+                    (self.hovered_target == .hdmi);
+                const icon: Icon = if (is_power) .bolt else if (is_audio) .headphones else .monitor;
+                const connected = if (is_power)
+                    status.power_connected
+                else if (is_audio)
+                    status.audio_connected
+                else
+                    status.hdmi_connected;
                 drawBottomCable(
                     c,
                     &part,
@@ -1682,8 +1711,8 @@ pub const BoardUi = struct {
                     if (hovered) t.primary else ink,
                     t.primary,
                     t.surface,
-                    if (is_power) .bolt else .monitor,
-                    if (is_power) status.power_connected else status.hdmi_connected,
+                    icon,
+                    connected,
                     hovered,
                 );
             }
@@ -1893,10 +1922,11 @@ pub fn drawBottomCable(
     const cx = r.x + r.w * 0.5;
     const sock_bottom = r.y + r.h;
 
+    const is_audio = (part.kind == .audio);
     const plug_w = r.w * 0.88;
     const plug_h = 5.4 * s;
-    const tip_w = r.w * 0.56;
-    const tip_h = 2.4 * s;
+    const tip_w = if (is_audio) (r.w * 0.30) else (r.w * 0.56);
+    const tip_h = if (is_audio) (3.0 * s) else (2.4 * s);
     const boot_w = r.w * 0.42;
     const boot_h = 1.8 * s;
     const cable_w = r.w * 0.24;
@@ -1911,16 +1941,23 @@ pub fn drawBottomCable(
             .w = tip_w,
             .h = tip_h,
         };
-        c.fillRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, surface_bg);
+        const tip_r: f32 = if (is_audio) (tip_w * 0.5) else (0.3 * s);
+        c.fillRoundedRect(tip_rect, .{ .tl = tip_r, .tr = tip_r, .br = 0, .bl = 0 }, surface_bg);
         if (hovered) {
-            c.fillRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, accent.withAlpha(0.22));
+            c.fillRoundedRect(tip_rect, .{ .tl = tip_r, .tr = tip_r, .br = 0, .bl = 0 }, accent.withAlpha(0.22));
         }
-        c.strokeRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, line_w, ink);
+        c.strokeRoundedRect(tip_rect, .{ .tl = tip_r, .tr = tip_r, .br = 0, .bl = 0 }, line_w, ink);
 
-        const notch_h = @max(1.0, tip_h * 0.45);
-        const notch_y = tip_rect.y + (tip_h - notch_h) * 0.5;
-        c.fillRect(.{ .x = cx - tip_w * 0.22 - line_w * 0.5, .y = notch_y, .w = line_w, .h = notch_h }, ink.withAlpha(0.75));
-        c.fillRect(.{ .x = cx + tip_w * 0.22 - line_w * 0.5, .y = notch_y, .w = line_w, .h = notch_h }, ink.withAlpha(0.75));
+        if (is_audio) {
+            // Horizontal TRRS insulating rings on the 3.5 mm audio plug pin
+            c.fillRect(.{ .x = tip_rect.x, .y = tip_rect.y + tip_h * 0.36, .w = tip_w, .h = line_w }, ink.withAlpha(0.75));
+            c.fillRect(.{ .x = tip_rect.x, .y = tip_rect.y + tip_h * 0.68, .w = tip_w, .h = line_w }, ink.withAlpha(0.75));
+        } else {
+            const notch_h = @max(1.0, tip_h * 0.45);
+            const notch_y = tip_rect.y + (tip_h - notch_h) * 0.5;
+            c.fillRect(.{ .x = cx - tip_w * 0.22 - line_w * 0.5, .y = notch_y, .w = line_w, .h = notch_h }, ink.withAlpha(0.75));
+            c.fillRect(.{ .x = cx + tip_w * 0.22 - line_w * 0.5, .y = notch_y, .w = line_w, .h = notch_h }, ink.withAlpha(0.75));
+        }
     }
 
     const body_rect: Rect = .{
@@ -2691,6 +2728,11 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(InteractiveTarget.usb_keyboard, BoardUi.targetAt(&board.pi1_b_plus, .{ 92.0, 9.0 }, true).?);
     try testing.expectEqual(InteractiveTarget.usb_mouse, BoardUi.targetAt(&board.pi1_b_plus, .{ 92.0, 27.0 }, true).?);
     try testing.expectEqual(InteractiveTarget.ethernet, BoardUi.targetAt(&board.pi1_b_plus, .{ 92.0, 45.75 }, true).?);
+    try testing.expectEqual(InteractiveTarget.audio, BoardUi.targetAt(&board.pi1_b_plus, .{ 53.5, 55.0 }, true).?);
+    try testing.expect(status.audio_connected);
+    status.audio_connected = false;
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    status.audio_connected = true;
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
 
     // Select item 2 (Raspberry Pi 3 Model A+): A+ board with wireless and external USB hub

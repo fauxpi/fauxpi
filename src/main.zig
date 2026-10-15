@@ -255,6 +255,7 @@ fn loadGuestBoot(
 
 fn syncWindowPeripheralsToSoc(w: *const window.WaylandWindow, soc: *Bcm2835) void {
     soc.setHdmiConnected(w.status.hdmi_connected);
+    soc.setAudioConnected(w.status.audio_connected);
     soc.usb.hid.hub_connected = w.status.usb_hub_connected;
     soc.usb.hid.keyboard_connected = w.status.usb_keyboard_connected;
     soc.usb.hid.mouse_connected = w.status.usb_mouse_connected;
@@ -437,6 +438,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 idle_us_accum = 0;
 
                 soc.setHdmiConnected(w.status.hdmi_connected);
+                soc.setAudioConnected(w.status.audio_connected);
                 soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
                 const disp_pixels = w.displayPixels();
                 w.status.hdmi_active = soc.renderDisplayFrame(disp_pixels, opts.width, opts.height);
