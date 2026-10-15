@@ -563,6 +563,10 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         }
         soc.updateIrqs();
 
+        const guest_ready_for_realtime_sleep = (wl_win != null) and
+            (soc.hvs.isActive() or soc.mailbox.fb_allocated) and
+            soc.usb.hid.allConnectedDevicesConfigured();
+
         var all_wfi = true;
         for (0..num_cores) |i| {
             if (cpus[i].halted_spin) continue;
@@ -575,6 +579,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
         if (all_wfi) {
             soc.usb.pollNetwork(soc.ram);
+            soc.usb.wakeIfPending();
             soc.updateIrqs();
             for (0..num_cores) |i| {
                 if (cpus[i].halted_spin) continue;
@@ -587,27 +592,87 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         }
 
         if (all_wfi) {
-            // Fast-forward timer to next compare match or core generic timer (capped at 2000 us so vblank/UI stays responsive)
-            var jump = soc.timer.usUntilNextMatch(2000);
-            for (0..num_cores) |i| {
-                if (!cpus[i].halted_spin) {
-                    jump = @min(jump, cpus[i].mmu.usUntilNextGenericTimer(2000));
+            if (guest_ready_for_realtime_sleep) {
+                const w = wl_win.?;
+                var timer_wait_us = soc.timer.usUntilNextMatch(1_000_000);
+                for (0..num_cores) |i| {
+                    if (!cpus[i].halted_spin) {
+                        timer_wait_us = @min(timer_wait_us, cpus[i].mmu.usUntilNextGenericTimer(1_000_000));
+                    }
                 }
-            }
-            jump = @max(jump, 1);
-            idle_us_accum += jump;
-            soc.timer.advance(jump, &soc.intc);
-            soc.advanceAudio(jump);
-            for (0..num_cores) |i| {
-                if (!cpus[i].halted_spin) {
-                    soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
-                    cpus[i].mmu.halted_wfi = false;
+                timer_wait_us = @max(timer_wait_us, 1);
+
+                const guest_vblank_irq_enabled = (soc.pv0.inten != 0) or
+                    (soc.pv1.inten != 0) or
+                    (soc.pv2.inten != 0) or
+                    ((soc.hvs.dispctrl & 0x3f80) != 0);
+                const has_activity = soc.hvs.dlist_updated or
+                    (soc.act_led_hold_frames > 0) or
+                    soc.sdhost.activity_latch or
+                    soc.gpio.act_pulse_latch or
+                    soc.mailbox.exp_act_latch or
+                    w.ui_dirty or
+                    (w.pending_scale != w.scale) or
+                    soc.usb.pending_csplit_sof or
+                    (soc.usb.sof_wakeup_frames > 0) or
+                    soc.usb.hid.hasPendingInterruptIn();
+
+                const sleep_start_ns = monotonicNs();
+                const sleep_us: u64 = if (guest_vblank_irq_enabled or has_activity) blk: {
+                    const elapsed_ns = sleep_start_ns -| last_vblank_ns;
+                    const until_vblank_us: u64 = if (elapsed_ns >= vblank_interval_ns)
+                        0
+                    else
+                        (vblank_interval_ns - elapsed_ns) / 1000;
+                    break :blk @min(timer_wait_us, until_vblank_us);
+                } else timer_wait_us;
+
+                if (sleep_us > 0) {
+                    try w.waitEventsUs(sleep_us);
+                } else {
+                    try w.pollEvents();
                 }
+                const sleep_end_ns = monotonicNs();
+                const elapsed_sleep_us = @max((sleep_end_ns -| sleep_start_ns) / 1000, 1);
+                const jump = if (w.ui_dirty or soc.usb.hid.hasPendingInterruptIn() or soc.usb.hid.hasEthBulkIn())
+                    @min(elapsed_sleep_us, timer_wait_us)
+                else
+                    @max(elapsed_sleep_us, sleep_us);
+                idle_us_accum += jump;
+                soc.timer.advance(jump, &soc.intc);
+                soc.advanceAudio(jump);
+                soc.usb.pollNetwork(soc.ram);
+                soc.usb.wakeIfPending();
+                for (0..num_cores) |i| {
+                    if (!cpus[i].halted_spin) {
+                        soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+                        cpus[i].mmu.halted_wfi = false;
+                    }
+                }
+                soc.updateIrqs();
+            } else {
+                // Fast-forward timer to next compare match or core generic timer during boot / headless mode
+                var jump = soc.timer.usUntilNextMatch(2000);
+                for (0..num_cores) |i| {
+                    if (!cpus[i].halted_spin) {
+                        jump = @min(jump, cpus[i].mmu.usUntilNextGenericTimer(2000));
+                    }
+                }
+                jump = @max(jump, 1);
+                idle_us_accum += jump;
+                soc.timer.advance(jump, &soc.intc);
+                soc.advanceAudio(jump);
+                for (0..num_cores) |i| {
+                    if (!cpus[i].halted_spin) {
+                        soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+                        cpus[i].mmu.halted_wfi = false;
+                    }
+                }
+                soc.updateIrqs();
             }
-            soc.updateIrqs();
         }
 
-        if (soc.timer.counter -| last_guest_vblank_us >= 16_667) {
+        if (!guest_ready_for_realtime_sleep and soc.timer.counter -| last_guest_vblank_us >= 16_667) {
             last_guest_vblank_us = soc.timer.counter;
             soc.triggerVblank();
         }
@@ -619,25 +684,51 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             soc.triggerVblank();
 
             if (wl_win) |w| {
+                const frame_active_us = active_us_accum;
                 const total_us = active_us_accum + idle_us_accum;
                 if (total_us > 0) {
                     const busy = (@as(f32, @floatFromInt(active_us_accum)) * 100.0) / @as(f32, @floatFromInt(total_us));
-                    w.status.cpu_busy_percent = w.status.cpu_busy_percent * 0.7 + busy * 0.3;
+                    const weight: f32 = if (total_us >= 100_000) 1.0 else 0.3;
+                    w.status.cpu_busy_percent = w.status.cpu_busy_percent * (1.0 - weight) + busy * weight;
                     w.status.temperature_c = 38.0 + (w.status.cpu_busy_percent * 0.14);
                 }
                 active_us_accum = 0;
                 idle_us_accum = 0;
 
+                try w.pollEvents();
                 soc.setHdmiConnected(w.status.hdmi_connected);
                 soc.setAudioConnected(w.status.audio_connected);
                 soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
+                soc.usb.wakeIfPending();
+                soc.updateIrqs();
+
+                const prev_act = w.status.act_led_on;
+                const prev_pwr = w.status.pwr_led_on;
                 const leds = soc.sampleBoardLeds(w.status.power_connected);
                 w.status.act_led_on = leds.act_on;
                 w.status.pwr_led_on = leds.pwr_on;
-                const disp_pixels = w.displayPixels();
-                w.status.hdmi_active = soc.renderDisplayFrame(disp_pixels, opts.width, opts.height);
-                w.compositeUi();
-                try w.present();
+                const leds_changed = (leds.act_on != prev_act) or (leds.pwr_on != prev_pwr);
+
+                const need_hdmi_render = soc.hvs.dlist_updated or
+                    !w.status.hdmi_active or
+                    (!soc.hvs.isActive() and soc.mailbox.fb_allocated) or
+                    (frame_active_us > 200);
+                var hdmi_changed = false;
+                if (need_hdmi_render) {
+                    soc.hvs.dlist_updated = false;
+                    const disp_pixels = w.displayPixels();
+                    w.status.hdmi_active = soc.renderDisplayFrame(disp_pixels, opts.width, opts.height);
+                    hdmi_changed = true;
+                }
+
+                const need_present = hdmi_changed or
+                    leds_changed or
+                    w.ui_dirty or
+                    (w.pending_scale != w.scale);
+                if (need_present) {
+                    w.compositeUi();
+                    try w.present();
+                }
             }
         }
     }

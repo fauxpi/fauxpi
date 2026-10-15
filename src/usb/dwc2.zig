@@ -88,6 +88,7 @@ pub const Dwc2Controller = struct {
     hfnum: u16 = 0,
     sof_base: u16 = 0,
     pending_csplit_sof: bool = false,
+    sof_wakeup_frames: u8 = 16,
     haintmsk: u32 = 0,
     hprt0: u32 = HPRT0_PRTCONNSTS | HPRT0_PRTSPD_HIGH,
     pcgcctl: u32 = 0,
@@ -142,16 +143,35 @@ pub const Dwc2Controller = struct {
         return (self.effectiveGintsts() & self.gintmsk) != 0;
     }
 
+    pub fn wakeIfPending(self: *Dwc2Controller) void {
+        self.syncRootPortConnection();
+        if (self.hid.hasPendingInterruptIn() or !self.hid.allConnectedDevicesConfigured() or self.pending_csplit_sof) {
+            self.sof_wakeup_frames = 8;
+            if ((self.gintmsk & GINTSTS_SOF) != 0) {
+                self.gintsts |= GINTSTS_SOF;
+            }
+        }
+    }
+
     pub fn tickSof(self: *Dwc2Controller, ram: []u8) void {
         self.syncRootPortConnection();
         // 1 vblank at 60 Hz (~16.67 ms) corresponds to ~128 USB High-Speed microframes (16.0 ms)
         self.sof_base = (self.sof_base + 128) & 0x3fff;
         self.hfnum = self.sof_base;
+        self.pollNetwork(ram);
+
+        const has_pending = self.hid.hasPendingInterruptIn() or !self.hid.allConnectedDevicesConfigured();
+        if (has_pending) {
+            self.sof_wakeup_frames = 8;
+        }
+        const need_sof = self.pending_csplit_sof or has_pending or (self.sof_wakeup_frames > 0);
         self.pending_csplit_sof = false;
-        if ((self.gintmsk & GINTSTS_SOF) != 0) {
+        if (!has_pending and self.sof_wakeup_frames > 0) {
+            self.sof_wakeup_frames -= 1;
+        }
+        if (need_sof and (self.gintmsk & GINTSTS_SOF) != 0) {
             self.gintsts |= GINTSTS_SOF;
         }
-        self.pollNetwork(ram);
     }
 
     pub fn pollNetwork(self: *Dwc2Controller, ram: []u8) void {
@@ -383,6 +403,7 @@ pub const Dwc2Controller = struct {
             if ((ch.hcsplt & HCSPLT_COMPSPLT) == 0) {
                 // Start-Split (SSPLIT): consume SETUP/OUT payload now and halt with HCINT_ACK | HCINT_CHHLTD
                 ch.hcchar &= ~HCCHAR_CHEN;
+                self.pending_csplit_sof = true;
                 if (epnum == 0) {
                     if (pid == 3 and !epdir_in) {
                         if (dma_phys + 8 <= ram.len) {
@@ -402,8 +423,6 @@ pub const Dwc2Controller = struct {
                         ch.hcdma +%= xfersize;
                         ch.hcdmab = ch.hcdma;
                     }
-                } else {
-                    self.pending_csplit_sof = true;
                 }
                 ch.hcint |= HCINT_ACK | HCINT_CHHLTD;
                 return;

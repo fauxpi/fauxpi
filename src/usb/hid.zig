@@ -352,6 +352,34 @@ pub const UsbHidComposite = struct {
         self.enqueueCdcNotif(&conn_notif);
     }
 
+    pub fn allConnectedDevicesConfigured(self: *const UsbHidComposite) bool {
+        if (!self.isHubPresent()) return true;
+        if (!self.hub_configured) return false;
+        if (!self.eth_configured) return false;
+        if (self.keyboard_connected and !self.kbd_configured) return false;
+        if (self.mouse_connected and !self.mouse_configured) return false;
+        return true;
+    }
+
+    pub fn hasPendingInterruptIn(self: *UsbHidComposite) bool {
+        if (!self.isHubPresent()) return false;
+        self.syncHubPortConnections();
+        const num_ports = self.hub_kind.numPorts();
+        for (0..num_ports) |p| {
+            if (self.port_change[p] != 0) return true;
+        }
+        const link_up = self.isEthernetLinkUp();
+        if (self.reported_link_up == null or self.reported_link_up.? != link_up or self.cdc_notif_count > 0) {
+            return true;
+        }
+        if (self.keyboard_connected and self.kbd_count > 0) return true;
+        if (self.mouse_connected) {
+            if (self.mouse_count > 0) return true;
+            if (self.has_target and (self.target_x != self.guest_x or self.target_y != self.guest_y)) return true;
+        }
+        return false;
+    }
+
     /// Returns the 1-byte Hub status change bitmap for EP1 IN on the Hub device if any port has a pending change.
     pub fn popHubInterrupt(self: *UsbHidComposite) ?u8 {
         if (!self.isHubPresent()) return null;

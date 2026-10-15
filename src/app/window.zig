@@ -598,17 +598,37 @@ pub const WaylandWindow = struct {
     }
 
     pub fn waitEvents(self: *WaylandWindow, timeout_ms: i32) !void {
+        const timeout_us: ?u64 = if (timeout_ms < 0) null else @as(u64, @intCast(timeout_ms)) * 1000;
+        return self.waitEventsUs(timeout_us);
+    }
+
+    pub fn waitEventsUs(self: *WaylandWindow, timeout_us: ?u64) !void {
         const was_dirty = self.ui_dirty;
         try self.display.pollAndDispatch();
         self.pollSdImagePicker();
         if (self.closed or (!was_dirty and self.ui_dirty)) return;
+        if (self.hid) |h| {
+            if (h.hasPendingInterruptIn()) return;
+        }
 
-        var fds: [2]linux.pollfd = .{
-            .{ .fd = self.display.conn.fd, .events = linux.POLL.IN, .revents = 0 },
-            .{ .fd = self.picker_fd, .events = linux.POLL.IN, .revents = 0 },
-        };
-        const nfds: linux.nfds_t = if (self.picker_fd >= 0) 2 else 1;
-        const rc = linux.poll(&fds, nfds, timeout_ms);
+        var fds: [2 + 32]linux.pollfd = undefined;
+        var nfds: usize = 1;
+        fds[0] = .{ .fd = self.display.conn.fd, .events = linux.POLL.IN, .revents = 0 };
+        if (self.picker_fd >= 0) {
+            fds[nfds] = .{ .fd = self.picker_fd, .events = linux.POLL.IN, .revents = 0 };
+            nfds += 1;
+        }
+        if (self.hid) |h| {
+            if (h.isEthernetLinkUp()) {
+                nfds += h.net.fillPollFds(fds[nfds..]);
+            }
+        }
+
+        const timeout_ms: i32 = if (timeout_us) |us|
+            @intCast(@min((us + 999) / 1000, @as(u64, std.math.maxInt(i32))))
+        else
+            -1;
+        const rc = linux.poll(&fds, @intCast(nfds), timeout_ms);
         if (linux.errno(rc) == .SUCCESS and rc > 0) {
             try self.display.pollAndDispatch();
             self.pollSdImagePicker();

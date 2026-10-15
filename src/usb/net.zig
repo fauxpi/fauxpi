@@ -594,6 +594,24 @@ pub const VirtualNetwork = struct {
         }
     }
 
+    pub fn fillPollFds(self: *const VirtualNetwork, out: []linux.pollfd) usize {
+        var n: usize = 0;
+        for (&self.udp_sessions) |*s| {
+            if (s.active and s.fd >= 0 and n < out.len) {
+                out[n] = .{ .fd = s.fd, .events = linux.POLL.IN, .revents = 0 };
+                n += 1;
+            }
+        }
+        for (&self.tcp_conns) |*c| {
+            if (c.state != .unused and c.fd >= 0 and n < out.len) {
+                const ev: i16 = if (c.tx_len > 0) (linux.POLL.IN | linux.POLL.OUT) else linux.POLL.IN;
+                out[n] = .{ .fd = c.fd, .events = ev, .revents = 0 };
+                n += 1;
+            }
+        }
+        return n;
+    }
+
     /// Polls non-blocking host UDP and TCP sockets and enqueues any incoming Ethernet frames.
     pub fn poll(self: *VirtualNetwork) void {
         self.tick_count +%= 1;

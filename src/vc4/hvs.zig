@@ -137,7 +137,11 @@ pub const Hvs = struct {
 
     pub fn write32(self: *Hvs, offset: u32, val: u32) void {
         if (offset >= DLIST_OFFSET and offset < DLIST_OFFSET + DLIST_WORDS * 4) {
-            self.dlist[(offset - DLIST_OFFSET) / 4] = val;
+            const slot = (offset - DLIST_OFFSET) / 4;
+            if (self.dlist[slot] != val) {
+                self.dlist[slot] = val;
+                self.dlist_updated = true;
+            }
             return;
         }
         switch (offset) {
