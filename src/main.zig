@@ -183,24 +183,22 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     return 0;
 }
 
-fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliOptions) !void {
-    const ram = try gpa.alloc(u8, Bcm2835.RAM_SIZE);
-    defer gpa.free(ram);
+fn loadGuestBoot(
+    gpa: std.mem.Allocator,
+    opts: CliOptions,
+    ram: []u8,
+    soc: *Bcm2835,
+    sd_image_buf: ?[]u8,
+) !loader.BootResult {
     @memset(ram, 0);
+    soc.* = Bcm2835.init(ram, opts.width, opts.height);
 
-    var soc = Bcm2835.init(ram, opts.width, opts.height);
-
-    var sd_image_buf: ?[]u8 = null;
-    defer if (sd_image_buf) |b| gpa.free(b);
-
-    const boot_res = if (opts.sd_path) |sd_path| blk: {
-        const img = try readFileLinux(gpa, sd_path);
-        sd_image_buf = img;
+    if (sd_image_buf) |img| {
         soc.sdhost.attachMutableSlice(img);
         const k_override = if (opts.kernel_path) |kp| try readFileLinux(gpa, kp) else null;
         defer if (k_override) |ko| gpa.free(ko);
-        break :blk try loader.loadFromSdImage(gpa, ram, img, opts.cmdline, k_override);
-    } else blk: {
+        return try loader.loadFromSdImage(gpa, ram, img, opts.cmdline, k_override);
+    } else {
         const k_path = opts.kernel_path orelse return error.MissingKernel;
         const d_path = opts.dtb_path orelse return error.MissingDtb;
         const k_bytes = try readFileLinux(gpa, k_path);
@@ -211,8 +209,22 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         defer if (rd_bytes) |rd| gpa.free(rd);
 
         const cmdline = opts.cmdline orelse "console=ttyAMA0,115200 earlycon=pl011,0x20201000";
-        break :blk try loader.loadDirect(gpa, ram, k_bytes, d_bytes, rd_bytes, cmdline, true);
-    };
+        return try loader.loadDirect(gpa, ram, k_bytes, d_bytes, rd_bytes, cmdline, true);
+    }
+}
+
+fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliOptions) !void {
+    const ram = try gpa.alloc(u8, Bcm2835.RAM_SIZE);
+    defer gpa.free(ram);
+
+    var sd_image_buf: ?[]u8 = null;
+    defer if (sd_image_buf) |b| gpa.free(b);
+    if (opts.sd_path) |sd_path| {
+        sd_image_buf = try readFileLinux(gpa, sd_path);
+    }
+
+    var soc: Bcm2835 = undefined;
+    const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, sd_image_buf);
 
     var cpu: Cpu = .{};
     cpu.initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
@@ -237,6 +249,31 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     while (true) {
         if (wl_win) |w| {
             if (w.closed) break;
+            if (w.power_reconnected) {
+                w.power_reconnected = false;
+                const reboot_res = try loadGuestBoot(gpa, opts, ram, &soc, sd_image_buf);
+                soc.setHdmiConnected(w.status.hdmi_connected);
+                cpu = .{};
+                cpu.initReset(reboot_res.entry_pc, reboot_res.r0, reboot_res.r1, reboot_res.r2);
+                last_guest_vblank_us = 0;
+                active_us_accum = 0;
+                idle_us_accum = 0;
+            }
+            if (!w.status.power_connected) {
+                const now_ns = monotonicNs();
+                if (now_ns -| last_vblank_ns >= vblank_interval_ns) {
+                    last_vblank_ns = now_ns;
+                    w.status.cpu_busy_percent = 0.0;
+                    w.status.temperature_c = @max(25.0, w.status.temperature_c - 0.05);
+                    w.status.hdmi_active = false;
+                    w.compositeUi();
+                    try w.present();
+                } else {
+                    var req: linux.timespec = .{ .sec = 0, .nsec = 2_000_000 };
+                    _ = linux.nanosleep(&req, null);
+                }
+                continue;
+            }
         }
         if (soc.pm.reboot_requested) break;
         if (opts.max_steps != 0 and cpu.cycles >= opts.max_steps) break;

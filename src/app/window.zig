@@ -45,6 +45,7 @@ pub const WaylandWindow = struct {
 
     configured: bool = false,
     closed: bool = false,
+    power_reconnected: bool = false,
 
     last_mouse_x: ?f64 = null,
     last_mouse_y: ?f64 = null,
@@ -489,6 +490,16 @@ pub const WaylandWindow = struct {
                                 self.status.hdmi_active = false;
                             }
                             self.gpio.setExternalPin(46, !self.status.hdmi_connected);
+                            return;
+                        },
+                        .toggle_power => {
+                            self.status.power_connected = !self.status.power_connected;
+                            if (self.status.power_connected) {
+                                self.power_reconnected = true;
+                            } else {
+                                self.status.hdmi_active = false;
+                                self.status.cpu_busy_percent = 0.0;
+                            }
                             return;
                         },
                         .close => {

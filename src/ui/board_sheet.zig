@@ -56,6 +56,7 @@ pub const SystemStatus = struct {
     hdmi_height: u16 = 720,
     hdmi_connected: bool = true,
     hdmi_active: bool = false,
+    power_connected: bool = true,
 };
 
 pub const Action = enum {
@@ -64,6 +65,7 @@ pub const Action = enum {
     start_drag,
     toggle_maximize,
     toggle_hdmi,
+    toggle_power,
     close,
 };
 
@@ -159,10 +161,17 @@ pub const BoardUi = struct {
 
     const hdmi_cable_ext_mm: f32 = 13.5;
 
+    fn hasCable(kind: board.Kind) bool {
+        return switch (kind) {
+            .mini_hdmi, .hdmi, .micro_hdmi, .power, .usb_c_power => true,
+            else => false,
+        };
+    }
+
     fn boardBoundsWithCable(drawing: *const board.Board) board.Rect {
         var r = drawing.bounds();
         for (drawing.parts) |p| {
-            if ((p.kind == .mini_hdmi or p.kind == .hdmi or p.kind == .micro_hdmi) and p.faces == .bottom) {
+            if (hasCable(p.kind) and p.faces == .bottom) {
                 const cable_bottom = p.rect.y + p.rect.h + hdmi_cable_ext_mm;
                 if (cable_bottom > r.y + r.h) {
                     r.h = cable_bottom - r.y;
@@ -175,7 +184,7 @@ pub const BoardUi = struct {
     fn partOrCableAt(drawing: *const board.Board, pt: [2]f32) ?usize {
         if (drawing.partAt(pt)) |idx| return idx;
         for (drawing.parts, 0..) |p, i| {
-            if ((p.kind == .mini_hdmi or p.kind == .hdmi or p.kind == .micro_hdmi) and p.faces == .bottom) {
+            if (hasCable(p.kind) and p.faces == .bottom) {
                 if (pt[0] >= p.rect.x and pt[0] <= p.rect.x + p.rect.w and
                     pt[1] >= p.rect.y and pt[1] <= p.rect.y + p.rect.h + hdmi_cable_ext_mm)
                 {
@@ -245,7 +254,7 @@ pub const BoardUi = struct {
         self.mode_menu_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 
         switch (part.kind) {
-            .soc, .soc_with_ram, .ram, .mini_hdmi, .hdmi, .micro_hdmi => {
+            .soc, .soc_with_ram, .ram, .mini_hdmi, .hdmi, .micro_hdmi, .power, .usb_c_power => {
                 y += 22.0;
             },
             .usb, .usb_double, .usb_otg => {
@@ -505,6 +514,9 @@ pub const BoardUi = struct {
                     if (kind == .mini_hdmi or kind == .hdmi or kind == .micro_hdmi) {
                         return .toggle_hdmi;
                     }
+                    if (kind == .power or kind == .usb_c_power) {
+                        return .toggle_power;
+                    }
                     return .consumed;
                 }
             }
@@ -746,7 +758,7 @@ pub const BoardUi = struct {
         // 2. Interactive BoardView drawing
         const drawing = board.forModel(status.model) orelse &board.pi_zero;
         const picked = self.resolvedPartIndex(drawing);
-        self.paintBoardDrawing(c, drawing, self.board_rect, picked, status.hdmi_connected);
+        self.paintBoardDrawing(c, drawing, self.board_rect, picked, status.hdmi_connected, status.power_connected);
         y = self.board_rect.y + self.board_rect.h + 12.0;
 
         // 3. Picked part title & description
@@ -772,12 +784,22 @@ pub const BoardUi = struct {
         switch (part.kind) {
             .soc, .soc_with_ram => {
                 var status_buf: [128]u8 = undefined;
-                const status_str = std.fmt.bufPrint(
-                    &status_buf,
-                    "{d:.0}% busy, at {d:.1} °C  ·  {d} MB of memory",
-                    .{ status.cpu_busy_percent, status.temperature_c, status.mem_total_mb },
-                ) catch "";
+                const status_str = if (!status.power_connected)
+                    std.fmt.bufPrint(&status_buf, "Powered off  ·  {d} MB of memory", .{status.mem_total_mb}) catch ""
+                else
+                    std.fmt.bufPrint(
+                        &status_buf,
+                        "{d:.0}% busy, at {d:.1} °C  ·  {d} MB of memory",
+                        .{ status.cpu_busy_percent, status.temperature_c, status.mem_total_mb },
+                    ) catch "";
                 _ = c.drawText(16.0, x0, y + 14.0, status_str, t.on_surface);
+            },
+            .power, .usb_c_power => {
+                const power_str = if (status.power_connected)
+                    "Connected  ·  5 V power supply (click socket to unplug)"
+                else
+                    "Disconnected — board powered off (click socket to connect)";
+                _ = c.drawText(16.0, x0, y + 14.0, power_str, t.on_surface);
             },
             .mini_hdmi, .hdmi, .micro_hdmi => {
                 var hdmi_buf: [96]u8 = undefined;
@@ -820,6 +842,7 @@ pub const BoardUi = struct {
         box: Rect,
         selected: ?usize,
         hdmi_connected: bool,
+        power_connected: bool,
     ) void {
         const t = &self.theme;
         const tr = boardTransform(b, box);
@@ -877,9 +900,11 @@ pub const BoardUi = struct {
             }
         }
 
-        // Draw HDMI cable and plug (connected into socket or unplugged below socket)
+        // Draw HDMI and Power cables and plugs (connected into socket or unplugged below socket)
         for (b.parts, 0..) |part, i| {
-            if (part.kind == .mini_hdmi or part.kind == .hdmi or part.kind == .micro_hdmi) {
+            const is_hdmi = (part.kind == .mini_hdmi or part.kind == .hdmi or part.kind == .micro_hdmi);
+            const is_power = (part.kind == .power or part.kind == .usb_c_power);
+            if (is_hdmi or is_power) {
                 const is_hovered = (self.hovered_part == i);
                 const is_selected = (selected == i);
                 drawHdmiCable(
@@ -890,7 +915,7 @@ pub const BoardUi = struct {
                     if (is_selected) t.primary else ink,
                     t.primary,
                     t.surface,
-                    hdmi_connected,
+                    if (is_power) power_connected else hdmi_connected,
                     is_hovered,
                     is_selected,
                 );
@@ -1316,6 +1341,14 @@ test "TitleBar and BoardSheet toggle, select parts, and configure GPIO pins" {
     _ = ui.pointerButton(hdmi_x, hdmi_y, true, status, &hw);
     try testing.expectEqual(Action.toggle_hdmi, ui.pointerButton(hdmi_x, hdmi_y, false, status, &hw));
     status.hdmi_connected = false;
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+
+    // Clicking the Power socket on the board outline returns .toggle_power
+    const pwr_x = tr.x + 54.0 * tr.scale;
+    const pwr_y = tr.y + 28.1 * tr.scale;
+    _ = ui.pointerButton(pwr_x, pwr_y, true, status, &hw);
+    try testing.expectEqual(Action.toggle_power, ui.pointerButton(pwr_x, pwr_y, false, status, &hw));
+    status.power_connected = false;
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
 
     // Clicking outside the sheet (near bottom of window) closes the sheet
