@@ -11,6 +11,7 @@ pub const decoder = @import("cpu/decoder.zig");
 pub const arm1176 = @import("cpu/arm1176.zig");
 
 pub const intc = @import("soc/intc.zig");
+pub const local_intc = @import("soc/local_intc.zig");
 pub const timer = @import("soc/timer.zig");
 pub const mailbox = @import("soc/mailbox.zig");
 pub const cprman = @import("soc/cprman.zig");
@@ -245,6 +246,8 @@ fn loadGuestBoot(
     soc.usb.hid.net.deinit();
     @memset(ram, 0);
     soc.* = Bcm2835.init(ram, opts.width, opts.height);
+    soc.is_bcm2837 = board_model.isBcm2837();
+    soc.setHdmiConnected(true);
     soc.mailbox.board_revision = board_model.boardRevision();
     soc.mailbox.board_serial = board_serial;
     soc.mailbox.mac_address = if (board_model.hasWireless()) wifi_mac_address else mac_address;
@@ -259,12 +262,12 @@ fn loadGuestBoot(
         defer gpa.free(boot_vol);
         const k_override = if (opts.kernel_path) |kp| try readFileLinux(gpa, kp) else null;
         defer if (k_override) |ko| gpa.free(ko);
-        break :blk try loader.loadFromSdImage(gpa, ram, boot_vol, opts.cmdline, k_override);
+        break :blk try loader.loadFromSdImageForModel(gpa, ram, boot_vol, board_model, opts.cmdline, k_override);
     } else if (sd_image_buf) |img| blk: {
         soc.sdhost.attachMutableSlice(img);
         const k_override = if (opts.kernel_path) |kp| try readFileLinux(gpa, kp) else null;
         defer if (k_override) |ko| gpa.free(ko);
-        break :blk try loader.loadFromSdImage(gpa, ram, img, opts.cmdline, k_override);
+        break :blk try loader.loadFromSdImageForModel(gpa, ram, img, board_model, opts.cmdline, k_override);
     } else blk: {
         const k_path = opts.kernel_path orelse return error.MissingKernel;
         const d_path = opts.dtb_path orelse return error.MissingDtb;
@@ -275,7 +278,11 @@ fn loadGuestBoot(
         const rd_bytes = if (opts.initramfs_path) |rd_p| try readFileLinux(gpa, rd_p) else null;
         defer if (rd_bytes) |rd| gpa.free(rd);
 
-        const cmdline = opts.cmdline orelse "console=ttyAMA0,115200 earlycon=pl011,0x20201000";
+        const default_cmdline = if (board_model.isBcm2837())
+            "console=ttyAMA0,115200 earlycon=pl011,0x3f201000"
+        else
+            "console=ttyAMA0,115200 earlycon=pl011,0x20201000";
+        const cmdline = opts.cmdline orelse default_cmdline;
         break :blk try loader.loadDirect(gpa, ram, k_bytes, d_bytes, rd_bytes, cmdline, true);
     };
 
@@ -290,6 +297,28 @@ fn loadGuestBoot(
         wifi_mac_opt,
     );
     return boot_res;
+}
+
+fn resetCpusForBoard(
+    cpus: *[4]Cpu,
+    num_cores: *usize,
+    board_model: ui_board_sheet.BoardModel,
+    boot_res: loader.BootResult,
+) void {
+    const is_a53 = board_model.isBcm2837();
+    cpus[0] = .{};
+    cpus[0].initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
+    cpus[0].mmu.is_cortex_a53 = is_a53;
+    cpus[0].vfp.is_vfpv4 = is_a53;
+    if (is_a53) {
+        num_cores.* = 4;
+        for (1..4) |i| {
+            cpus[i] = .{};
+            cpus[i].initSecondaryCore(@intCast(i));
+        }
+    } else {
+        num_cores.* = 1;
+    }
 }
 
 fn syncWindowPeripheralsToSoc(w: *const window.WaylandWindow, soc: *Bcm2835) void {
@@ -322,7 +351,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
     var soc = Bcm2835.init(ram, opts.width, opts.height);
     defer soc.usb.hid.net.deinit();
-    var cpu: Cpu = .{};
+    var cpus: [4]Cpu = @splat(.{});
+    var num_cores: usize = 1;
     var guest_booted = false;
 
     const initial_power = opts.power or opts.headless;
@@ -363,7 +393,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             null;
         const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, if (initial_sd) sd_image_buf else null, bm, serial, mac, wifi_mac);
         if (wl_win) |w| syncWindowPeripheralsToSoc(w, &soc);
-        cpu.initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
+        resetCpusForBoard(&cpus, &num_cores, bm, boot_res);
         guest_booted = true;
     }
 
@@ -431,8 +461,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     if (host_audio) |ha| ha.setPaused(true);
                     if (loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, active_sd, w.status.board_model, w.status.serial_u64, w.status.mac_address, w.status.wifi_mac_address)) |reboot_res| {
                         syncWindowPeripheralsToSoc(w, &soc);
-                        cpu = .{};
-                        cpu.initReset(reboot_res.entry_pc, reboot_res.r0, reboot_res.r1, reboot_res.r2);
+                        resetCpusForBoard(&cpus, &num_cores, w.status.board_model, reboot_res);
                         guest_booted = true;
                         last_guest_vblank_us = 0;
                         active_us_accum = 0;
@@ -483,34 +512,99 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             idle_rendered_booted = null;
         }
         if (soc.pm.reboot_requested) break;
-        if (opts.max_steps != 0 and cpu.cycles >= opts.max_steps) break;
+        if (opts.max_steps != 0 and cpus[0].cycles >= opts.max_steps) break;
 
+        // Check secondary core wakeup via bcm2836-l1-intc mailbox 3 or spin-table at 0xd8..0xf0
+        for (1..num_cores) |i| {
+            if (cpus[i].halted_spin) {
+                if (soc.local_intc.takeCoreWakeup(@intCast(i))) |wakeup_addr| {
+                    cpus[i].halted_spin = false;
+                    cpus[i].mmu.halted_wfi = false;
+                    cpus[i].r[15] = wakeup_addr;
+                } else {
+                    const spin_off: usize = 0xd8 + i * 8;
+                    const spin_addr = std.mem.readInt(u32, ram[spin_off..][0..4], .little);
+                    if (spin_addr != 0) {
+                        cpus[i].halted_spin = false;
+                        cpus[i].mmu.halted_wfi = false;
+                        cpus[i].r[15] = spin_addr;
+                    }
+                }
+            }
+        }
+
+        const max_slice: u64 = if (num_cores > 1) 4096 else 65536;
         const batch: usize = if (opts.max_steps != 0)
-            @intCast(@min(@as(u64, 65536), opts.max_steps - cpu.cycles))
+            @intCast(@min(max_slice, opts.max_steps - cpus[0].cycles))
         else
-            65536;
+            @intCast(max_slice);
 
-        const ran = cpu.runSteps(&soc, batch);
+        var total_ran: usize = 0;
+        var active_cores: usize = 0;
+        for (0..num_cores) |i| {
+            if (cpus[i].halted_spin) continue;
+            active_cores += 1;
+            soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+            const ran = cpus[i].runSteps(&soc, batch);
+            total_ran += ran;
+            soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+        }
 
-        // Advance 1 MHz system timer proportionally to instructions executed (~256 instructions per us on ARM1176)
-        const timer_ticks: u64 = if (ran > 0) @max(ran / 256, 1) else 1;
+        // Advance 1 MHz system timer proportionally to instructions executed (~256 instructions per us)
+        const ran_per_core = if (active_cores > 0) total_ran / active_cores else 0;
+        const timer_ticks: u64 = if (ran_per_core > 0) @max(ran_per_core / 256, 1) else 1;
         active_us_accum += timer_ticks;
         soc.timer.advance(timer_ticks, &soc.intc);
         soc.advanceAudio(timer_ticks);
+        for (0..num_cores) |i| {
+            if (!cpus[i].halted_spin) {
+                soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+            }
+        }
         soc.updateIrqs();
 
-        if (cpu.mmu.halted_wfi and !soc.hasPendingIrq() and !soc.hasPendingFiq()) {
+        var all_wfi = true;
+        for (0..num_cores) |i| {
+            if (cpus[i].halted_spin) continue;
+            const cid: u2 = @intCast(i);
+            if (!cpus[i].mmu.halted_wfi or soc.hasPendingIrqForCore(cid) or soc.hasPendingFiqForCore(cid)) {
+                all_wfi = false;
+                break;
+            }
+        }
+
+        if (all_wfi) {
             soc.usb.pollNetwork(soc.ram);
             soc.updateIrqs();
+            for (0..num_cores) |i| {
+                if (cpus[i].halted_spin) continue;
+                const cid: u2 = @intCast(i);
+                if (!cpus[i].mmu.halted_wfi or soc.hasPendingIrqForCore(cid) or soc.hasPendingFiqForCore(cid)) {
+                    all_wfi = false;
+                    break;
+                }
+            }
         }
-        if (cpu.mmu.halted_wfi and !soc.hasPendingIrq() and !soc.hasPendingFiq()) {
-            // Fast-forward timer to next compare match (capped at 2000 us so vblank/UI stays responsive)
-            const jump = @max(soc.timer.usUntilNextMatch(2000), 1);
+
+        if (all_wfi) {
+            // Fast-forward timer to next compare match or core generic timer (capped at 2000 us so vblank/UI stays responsive)
+            var jump = soc.timer.usUntilNextMatch(2000);
+            for (0..num_cores) |i| {
+                if (!cpus[i].halted_spin) {
+                    jump = @min(jump, cpus[i].mmu.usUntilNextGenericTimer(2000));
+                }
+            }
+            jump = @max(jump, 1);
             idle_us_accum += jump;
             soc.timer.advance(jump, &soc.intc);
             soc.advanceAudio(jump);
+            for (0..num_cores) |i| {
+                if (!cpus[i].halted_spin) {
+                    soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+                    cpus[i].mmu.halted_wfi = false;
+                }
+            }
             soc.updateIrqs();
-            cpu.mmu.halted_wfi = false;
         }
 
         if (soc.timer.counter -| last_guest_vblank_us >= 16_667) {
@@ -552,17 +646,25 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         std.debug.print(
             "\n[fauxpi] Stopped at cycle={d} pc=0x{x:0>8} lr=0x{x:0>8} sp=0x{x:0>8} cpsr=0x{x:0>8} sctlr=0x{x:0>8} ttbr0=0x{x:0>8} timer_us={d} uart_tx={d}\n",
             .{
-                cpu.cycles,
-                cpu.r[15],
-                cpu.r[14],
-                cpu.r[13],
-                cpu.cpsr,
-                cpu.mmu.sctlr,
-                cpu.mmu.ttbr0,
+                cpus[0].cycles,
+                cpus[0].r[15],
+                cpus[0].r[14],
+                cpus[0].r[13],
+                cpus[0].cpsr,
+                cpus[0].mmu.sctlr,
+                cpus[0].mmu.ttbr0,
                 soc.timer.counter,
                 soc.uart0.tx_log_len,
             },
         );
+        if (num_cores > 1) {
+            for (1..num_cores) |i| {
+                std.debug.print(
+                    "  core[{d}] spin={} wfi={} cycles={d} pc=0x{x:0>8} cpsr=0x{x:0>8}\n",
+                    .{ i, cpus[i].halted_spin, cpus[i].mmu.halted_wfi, cpus[i].cycles, cpus[i].r[15], cpus[i].cpsr },
+                );
+            }
+        }
         const test_fb = try gpa.alloc(u32, @as(usize, opts.width) * @as(usize, opts.height));
         defer gpa.free(test_fb);
         const active_disp = soc.renderDisplayFrame(test_fb, opts.width, opts.height);

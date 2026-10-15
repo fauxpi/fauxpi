@@ -121,6 +121,13 @@ pub const BoardModel = enum {
         };
     }
 
+    pub fn isBcm2837(self: BoardModel) bool {
+        return switch (self) {
+            .pi_3_a_plus, .pi_3_b_plus, .pi_zero_2_w => true,
+            .pi_1_a_plus, .pi_1_b_plus, .pi_zero, .pi_zero_w => false,
+        };
+    }
+
     pub fn fromModel(model: []const u8) BoardModel {
         if (std.mem.indexOf(u8, model, "Zero 2 W") != null) return .pi_zero_2_w;
         if (std.mem.indexOf(u8, model, "Zero W") != null) return .pi_zero_w;

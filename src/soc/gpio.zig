@@ -62,8 +62,8 @@ pub const Gpio = struct {
     pull_down_mask: u64 = DEFAULT_PULL_DOWN_MASK,
     /// External hardware pin levels (GPIO 46 = HDMI_HPD_N = 0 = active/connected)
     ext_level: u64 = (1 << 2) | (1 << 3),
-    /// Mask of pins driven by external hardware (e.g., GPIO 46 HDMI HPD)
-    ext_mask: u64 = (1 << 46),
+    /// Mask of pins driven by external hardware (GPIO 46 and BCM2837 GPIO 28 HDMI HPD)
+    ext_mask: u64 = (1 << 46) | (1 << 28),
 
     /// Event detect status and edge/level enables
     gpeds: u64 = 0,
@@ -236,6 +236,7 @@ pub const Gpio = struct {
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },
             0x1c => { // GPSET0
+                if ((val & (1 << 29)) != 0) self.act_pulse_latch = true;
                 self.out_level |= @as(u64, val);
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },
@@ -245,6 +246,7 @@ pub const Gpio = struct {
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },
             0x28 => { // GPCLR0
+                if ((val & (1 << 29)) != 0) self.act_pulse_latch = true;
                 self.out_level &= ~@as(u64, val);
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },

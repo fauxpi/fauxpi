@@ -266,9 +266,12 @@ pub const Tree = struct {
     pub fn setHeadphoneAudioEnabled(self: *Tree, enabled: bool) !void {
         // Configure audio_pins under /soc/gpio@7e200000 so pinctrl-bcm2835 succeeds when vchiq probes
         if (self.findNode("audio_pins") orelse self.findNode("/soc/gpio@7e200000/audio_pins")) |ap| {
-            try ap.setCellsProp(self.allocator, "brcm,pins", &.{ 40, 45 });
-            try ap.setU32Prop(self.allocator, "brcm,function", 4); // ALT0 (PWM0/PWM1)
-            try ap.setU32Prop(self.allocator, "brcm,pull", 0);
+            const existing_pins = ap.getProp("brcm,pins") orelse &.{};
+            if (existing_pins.len == 0) {
+                try ap.setCellsProp(self.allocator, "brcm,pins", &.{ 40, 45 });
+                try ap.setU32Prop(self.allocator, "brcm,function", 4); // ALT0 (PWM0/PWM1)
+                try ap.setU32Prop(self.allocator, "brcm,pull", 0);
+            }
         }
         if (self.findNode("vchiq") orelse self.findNode("/soc/mailbox@7e00b840")) |vchiq_node| {
             try vchiq_node.setStringProp(self.allocator, "status", "okay");
@@ -391,9 +394,12 @@ pub const Tree = struct {
 
         // Configure audio_pins so /soc/mailbox@7e00b840 (vchiq) probes without pinctrl errors
         if (self.findNode("audio_pins") orelse self.findNode("/soc/gpio@7e200000/audio_pins")) |ap| {
-            try ap.setCellsProp(self.allocator, "brcm,pins", &.{ 40, 45 });
-            try ap.setU32Prop(self.allocator, "brcm,function", 4);
-            try ap.setU32Prop(self.allocator, "brcm,pull", 0);
+            const existing_pins = ap.getProp("brcm,pins") orelse &.{};
+            if (existing_pins.len == 0) {
+                try ap.setCellsProp(self.allocator, "brcm,pins", &.{ 40, 45 });
+                try ap.setU32Prop(self.allocator, "brcm,function", 4);
+                try ap.setU32Prop(self.allocator, "brcm,pull", 0);
+            }
         }
 
         // 4. Enable vc4-kms-v3d nodes (equivalent to dtoverlay=vc4-kms-v3d)

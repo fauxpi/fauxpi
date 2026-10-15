@@ -8,6 +8,7 @@
 const std = @import("std");
 const fat32 = @import("fat32.zig");
 const fdt = @import("fdt.zig");
+const BoardModel = @import("../ui/board_sheet.zig").BoardModel;
 
 pub const kernel_load_addr: u32 = 0x0000_8000;
 pub const dtb_load_addr: u32 = 0x03f0_0000;
@@ -21,7 +22,13 @@ pub const BootConfig = struct {
     vc4_kms_v3d: bool = false,
 
     pub fn parse(text: []const u8) BootConfig {
-        var cfg: BootConfig = .{};
+        return parseForModel(text, .pi_zero);
+    }
+
+    pub fn parseForModel(text: []const u8, board_model: BoardModel) BootConfig {
+        var cfg: BootConfig = .{
+            .kernel = if (board_model.isBcm2837()) "kernel7.img" else "kernel.img",
+        };
         var section_active = true;
         var lines = std.mem.tokenizeAny(u8, text, "\r\n");
         while (lines.next()) |raw_line| {
@@ -30,9 +37,24 @@ pub const BootConfig = struct {
             if (line.len == 0) continue;
             if (line[0] == '[' and line[line.len - 1] == ']') {
                 const sec = line[1 .. line.len - 1];
-                section_active = std.mem.eql(u8, sec, "all") or
-                    std.mem.eql(u8, sec, "pi0") or
-                    std.mem.eql(u8, sec, "pi0w");
+                section_active = if (std.mem.eql(u8, sec, "all"))
+                    true
+                else if (std.mem.eql(u8, sec, "none"))
+                    false
+                else if (std.mem.eql(u8, sec, "pi0"))
+                    (board_model == .pi_zero or board_model == .pi_zero_w or board_model == .pi_zero_2_w)
+                else if (std.mem.eql(u8, sec, "pi0w"))
+                    (board_model == .pi_zero_w)
+                else if (std.mem.eql(u8, sec, "pi02"))
+                    (board_model == .pi_zero_2_w)
+                else if (std.mem.eql(u8, sec, "pi1"))
+                    (board_model == .pi_1_a_plus or board_model == .pi_1_b_plus)
+                else if (std.mem.eql(u8, sec, "pi3"))
+                    (board_model == .pi_3_a_plus or board_model == .pi_3_b_plus or board_model == .pi_zero_2_w)
+                else if (std.mem.eql(u8, sec, "pi3+"))
+                    (board_model == .pi_3_a_plus or board_model == .pi_3_b_plus)
+                else
+                    false;
                 continue;
             }
             if (!section_active) continue;
@@ -76,11 +98,67 @@ pub const BootResult = struct {
     initrd_size: usize,
 };
 
+pub fn dtbCandidatesForModel(board_model: BoardModel) []const []const u8 {
+    return switch (board_model) {
+        .pi_zero => &.{
+            "bcm2708-rpi-zero.dtb",
+            "bcm2835-rpi-zero.dtb",
+            "bcm2708-rpi-zero-w.dtb",
+            "bcm2835-rpi-zero-w.dtb",
+        },
+        .pi_zero_w => &.{
+            "bcm2708-rpi-zero-w.dtb",
+            "bcm2835-rpi-zero-w.dtb",
+            "bcm2708-rpi-zero.dtb",
+            "bcm2835-rpi-zero.dtb",
+        },
+        .pi_1_a_plus, .pi_1_b_plus => &.{
+            "bcm2708-rpi-b-plus.dtb",
+            "bcm2835-rpi-b-plus.dtb",
+            "bcm2708-rpi-zero.dtb",
+            "bcm2835-rpi-zero.dtb",
+        },
+        .pi_3_a_plus => &.{
+            "bcm2837-rpi-3-a-plus.dtb",
+            "bcm2710-rpi-3-b-plus.dtb",
+            "bcm2837-rpi-3-b-plus.dtb",
+            "bcm2710-rpi-3-b.dtb",
+            "bcm2708-rpi-zero.dtb",
+        },
+        .pi_3_b_plus => &.{
+            "bcm2710-rpi-3-b-plus.dtb",
+            "bcm2837-rpi-3-b-plus.dtb",
+            "bcm2710-rpi-3-b.dtb",
+            "bcm2837-rpi-3-a-plus.dtb",
+            "bcm2708-rpi-zero.dtb",
+        },
+        .pi_zero_2_w => &.{
+            "bcm2710-rpi-zero-2-w.dtb",
+            "bcm2837-rpi-zero-2-w.dtb",
+            "bcm2710-rpi-zero-2.dtb",
+            "bcm2710-rpi-3-b-plus.dtb",
+            "bcm2708-rpi-zero-w.dtb",
+        },
+    };
+}
+
 /// Loads a Raspberry Pi Zero system from an SD card image (`sd_image`) into `ram`.
 pub fn loadFromSdImage(
     allocator: std.mem.Allocator,
     ram: []u8,
     sd_image: []const u8,
+    extra_cmdline: ?[]const u8,
+    override_kernel: ?[]const u8,
+) !BootResult {
+    return loadFromSdImageForModel(allocator, ram, sd_image, .pi_zero, extra_cmdline, override_kernel);
+}
+
+/// Loads a Raspberry Pi system for `board_model` from an SD card image (`sd_image`) into `ram`.
+pub fn loadFromSdImageForModel(
+    allocator: std.mem.Allocator,
+    ram: []u8,
+    sd_image: []const u8,
+    board_model: BoardModel,
     extra_cmdline: ?[]const u8,
     override_kernel: ?[]const u8,
 ) !BootResult {
@@ -91,23 +169,30 @@ pub fn loadFromSdImage(
     const fs = try fat32.FatFs.init(sd_image);
 
     const config_txt = fs.readFileAlloc(alloc, "config.txt") catch "";
-    const cfg = BootConfig.parse(config_txt);
+    const cfg = BootConfig.parseForModel(config_txt, board_model);
 
     const kernel_bytes = if (override_kernel) |ok| ok else blk: {
         const kernel_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, cfg.kernel });
-        break :blk try fs.readFileAlloc(alloc, kernel_path);
+        if (fs.readFileAlloc(alloc, kernel_path)) |kb| break :blk kb else |err| {
+            if (board_model.isBcm2837()) {
+                const fallback_path = try std.fmt.allocPrint(alloc, "{s}kernel.img", .{cfg.os_prefix});
+                if (fs.readFileAlloc(alloc, fallback_path)) |kb| break :blk kb else |_| {}
+            }
+            return err;
+        }
     };
 
-    const dtb_candidates = [_][]const u8{
-        cfg.device_tree orelse "bcm2708-rpi-zero.dtb",
-        "bcm2835-rpi-zero.dtb",
-        "bcm2708-rpi-zero-w.dtb",
-        "bcm2835-rpi-zero-w.dtb",
+    const dtb_bytes = blk: {
+        if (cfg.device_tree) |dt_override| {
+            const p = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, dt_override });
+            if (fs.readFileAlloc(alloc, p)) |b| break :blk b else |_| {}
+        }
+        for (dtbCandidatesForModel(board_model)) |cand| {
+            const p = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, cand });
+            if (fs.readFileAlloc(alloc, p)) |b| break :blk b else |_| {}
+        }
+        return error.DtbNotFound;
     };
-    const dtb_bytes = for (dtb_candidates) |cand| {
-        const p = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, cand });
-        if (fs.readFileAlloc(alloc, p)) |b| break b else |_| {}
-    } else return error.DtbNotFound;
 
     const initrd_bytes: ?[]const u8 = if (cfg.initramfs) |rd_name| blk: {
         const p = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, rd_name });

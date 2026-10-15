@@ -541,9 +541,6 @@ pub const Cyw43430 = struct {
                 0x020 => {
                     // intstatus is write-1-to-clear
                     self.sdio_intstatus &= ~val;
-                    if (self.rx_count > 0) {
-                        self.sdio_intstatus |= I_HMB_FRAME_IND;
-                    }
                 },
                 0x024 => self.sdio_hostintmask = val,
                 0x040 => {

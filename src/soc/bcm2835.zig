@@ -15,8 +15,9 @@ const hvs_mod = @import("../vc4/hvs.zig");
 const pv_mod = @import("../vc4/pixelvalve.zig");
 const hdmi_mod = @import("../vc4/hdmi.zig");
 const audio_mod = @import("audio.zig");
+const local_intc_mod = @import("local_intc.zig");
 
-/// Complete BCM2835 SoC Bus & Peripherals for Raspberry Pi Zero 1.
+/// Complete BCM2835 / BCM2837 SoC Bus & Peripherals.
 /// Directly satisfies the `Bus` concept required by `Arm1176(Bcm2835)`.
 pub const Bcm2835 = struct {
     pub const RAM_SIZE: usize = 512 * 1024 * 1024;
@@ -29,8 +30,10 @@ pub const Bcm2835 = struct {
     pub const INTC_SIZE: u32 = 0x200;
 
     ram: []u8,
+    is_bcm2837: bool = false,
 
     intc: intc_mod.IntController = .{},
+    local_intc: local_intc_mod.LocalIntc = .{},
     timer: timer_mod.SystemTimer = .{},
     mailbox: mailbox_mod.Mailbox = .{},
     cprman: cprman_mod.Cprman = .{},
@@ -82,12 +85,26 @@ pub const Bcm2835 = struct {
         return soc;
     }
 
+    pub inline fn hasPendingIrqForCore(self: *const Bcm2835, core_id: u2) bool {
+        if (self.is_bcm2837) {
+            return self.local_intc.irqPendingForCore(core_id, self.intc.hasPendingIrq()) != 0;
+        }
+        return core_id == 0 and self.intc.hasPendingIrq();
+    }
+
+    pub inline fn hasPendingFiqForCore(self: *const Bcm2835, core_id: u2) bool {
+        if (self.is_bcm2837) {
+            return self.local_intc.fiqPendingForCore(core_id, self.intc.hasPendingFiq()) != 0;
+        }
+        return core_id == 0 and self.intc.hasPendingFiq();
+    }
+
     pub inline fn hasPendingIrq(self: *const Bcm2835) bool {
-        return self.intc.hasPendingIrq();
+        return self.hasPendingIrqForCore(0);
     }
 
     pub inline fn hasPendingFiq(self: *const Bcm2835) bool {
-        return self.intc.hasPendingFiq();
+        return self.hasPendingFiqForCore(0);
     }
 
     fn dmaMmio(self: *Bcm2835) dma_mod.DmaController.MmioIo {
@@ -186,13 +203,14 @@ pub const Bcm2835 = struct {
         self.updateIrqs();
     }
 
-    /// Connects or disconnects the simulated HDMI monitor cable (updating HPD register, DDC EDID, and GPIO 46 HDMI_HPD_N).
+    /// Connects or disconnects the simulated HDMI monitor cable (updating HPD register, DDC EDID, and GPIO 46/28 HDMI_HPD_N).
     pub fn setHdmiConnected(self: *Bcm2835, connected: bool) void {
         if (self.hdmi.connected == connected) return;
         self.hdmi.connected = connected;
         self.bsc2.has_hdmi_edid = connected;
-        // GPIO 46 on Raspberry Pi Zero is HDMI_HPD_N (active-low: 0 = connected, 1 = disconnected)
+        // GPIO 46 (BCM2835) and GPIO 28 (BCM2837) are HDMI_HPD_N (active-low: 0 = connected, 1 = disconnected)
         self.gpio.setExternalPin(46, !connected);
+        self.gpio.setExternalPin(28, !connected);
         self.updateIrqs();
     }
 
@@ -236,11 +254,12 @@ pub const Bcm2835 = struct {
         }
 
         const gpio47_steady = (self.gpio.getPinFunction(47) == .output) and !self.gpio.getPinLevel(47);
+        const gpio29_steady = (self.gpio.getPinFunction(29) == .output) and self.gpio.getPinLevel(29);
         const exp_steady = self.mailbox.exp_gpio_state[0] != 0;
-        const act_on = gpio47_steady or exp_steady or (self.act_led_hold_frames > 0);
+        const act_on = gpio47_steady or gpio29_steady or exp_steady or (self.act_led_hold_frames > 0);
 
         const gpio35_off = (self.gpio.getPinFunction(35) == .output) and !self.gpio.getPinLevel(35);
-        const exp_pwr_off = self.mailbox.exp_gpio_state[7] == 0;
+        const exp_pwr_off = (self.mailbox.exp_gpio_state[7] == 0) or (self.mailbox.exp_gpio_state[2] != 0);
         const pwr_on = !gpio35_off and !exp_pwr_off;
 
         return .{ .act_on = act_on, .pwr_on = pwr_on };
@@ -278,16 +297,23 @@ pub const Bcm2835 = struct {
     }
 
     fn normalizeAddr(addr: u32) u32 {
-        // VideoCore bus addresses map 0x7e000000..0x7effffff -> 0x20000000..0x20ffffff
-        if ((addr & 0xFF000000) == 0x7E000000) {
+        // VideoCore bus addresses (0x7e000000..0x7effffff) and BCM2837 physical peripheral
+        // addresses (0x3f000000..0x3fffffff) map to 0x20000000..0x20ffffff.
+        const top = addr & 0xFF000000;
+        if (top == 0x7E000000 or top == 0x3F000000) {
             return 0x20000000 | (addr & 0x00FFFFFF);
         }
         return addr;
     }
 
+    inline fn isMmioAddr(addr: u32) bool {
+        return (addr >= PERIPH_BASE and addr < PERIPH_END) or
+            (addr >= local_intc_mod.LocalIntc.BASE_ADDR and addr < local_intc_mod.LocalIntc.BASE_ADDR + local_intc_mod.LocalIntc.SIZE);
+    }
+
     pub fn read8(self: *Bcm2835, raw_addr: u32) u8 {
         const addr = normalizeAddr(raw_addr);
-        if (addr < PERIPH_BASE or addr >= PERIPH_END) {
+        if (!isMmioAddr(addr)) {
             const ram_off = addr & 0x1FFFFFFF;
             if (ram_off < self.ram.len) return self.ram[ram_off];
             return 0;
@@ -299,7 +325,7 @@ pub const Bcm2835 = struct {
 
     pub fn read16(self: *Bcm2835, raw_addr: u32) u16 {
         const addr = normalizeAddr(raw_addr);
-        if (addr < PERIPH_BASE or addr >= PERIPH_END) {
+        if (!isMmioAddr(addr)) {
             const ram_off = addr & 0x1FFFFFFF;
             if (ram_off + 2 <= self.ram.len) return std.mem.readInt(u16, self.ram[ram_off..][0..2], .little);
             return 0;
@@ -311,7 +337,7 @@ pub const Bcm2835 = struct {
 
     pub fn read32(self: *Bcm2835, raw_addr: u32) u32 {
         const addr = normalizeAddr(raw_addr);
-        if (addr < PERIPH_BASE or addr >= PERIPH_END) {
+        if (!isMmioAddr(addr)) {
             const ram_off = addr & 0x1FFFFFFF;
             if (ram_off + 4 <= self.ram.len) return std.mem.readInt(u32, self.ram[ram_off..][0..4], .little);
             return 0;
@@ -321,7 +347,7 @@ pub const Bcm2835 = struct {
 
     pub fn write8(self: *Bcm2835, raw_addr: u32, val: u8) void {
         const addr = normalizeAddr(raw_addr);
-        if (addr < PERIPH_BASE or addr >= PERIPH_END) {
+        if (!isMmioAddr(addr)) {
             const ram_off = addr & 0x1FFFFFFF;
             if (ram_off < self.ram.len) self.ram[ram_off] = val;
             return;
@@ -331,7 +357,7 @@ pub const Bcm2835 = struct {
 
     pub fn write16(self: *Bcm2835, raw_addr: u32, val: u16) void {
         const addr = normalizeAddr(raw_addr);
-        if (addr < PERIPH_BASE or addr >= PERIPH_END) {
+        if (!isMmioAddr(addr)) {
             const ram_off = addr & 0x1FFFFFFF;
             if (ram_off + 2 <= self.ram.len) std.mem.writeInt(u16, self.ram[ram_off..][0..2], val, .little);
             return;
@@ -341,7 +367,7 @@ pub const Bcm2835 = struct {
 
     pub fn write32(self: *Bcm2835, raw_addr: u32, val: u32) void {
         const addr = normalizeAddr(raw_addr);
-        if (addr < PERIPH_BASE or addr >= PERIPH_END) {
+        if (!isMmioAddr(addr)) {
             const ram_off = addr & 0x1FFFFFFF;
             if (ram_off + 4 <= self.ram.len) std.mem.writeInt(u32, self.ram[ram_off..][0..4], val, .little);
             return;
@@ -350,6 +376,15 @@ pub const Bcm2835 = struct {
     }
 
     pub fn readMmio32(self: *Bcm2835, addr: u32) u32 {
+        if (addr >= local_intc_mod.LocalIntc.BASE_ADDR and addr < local_intc_mod.LocalIntc.BASE_ADDR + local_intc_mod.LocalIntc.SIZE) {
+            self.updateIrqs();
+            return self.local_intc.read32(
+                addr - local_intc_mod.LocalIntc.BASE_ADDR,
+                self.timer.counter,
+                self.intc.hasPendingIrq(),
+                self.intc.hasPendingFiq(),
+            );
+        }
         if (addr >= TIMER_BASE and addr < TIMER_BASE + TIMER_SIZE) {
             return self.timer.read32(addr - TIMER_BASE);
         }
@@ -439,7 +474,9 @@ pub const Bcm2835 = struct {
     }
 
     pub fn writeMmio32(self: *Bcm2835, addr: u32, val: u32) void {
-        if (addr >= TIMER_BASE and addr < TIMER_BASE + TIMER_SIZE) {
+        if (addr >= local_intc_mod.LocalIntc.BASE_ADDR and addr < local_intc_mod.LocalIntc.BASE_ADDR + local_intc_mod.LocalIntc.SIZE) {
+            self.local_intc.write32(addr - local_intc_mod.LocalIntc.BASE_ADDR, val);
+        } else if (addr >= TIMER_BASE and addr < TIMER_BASE + TIMER_SIZE) {
             self.timer.write32(addr - TIMER_BASE, val, &self.intc);
         } else if (addr >= hdmi_mod.Txp.BASE_ADDR and addr < hdmi_mod.Txp.BASE_ADDR + hdmi_mod.Txp.SIZE) {
             self.txp.write32(addr - hdmi_mod.Txp.BASE_ADDR, val);

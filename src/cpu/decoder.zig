@@ -323,6 +323,9 @@ pub fn executeMedia(inst: u32, r_rn: u32, r_rm: u32, r_rd: u32, r_ra: u32, cpsr:
                     const rot_rm = std.math.rotr(u32, r_rm, rot);
                     const uext: u32 = @as(u16, @truncate(rot_rm));
                     return r_rn +% uext;
+                } else if (sub_op == 0b111 and op2 == 0b001) {
+                    // RBIT (Reverse Bits)
+                    return @bitReverse(r_rm);
                 } else if (sub_op == 0b111 and op2 == 0b101) {
                     // REVSH
                     const lo: u16 = @byteSwap(@as(u16, @truncate(r_rm)));
@@ -371,6 +374,23 @@ pub fn executeMedia(inst: u32, r_rn: u32, r_rm: u32, r_rd: u32, r_ra: u32, cpsr:
                 const sum: i64 = (if (is_sub) (p1 - p2) else (p1 + p2)) + @as(i64, @as(i32, @bitCast(r_ra)));
                 return @truncate(@as(u64, @bitCast(sum)));
             },
+            0b001 => {
+                // SDIV Rd, Rn, Rm (op2 == 0b000)
+                if (op2 == 0b000) {
+                    if (r_rm == 0) return 0;
+                    const num: i32 = @bitCast(r_rn);
+                    const den: i32 = @bitCast(r_rm);
+                    if (num == std.math.minInt(i32) and den == -1) return @bitCast(num);
+                    return @bitCast(@divTrunc(num, den));
+                }
+            },
+            0b011 => {
+                // UDIV Rd, Rn, Rm (op2 == 0b000)
+                if (op2 == 0b000) {
+                    if (r_rm == 0) return 0;
+                    return r_rn / r_rm;
+                }
+            },
             0b101 => {
                 // SMMUL / SMMLA / SMMLS
                 const round = (op2 & 1) != 0;
@@ -401,8 +421,8 @@ pub fn executeMedia(inst: u32, r_rn: u32, r_rm: u32, r_rd: u32, r_ra: u32, cpsr:
         return diff_sum;
     }
 
-    // UBFX / SBFX / BFI / BFC (ARMv6T2/v7 extensions sometimes emitted if enabled)
-    if ((op1 == 0b11010 or op1 == 0b11011 or op1 == 0b11110 or op1 == 0b11111) and (op2 == 0b010)) {
+    // UBFX / SBFX / BFI / BFC (bit 7 of inst is lsb[0], i.e. bit 2 of op2)
+    if ((op1 == 0b11010 or op1 == 0b11011 or op1 == 0b11110 or op1 == 0b11111) and ((op2 & 0b011) == 0b010)) {
         // SBFX / UBFX
         const lsb: u5 = @truncate((inst >> 7) & 0x1f);
         const widthm1: u5 = @truncate((inst >> 16) & 0x1f);
@@ -419,7 +439,7 @@ pub fn executeMedia(inst: u32, r_rn: u32, r_rm: u32, r_rd: u32, r_ra: u32, cpsr:
         }
         return val;
     }
-    if ((op1 == 0b11100 or op1 == 0b11101) and (op2 == 0b000)) {
+    if ((op1 == 0b11100 or op1 == 0b11101) and ((op2 & 0b011) == 0b000)) {
         // BFI / BFC
         const lsb: u5 = @truncate((inst >> 7) & 0x1f);
         const msb: u5 = @truncate((inst >> 16) & 0x1f);

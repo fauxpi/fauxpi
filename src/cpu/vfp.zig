@@ -1,17 +1,21 @@
-//! ARM1176JZF-S VFPv2 Floating-Point Coprocessor (CP10 & CP11).
+//! ARM1176JZF-S VFPv2 & Cortex-A53 VFPv4 Floating-Point Coprocessor (CP10 & CP11).
 //!
-//! Implements the VFPv2 register file (`s0..s31` / `d0..d15`), system registers
-//! (`FPSID`, `FPSCR`, `FPEXC`, `FPINST`, `FPINST2`, `MVFR0`, `MVFR1`), lazy context
-//! switch trap semantics (`FPEXC.EN` & `CPACR`), and single/double-precision
-//! arithmetic, conversions, comparisons, and load/store multiple operations.
+//! Implements the VFPv2/VFPv3/VFPv4 register file (`s0..s31` and `d0..d31`),
+//! system registers (`FPSID`, `FPSCR`, `FPEXC`, `FPINST`, `FPINST2`, `MVFR0`, `MVFR1`),
+//! lazy context switch trap semantics (`FPEXC.EN` & `CPACR`), single/double-precision
+//! arithmetic, VFPv3 `VMOV (immediate)`, VFPv4 fused multiply-accumulate (`VFMA`/`VFMS`/
+//! `VFNMA`/`VFNMS`), conversions, comparisons, and load/store multiple operations.
 
 const std = @import("std");
 
 pub const Vfp = struct {
-    /// 32 single-precision 32-bit registers (aliased as 16 64-bit `d0..d15` registers)
-    s: [32]u32 = @splat(0),
+    /// 64 32-bit words backing `s0..s31` (first 32 words) and `d0..d31` (all 64 words)
+    s: [64]u32 = @splat(0),
 
-    /// Floating-Point System ID Register (ARM1176JZF-S VFPv2)
+    /// True when emulating Cortex-A53 VFPv4-D32 instead of ARM1176 VFPv2-D16
+    is_vfpv4: bool = false,
+
+    /// Floating-Point System ID Register
     fpsid: u32 = 0x410120b5,
     /// Floating-Point Status and Control Register
     fpscr: u32 = 0,
@@ -32,35 +36,39 @@ pub const Vfp = struct {
         self.s[idx] = @bitCast(val);
     }
 
-    pub inline fn getD(self: *const Vfp, idx: u4) f64 {
-        const lo: u64 = self.s[@as(u5, idx) * 2];
-        const hi: u64 = self.s[@as(u5, idx) * 2 + 1];
+    pub inline fn getD(self: *const Vfp, idx: u5) f64 {
+        const base: usize = @as(usize, idx) * 2;
+        const lo: u64 = self.s[base];
+        const hi: u64 = self.s[base + 1];
         return @bitCast((hi << 32) | lo);
     }
 
-    pub inline fn setD(self: *Vfp, idx: u4, val: f64) void {
+    pub inline fn setD(self: *Vfp, idx: u5, val: f64) void {
+        const base: usize = @as(usize, idx) * 2;
         const bits: u64 = @bitCast(val);
-        self.s[@as(u5, idx) * 2] = @truncate(bits);
-        self.s[@as(u5, idx) * 2 + 1] = @truncate(bits >> 32);
+        self.s[base] = @truncate(bits);
+        self.s[base + 1] = @truncate(bits >> 32);
     }
 
-    pub inline fn getDU64(self: *const Vfp, idx: u4) u64 {
-        const lo: u64 = self.s[@as(u5, idx) * 2];
-        const hi: u64 = self.s[@as(u5, idx) * 2 + 1];
+    pub inline fn getDU64(self: *const Vfp, idx: u5) u64 {
+        const base: usize = @as(usize, idx) * 2;
+        const lo: u64 = self.s[base];
+        const hi: u64 = self.s[base + 1];
         return (hi << 32) | lo;
     }
 
-    pub inline fn setDU64(self: *Vfp, idx: u4, bits: u64) void {
-        self.s[@as(u5, idx) * 2] = @truncate(bits);
-        self.s[@as(u5, idx) * 2 + 1] = @truncate(bits >> 32);
+    pub inline fn setDU64(self: *Vfp, idx: u5, bits: u64) void {
+        const base: usize = @as(usize, idx) * 2;
+        self.s[base] = @truncate(bits);
+        self.s[base + 1] = @truncate(bits >> 32);
     }
 
     pub fn readSysReg(self: *const Vfp, reg: u4) u32 {
         return switch (reg) {
-            0 => self.fpsid,
+            0 => if (self.is_vfpv4) 0x410340f4 else self.fpsid,
             1 => self.fpscr,
-            6 => 0x00000000, // MVFR1
-            7 => 0x11110222, // MVFR0
+            6 => if (self.is_vfpv4) 0x10000011 else 0x00000000, // MVFR1 (FMA = VFPv4)
+            7 => if (self.is_vfpv4) 0x10110222 else 0x11110222, // MVFR0 (A_SIMD=2 -> 32 D regs)
             8 => self.fpexc,
             9 => self.fpinst,
             10 => self.fpinst2,
@@ -123,6 +131,22 @@ pub const Vfp = struct {
         return @intFromFloat(r);
     }
 
+    pub fn expandImmF32(imm8: u8) f32 {
+        const sign: u32 = (imm8 >> 7) & 1;
+        const not_b6: u32 = ((imm8 >> 6) & 1) ^ 1;
+        const exp: u32 = (not_b6 << 7) | (if (not_b6 == 0) @as(u32, 0x1f << 2) else 0) | ((imm8 >> 4) & 3);
+        const frac: u32 = (@as(u32, imm8 & 0xf)) << 19;
+        return @bitCast((sign << 31) | (exp << 23) | frac);
+    }
+
+    pub fn expandImmF64(imm8: u8) f64 {
+        const sign: u64 = (imm8 >> 7) & 1;
+        const not_b6: u64 = ((imm8 >> 6) & 1) ^ 1;
+        const exp: u64 = (not_b6 << 10) | (if (not_b6 == 0) @as(u64, 0xff << 2) else 0) | ((imm8 >> 4) & 3);
+        const frac: u64 = (@as(u64, imm8 & 0xf)) << 48;
+        return @bitCast((sign << 63) | (exp << 52) | frac);
+    }
+
     /// Executes a VFP data processing instruction (`(inst & 0x0f00_0010) == 0x0e00_0000`).
     pub fn executeDataProc(self: *Vfp, inst: u32) void {
         const is_double = ((inst >> 8) & 0xf) == 11;
@@ -136,9 +160,20 @@ pub const Vfp = struct {
         const sn: u5 = @truncate((((inst >> 16) & 0xf) << 1) | ((inst >> 7) & 1));
         const sm: u5 = @truncate(((inst & 0xf) << 1) | ((inst >> 5) & 1));
 
-        const dd: u4 = @truncate((inst >> 12) & 0xf);
-        const dn: u4 = @truncate((inst >> 16) & 0xf);
-        const dm: u4 = @truncate(inst & 0xf);
+        const dd: u5 = @truncate((((inst >> 22) & 1) << 4) | ((inst >> 12) & 0xf));
+        const dn: u5 = @truncate((((inst >> 7) & 1) << 4) | ((inst >> 16) & 0xf));
+        const dm: u5 = @truncate((((inst >> 5) & 1) << 4) | (inst & 0xf));
+
+        if (op4 == 0b1110) {
+            // VFPv3 VMOV (immediate)
+            const imm8: u8 = @truncate((((inst >> 16) & 0xf) << 4) | (inst & 0xf));
+            if (!is_double) {
+                self.setS(sd, expandImmF32(imm8));
+            } else {
+                self.setD(dd, expandImmF64(imm8));
+            }
+            return;
+        }
 
         if (op4 != 0b1111) {
             // Binary operations
@@ -156,6 +191,10 @@ pub const Vfp = struct {
                     0b0110 => a + b, // VADD
                     0b0111 => a - b, // VSUB
                     0b1000 => a / b, // VDIV
+                    0b1010 => @mulAdd(f32, a, b, -d), // VFNMS
+                    0b1011 => @mulAdd(f32, -a, b, -d), // VFNMA
+                    0b1100 => @mulAdd(f32, a, b, d), // VFMA
+                    0b1101 => @mulAdd(f32, -a, b, d), // VFMS
                     else => d,
                 };
                 self.setS(sd, res);
@@ -173,6 +212,10 @@ pub const Vfp = struct {
                     0b0110 => a + b,
                     0b0111 => a - b,
                     0b1000 => a / b,
+                    0b1010 => @mulAdd(f64, a, b, -d), // VFNMS
+                    0b1011 => @mulAdd(f64, -a, b, -d), // VFNMA
+                    0b1100 => @mulAdd(f64, a, b, d), // VFMA
+                    0b1101 => @mulAdd(f64, -a, b, d), // VFMS
                     else => d,
                 };
                 self.setD(dd, res);
@@ -267,8 +310,8 @@ pub const Vfp = struct {
     }
 };
 
-test "VFPv2 single and double precision operations and conversions" {
-    var vfp: Vfp = .{};
+test "VFPv2/VFPv4 single and double precision operations, D16..D31, and VMOV immediate" {
+    var vfp: Vfp = .{ .is_vfpv4 = true };
     vfp.fpexc = 1 << 30;
     vfp.setS(0, 3.5);
     vfp.setS(1, 2.0);
@@ -277,8 +320,12 @@ test "VFPv2 single and double precision operations and conversions" {
     vfp.executeDataProc(vadd_s2_s0_s1);
     try std.testing.expectEqual(@as(f32, 5.5), vfp.getS(2));
 
-    // VCVT.F64.F32 d3, s2: 0xeeb73ae1 (op4=1111, sn=01111 -> Vn=7, N=1, dd=3, sm=2 -> Vm=1, M=0)
+    // VCVT.F64.F32 d3, s2: 0xeeb73ac1 (op4=1111, sn=01111 -> Vn=7, N=1, dd=3, sm=2 -> Vm=1, M=0)
     const vcvt_d3_s2: u32 = 0xeeb7_3ac1;
     vfp.executeDataProc(vcvt_d3_s2);
     try std.testing.expectEqual(@as(f64, 5.5), vfp.getD(3));
+
+    // VMOV.F64 d16, #1.0 (imm8 = 0x70 -> Vn=7, Vm=0, D=1, Vd=0 -> 0xeef70b00)
+    vfp.executeDataProc(0xeef7_0b00);
+    try std.testing.expectEqual(@as(f64, 1.0), vfp.getD(16));
 }

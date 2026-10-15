@@ -58,6 +58,10 @@ pub fn Arm1176(comptime Bus: type) type {
         /// Exclusive monitor state (`LDREX` / `STREX` / `CLREX`)
         excl_valid: bool = false,
         excl_paddr: u32 = 0,
+        /// True for secondary SMP cores (`1..3`) before wakeup via Mailbox 3 or spin-table
+        halted_spin: bool = false,
+        /// True when `WFE` or `YIELD` executes so the SMP scheduler switches to the next core immediately
+        yield_slice: bool = false,
 
         /// Total executed instructions
         cycles: u64 = 0,
@@ -84,6 +88,15 @@ pub fn Arm1176(comptime Bus: type) type {
             self.r[1] = r1;
             self.r[2] = r2;
             self.r[15] = entry_pc;
+            self.cpsr = PsrFlags.I | PsrFlags.F | @intFromEnum(Mode.svc);
+        }
+
+        pub fn initSecondaryCore(self: *Self, core_id: u2) void {
+            self.* = .{};
+            self.mmu.core_id = core_id;
+            self.mmu.is_cortex_a53 = true;
+            self.vfp.is_vfpv4 = true;
+            self.halted_spin = true;
             self.cpsr = PsrFlags.I | PsrFlags.F | @intFromEnum(Mode.svc);
         }
 
@@ -206,21 +219,29 @@ pub fn Arm1176(comptime Bus: type) type {
                 self.cpsr |= PsrFlags.A;
             }
 
-            const base: u32 = if (self.mmu.highVectors()) 0xffff_0000 else 0x0000_0000;
+            const base: u32 = if (self.mmu.highVectors()) 0xffff_0000 else self.mmu.vbar;
             self.r[15] = base + vector_offset;
             self.excl_valid = false;
             self.invalidateInlineTlb();
         }
 
         pub inline fn checkInterrupts(self: *Self, bus: *const Bus) bool {
-            if (bus.hasPendingFiq()) {
+            const pending_fiq = if (@hasDecl(Bus, "hasPendingFiqForCore"))
+                bus.hasPendingFiqForCore(self.mmu.core_id)
+            else
+                bus.hasPendingFiq();
+            if (pending_fiq) {
                 self.mmu.halted_wfi = false;
                 if ((self.cpsr & PsrFlags.F) == 0) {
                     self.enterException(.fiq, 0x1c, self.r[15] +% 4, true);
                     return true;
                 }
             }
-            if (bus.hasPendingIrq()) {
+            const pending_irq = if (@hasDecl(Bus, "hasPendingIrqForCore"))
+                bus.hasPendingIrqForCore(self.mmu.core_id)
+            else
+                bus.hasPendingIrq();
+            if (pending_irq) {
                 self.mmu.halted_wfi = false;
                 if ((self.cpsr & PsrFlags.I) == 0) {
                     self.enterException(.irq, 0x18, self.r[15] +% 4, false);
@@ -398,15 +419,19 @@ pub fn Arm1176(comptime Bus: type) type {
         /// Executes up to `max_steps` instructions, stopping early if the CPU
         /// enters `WFI` or an interrupt becomes pending.
         pub fn runSteps(self: *Self, bus: *Bus, max_steps: usize) usize {
+            if (self.halted_spin) return 0;
             _ = self.checkInterrupts(bus);
             if (self.mmu.halted_wfi) return 0;
+
+            self.yield_slice = false;
+            defer self.excl_valid = false;
 
             var executed: usize = 0;
             while (executed < max_steps) {
                 self.stepOne(bus);
                 self.cycles +%= 1;
                 executed += 1;
-                if (self.mmu.halted_wfi) break;
+                if (self.mmu.halted_wfi or self.yield_slice) break;
                 _ = self.checkInterrupts(bus);
             }
             return executed;
@@ -670,8 +695,11 @@ pub fn Arm1176(comptime Bus: type) type {
                 const mask: u4 = @truncate((inst >> 16) & 0xf);
                 if (op == 0b1001 and mask == 0) {
                     // Architecture hints: NOP (0), YIELD (1), WFE (2), WFI (3), SEV (4)
-                    if ((inst & 0xff) == 3) {
+                    const hint = inst & 0xff;
+                    if (hint == 3) {
                         self.mmu.halted_wfi = true;
+                    } else if (hint == 1 or hint == 2) {
+                        self.yield_slice = true;
                     }
                     return;
                 }
@@ -1145,6 +1173,9 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.r[rd_lo] = @truncate(prod);
                         self.r[rd_hi] = @truncate(prod >> 32);
                     },
+                    0b011 => { // MLS Rd, Rn, Rm, Ra
+                        self.r[rd_hi] = self.r[rd_lo] -% (self.r[rm] *% self.r[rs]);
+                    },
                     0b100 => { // UMULL
                         const prod: u64 = @as(u64, self.r[rm]) * @as(u64, self.r[rs]);
                         self.r[rd_lo] = @truncate(prod);
@@ -1175,7 +1206,6 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.r[rd_hi] = @truncate(prod >> 32);
                         if (s) self.setNZ64(prod);
                     },
-                    else => {},
                 }
                 return;
             }
@@ -1501,11 +1531,13 @@ pub fn Arm1176(comptime Bus: type) type {
 
                     // Unprivileged access to CP15 is allowed for:
                     // - TPIDRURW (c13, 0, c0, 2) and TPIDRURO (c13, 0, c0, 3)
-                    // - ARMv6 memory/instruction barriers (c7, 0, c10, 4/5 = DSB/DMB; c7, 0, c5, 4/6 = ISB/BPIALL)
+                    // - ARMv6/v7 memory/instruction barriers (c7, 0, c10, 4/5 = DSB/DMB; c7, 0, c5, 4/6 = ISB/BPIALL)
+                    // - ARMv7 Generic Timer user reads (c14, 0, c0, 0 = CNTFRQ)
                     if (!self.isPrivileged()) {
                         const allowed_c13 = (crn == 13 and crm == 0 and (opc2 == 2 or (opc2 == 3 and l)));
                         const allowed_c7 = (crn == 7 and !l and ((crm == 10 and (opc2 == 4 or opc2 == 5)) or (crm == 5 and (opc2 == 4 or opc2 == 6))));
-                        if (!allowed_c13 and !allowed_c7) {
+                        const allowed_c14 = (crn == 14 and l);
+                        if (!allowed_c13 and !allowed_c7 and !allowed_c14) {
                             self.enterException(.und, 0x04, inst_pc +% 4, false);
                             return;
                         }
@@ -1525,8 +1557,28 @@ pub fn Arm1176(comptime Bus: type) type {
                     }
                     return;
                 }
-                // MCRR / MRRC p15 (64-bit cache maintenance) -> no-op
-                if ((inst & 0x0fe0_0000) == 0x0c40_0000) return;
+                // MCRR / MRRC p15 (64-bit TTBR0/TTBR1, PAR, CNTPCT/CNTVCT/CVAL, CPUECTLR)
+                if ((inst & 0x0fe0_0000) == 0x0c40_0000) {
+                    const l = (inst & (1 << 20)) != 0;
+                    const rt2: u4 = @truncate((inst >> 16) & 0xf);
+                    const rt: u4 = @truncate((inst >> 12) & 0xf);
+                    const opc1_64: u4 = @truncate((inst >> 4) & 0xf);
+                    const crm: u4 = @truncate(inst & 0xf);
+                    if (!self.isPrivileged() and !(crm == 14 and l)) {
+                        self.enterException(.und, 0x04, inst_pc +% 4, false);
+                        return;
+                    }
+                    if (l) {
+                        const val64 = self.mmu.readCp15_64(opc1_64, crm);
+                        self.r[rt] = @truncate(val64);
+                        self.r[rt2] = @truncate(val64 >> 32);
+                    } else {
+                        const val64: u64 = (@as(u64, self.r[rt2]) << 32) | self.r[rt];
+                        self.mmu.writeCp15_64(opc1_64, crm, val64);
+                        self.invalidateInlineTlb();
+                    }
+                    return;
+                }
                 self.enterException(.und, 0x04, inst_pc +% 4, false);
                 return;
             }
@@ -1598,7 +1650,7 @@ pub fn Arm1176(comptime Bus: type) type {
                         if (sm < 31) self.vfp.s[sm + 1] = self.r[rt2];
                     }
                 } else {
-                    const dm: u4 = @truncate(inst & 0xf);
+                    const dm: u5 = @truncate((((inst >> 5) & 1) << 4) | (inst & 0xf));
                     if (l) {
                         const val = self.vfp.getDU64(dm);
                         self.r[rt] = @truncate(val);
@@ -1642,7 +1694,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             };
                         }
                     } else {
-                        const dd: u4 = @truncate(vd);
+                        const dd: u5 = (d_bit << 4) | vd;
                         if (l) {
                             const lo = self.read32(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, inst_pc +% 8, false);
@@ -1670,13 +1722,13 @@ pub fn Arm1176(comptime Bus: type) type {
 
                 // VLDM / VSTM / FLDMX / FSTMX (multiple registers)
                 // Note: for FLDMX/FSTMX, imm8 may be odd (extra alignment word); the number of 32-bit float words is `imm8 & ~1` for double!
-                const word_count: u32 = if (is_double) (imm8 & ~@as(u32, 1)) else imm8;
+                const word_count: u32 = @min(@as(u32, 64), if (is_double) (imm8 & ~@as(u32, 1)) else imm8);
                 const start_addr = if (u) base_val else (base_val -% offset_bytes);
                 const final_base = if (u) (base_val +% offset_bytes) else (base_val -% offset_bytes);
-                const first_s: usize = if (is_double) (@as(usize, vd) * 2) else ((@as(usize, vd) << 1) | d_bit);
+                const first_s: usize = if (is_double) (@as(usize, (d_bit << 4) | vd) * 2) else ((@as(usize, vd) << 1) | d_bit);
 
                 if (l) {
-                    var loaded: [32]u32 = undefined;
+                    var loaded: [64]u32 = undefined;
                     for (0..word_count) |i| {
                         loaded[i] = self.read32(bus, start_addr +% @as(u32, @intCast(i * 4))) catch {
                             self.enterException(.abt, 0x10, inst_pc +% 8, false);
@@ -1684,7 +1736,7 @@ pub fn Arm1176(comptime Bus: type) type {
                         };
                     }
                     for (0..word_count) |i| {
-                        if (first_s + i < 32) self.vfp.s[first_s + i] = loaded[i];
+                        if (first_s + i < 64) self.vfp.s[first_s + i] = loaded[i];
                     }
                     if (w) self.r[rn] = final_base;
                 } else {
@@ -1699,7 +1751,7 @@ pub fn Arm1176(comptime Bus: type) type {
                         };
                     }
                     for (0..word_count) |i| {
-                        const val = if (first_s + i < 32) self.vfp.s[first_s + i] else 0;
+                        const val = if (first_s + i < 64) self.vfp.s[first_s + i] else 0;
                         self.write32(bus, start_addr +% @as(u32, @intCast(i * 4)), val) catch {
                             self.enterException(.abt, 0x10, inst_pc +% 8, false);
                             return;
@@ -1721,7 +1773,8 @@ pub fn Arm1176(comptime Bus: type) type {
                     const sn: u5 = (vn << 1) | n_bit;
                     if (l) self.r[rt] = self.vfp.s[sn] else self.vfp.s[sn] = self.r[rt];
                 } else if (is_double and (opc1 == 0 or opc1 == 1)) {
-                    const s_idx: u5 = (vn << 1) | (opc1 & 1);
+                    const d_idx: u5 = (n_bit << 4) | vn;
+                    const s_idx: u6 = (@as(u6, d_idx) << 1) | @as(u6, opc1 & 1);
                     if (l) self.r[rt] = self.vfp.s[s_idx] else self.vfp.s[s_idx] = self.r[rt];
                 }
                 return;
