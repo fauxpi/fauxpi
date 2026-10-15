@@ -37,11 +37,17 @@ pub const Dwc2Controller = struct {
     pub const HPRT0_PRTSUSP: u32 = 1 << 7;
     pub const HPRT0_PRTRST: u32 = 1 << 8;
     pub const HPRT0_PRTPWR: u32 = 1 << 12;
+    pub const HPRT0_PRTSPD_HIGH: u32 = 0 << 17; // High speed (480 Mbps)
     pub const HPRT0_PRTSPD_FULL: u32 = 1 << 17; // Full speed (12 Mbps)
+    pub const HPRT0_PRTSPD_MASK: u32 = 3 << 17;
 
     // HCCHAR bits
     pub const HCCHAR_CHDIS: u32 = 1 << 30;
     pub const HCCHAR_CHEN: u32 = 1 << 31;
+
+    // HCSPLT bits
+    pub const HCSPLT_COMPSPLT: u32 = 1 << 16;
+    pub const HCSPLT_SPLTENA: u32 = 1 << 31;
 
     // HCINT bits
     pub const HCINT_XFERCOMP: u32 = 1 << 0;
@@ -81,11 +87,28 @@ pub const Dwc2Controller = struct {
     hfir: u32 = 60000,
     hfnum: u16 = 0,
     haintmsk: u32 = 0,
-    hprt0: u32 = HPRT0_PRTCONNSTS | HPRT0_PRTSPD_FULL,
+    hprt0: u32 = HPRT0_PRTCONNSTS | HPRT0_PRTSPD_HIGH,
     pcgcctl: u32 = 0,
 
     channels: [NUM_CHANNELS]HostChannel = [_]HostChannel{.{}} ** NUM_CHANNELS,
     hid: UsbHidComposite = .{},
+
+    pub fn syncRootPortConnection(self: *Dwc2Controller) void {
+        if (self.hid.isHubPresent()) {
+            if ((self.hprt0 & HPRT0_PRTCONNSTS) == 0) {
+                self.hprt0 = (self.hprt0 & ~HPRT0_PRTSPD_MASK) | HPRT0_PRTCONNSTS | HPRT0_PRTSPD_HIGH;
+                if ((self.hprt0 & HPRT0_PRTPWR) != 0) {
+                    self.hprt0 |= HPRT0_PRTCONNDET;
+                }
+            }
+        } else {
+            if ((self.hprt0 & HPRT0_PRTCONNSTS) != 0) {
+                self.hprt0 &= ~(HPRT0_PRTCONNSTS | HPRT0_PRTENA);
+                self.hprt0 |= HPRT0_PRTCONNDET | HPRT0_PRTENCHNG;
+                self.hid.reset();
+            }
+        }
+    }
 
     pub fn effectiveGintsts(self: *const Dwc2Controller) u32 {
         var sts = self.gintsts | GINTSTS_CURMODE_HOST | GINTSTS_NPTXFEMP | GINTSTS_PTXFEMP;
@@ -118,6 +141,7 @@ pub const Dwc2Controller = struct {
     }
 
     pub fn tickSof(self: *Dwc2Controller, ram: []u8) void {
+        self.syncRootPortConnection();
         self.hfnum +%= 1;
         if ((self.gintmsk & GINTSTS_SOF) != 0) {
             self.gintsts |= GINTSTS_SOF;
@@ -126,6 +150,7 @@ pub const Dwc2Controller = struct {
     }
 
     pub fn pollNetwork(self: *Dwc2Controller, ram: []u8) void {
+        self.syncRootPortConnection();
         if (self.hid.isEthernetLinkUp()) {
             self.hid.net.poll();
             if (self.hid.hasEthBulkIn()) {
@@ -141,8 +166,11 @@ pub const Dwc2Controller = struct {
                 const epnum: u4 = @truncate((ch.hcchar >> 11) & 0xf);
                 const epdir_in = ((ch.hcchar >> 15) & 1) != 0;
                 const eptype: u2 = @truncate((ch.hcchar >> 18) & 3);
-                if (eptype == 2 and epdir_in and epnum == 4) {
-                    if (!self.tryCompleteBulkIn(ch_idx, ram)) break;
+                const devaddr: u7 = @truncate((ch.hcchar >> 22) & 0x7f);
+                if (eptype == 2 and epdir_in and (epnum == 2 or epnum == 4)) {
+                    if (self.hid.resolveDevice(devaddr) == .eth) {
+                        if (!self.tryCompleteBulkIn(ch_idx, ram)) break;
+                    }
                 }
             }
         }
@@ -153,6 +181,7 @@ pub const Dwc2Controller = struct {
         const xfersize: u32 = ch.hctsiz & 0x7ffff;
         const pid: u2 = @truncate((ch.hctsiz >> 29) & 3);
         const dma_phys: u32 = ch.hcdma & 0x1FFFFFFF;
+        const mps: usize = @max(@as(usize, ch.hcchar & 0x7ff), 1);
 
         if (dma_phys + xfersize > ram.len) {
             ch.hcchar &= ~HCCHAR_CHEN;
@@ -163,7 +192,7 @@ pub const Dwc2Controller = struct {
         if (self.hid.popEthBulkIn(ram[dma_phys .. dma_phys + xfersize])) |copy_len| {
             ch.hcchar &= ~HCCHAR_CHEN;
             const rem: u32 = xfersize - @as(u32, @intCast(copy_len));
-            const pkt_transferred: usize = if (copy_len == 0) 1 else (copy_len + 63) / 64;
+            const pkt_transferred: usize = if (copy_len == 0) 1 else (copy_len + mps - 1) / mps;
             const next_pid: u32 = if ((pkt_transferred & 1) != 0)
                 (if (pid == 0) @as(u32, 2) else 0)
             else
@@ -178,6 +207,7 @@ pub const Dwc2Controller = struct {
     }
 
     pub fn read32(self: *Dwc2Controller, offset: u32) u32 {
+        self.syncRootPortConnection();
         if (offset >= 0x500 and offset < 0x500 + NUM_CHANNELS * 0x20) {
             const ch_idx = (offset - 0x500) / 0x20;
             const reg = (offset - 0x500) % 0x20;
@@ -228,6 +258,7 @@ pub const Dwc2Controller = struct {
     }
 
     pub fn write32(self: *Dwc2Controller, offset: u32, val: u32, ram: []u8) void {
+        self.syncRootPortConnection();
         if (offset >= 0x500 and offset < 0x500 + NUM_CHANNELS * 0x20) {
             const ch_idx = (offset - 0x500) / 0x20;
             const reg = (offset - 0x500) % 0x20;
@@ -285,18 +316,21 @@ pub const Dwc2Controller = struct {
                 const rw_mask: u32 = HPRT0_PRTRES | HPRT0_PRTSUSP | HPRT0_PRTRST | HPRT0_PRTPWR;
                 next = (next & ~rw_mask) | (val & rw_mask);
 
-                // Always keep device connected at Full Speed
-                next |= HPRT0_PRTCONNSTS | HPRT0_PRTSPD_FULL;
+                if (self.hid.isHubPresent()) {
+                    next = (next & ~HPRT0_PRTSPD_MASK) | HPRT0_PRTCONNSTS | HPRT0_PRTSPD_HIGH;
 
-                // Rising edge of PRTPWR -> trigger PRTCONNDET
-                if ((prev & HPRT0_PRTPWR) == 0 and (val & HPRT0_PRTPWR) != 0) {
-                    next |= HPRT0_PRTCONNDET;
-                }
+                    // Rising edge of PRTPWR -> trigger PRTCONNDET
+                    if ((prev & HPRT0_PRTPWR) == 0 and (val & HPRT0_PRTPWR) != 0) {
+                        next |= HPRT0_PRTCONNDET;
+                    }
 
-                // Falling edge of PRTRST (1 -> 0) -> port reset complete, enable port!
-                if ((prev & HPRT0_PRTRST) != 0 and (val & HPRT0_PRTRST) == 0) {
-                    self.hid.reset();
-                    next |= HPRT0_PRTENA | HPRT0_PRTENCHNG;
+                    // Falling edge of PRTRST (1 -> 0) -> port reset complete, enable port!
+                    if ((prev & HPRT0_PRTRST) != 0 and (val & HPRT0_PRTRST) == 0) {
+                        self.hid.reset();
+                        next |= HPRT0_PRTENA | HPRT0_PRTENCHNG;
+                    }
+                } else {
+                    next &= ~(HPRT0_PRTCONNSTS | HPRT0_PRTENA);
                 }
 
                 self.hprt0 = next;
@@ -319,16 +353,58 @@ pub const Dwc2Controller = struct {
         const epdir_in = ((ch.hcchar >> 15) & 1) != 0;
         const eptype: u2 = @truncate((ch.hcchar >> 18) & 3);
         const devaddr: u7 = @truncate((ch.hcchar >> 22) & 0x7f);
+        const mps: usize = @max(@as(usize, ch.hcchar & 0x7ff), 1);
 
         const xfersize: u32 = ch.hctsiz & 0x7ffff;
         const pid: u2 = @truncate((ch.hctsiz >> 29) & 3);
         const dma_phys: u32 = ch.hcdma & 0x1FFFFFFF;
 
-        // Check device address (respond to address 0 before SET_ADDRESS or matching address)
-        if (devaddr != self.hid.address and devaddr != 0) {
+        const target = self.hid.resolveDevice(devaddr) orelse {
             ch.hcchar &= ~HCCHAR_CHEN;
             ch.hcint |= HCINT_XACTERR | HCINT_CHHLTD;
             return;
+        };
+
+        // Handle High-Speed Hub Split Transactions (SSPLIT / CSPLIT) for Full/Low-Speed downstream devices
+        if ((ch.hcsplt & HCSPLT_SPLTENA) != 0) {
+            if ((ch.hcsplt & HCSPLT_COMPSPLT) == 0) {
+                // Start-Split (SSPLIT): consume SETUP/OUT payload now and halt with HCINT_ACK | HCINT_CHHLTD
+                ch.hcchar &= ~HCCHAR_CHEN;
+                if (epnum == 0 or eptype == 0) {
+                    if (pid == 3 and !epdir_in) {
+                        if (dma_phys + 8 <= ram.len) {
+                            var setup: [8]u8 = undefined;
+                            @memcpy(&setup, ram[dma_phys .. dma_phys + 8]);
+                            _ = self.hid.handleTargetSetup(target, setup);
+                            ch.hctsiz = (@as(u32, pid) << 29);
+                            ch.hcdma +%= xfersize;
+                            ch.hcdmab = ch.hcdma;
+                            ch.hcint |= HCINT_ACK | HCINT_CHHLTD;
+                        } else {
+                            ch.hcint |= HCINT_AHBERR | HCINT_CHHLTD;
+                        }
+                        return;
+                    } else if (!epdir_in) {
+                        ch.hctsiz = (@as(u32, pid) << 29);
+                        ch.hcdma +%= xfersize;
+                        ch.hcdmab = ch.hcdma;
+                    }
+                }
+                ch.hcint |= HCINT_ACK | HCINT_CHHLTD;
+                return;
+            } else {
+                // Complete-Split (CSPLIT): for SETUP stage, return the status of the SSPLIT setup
+                if ((epnum == 0 or eptype == 0) and pid == 3 and !epdir_in) {
+                    ch.hcchar &= ~HCCHAR_CHEN;
+                    if (self.hid.ctrl[@intFromEnum(target)].last_setup_ok) {
+                        ch.hctsiz = (@as(u32, pid) << 29);
+                        ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
+                    } else {
+                        ch.hcint |= HCINT_STALL | HCINT_CHHLTD;
+                    }
+                    return;
+                }
+            }
         }
 
         // Control endpoint 0
@@ -339,7 +415,7 @@ pub const Dwc2Controller = struct {
                 if (dma_phys + 8 <= ram.len) {
                     var setup: [8]u8 = undefined;
                     @memcpy(&setup, ram[dma_phys .. dma_phys + 8]);
-                    const ok = self.hid.handleSetup(setup);
+                    const ok = self.hid.handleTargetSetup(target, setup);
                     if (ok) {
                         ch.hctsiz = (@as(u32, pid) << 29); // xfersize=0, pktcnt=0
                         ch.hcdma +%= xfersize;
@@ -357,9 +433,9 @@ pub const Dwc2Controller = struct {
                     ch.hctsiz = (@as(u32, pid) << 29);
                     ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
                 } else if (dma_phys + xfersize <= ram.len) {
-                    const n = self.hid.readControlData(ram[dma_phys .. dma_phys + xfersize]);
+                    const n = self.hid.readTargetControlData(target, ram[dma_phys .. dma_phys + xfersize]);
                     const rem: u32 = xfersize - @as(u32, @intCast(n));
-                    const pkt_transferred: usize = if (n == 0) 1 else (n + 63) / 64;
+                    const pkt_transferred: usize = if (n == 0) 1 else (n + mps - 1) / mps;
                     const next_pid: u32 = if ((pkt_transferred & 1) != 0)
                         (if (pid == 0) @as(u32, 2) else 0)
                     else
@@ -381,8 +457,8 @@ pub const Dwc2Controller = struct {
             return;
         }
 
-        // Bulk endpoints (EP4 IN / OUT for CDC-ECM Ethernet)
-        if (eptype == 2 and epnum == 4) {
+        // Bulk endpoints (EP2 IN / OUT on CDC-ECM Ethernet device)
+        if (eptype == 2 and target == .eth and (epnum == 2 or epnum == 4)) {
             if (epdir_in) {
                 // In DWC2 DMA mode, Bulk IN channels stay enabled (HCCHAR_CHEN) until an RX frame arrives
                 // or the host driver aborts the channel with HCCHAR_CHDIS.
@@ -397,7 +473,7 @@ pub const Dwc2Controller = struct {
                     if (xfersize >= 14) {
                         self.hid.handleEthBulkOut(ram[dma_phys .. dma_phys + xfersize]);
                     }
-                    const pkt_transferred: u32 = if (xfersize == 0) 1 else (xfersize + 63) / 64;
+                    const pkt_transferred: usize = if (xfersize == 0) 1 else (@as(usize, xfersize) + mps - 1) / mps;
                     const next_pid: u32 = if ((pkt_transferred & 1) != 0)
                         (if (pid == 0) @as(u32, 2) else 0)
                     else
@@ -417,55 +493,88 @@ pub const Dwc2Controller = struct {
             }
         }
 
-        // Interrupt IN endpoints: EP1 (Keyboard), EP2 (Mouse), EP3 (CDC-ECM Status)
+        // Interrupt IN endpoints on each device:
+        // - Hub (.hub): EP1 IN (Status Change Bitmap)
+        // - Ethernet (.eth): EP1 IN (CDC-ECM Notifications)
+        // - Keyboard (.kbd): EP1 IN (8-byte Boot Keyboard Report)
+        // - Mouse (.mouse): EP1 IN (4-byte Boot Mouse Report)
         if (eptype == 3 and epdir_in) {
             ch.hcchar &= ~HCCHAR_CHEN;
-            if (epnum == 1) {
-                if (self.hid.popKbdReport()) |report| {
-                    const copy_len = @min(@as(usize, xfersize), 8);
-                    if (dma_phys + copy_len <= ram.len) {
-                        @memcpy(ram[dma_phys .. dma_phys + copy_len], report[0..copy_len]);
-                    }
-                    const rem: u32 = xfersize - @as(u32, @intCast(copy_len));
-                    const next_pid: u32 = if (pid == 0) 2 else 0;
-                    ch.hctsiz = (next_pid << 29) | rem;
-                    ch.hcdma +%= @intCast(copy_len);
-                    ch.hcdmab = ch.hcdma;
-                    ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
-                } else {
-                    ch.hcint |= HCINT_NAK | HCINT_CHHLTD;
-                }
-                return;
-            } else if (epnum == 2) {
-                if (self.hid.popMouseReport()) |report| {
-                    const copy_len = @min(@as(usize, xfersize), 4);
-                    if (dma_phys + copy_len <= ram.len) {
-                        @memcpy(ram[dma_phys .. dma_phys + copy_len], report[0..copy_len]);
-                    }
-                    const rem: u32 = xfersize - @as(u32, @intCast(copy_len));
-                    const next_pid: u32 = if (pid == 0) 2 else 0;
-                    ch.hctsiz = (next_pid << 29) | rem;
-                    ch.hcdma +%= @intCast(copy_len);
-                    ch.hcdmab = ch.hcdma;
-                    ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
-                } else {
-                    ch.hcint |= HCINT_NAK | HCINT_CHHLTD;
-                }
-                return;
-            } else if (epnum == 3) {
-                if (dma_phys + xfersize <= ram.len) {
-                    if (self.hid.popCdcNotification(ram[dma_phys .. dma_phys + xfersize])) |copy_len| {
-                        const rem: u32 = xfersize - @as(u32, @intCast(copy_len));
-                        const next_pid: u32 = if (pid == 0) 2 else 0;
-                        ch.hctsiz = (next_pid << 29) | rem;
-                        ch.hcdma +%= @intCast(copy_len);
-                        ch.hcdmab = ch.hcdma;
-                        ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
+            switch (target) {
+                .hub => {
+                    if (epnum == 1) {
+                        if (self.hid.popHubInterrupt()) |bitmap| {
+                            if (xfersize >= 1 and dma_phys + 1 <= ram.len) {
+                                ram[dma_phys] = bitmap;
+                            }
+                            const copy_len: u32 = @min(xfersize, 1);
+                            const rem: u32 = xfersize - copy_len;
+                            const next_pid: u32 = if (pid == 0) 2 else 0;
+                            ch.hctsiz = (next_pid << 29) | rem;
+                            ch.hcdma +%= copy_len;
+                            ch.hcdmab = ch.hcdma;
+                            ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
+                        } else {
+                            ch.hcint |= HCINT_NAK | HCINT_CHHLTD;
+                        }
                         return;
                     }
-                }
-                ch.hcint |= HCINT_NAK | HCINT_CHHLTD;
-                return;
+                },
+                .eth => {
+                    if (epnum == 1 or epnum == 3) {
+                        if (dma_phys + xfersize <= ram.len) {
+                            if (self.hid.popCdcNotification(ram[dma_phys .. dma_phys + xfersize])) |copy_len| {
+                                const rem: u32 = xfersize - @as(u32, @intCast(copy_len));
+                                const next_pid: u32 = if (pid == 0) 2 else 0;
+                                ch.hctsiz = (next_pid << 29) | rem;
+                                ch.hcdma +%= @intCast(copy_len);
+                                ch.hcdmab = ch.hcdma;
+                                ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
+                                return;
+                            }
+                        }
+                        ch.hcint |= HCINT_NAK | HCINT_CHHLTD;
+                        return;
+                    }
+                },
+                .kbd => {
+                    if (epnum == 1) {
+                        if (self.hid.popKbdReport()) |report| {
+                            const copy_len = @min(@as(usize, xfersize), 8);
+                            if (dma_phys + copy_len <= ram.len) {
+                                @memcpy(ram[dma_phys .. dma_phys + copy_len], report[0..copy_len]);
+                            }
+                            const rem: u32 = xfersize - @as(u32, @intCast(copy_len));
+                            const next_pid: u32 = if (pid == 0) 2 else 0;
+                            ch.hctsiz = (next_pid << 29) | rem;
+                            ch.hcdma +%= @intCast(copy_len);
+                            ch.hcdmab = ch.hcdma;
+                            ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
+                        } else {
+                            ch.hcint |= HCINT_NAK | HCINT_CHHLTD;
+                        }
+                        return;
+                    }
+                },
+                .mouse => {
+                    if (epnum == 1 or epnum == 2) {
+                        if (self.hid.popMouseReport()) |report| {
+                            const copy_len = @min(@as(usize, xfersize), 4);
+                            if (dma_phys + copy_len <= ram.len) {
+                                @memcpy(ram[dma_phys .. dma_phys + copy_len], report[0..copy_len]);
+                            }
+                            const rem: u32 = xfersize - @as(u32, @intCast(copy_len));
+                            const next_pid: u32 = if (pid == 0) 2 else 0;
+                            ch.hctsiz = (next_pid << 29) | rem;
+                            ch.hcdma +%= @intCast(copy_len);
+                            ch.hcdmab = ch.hcdma;
+                            ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
+                        } else {
+                            ch.hcint |= HCINT_NAK | HCINT_CHHLTD;
+                        }
+                        return;
+                    }
+                },
             }
         }
 
@@ -474,7 +583,61 @@ pub const Dwc2Controller = struct {
     }
 };
 
-test "DWC2 enumeration, USB HID keyboard report, and CDC-ECM Ethernet" {
+fn testSendSetup(dwc2: *Dwc2Controller, ram: []u8, devaddr: u7, setup: [8]u8, split: bool) !void {
+    @memcpy(ram[0x100..0x108], &setup);
+    dwc2.write32(0x508, 0x7ff, ram);
+    if (split) {
+        // SSPLIT SETUP
+        dwc2.write32(0x504, Dwc2Controller.HCSPLT_SPLTENA, ram);
+        dwc2.write32(0x510, (3 << 29) | (1 << 19) | 8, ram);
+        dwc2.write32(0x514, 0xc0000100, ram);
+        dwc2.write32(0x500, Dwc2Controller.HCCHAR_CHEN | (@as(u32, devaddr) << 22) | 64, ram);
+        try std.testing.expect((dwc2.read32(0x508) & Dwc2Controller.HCINT_ACK) != 0);
+        try std.testing.expect((dwc2.read32(0x508) & Dwc2Controller.HCINT_XFERCOMP) == 0);
+
+        // CSPLIT SETUP
+        dwc2.write32(0x508, 0x7ff, ram);
+        dwc2.write32(0x504, Dwc2Controller.HCSPLT_SPLTENA | Dwc2Controller.HCSPLT_COMPSPLT, ram);
+        dwc2.write32(0x510, (3 << 29) | (1 << 19) | 0, ram);
+        dwc2.write32(0x500, Dwc2Controller.HCCHAR_CHEN | (@as(u32, devaddr) << 22) | 64, ram);
+        try std.testing.expect((dwc2.read32(0x508) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+        dwc2.write32(0x504, 0, ram);
+    } else {
+        dwc2.write32(0x504, 0, ram);
+        dwc2.write32(0x510, (3 << 29) | (1 << 19) | 8, ram);
+        dwc2.write32(0x514, 0xc0000100, ram);
+        dwc2.write32(0x500, Dwc2Controller.HCCHAR_CHEN | (@as(u32, devaddr) << 22) | 64, ram);
+        try std.testing.expect((dwc2.read32(0x508) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+    }
+}
+
+fn testReadControlData(dwc2: *Dwc2Controller, ram: []u8, devaddr: u7, dest_off: u32, len: u32, split: bool) !void {
+    dwc2.write32(0x508, 0x7ff, ram);
+    if (split) {
+        // SSPLIT Control IN
+        dwc2.write32(0x504, Dwc2Controller.HCSPLT_SPLTENA, ram);
+        dwc2.write32(0x510, (2 << 29) | (1 << 19) | 0, ram);
+        dwc2.write32(0x500, Dwc2Controller.HCCHAR_CHEN | (@as(u32, devaddr) << 22) | (1 << 15) | 64, ram);
+        try std.testing.expect((dwc2.read32(0x508) & Dwc2Controller.HCINT_ACK) != 0);
+
+        // CSPLIT Control IN
+        dwc2.write32(0x508, 0x7ff, ram);
+        dwc2.write32(0x504, Dwc2Controller.HCSPLT_SPLTENA | Dwc2Controller.HCSPLT_COMPSPLT, ram);
+        dwc2.write32(0x510, (2 << 29) | (1 << 19) | len, ram);
+        dwc2.write32(0x514, 0xc0000000 | dest_off, ram);
+        dwc2.write32(0x500, Dwc2Controller.HCCHAR_CHEN | (@as(u32, devaddr) << 22) | (1 << 15) | 64, ram);
+        try std.testing.expect((dwc2.read32(0x508) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+        dwc2.write32(0x504, 0, ram);
+    } else {
+        dwc2.write32(0x504, 0, ram);
+        dwc2.write32(0x510, (2 << 29) | (1 << 19) | len, ram);
+        dwc2.write32(0x514, 0xc0000000 | dest_off, ram);
+        dwc2.write32(0x500, Dwc2Controller.HCCHAR_CHEN | (@as(u32, devaddr) << 22) | (1 << 15) | 64, ram);
+        try std.testing.expect((dwc2.read32(0x508) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+    }
+}
+
+test "DWC2 multi-device USB Hub, Ethernet, Keyboard, and Mouse enumeration and transfers" {
     var dwc2 = Dwc2Controller{};
     defer dwc2.hid.net.deinit();
     var ram: [4096]u8 = [_]u8{0} ** 4096;
@@ -482,62 +645,108 @@ test "DWC2 enumeration, USB HID keyboard report, and CDC-ECM Ethernet" {
     // Verify Synopsis ID
     try std.testing.expectEqual(@as(u32, 0x4f54280a), dwc2.read32(0x040));
 
-    // Power on port -> PRTCONNDET asserted
+    // Power on port -> PRTCONNDET asserted at High-Speed (bits 18:17 = 00)
     dwc2.write32(0x440, Dwc2Controller.HPRT0_PRTPWR, &ram);
     try std.testing.expect((dwc2.read32(0x440) & Dwc2Controller.HPRT0_PRTCONNDET) != 0);
+    try std.testing.expectEqual(@as(u32, Dwc2Controller.HPRT0_PRTSPD_HIGH), dwc2.read32(0x440) & Dwc2Controller.HPRT0_PRTSPD_MASK);
 
-    // Reset port (PRTRST = 1 then 0) -> PRTENA asserted
+    // Reset root port (PRTRST = 1 then 0) -> PRTENA asserted
     dwc2.write32(0x440, Dwc2Controller.HPRT0_PRTPWR | Dwc2Controller.HPRT0_PRTRST, &ram);
     dwc2.write32(0x440, Dwc2Controller.HPRT0_PRTPWR, &ram);
     try std.testing.expect((dwc2.read32(0x440) & Dwc2Controller.HPRT0_PRTENA) != 0);
 
-    // Issue GET_DESCRIPTOR(Device) SETUP on Channel 0
-    const setup = [8]u8{ 0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00 };
-    @memcpy(ram[0x100..0x108], &setup);
+    // 1. Enumerate USB Hub (1-1) at address 0 -> assign address 2
+    try testSendSetup(&dwc2, &ram, 0, .{ 0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00 }, false);
+    try testReadControlData(&dwc2, &ram, 0, 0x200, 18, false);
+    try std.testing.expectEqual(@as(u8, 0x09), ram[0x204]); // bDeviceClass = USB_CLASS_HUB
+    try testSendSetup(&dwc2, &ram, 0, .{ 0x00, 0x05, 2, 0x00, 0x00, 0x00, 0x00, 0x00 }, false); // SET_ADDRESS(2)
+    try testReadControlData(&dwc2, &ram, 0, 0x200, 0, false); // Status stage at address 0!
+    try testSendSetup(&dwc2, &ram, 2, .{ 0x00, 0x09, 1, 0x00, 0x00, 0x00, 0x00, 0x00 }, false); // SET_CONFIGURATION(1)
 
-    dwc2.write32(0x510, (3 << 29) | (1 << 19) | 8, &ram); // HCTSIZ0: PID=SETUP, pktcnt=1, xfersize=8
-    dwc2.write32(0x514, 0xc0000100, &ram); // HCDMA0
-    dwc2.write32(0x500, Dwc2Controller.HCCHAR_CHEN | 64, &ram); // HCCHAR0: CHEN, EP0 OUT
-    try std.testing.expect((dwc2.read32(0x508) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+    // Power on ports 1, 2, 3 on Hub (devaddr = 2)
+    for (1..4) |port1| {
+        try testSendSetup(&dwc2, &ram, 2, .{ 0x23, 0x03, 8, 0x00, @intCast(port1), 0x00, 0x00, 0x00 }, false); // SetPortFeature(PORT_POWER)
+    }
 
-    // Control IN data stage (18 bytes) into 0x200
-    dwc2.write32(0x508, 0x7ff, &ram); // clear HCINT0
-    dwc2.write32(0x510, (2 << 29) | (1 << 19) | 18, &ram); // PID=DATA1, xfersize=18
-    dwc2.write32(0x514, 0xc0000200, &ram);
-    dwc2.write32(0x500, Dwc2Controller.HCCHAR_CHEN | (1 << 15) | 64, &ram); // EP0 IN
-    try std.testing.expectEqualSlices(u8, &UsbHidComposite.DEVICE_DESC, ram[0x200 .. 0x200 + 18]);
+    // Hub EP1 IN Interrupt reports status change bitmap for Ports 1, 2, 3 (0b00001110 = 0x0e)
+    dwc2.write32(0x528, 0x7ff, &ram);
+    dwc2.write32(0x530, (0 << 29) | (1 << 19) | 1, &ram);
+    dwc2.write32(0x534, 0xc0000280, &ram);
+    dwc2.write32(0x520, Dwc2Controller.HCCHAR_CHEN | (2 << 22) | (3 << 18) | (1 << 15) | (1 << 11) | 1, &ram);
+    try std.testing.expect((dwc2.read32(0x528) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+    try std.testing.expectEqual(@as(u8, 0x0e), ram[0x280]);
 
-    // Inject 'A' key press (evdev keycode 30 -> HID usage 0x04) and poll EP1 IN on Channel 1
+    // 2. Reset Port 1 (Ethernet, High-Speed) -> enumerate at address 0 -> assign address 3
+    try testSendSetup(&dwc2, &ram, 2, .{ 0x23, 0x03, 4, 0x00, 1, 0x00, 0x00, 0x00 }, false); // SetPortFeature(PORT_RESET, port=1)
+    try testSendSetup(&dwc2, &ram, 0, .{ 0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00 }, false);
+    try testReadControlData(&dwc2, &ram, 0, 0x220, 18, false);
+    try std.testing.expectEqual(@as(u16, 0x0105), std.mem.readInt(u16, ram[0x220 + 10 ..][0..2], .little));
+    try testSendSetup(&dwc2, &ram, 0, .{ 0x00, 0x05, 3, 0x00, 0x00, 0x00, 0x00, 0x00 }, false); // SET_ADDRESS(3)
+
+    // 3. Reset Port 2 (Keyboard, Full-Speed via Split Transactions) -> enumerate at address 0 -> assign address 4
+    try testSendSetup(&dwc2, &ram, 2, .{ 0x23, 0x03, 4, 0x00, 2, 0x00, 0x00, 0x00 }, false); // SetPortFeature(PORT_RESET, port=2)
+    try testSendSetup(&dwc2, &ram, 0, .{ 0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00 }, true);
+    try testReadControlData(&dwc2, &ram, 0, 0x240, 18, true);
+    try std.testing.expectEqualSlices(u8, &UsbHidComposite.KBD_DEVICE_DESC, ram[0x240 .. 0x240 + 18]);
+    try testSendSetup(&dwc2, &ram, 0, .{ 0x00, 0x05, 4, 0x00, 0x00, 0x00, 0x00, 0x00 }, true); // SET_ADDRESS(4)
+
+    // 4. Reset Port 3 (Mouse, Full-Speed via Split Transactions) -> enumerate at address 0 -> assign address 5
+    try testSendSetup(&dwc2, &ram, 2, .{ 0x23, 0x03, 4, 0x00, 3, 0x00, 0x00, 0x00 }, false); // SetPortFeature(PORT_RESET, port=3)
+    try testSendSetup(&dwc2, &ram, 0, .{ 0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00 }, true);
+    try testReadControlData(&dwc2, &ram, 0, 0x260, 18, true);
+    try std.testing.expectEqualSlices(u8, &UsbHidComposite.MOUSE_DEVICE_DESC, ram[0x260 .. 0x260 + 18]);
+    try testSendSetup(&dwc2, &ram, 0, .{ 0x00, 0x05, 5, 0x00, 0x00, 0x00, 0x00, 0x00 }, true); // SET_ADDRESS(5)
+
+    // 5. Inject 'A' key press (evdev keycode 30 -> HID usage 0x04) and poll Keyboard (devaddr=4) EP1 IN on Channel 1
     dwc2.hid.handleEvdevKey(30, true);
+    dwc2.write32(0x528, 0x7ff, &ram);
     dwc2.write32(0x530, (0 << 29) | (1 << 19) | 8, &ram); // HCTSIZ1: xfersize=8
     dwc2.write32(0x534, 0xc0000300, &ram); // HCDMA1
-    dwc2.write32(0x520, Dwc2Controller.HCCHAR_CHEN | (3 << 18) | (1 << 15) | (1 << 11) | 8, &ram); // EP1 IN Interrupt
+    dwc2.write32(0x520, Dwc2Controller.HCCHAR_CHEN | (4 << 22) | (3 << 18) | (1 << 15) | (1 << 11) | 8, &ram); // devaddr=4, EP1 IN Interrupt
     try std.testing.expect((dwc2.read32(0x528) & Dwc2Controller.HCINT_XFERCOMP) != 0);
     try std.testing.expectEqual(@as(u8, 0x04), ram[0x302]);
 
-    // Poll CDC-ECM EP3 IN Interrupt on Channel 2 -> expect SPEED_CHANGE (16 bytes) then NETWORK_CONNECTION (8 bytes)
+    // 6. Inject mouse motion and poll Mouse (devaddr=5) EP1 IN on Channel 1 (using SSPLIT + CSPLIT)
+    dwc2.hid.handleMouseMotion(15, -10, 0);
+    dwc2.write32(0x528, 0x7ff, &ram);
+    dwc2.write32(0x524, Dwc2Controller.HCSPLT_SPLTENA, &ram);
+    dwc2.write32(0x530, (0 << 29) | (1 << 19) | 0, &ram);
+    dwc2.write32(0x520, Dwc2Controller.HCCHAR_CHEN | (5 << 22) | (3 << 18) | (1 << 15) | (1 << 11) | 4, &ram);
+    try std.testing.expect((dwc2.read32(0x528) & Dwc2Controller.HCINT_ACK) != 0);
+
+    dwc2.write32(0x528, 0x7ff, &ram);
+    dwc2.write32(0x524, Dwc2Controller.HCSPLT_SPLTENA | Dwc2Controller.HCSPLT_COMPSPLT, &ram);
+    dwc2.write32(0x530, (0 << 29) | (1 << 19) | 4, &ram);
+    dwc2.write32(0x534, 0xc0000320, &ram);
+    dwc2.write32(0x520, Dwc2Controller.HCCHAR_CHEN | (5 << 22) | (3 << 18) | (1 << 15) | (1 << 11) | 4, &ram);
+    try std.testing.expect((dwc2.read32(0x528) & Dwc2Controller.HCINT_XFERCOMP) != 0);
+    try std.testing.expectEqual(@as(i8, 15), @as(i8, @bitCast(ram[0x321])));
+    try std.testing.expectEqual(@as(i8, -10), @as(i8, @bitCast(ram[0x322])));
+    dwc2.write32(0x524, 0, &ram);
+
+    // 7. Poll CDC-ECM Ethernet (devaddr=3) EP1 IN Interrupt on Channel 2 -> expect SPEED_CHANGE then NETWORK_CONNECTION
     dwc2.write32(0x550, (0 << 29) | (1 << 19) | 16, &ram);
     dwc2.write32(0x554, 0xc0000400, &ram);
-    dwc2.write32(0x540, Dwc2Controller.HCCHAR_CHEN | (3 << 18) | (1 << 15) | (3 << 11) | 16, &ram);
+    dwc2.write32(0x540, Dwc2Controller.HCCHAR_CHEN | (3 << 22) | (3 << 18) | (1 << 15) | (1 << 11) | 16, &ram);
     try std.testing.expect((dwc2.read32(0x548) & Dwc2Controller.HCINT_XFERCOMP) != 0);
     try std.testing.expectEqual(@as(u8, 0x2a), ram[0x401]); // USB_CDC_NOTIFY_SPEED_CHANGE
 
     dwc2.write32(0x548, 0x7ff, &ram);
     dwc2.write32(0x550, (2 << 29) | (1 << 19) | 16, &ram);
     dwc2.write32(0x554, 0xc0000420, &ram);
-    dwc2.write32(0x540, Dwc2Controller.HCCHAR_CHEN | (3 << 18) | (1 << 15) | (3 << 11) | 16, &ram);
+    dwc2.write32(0x540, Dwc2Controller.HCCHAR_CHEN | (3 << 22) | (3 << 18) | (1 << 15) | (1 << 11) | 16, &ram);
     try std.testing.expect((dwc2.read32(0x548) & Dwc2Controller.HCINT_XFERCOMP) != 0);
     try std.testing.expectEqual(@as(u8, 0x00), ram[0x421]); // USB_CDC_NOTIFY_NETWORK_CONNECTION
     try std.testing.expectEqual(@as(u8, 0x01), ram[0x422]); // Connected = 1
 
-    // Arm Bulk IN (EP4 IN) on Channel 3 before any RX frame exists -> stays enabled (HCCHAR_CHEN set)
-    dwc2.write32(0x570, (0 << 29) | (24 << 19) | 1536, &ram);
+    // 8. Arm Bulk IN (devaddr=3, EP2 IN) on Channel 3 before any RX frame exists -> stays enabled (HCCHAR_CHEN set)
+    dwc2.write32(0x570, (0 << 29) | (3 << 19) | 1536, &ram);
     dwc2.write32(0x574, 0xc0000800, &ram);
-    dwc2.write32(0x560, Dwc2Controller.HCCHAR_CHEN | (2 << 18) | (1 << 15) | (4 << 11) | 64, &ram);
+    dwc2.write32(0x560, Dwc2Controller.HCCHAR_CHEN | (3 << 22) | (2 << 18) | (1 << 15) | (2 << 11) | 512, &ram);
     try std.testing.expect((dwc2.read32(0x560) & Dwc2Controller.HCCHAR_CHEN) != 0);
     try std.testing.expectEqual(@as(u32, 0), dwc2.read32(0x568));
 
-    // Transmit ARP Request on Bulk OUT (EP4 OUT) on Channel 4 -> automatically completes waiting Channel 3 Bulk IN!
+    // Transmit ARP Request on Bulk OUT (devaddr=3, EP2 OUT) on Channel 4 -> automatically completes waiting Channel 3 Bulk IN!
     var arp_req = ram[0x500 .. 0x500 + 42];
     @memset(arp_req[0..6], 0xff);
     @memcpy(arp_req[6..12], &[_]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 });
@@ -553,7 +762,7 @@ test "DWC2 enumeration, USB HID keyboard report, and CDC-ECM Ethernet" {
 
     dwc2.write32(0x590, (0 << 29) | (1 << 19) | 42, &ram);
     dwc2.write32(0x594, 0xc0000500, &ram);
-    dwc2.write32(0x580, Dwc2Controller.HCCHAR_CHEN | (2 << 18) | (0 << 15) | (4 << 11) | 64, &ram);
+    dwc2.write32(0x580, Dwc2Controller.HCCHAR_CHEN | (3 << 22) | (2 << 18) | (0 << 15) | (2 << 11) | 512, &ram);
     try std.testing.expect((dwc2.read32(0x588) & Dwc2Controller.HCINT_XFERCOMP) != 0);
 
     // Verify Channel 3 Bulk IN completed with the 42-byte ARP Reply

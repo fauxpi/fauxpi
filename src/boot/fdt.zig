@@ -9,6 +9,7 @@
 //! - Sets `/soc/usb@7e980000` `compatible = "brcm,bcm2835-usb"` so mainline `dwc2` binds.
 
 const std = @import("std");
+const HubKind = @import("../usb/hid.zig").HubKind;
 
 pub const fdt_magic: u32 = 0xd00dfeed;
 pub const fdt_version: u32 = 17;
@@ -257,6 +258,19 @@ pub const Tree = struct {
         try self.root.setStringProp(self.allocator, "model", model_str);
         const sys_node = try self.findOrCreateNode("/system");
         try sys_node.setU32Prop(self.allocator, "linux,revision", revision);
+        try self.setBuiltInUsbHub(HubKind.fromModel(model_str));
+    }
+
+    pub fn setBuiltInUsbHub(self: *Tree, hub_kind: HubKind) !void {
+        const usb = self.findNode("usb") orelse self.findNode("/soc/usb@7e980000") orelse return;
+        usb.children.clearRetainingCapacity();
+        if (hub_kind.dtHubCompatible()) |compat| {
+            try usb.setU32Prop(self.allocator, "#address-cells", 1);
+            try usb.setU32Prop(self.allocator, "#size-cells", 0);
+            const hub_node = try usb.findOrCreateChild(self.allocator, "usb1@1");
+            try hub_node.setStringProp(self.allocator, "compatible", compat);
+            try hub_node.setU32Prop(self.allocator, "reg", 1);
+        }
     }
 
     pub fn setWirelessMac(self: *Tree, wifi_mac: [6]u8) !void {
@@ -300,6 +314,9 @@ pub const Tree = struct {
         if (self.findNode("usb") orelse self.findNode("/soc/usb@7e980000")) |usb| {
             try usb.setStringProp(self.allocator, "compatible", "brcm,bcm2835-usb");
             try usb.setStringProp(self.allocator, "status", "okay");
+        }
+        if (self.root.getStringProp("model")) |m| {
+            try self.setBuiltInUsbHub(HubKind.fromModel(m));
         }
 
         // 4. Enable vc4-kms-v3d nodes (equivalent to dtoverlay=vc4-kms-v3d)
@@ -458,7 +475,7 @@ test "FDT roundtrip and Pi Zero patching" {
     try tree.patchForPiZero(512 * 1024 * 1024, "console=ttyAMA0,115200", .{ .start = 0x02000000, .end = 0x02500000 }, true);
 
     const blob = try tree.serialize(alloc);
-    const parsed = try Tree.parse(alloc, blob);
+    var parsed = try Tree.parse(alloc, blob);
 
     const chosen = parsed.findNode("/chosen").?;
     try std.testing.expectEqualStrings("console=ttyAMA0,115200", chosen.getStringProp("bootargs").?);
@@ -469,4 +486,13 @@ test "FDT roundtrip and Pi Zero patching" {
 
     const hvs_parsed = parsed.findNode("/soc/hvs@7e400000").?;
     try std.testing.expectEqualStrings("okay", hvs_parsed.getStringProp("status").?);
+
+    // Built-in USB hub node usb1@1 is populated for boards with built-in hubs (e.g. Pi 3 Model B -> usb424,9514)
+    try parsed.setBoardModel("Raspberry Pi 3 Model B Rev 1.2", 0x00a02082);
+    const hub_node = parsed.findNode("/soc/usb@7e980000/usb1@1").?;
+    try std.testing.expectEqualStrings("usb424,9514", hub_node.getStringProp("compatible").?);
+
+    // And removed for boards with an external hub (e.g. Pi Zero)
+    try parsed.setBoardModel("Raspberry Pi Zero Rev 1.3", 0x00900093);
+    try std.testing.expect(parsed.findNode("/soc/usb@7e980000/usb1@1") == null);
 }

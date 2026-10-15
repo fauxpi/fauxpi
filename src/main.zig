@@ -221,6 +221,7 @@ fn loadGuestBoot(
     soc.mailbox.board_revision = board_model.boardRevision();
     soc.mailbox.board_serial = board_serial;
     soc.mailbox.mac_address = if (board_model.hasWireless()) wifi_mac_address else mac_address;
+    soc.usb.hid.setHubKind(hid.HubKind.fromModel(board_model.dtModel()));
     soc.usb.hid.net.guest_mac = mac_address;
 
     const boot_res = if (sd_qcow2) |disk| blk: {
@@ -265,6 +266,7 @@ fn loadGuestBoot(
 fn syncWindowPeripheralsToSoc(w: *const window.WaylandWindow, soc: *Bcm2835) void {
     soc.setHdmiConnected(w.status.hdmi_connected);
     soc.setAudioConnected(w.status.audio_connected);
+    soc.usb.hid.setHubKind(hid.HubKind.fromModel(w.status.model));
     soc.usb.hid.hub_connected = w.status.usb_hub_connected;
     soc.usb.hid.keyboard_connected = w.status.usb_keyboard_connected;
     soc.usb.hid.mouse_connected = w.status.usb_mouse_connected;

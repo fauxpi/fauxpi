@@ -596,7 +596,10 @@ pub const WaylandWindow = struct {
         self.ui.title = bm.windowTitle();
         if (!bm.usesExternalUsbHub()) {
             self.status.usb_hub_connected = true;
-            if (self.hid) |h| h.hub_connected = true;
+        }
+        if (self.hid) |h| {
+            h.setHubKind(@import("../usb/hid.zig").HubKind.fromModel(self.status.model));
+            h.hub_connected = self.status.usb_hub_connected;
         }
         var m = self.toplevel.request(protocol.xdg_toplevel.request.set_title) catch return;
         m.string(self.ui.title).end();
