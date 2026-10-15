@@ -12,10 +12,12 @@ const std = @import("std");
 const mmu_mod = @import("mmu.zig");
 const vfp_mod = @import("vfp.zig");
 const dec = @import("decoder.zig");
+const aarch64_mod = @import("aarch64.zig");
 
 pub const Mmu = mmu_mod.Mmu;
 pub const Vfp = vfp_mod.Vfp;
 pub const PsrFlags = dec.PsrFlags;
+pub const PstateFlags = aarch64_mod.PstateFlags;
 
 pub const Mode = enum(u5) {
     usr = 0b10000,
@@ -39,6 +41,21 @@ pub fn Arm1176(comptime Bus: type) type {
         r: [16]u32 = @splat(0),
         /// Current Program Status Register
         cpsr: u32 = PsrFlags.I | PsrFlags.F | @intFromEnum(Mode.svc),
+
+        /// True when executing in 64-bit ARMv8 AArch64 (A64) state (`EL3` / `EL2` / `EL1` / `EL0`)
+        is_aarch64: bool = false,
+        /// AArch64 64-bit general-purpose registers `X0..X30` (`X30` = LR; `XZR`/`WZR` is reg 31)
+        x: [31]u64 = @splat(0),
+        /// AArch64 Stack Pointers `SP_EL0`, `SP_EL1`, `SP_EL2`, `SP_EL3`
+        sp_el: [4]u64 = @splat(0),
+        /// AArch64 64-bit Program Counter
+        pc64: u64 = 0,
+        /// AArch64 Processor State (`NZCV`, `DAIF`, `EL`, `SPSel`)
+        pstate: u32 = PstateFlags.D | PstateFlags.A | PstateFlags.I | PstateFlags.F | PstateFlags.M_EL2h,
+        /// AArch64 Exception Link Registers (`ELR_EL1..ELR_EL3`)
+        elr_el: [4]u64 = @splat(0),
+        /// AArch64 Saved Program Status Registers (`SPSR_EL1..SPSR_EL3`)
+        spsr_el: [4]u32 = @splat(0),
 
         /// Banked R8..R12 forUsr/Sys vs FIQ
         usr_r8_12: [5]u32 = @splat(0),
@@ -75,11 +92,18 @@ pub fn Arm1176(comptime Bus: type) type {
         dtlb_r_pbase: u32 = 0,
         dtlb_w_vbase: u32 = 0xffff_ffff,
         dtlb_w_pbase: u32 = 0,
+        /// 64-bit virtual page bases for AArch64 inline TLBs (`0xffff_ffff_ffff_ffff` when invalid)
+        itlb64_vbase: u64 = 0xffff_ffff_ffff_ffff,
+        dtlb64_r_vbase: u64 = 0xffff_ffff_ffff_ffff,
+        dtlb64_w_vbase: u64 = 0xffff_ffff_ffff_ffff,
 
         pub inline fn invalidateInlineTlb(self: *Self) void {
             self.itlb_vbase = 0xffff_ffff;
             self.dtlb_r_vbase = 0xffff_ffff;
             self.dtlb_w_vbase = 0xffff_ffff;
+            self.itlb64_vbase = 0xffff_ffff_ffff_ffff;
+            self.dtlb64_r_vbase = 0xffff_ffff_ffff_ffff;
+            self.dtlb64_w_vbase = 0xffff_ffff_ffff_ffff;
         }
 
         pub fn initReset(self: *Self, entry_pc: u32, r0: u32, r1: u32, r2: u32) void {
@@ -91,6 +115,18 @@ pub fn Arm1176(comptime Bus: type) type {
             self.cpsr = PsrFlags.I | PsrFlags.F | @intFromEnum(Mode.svc);
         }
 
+        pub fn initReset64(self: *Self, entry_pc: u64, x0_dtb: u64) void {
+            self.* = .{};
+            self.is_aarch64 = true;
+            self.mmu.is_cortex_a53 = true;
+            self.vfp.is_vfpv4 = true;
+            self.x[0] = x0_dtb;
+            self.pc64 = entry_pc;
+            self.r[15] = @truncate(entry_pc);
+            self.pstate = PstateFlags.D | PstateFlags.A | PstateFlags.I | PstateFlags.F | PstateFlags.M_EL2h;
+            self.cpsr = self.pstate;
+        }
+
         pub fn initSecondaryCore(self: *Self, core_id: u2) void {
             self.* = .{};
             self.mmu.core_id = core_id;
@@ -98,6 +134,17 @@ pub fn Arm1176(comptime Bus: type) type {
             self.vfp.is_vfpv4 = true;
             self.halted_spin = true;
             self.cpsr = PsrFlags.I | PsrFlags.F | @intFromEnum(Mode.svc);
+        }
+
+        pub fn initSecondaryCore64(self: *Self, core_id: u2) void {
+            self.* = .{};
+            self.is_aarch64 = true;
+            self.mmu.core_id = core_id;
+            self.mmu.is_cortex_a53 = true;
+            self.vfp.is_vfpv4 = true;
+            self.halted_spin = true;
+            self.pstate = PstateFlags.D | PstateFlags.A | PstateFlags.I | PstateFlags.F | PstateFlags.M_EL2h;
+            self.cpsr = self.pstate;
         }
 
         pub inline fn mode(self: *const Self) Mode {
@@ -420,6 +467,22 @@ pub fn Arm1176(comptime Bus: type) type {
         /// enters `WFI` or an interrupt becomes pending.
         pub fn runSteps(self: *Self, bus: *Bus, max_steps: usize) usize {
             if (self.halted_spin) return 0;
+            if (self.is_aarch64) {
+                const A64 = aarch64_mod.Aarch64Exec(Self, Bus);
+                _ = A64.checkInterrupts64(self, bus);
+                if (self.mmu.halted_wfi) return 0;
+
+                self.yield_slice = false;
+                defer self.excl_valid = false;
+
+                var executed: usize = 0;
+                while (executed < max_steps) {
+                    A64.step64(self, bus);
+                    executed += 1;
+                    if (self.mmu.halted_wfi or self.yield_slice) break;
+                }
+                return executed;
+            }
             _ = self.checkInterrupts(bus);
             if (self.mmu.halted_wfi) return 0;
 
@@ -438,6 +501,10 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         pub inline fn stepOne(self: *Self, bus: *Bus) void {
+            if (self.is_aarch64) {
+                aarch64_mod.Aarch64Exec(Self, Bus).step64(self, bus);
+                return;
+            }
             if (self.isThumb()) {
                 const pc = self.r[15] & ~@as(u32, 1);
                 const inst16 = self.fetch16(bus, pc) catch {
@@ -2335,4 +2402,5 @@ test "ARM1176 data processing, load/store, banked modes, and exceptions" {
     try std.testing.expectEqual(@as(u32, 100), cpu.r[1]);
     try std.testing.expectEqual(@as(u32, 100), cpu.r[3]);
     try std.testing.expectEqual(@as(u32, 0x64000000), cpu.r[4]);
+    _ = aarch64_mod;
 }

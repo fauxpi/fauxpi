@@ -95,6 +95,39 @@ pub const Mmu = struct {
     pmccntr: u32 = 0,
     cpuectlr_64: u64 = 0,
 
+    /// AArch64 (VMSAv8-64) EL1/EL2/EL3 System Registers
+    sctlr_el1: u64 = 0x30d00800,
+    sctlr_el2: u64 = 0x30c50830,
+    sctlr_el3: u64 = 0x30c50830,
+    tcr_el1: u64 = 0,
+    tcr_el2: u64 = 0,
+    ttbr0_el2: u64 = 0,
+    mair_el1: u64 = 0,
+    mair_el2: u64 = 0,
+    amair_el1: u64 = 0,
+    vbar_el1: u64 = 0,
+    vbar_el2: u64 = 0,
+    vbar_el3: u64 = 0,
+    esr_el1: u32 = 0,
+    esr_el2: u32 = 0,
+    far_el1: u64 = 0,
+    far_el2: u64 = 0,
+    hcr_el2: u64 = 1 << 31, // RW=1 (EL1 is AArch64)
+    scr_el3: u64 = (1 << 10) | (1 << 8) | (1 << 0), // RW=1, HCE=1, NS=1
+    cptr_el2: u64 = 0,
+    cptr_el3: u64 = 0,
+    cpacr_el1: u64 = 3 << 20, // FPEN=0b11
+    tpidr_el0: u64 = 0,
+    tpidrro_el0: u64 = 0,
+    tpidr_el1: u64 = 0,
+    tpidr_el2: u64 = 0,
+    vpidr_el2: u32 = 0x410fd034,
+    vmpidr_el2: u64 = 0x80000000,
+    cnthctl_el2: u32 = 3,
+    mdcr_el2: u32 = 0,
+    oslar_el1: u32 = 0,
+    pmuserenr_el0: u32 = 0,
+
     /// Set to true when the guest executes WFI (`mcr p15, 0, rX, c7, c0, 4` or `wfi`)
     halted_wfi: bool = false,
 
@@ -116,7 +149,7 @@ pub const Mmu = struct {
 
     pub const TlbEntry = struct {
         gen: u32 = 0,
-        vpn: u20 = 0,
+        vpn: u52 = 0,
         perms: u8 = 0,
         domain: u4 = 0,
         is_page: bool = false,
@@ -149,8 +182,16 @@ pub const Mmu = struct {
     }
 
     pub fn flushTlbMva(self: *Mmu, mva: u32) void {
-        const vpn: u20 = @truncate(mva >> 12);
-        const idx = vpn & tlb_mask;
+        const vpn: u52 = @truncate(mva >> 12);
+        const idx: usize = @as(usize, @truncate(vpn)) & tlb_mask;
+        if (self.tlb[idx].gen == self.tlb_gen and self.tlb[idx].vpn == vpn) {
+            self.tlb[idx].gen = 0;
+        }
+    }
+
+    pub fn flushTlbVa64(self: *Mmu, va_page_shifted: u64) void {
+        const vpn: u52 = @truncate(va_page_shifted & 0x000f_ffff_ffff_ffff);
+        const idx: usize = @as(usize, @truncate(vpn)) & tlb_mask;
         if (self.tlb[idx].gen == self.tlb_gen and self.tlb[idx].vpn == vpn) {
             self.tlb[idx].gen = 0;
         }
@@ -224,8 +265,8 @@ pub const Mmu = struct {
             return vaddr;
         }
 
-        const vpn: u20 = @truncate(vaddr >> 12);
-        const idx = vpn & tlb_mask;
+        const vpn: u52 = @truncate(vaddr >> 12);
+        const idx: usize = @as(usize, @truncate(vpn)) & tlb_mask;
         const entry = &self.tlb[idx];
 
         const req_perm: u8 = switch (access) {
@@ -250,6 +291,40 @@ pub const Mmu = struct {
         }
 
         return self.walkAndFillTlb(ram, vaddr, access, is_priv, req_perm);
+    }
+
+    /// Translates 64-bit virtual address `vaddr` using VMSAv8-64 4-level/3-level page tables.
+    /// On fault, updates `FAR_EL1` and `ESR_EL1` and returns `error.Abort`.
+    pub fn translate64(
+        self: *Mmu,
+        ram: []const u8,
+        vaddr: u64,
+        access: AccessKind,
+        is_priv: bool,
+    ) error{Abort}!u32 {
+        if (!self.isMmuEnabled()) {
+            return @truncate(vaddr);
+        }
+
+        const vpn: u52 = @truncate((vaddr & 0x00ff_ffff_ffff_ffff) >> 12);
+        const idx: usize = @as(usize, @truncate(vpn)) & tlb_mask;
+        const entry = &self.tlb[idx];
+
+        const req_perm: u8 = switch (access) {
+            .read => if (is_priv) perm_priv_r else perm_user_r,
+            .write => if (is_priv) perm_priv_w else perm_user_w,
+            .fetch => if (is_priv) perm_priv_x else perm_user_x,
+        };
+
+        if (entry.gen == self.tlb_gen and entry.vpn == vpn) {
+            if ((entry.perms & req_perm) != 0) {
+                return entry.ppn_base | @as(u32, @truncate(vaddr & 0xfff));
+            }
+            self.recordFault64(vaddr, access, is_priv, 0b001100 | @as(u6, entry.level));
+            return error.Abort;
+        }
+
+        return self.walkAndFillTlb64(ram, vaddr, vpn, access, is_priv, req_perm);
     }
 
     noinline fn walkAndFillTlb(
@@ -379,8 +454,8 @@ pub const Mmu = struct {
         }
 
         // Fill software TLB entry
-        const vpn: u20 = @truncate(vaddr >> 12);
-        self.tlb[vpn & tlb_mask] = .{
+        const vpn: u52 = @truncate(vaddr >> 12);
+        self.tlb[@as(usize, @truncate(vpn)) & tlb_mask] = .{
             .gen = self.tlb_gen,
             .vpn = vpn,
             .ppn_base = phys_page_base,
@@ -566,8 +641,8 @@ pub const Mmu = struct {
             perms |= perm_user_x;
         }
 
-        const vpn: u20 = @truncate(vaddr >> 12);
-        self.tlb[vpn & tlb_mask] = .{
+        const vpn: u52 = @truncate(vaddr >> 12);
+        self.tlb[@as(usize, @truncate(vpn)) & tlb_mask] = .{
             .gen = self.tlb_gen,
             .vpn = vpn,
             .ppn_base = phys_page_base,
@@ -583,6 +658,162 @@ pub const Mmu = struct {
         }
 
         return phys_page_base | (vaddr & 0xfff);
+    }
+
+    noinline fn walkAndFillTlb64(
+        self: *Mmu,
+        ram: []const u8,
+        vaddr: u64,
+        vpn: u52,
+        access: AccessKind,
+        is_priv: bool,
+        req_perm: u8,
+    ) error{Abort}!u32 {
+        const use_ttbr1 = ((vaddr >> 55) & 1) != 0;
+        const tnsz_raw: u6 = if (use_ttbr1) @truncate(self.tcr_el1 >> 16) else @truncate(self.tcr_el1);
+        const epd: u1 = if (use_ttbr1) @truncate(self.tcr_el1 >> 23) else @truncate(self.tcr_el1 >> 7);
+        if (epd != 0 or tnsz_raw < 16 or tnsz_raw > 39) {
+            self.recordFault64(vaddr, access, is_priv, 0b000100);
+            return error.Abort;
+        }
+
+        // Canonical address check (ignoring top byte [63:56] when TBI or bit 55 sign-extended)
+        const va_bits: u6 = @intCast(@as(u7, 64) - @as(u7, tnsz_raw));
+        const clean_va: u64 = if (use_ttbr1) (vaddr | 0xff00_0000_0000_0000) else (vaddr & 0x00ff_ffff_ffff_ffff);
+        const top_shifted = clean_va >> va_bits;
+        const expected_top: u64 = if (use_ttbr1) ((@as(u64, 1) << tnsz_raw) - 1) else 0;
+        if (top_shifted != expected_top) {
+            self.recordFault64(vaddr, access, is_priv, 0b000100);
+            return error.Abort;
+        }
+
+        const ttbr: u64 = if (use_ttbr1) self.ttbr1_64 else self.ttbr0_64;
+        var table_base: u32 = @as(u32, @truncate(ttbr)) & 0xffff_f000;
+        const start_level: u2 = if (tnsz_raw <= 24) 0 else if (tnsz_raw <= 33) 1 else 2;
+
+        var ap_table: u2 = 0;
+        var pxn_table: bool = false;
+        var xn_table: bool = false;
+        var leaf_level: u2 = 3;
+        var leaf_desc: u64 = 0;
+        var phys_page_base: u32 = 0;
+
+        var level: u2 = start_level;
+        while (true) {
+            const shift: u6 = switch (level) {
+                0 => 39,
+                1 => 30,
+                2 => 21,
+                3 => 12,
+            };
+            const idx_mask: u64 = if (level == start_level) blk: {
+                const idx_bits: u6 = va_bits - shift;
+                break :blk if (idx_bits >= 9) 0x1ff else ((@as(u64, 1) << idx_bits) - 1);
+            } else 0x1ff;
+            const idx: u32 = @truncate((clean_va >> shift) & idx_mask);
+            const desc_addr: u32 = (table_base + idx * 8) & 0x1fff_ffff;
+            if (desc_addr + 8 > ram.len) {
+                self.recordFault64(vaddr, access, is_priv, 0b000100 | @as(u6, level));
+                return error.Abort;
+            }
+            const desc = std.mem.readInt(u64, ram[desc_addr..][0..8], .little);
+            const dtype: u2 = @truncate(desc);
+
+            if (dtype == 0b00 or dtype == 0b10) {
+                self.recordFault64(vaddr, access, is_priv, 0b000100 | @as(u6, level));
+                return error.Abort;
+            }
+
+            if (level == 3) {
+                // At level 3, 0b11 is a 4 KB Page Descriptor
+                leaf_level = 3;
+                leaf_desc = desc;
+                phys_page_base = @as(u32, @truncate(desc)) & 0xffff_f000;
+                break;
+            }
+
+            if (dtype == 0b01) {
+                if (level == 0) {
+                    // Block descriptors are not permitted at level 0 with 4 KB granule
+                    self.recordFault64(vaddr, access, is_priv, 0b000100);
+                    return error.Abort;
+                }
+                leaf_level = level;
+                leaf_desc = desc;
+                if (level == 1) {
+                    phys_page_base = (@as(u32, @truncate(desc)) & 0xc000_0000) | (@as(u32, @truncate(clean_va)) & 0x3fff_f000);
+                } else {
+                    phys_page_base = (@as(u32, @truncate(desc)) & 0xffe0_0000) | (@as(u32, @truncate(clean_va)) & 0x001f_f000);
+                }
+                break;
+            }
+
+            // Table descriptor (0b11 at level 0, 1, or 2)
+            ap_table |= @truncate(desc >> 61);
+            if ((desc & (@as(u64, 1) << 59)) != 0) pxn_table = true;
+            if ((desc & (@as(u64, 1) << 60)) != 0) xn_table = true;
+            table_base = @as(u32, @truncate(desc)) & 0xffff_f000;
+            level += 1;
+        }
+
+        // Check Access Flag (AF = bit 10)
+        if ((leaf_desc & (1 << 10)) == 0) {
+            self.recordFault64(vaddr, access, is_priv, 0b001000 | @as(u6, leaf_level));
+            return error.Abort;
+        }
+
+        const ap21: u2 = @truncate(leaf_desc >> 6);
+        var perms: u8 = switch (ap21) {
+            0b00 => perm_priv_r | perm_priv_w,
+            0b01 => perm_priv_r | perm_priv_w | perm_user_r | perm_user_w,
+            0b10 => perm_priv_r,
+            0b11 => perm_priv_r | perm_user_r,
+        };
+        if ((ap_table & 0b01) != 0) {
+            perms &= ~(perm_user_r | perm_user_w | perm_user_x);
+        }
+        if ((ap_table & 0b10) != 0) {
+            perms &= ~(perm_priv_w | perm_user_w);
+        }
+
+        const pxn = pxn_table or ((leaf_desc & (@as(u64, 1) << 53)) != 0);
+        const uxn = xn_table or ((leaf_desc & (@as(u64, 1) << 54)) != 0);
+        const wxn = (self.sctlr_el1 & (1 << 19)) != 0 and ((perms & (perm_priv_w | perm_user_w)) != 0);
+
+        if (!pxn and !wxn and ((perms & perm_user_w) == 0) and (perms & perm_priv_r) != 0) {
+            perms |= perm_priv_x;
+        }
+        if (!uxn and !wxn and (perms & perm_user_r) != 0) {
+            perms |= perm_user_x;
+        }
+
+        self.tlb[@as(usize, @truncate(vpn)) & tlb_mask] = .{
+            .gen = self.tlb_gen,
+            .vpn = vpn,
+            .ppn_base = phys_page_base,
+            .perms = perms,
+            .domain = 0,
+            .is_page = (leaf_level >= 2),
+            .level = leaf_level,
+        };
+
+        if ((perms & req_perm) == 0) {
+            self.recordFault64(vaddr, access, is_priv, 0b001100 | @as(u6, leaf_level));
+            return error.Abort;
+        }
+
+        return phys_page_base | @as(u32, @truncate(vaddr & 0xfff));
+    }
+
+    pub fn recordFault64(self: *Mmu, vaddr: u64, access: AccessKind, is_priv: bool, fsc: u6) void {
+        self.far_el1 = vaddr;
+        self.dfar = @truncate(vaddr);
+        const ec: u32 = switch (access) {
+            .fetch => if (is_priv) 0b100001 else 0b100000, // Instruction Abort (same/lower EL)
+            .read, .write => if (is_priv) 0b100101 else 0b100100, // Data Abort (same/lower EL)
+        };
+        const wnr: u32 = if (access == .write) (1 << 6) else 0;
+        self.esr_el1 = (ec << 26) | (1 << 25) | wnr | @as(u32, fsc);
     }
 
     fn computeClientPerms(apx: u1, ap: u2, xn: bool, sctlr: u32, xp: bool) u8 {
@@ -1066,3 +1297,41 @@ test "Cortex-A53 LPAE 3-level MMU translation (T1SZ=2 TTBR1_OFFSET, 2MB block, 4
     try std.testing.expectEqual(@as(u4, 0), mmu.syncGenericTimer(105));
     try std.testing.expectEqual(@as(u4, 0b0010), mmu.syncGenericTimer(110));
 }
+
+test "AArch64 VMSAv8-64 4-level (48-bit VA) and 3-level (39-bit VA) page table translation" {
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 4 * 1024 * 1024);
+    defer allocator.free(ram);
+    @memset(ram, 0);
+
+    var mmu: Mmu = .{ .is_cortex_a53 = true };
+    // Configure 48-bit VA for TTBR1 (T1SZ=16 -> 4-level L0..L3) and 39-bit VA for TTBR0 (T0SZ=25 -> 3-level L1..L3)
+    mmu.tcr_el1 = (16 << 16) | 25;
+    mmu.ttbr0_64 = 0x0000_2000; // L1 table for TTBR0
+    mmu.ttbr1_64 = 0x0000_6000; // L0 table for TTBR1
+    mmu.sctlr_el1 |= 1;
+    mmu.sctlr |= 1;
+
+    // 1. TTBR1 4-level walk: VA 0xffff_8000_0020_1234 (L0[256] -> L1[0] -> L2[1] 2MB block -> PA 0x0020_1234)
+    std.mem.writeInt(u64, ram[0x6000 + 256 * 8 ..][0..8], 0x0000_7000 | 0b11, .little); // L0[256] -> L1 at 0x7000
+    std.mem.writeInt(u64, ram[0x7000 + 0 * 8 ..][0..8], 0x0000_8000 | 0b11, .little); // L1[0] -> L2 at 0x8000
+    std.mem.writeInt(u64, ram[0x8000 + 1 * 8 ..][0..8], 0x0020_0000 | (1 << 10) | 0b01, .little); // L2[1] -> 2MB block PA 0x200000, AF=1, Priv RW
+
+    const kpa = try mmu.translate64(ram, 0xffff_8000_0020_1234, .write, true);
+    try std.testing.expectEqual(@as(u32, 0x0020_1234), kpa);
+
+    // 2. TTBR0 3-level walk: VA 0x0000_0000_0000_4abc (L1[0] at 0x2000 -> L2[0] at 0x3000 -> L3[4] at 0x4000 -> PA 0x0015_0abc, User RO)
+    std.mem.writeInt(u64, ram[0x2000 + 0 * 8 ..][0..8], 0x0000_3000 | 0b11, .little);
+    std.mem.writeInt(u64, ram[0x3000 + 0 * 8 ..][0..8], 0x0000_4000 | 0b11, .little);
+    std.mem.writeInt(u64, ram[0x4000 + 4 * 8 ..][0..8], 0x0015_0000 | (1 << 10) | (0b11 << 6) | 0b11, .little);
+    mmu.flushTlb();
+
+    const upa = try mmu.translate64(ram, 0x0000_0000_0000_4abc, .read, false);
+    try std.testing.expectEqual(@as(u32, 0x0015_0abc), upa);
+
+    // User write to RO page faults and populates FAR_EL1 and ESR_EL1 (EC=0b100100 Data Abort lower EL, WnR=1, DFSC=0x0f)
+    try std.testing.expectError(error.Abort, mmu.translate64(ram, 0x0000_0000_0000_4abc, .write, false));
+    try std.testing.expectEqual(@as(u64, 0x0000_0000_0000_4abc), mmu.far_el1);
+    try std.testing.expectEqual(@as(u32, (0b100100 << 26) | (1 << 25) | (1 << 6) | 0x0f), mmu.esr_el1);
+}
+

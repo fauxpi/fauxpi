@@ -11,6 +11,8 @@ const std = @import("std");
 pub const Vfp = struct {
     /// 64 32-bit words backing `s0..s31` (first 32 words) and `d0..d31` (all 64 words)
     s: [64]u32 = @splat(0),
+    /// 32 128-bit SIMD/FP registers `V0..V31` (`Q0..Q31` / `D0..D31` / `S0..S31`) for AArch64
+    v: [32]u128 = @splat(0),
 
     /// True when emulating Cortex-A53 VFPv4-D32 instead of ARM1176 VFPv2-D16
     is_vfpv4: bool = false,
@@ -19,6 +21,9 @@ pub const Vfp = struct {
     fpsid: u32 = 0x410120b5,
     /// Floating-Point Status and Control Register
     fpscr: u32 = 0,
+    /// AArch64 Floating-Point Control Register & Status Register
+    fpcr64: u64 = 0,
+    fpsr64: u64 = 0,
     /// Floating-Point Exception Control Register (bit 30 = EN)
     fpexc: u32 = 0,
     fpinst: u32 = 0,

@@ -367,6 +367,30 @@ pub const Tree = struct {
         }
     }
 
+    pub fn configureSpinTable64(self: *Tree) !void {
+        var has_zero_reserve = false;
+        for (self.reserves.items) |r| {
+            if (r.address == 0) {
+                has_zero_reserve = true;
+                break;
+            }
+        }
+        if (!has_zero_reserve) {
+            try self.reserves.append(self.allocator, .{ .address = 0, .size = 0x1000 });
+        }
+
+        const cpus = try self.findOrCreateNode("/cpus");
+        const cpu_names = [_][]const u8{ "cpu@0", "cpu@1", "cpu@2", "cpu@3" };
+        for (cpu_names, 0..) |cname, i| {
+            const cnode = try cpus.findOrCreateChild(self.allocator, cname);
+            try cnode.setStringProp(self.allocator, "device_type", "cpu");
+            try cnode.setStringProp(self.allocator, "compatible", "arm,cortex-a53");
+            try cnode.setU32Prop(self.allocator, "reg", @intCast(i));
+            try cnode.setStringProp(self.allocator, "enable-method", "spin-table");
+            try cnode.setCellsProp(self.allocator, "cpu-release-addr", &.{ 0, @intCast(0xd8 + i * 8) });
+        }
+    }
+
     pub fn patchForPiZero(
         self: *Tree,
         ram_size: u32,

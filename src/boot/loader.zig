@@ -11,12 +11,30 @@ const fdt = @import("fdt.zig");
 const BoardModel = @import("../ui/board_sheet.zig").BoardModel;
 
 pub const kernel_load_addr: u32 = 0x0000_8000;
+pub const kernel64_load_addr: u32 = 0x0008_0000;
 pub const dtb_load_addr: u32 = 0x03f0_0000;
 pub const initrd_load_addr: u32 = 0x0400_0000;
+pub const arm64_image_magic: u32 = 0x644d_5241; // "ARM\x64" at byte offset 0x38
+
+pub fn isArm64KernelImage(kernel_bytes: []const u8) bool {
+    if (kernel_bytes.len < 64) return false;
+    return std.mem.readInt(u32, kernel_bytes[0x38..0x3c], .little) == arm64_image_magic;
+}
+
+pub fn arm64KernelLoadOffset(kernel_bytes: []const u8) u32 {
+    if (!isArm64KernelImage(kernel_bytes)) return kernel64_load_addr;
+    const text_offset = std.mem.readInt(u64, kernel_bytes[0x08..0x10], .little);
+    if (text_offset > 0 and text_offset <= 0x0200_0000 and (text_offset & 3) == 0) {
+        return @intCast(text_offset);
+    }
+    return kernel64_load_addr;
+}
 
 pub const BootConfig = struct {
     os_prefix: []const u8 = "",
     kernel: []const u8 = "kernel.img",
+    kernel_explicit: bool = false,
+    arm_64bit: ?bool = null,
     device_tree: ?[]const u8 = null,
     initramfs: ?[]const u8 = null,
     vc4_kms_v3d: bool = false,
@@ -27,7 +45,7 @@ pub const BootConfig = struct {
 
     pub fn parseForModel(text: []const u8, board_model: BoardModel) BootConfig {
         var cfg: BootConfig = .{
-            .kernel = if (board_model.isBcm2837()) "kernel7.img" else "kernel.img",
+            .kernel = if (board_model.isBcm2837()) "kernel8.img" else "kernel.img",
         };
         var section_active = true;
         var lines = std.mem.tokenizeAny(u8, text, "\r\n");
@@ -76,6 +94,13 @@ pub const BootConfig = struct {
                 cfg.os_prefix = val;
             } else if (std.mem.eql(u8, key, "kernel")) {
                 cfg.kernel = val;
+                cfg.kernel_explicit = true;
+            } else if (std.mem.eql(u8, key, "arm_64bit")) {
+                const is_64 = std.mem.eql(u8, val, "1") or std.ascii.eqlIgnoreCase(val, "true");
+                cfg.arm_64bit = is_64;
+                if (!cfg.kernel_explicit and board_model.isBcm2837()) {
+                    cfg.kernel = if (is_64) "kernel8.img" else "kernel7.img";
+                }
             } else if (std.mem.eql(u8, key, "device_tree")) {
                 cfg.device_tree = val;
             } else if (std.mem.eql(u8, key, "dtoverlay")) {
@@ -90,6 +115,7 @@ pub const BootConfig = struct {
 
 pub const BootResult = struct {
     entry_pc: u32 = kernel_load_addr,
+    is_aarch64: bool = false,
     r0: u32 = 0,
     r1: u32 = 0xffffffff, // Device-tree machine ID
     r2: u32 = dtb_load_addr,
@@ -174,9 +200,11 @@ pub fn loadFromSdImageForModel(
     const kernel_bytes = if (override_kernel) |ok| ok else blk: {
         const kernel_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, cfg.kernel });
         if (fs.readFileAlloc(alloc, kernel_path)) |kb| break :blk kb else |err| {
-            if (board_model.isBcm2837()) {
-                const fallback_path = try std.fmt.allocPrint(alloc, "{s}kernel.img", .{cfg.os_prefix});
-                if (fs.readFileAlloc(alloc, fallback_path)) |kb| break :blk kb else |_| {}
+            if (board_model.isBcm2837() and !cfg.kernel_explicit) {
+                for ([_][]const u8{ "kernel7.img", "kernel.img" }) |fb_name| {
+                    const fallback_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, fb_name });
+                    if (fs.readFileAlloc(alloc, fallback_path)) |kb| break :blk kb else |_| {}
+                }
             }
             return err;
         }
@@ -228,8 +256,11 @@ pub fn loadDirect(
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    if (kernel_load_addr + kernel_bytes.len > ram.len) return error.KernelTooLarge;
-    @memcpy(ram[kernel_load_addr .. kernel_load_addr + kernel_bytes.len], kernel_bytes);
+    const is_aarch64 = isArm64KernelImage(kernel_bytes);
+    const load_addr: u32 = if (is_aarch64) arm64KernelLoadOffset(kernel_bytes) else kernel_load_addr;
+
+    if (load_addr + kernel_bytes.len > ram.len) return error.KernelTooLarge;
+    @memcpy(ram[load_addr .. load_addr + kernel_bytes.len], kernel_bytes);
 
     var initrd_range: ?fdt.Tree.InitrdRange = null;
     var initrd_len: usize = 0;
@@ -245,16 +276,20 @@ pub fn loadDirect(
 
     var tree = try fdt.Tree.parse(alloc, dtb_bytes);
     try tree.patchForPiZero(@intCast(ram.len), cmdline, initrd_range, enable_vc4_kms);
+    if (is_aarch64) {
+        try tree.configureSpinTable64();
+    }
     const patched_dtb = try tree.serialize(alloc);
 
     if (dtb_load_addr + patched_dtb.len > ram.len) return error.DtbTooLarge;
     @memcpy(ram[dtb_load_addr .. dtb_load_addr + patched_dtb.len], patched_dtb);
 
     return .{
-        .entry_pc = kernel_load_addr,
-        .r0 = 0,
-        .r1 = 0xffffffff,
-        .r2 = dtb_load_addr,
+        .entry_pc = load_addr,
+        .is_aarch64 = is_aarch64,
+        .r0 = if (is_aarch64) dtb_load_addr else 0,
+        .r1 = if (is_aarch64) 0 else 0xffffffff,
+        .r2 = if (is_aarch64) 0 else dtb_load_addr,
         .kernel_size = kernel_bytes.len,
         .dtb_size = patched_dtb.len,
         .initrd_size = initrd_len,
@@ -309,4 +344,19 @@ test "parse config.txt" {
     try std.testing.expectEqualStrings("kernel.img", cfg.kernel);
     try std.testing.expectEqualStrings("initramfs.cpio", cfg.initramfs.?);
     try std.testing.expect(cfg.vc4_kms_v3d);
+
+    const cfg64 = BootConfig.parseForModel("arm_64bit=1\n", .pi_3_b_plus);
+    try std.testing.expectEqualStrings("kernel8.img", cfg64.kernel);
+    try std.testing.expectEqual(@as(?bool, true), cfg64.arm_64bit);
+
+    const cfg32 = BootConfig.parseForModel("arm_64bit=0\n", .pi_3_b_plus);
+    try std.testing.expectEqualStrings("kernel7.img", cfg32.kernel);
+    try std.testing.expectEqual(@as(?bool, false), cfg32.arm_64bit);
+
+    var fake_arm64_hdr: [64]u8 = @splat(0);
+    std.mem.writeInt(u64, fake_arm64_hdr[0x08..0x10], 0x0008_0000, .little);
+    std.mem.writeInt(u32, fake_arm64_hdr[0x38..0x3c], arm64_image_magic, .little);
+    try std.testing.expect(isArm64KernelImage(&fake_arm64_hdr));
+    try std.testing.expectEqual(@as(u32, 0x0008_0000), arm64KernelLoadOffset(&fake_arm64_hdr));
 }
+

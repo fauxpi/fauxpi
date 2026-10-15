@@ -309,16 +309,24 @@ fn resetCpusForBoard(
     board_model: ui_board_sheet.BoardModel,
     boot_res: loader.BootResult,
 ) void {
-    const is_a53 = board_model.isBcm2837();
+    const is_a53 = board_model.isBcm2837() or boot_res.is_aarch64;
     cpus[0] = .{};
-    cpus[0].initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
-    cpus[0].mmu.is_cortex_a53 = is_a53;
-    cpus[0].vfp.is_vfpv4 = is_a53;
+    if (boot_res.is_aarch64) {
+        cpus[0].initReset64(boot_res.entry_pc, boot_res.r0);
+    } else {
+        cpus[0].initReset(boot_res.entry_pc, boot_res.r0, boot_res.r1, boot_res.r2);
+        cpus[0].mmu.is_cortex_a53 = is_a53;
+        cpus[0].vfp.is_vfpv4 = is_a53;
+    }
     if (is_a53) {
         num_cores.* = 4;
         for (1..4) |i| {
             cpus[i] = .{};
-            cpus[i].initSecondaryCore(@intCast(i));
+            if (boot_res.is_aarch64) {
+                cpus[i].initSecondaryCore64(@intCast(i));
+            } else {
+                cpus[i].initSecondaryCore(@intCast(i));
+            }
         }
     } else {
         num_cores.* = 1;
@@ -525,14 +533,25 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 if (soc.local_intc.takeCoreWakeup(@intCast(i))) |wakeup_addr| {
                     cpus[i].halted_spin = false;
                     cpus[i].mmu.halted_wfi = false;
+                    cpus[i].pc64 = wakeup_addr;
                     cpus[i].r[15] = wakeup_addr;
                 } else {
                     const spin_off: usize = 0xd8 + i * 8;
-                    const spin_addr = std.mem.readInt(u32, ram[spin_off..][0..4], .little);
-                    if (spin_addr != 0) {
-                        cpus[i].halted_spin = false;
-                        cpus[i].mmu.halted_wfi = false;
-                        cpus[i].r[15] = spin_addr;
+                    if (cpus[i].is_aarch64) {
+                        const spin_addr64 = std.mem.readInt(u64, ram[spin_off..][0..8], .little);
+                        if (spin_addr64 != 0) {
+                            cpus[i].halted_spin = false;
+                            cpus[i].mmu.halted_wfi = false;
+                            cpus[i].pc64 = spin_addr64;
+                            cpus[i].r[15] = @truncate(spin_addr64);
+                        }
+                    } else {
+                        const spin_addr = std.mem.readInt(u32, ram[spin_off..][0..4], .little);
+                        if (spin_addr != 0) {
+                            cpus[i].halted_spin = false;
+                            cpus[i].mmu.halted_wfi = false;
+                            cpus[i].r[15] = spin_addr;
+                        }
                     }
                 }
             }
@@ -742,25 +761,43 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     }
 
     if (opts.headless) {
-        std.debug.print(
-            "\n[fauxpi] Stopped at cycle={d} pc=0x{x:0>8} lr=0x{x:0>8} sp=0x{x:0>8} cpsr=0x{x:0>8} sctlr=0x{x:0>8} ttbr0=0x{x:0>8} timer_us={d} uart_tx={d}\n",
-            .{
-                cpus[0].cycles,
-                cpus[0].r[15],
-                cpus[0].r[14],
-                cpus[0].r[13],
-                cpus[0].cpsr,
-                cpus[0].mmu.sctlr,
-                cpus[0].mmu.ttbr0,
-                soc.timer.counter,
-                soc.uart0.tx_log_len,
-            },
-        );
+        if (cpus[0].is_aarch64) {
+            std.debug.print(
+                "\n[fauxpi] Stopped (AArch64) at cycle={d} pc=0x{x:0>16} lr=0x{x:0>16} sp=0x{x:0>16} pstate=0x{x:0>8} sctlr_el1=0x{x:0>8} ttbr0_el1=0x{x:0>16} timer_us={d} uart_tx={d}\n",
+                .{
+                    cpus[0].cycles,
+                    cpus[0].pc64,
+                    cpus[0].x[30],
+                    cpus[0].sp_el[1],
+                    cpus[0].pstate,
+                    cpus[0].mmu.sctlr_el1,
+                    cpus[0].mmu.ttbr0_64,
+                    soc.timer.counter,
+                    soc.uart0.tx_log_len,
+                },
+            );
+        } else {
+            std.debug.print(
+                "\n[fauxpi] Stopped at cycle={d} pc=0x{x:0>8} lr=0x{x:0>8} sp=0x{x:0>8} cpsr=0x{x:0>8} sctlr=0x{x:0>8} ttbr0=0x{x:0>8} timer_us={d} uart_us={d}\n",
+                .{
+                    cpus[0].cycles,
+                    cpus[0].r[15],
+                    cpus[0].r[14],
+                    cpus[0].r[13],
+                    cpus[0].cpsr,
+                    cpus[0].mmu.sctlr,
+                    cpus[0].mmu.ttbr0,
+                    soc.timer.counter,
+                    soc.uart0.tx_log_len,
+                },
+            );
+        }
         if (num_cores > 1) {
             for (1..num_cores) |i| {
+                const pc_val: u64 = if (cpus[i].is_aarch64) cpus[i].pc64 else cpus[i].r[15];
                 std.debug.print(
                     "  core[{d}] spin={} wfi={} cycles={d} pc=0x{x:0>8} cpsr=0x{x:0>8}\n",
-                    .{ i, cpus[i].halted_spin, cpus[i].mmu.halted_wfi, cpus[i].cycles, cpus[i].r[15], cpus[i].cpsr },
+                    .{ i, cpus[i].halted_spin, cpus[i].mmu.halted_wfi, cpus[i].cycles, pc_val, cpus[i].cpsr },
                 );
             }
         }
