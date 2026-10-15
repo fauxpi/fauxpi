@@ -22,6 +22,7 @@ pub const qcow2 = @import("soc/qcow2.zig");
 pub const sdhost = @import("soc/sdhost.zig");
 pub const cyw43430 = @import("soc/cyw43430.zig");
 pub const i2c = @import("soc/i2c.zig");
+pub const soc_audio = @import("soc/audio.zig");
 pub const bcm2835 = @import("soc/bcm2835.zig");
 
 pub const hid = @import("usb/hid.zig");
@@ -47,6 +48,7 @@ pub const ui_gpio_model = @import("ui/gpio_model.zig");
 pub const ui_canvas = @import("ui/canvas.zig");
 pub const ui_board_sheet = @import("ui/board_sheet.zig");
 pub const window = @import("app/window.zig");
+pub const app_audio = @import("app/audio.zig");
 
 const Bcm2835 = bcm2835.Bcm2835;
 const Cpu = arm1176.Arm1176(Bcm2835);
@@ -350,6 +352,12 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         guest_booted = true;
     }
 
+    const host_audio: ?*app_audio.HostAudioOutput = if (!opts.headless)
+        try app_audio.HostAudioOutput.create(gpa, &soc.audio_fifo)
+    else
+        null;
+    defer if (host_audio) |ha| ha.destroy(gpa);
+
     if (wl_win) |w| {
         const disp_pixels = w.displayPixels();
         @memset(disp_pixels, 0xFF101418);
@@ -399,6 +407,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 const active_qcow2: ?*qcow2.Qcow2Disk = if (w.status.sd_connected and w.ui.activeSdCard() != null) &w.ui.activeSdCard().?.disk else null;
                 const active_sd = if (w.status.sd_connected) sd_image_buf else null;
                 if (active_qcow2 != null or active_sd != null or opts.kernel_path != null) {
+                    if (host_audio) |ha| ha.setPaused(true);
+                    defer if (host_audio) |ha| ha.setPaused(false);
                     if (loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, active_sd, w.status.board_model, w.status.serial_u64, w.status.mac_address, w.status.wifi_mac_address)) |reboot_res| {
                         syncWindowPeripheralsToSoc(w, &soc);
                         cpu = .{};
@@ -449,6 +459,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         const timer_ticks: u64 = if (ran > 0) @max(ran / 256, 1) else 1;
         active_us_accum += timer_ticks;
         soc.timer.advance(timer_ticks, &soc.intc);
+        soc.advanceAudio(timer_ticks);
         soc.updateIrqs();
 
         if (cpu.mmu.halted_wfi and !soc.hasPendingIrq() and !soc.hasPendingFiq()) {
@@ -460,6 +471,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             const jump = @max(soc.timer.usUntilNextMatch(2000), 1);
             idle_us_accum += jump;
             soc.timer.advance(jump, &soc.intc);
+            soc.advanceAudio(jump);
             soc.updateIrqs();
             cpu.mmu.halted_wfi = false;
         }

@@ -1,4 +1,5 @@
 const std = @import("std");
+const audio_mod = @import("../soc/audio.zig");
 
 /// VideoCore IV HDMI Controller (`brcm,bcm2835-hdmi`) at `0x20902000` (HDMI) and `0x20808000` (HD).
 pub const Hdmi = struct {
@@ -14,9 +15,24 @@ pub const Hdmi = struct {
     pub const HDMI_RAM_PACKET_STATUS: u32 = 0x0a4;
     pub const HDMI_SCHEDULER_CONTROL: u32 = 0x0c0;
 
+    // HD registers (offset from 0x20808000) for Multi-channel Audio Interconnect (MAI)
+    pub const HD_MAI_CTL: u32 = 0x014;
+    pub const HD_MAI_THR: u32 = 0x018;
+    pub const HD_MAI_FMT: u32 = 0x01c;
+    pub const HD_MAI_DATA: u32 = 0x020;
+    pub const HD_MAI_SMP: u32 = 0x02c;
+
+    pub const HD_MAI_CTL_RESET: u32 = 1 << 1;
+    pub const HD_MAI_CTL_FLUSH: u32 = 1 << 2;
+    pub const HD_MAI_CTL_ENABLE: u32 = 1 << 3;
+    pub const HD_MAI_CTL_EMPTY: u32 = 1 << 11;
+
     connected: bool = true,
     hdmi_regs: [HDMI_SIZE / 4]u32 = initHdmiRegs(),
     hd_regs: [HD_SIZE / 4]u32 = [_]u32{0} ** (HD_SIZE / 4),
+
+    mai_pending_left: i16 = 0,
+    mai_has_left: bool = false,
 
     fn initHdmiRegs() [HDMI_SIZE / 4]u32 {
         var r: [HDMI_SIZE / 4]u32 = [_]u32{0} ** (HDMI_SIZE / 4);
@@ -24,6 +40,28 @@ pub const Hdmi = struct {
         r[HDMI_HOTPLUG / 4] = 0x00000001; // Connected
         r[HDMI_FIFO_CTL / 4] = (1 << 14) | 1; // VC4_HDMI_FIFO_CTL_RECENTER_DONE | MASTER_SLAVE_N
         return r;
+    }
+
+    pub fn maiSampleRate(self: *const Hdmi) u32 {
+        const fmt = self.hd_regs[HD_MAI_FMT / 4];
+        const sr_enum: u8 = @truncate((fmt >> 8) & 0xff);
+        return switch (sr_enum) {
+            2 => 8_000,
+            3 => 11_025,
+            4 => 12_000,
+            5 => 16_000,
+            6 => 22_050,
+            7 => 32_000,
+            8 => 44_100,
+            9 => 48_000,
+            10 => 64_000,
+            11 => 88_200,
+            12 => 96_000,
+            13 => 128_000,
+            14 => 176_400,
+            15 => 192_000,
+            else => 48_000,
+        };
     }
 
     pub fn readHdmi32(self: *const Hdmi, offset: u32) u32 {
@@ -53,12 +91,51 @@ pub const Hdmi = struct {
 
     pub fn readHd32(self: *const Hdmi, offset: u32) u32 {
         if (offset >= HD_SIZE) return 0;
+        if (offset == HD_MAI_CTL) {
+            return self.hd_regs[HD_MAI_CTL / 4] | HD_MAI_CTL_EMPTY;
+        }
         return self.hd_regs[offset / 4];
     }
 
-    pub fn writeHd32(self: *Hdmi, offset: u32, val: u32) void {
+    pub fn writeHd32(self: *Hdmi, offset: u32, val: u32, audio_fifo: ?*audio_mod.AudioFifo) void {
         if (offset >= HD_SIZE) return;
         self.hd_regs[offset / 4] = val;
+
+        if (offset == HD_MAI_CTL) {
+            if ((val & (HD_MAI_CTL_RESET | HD_MAI_CTL_FLUSH)) != 0) {
+                self.mai_has_left = false;
+            }
+        } else if (offset == HD_MAI_DATA) {
+            // Unpack 32-bit IEC958_SUBFRAME_LE word:
+            // bits [3:0] = preamble (0x8 = B/left frame 0, 0x2 = M/left, 0x4 = W/right)
+            // bits [27:12] = signed 16-bit PCM sample
+            const preamble: u4 = @truncate(val & 0xf);
+            const sample: i16 = @bitCast(@as(u16, @truncate((val >> 12) & 0xffff)));
+
+            if (preamble == 0x8 or preamble == 0x2) {
+                self.mai_pending_left = sample;
+                self.mai_has_left = true;
+            } else if (preamble == 0x4) {
+                self.mai_has_left = false;
+                if (self.connected) {
+                    if (audio_fifo) |fifo| {
+                        fifo.pushStereoSample(self.mai_pending_left, sample, self.maiSampleRate());
+                    }
+                }
+            } else {
+                if (!self.mai_has_left) {
+                    self.mai_pending_left = sample;
+                    self.mai_has_left = true;
+                } else {
+                    self.mai_has_left = false;
+                    if (self.connected) {
+                        if (audio_fifo) |fifo| {
+                            fifo.pushStereoSample(self.mai_pending_left, sample, self.maiSampleRate());
+                        }
+                    }
+                }
+            }
+        }
     }
 };
 

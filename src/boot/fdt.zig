@@ -259,6 +259,45 @@ pub const Tree = struct {
         const sys_node = try self.findOrCreateNode("/system");
         try sys_node.setU32Prop(self.allocator, "linux,revision", revision);
         try self.setBuiltInUsbHub(HubKind.fromModel(model_str));
+        const has_headphone_jack = std.mem.indexOf(u8, model_str, "Zero") == null;
+        try self.setHeadphoneAudioEnabled(has_headphone_jack);
+    }
+
+    pub fn setHeadphoneAudioEnabled(self: *Tree, enabled: bool) !void {
+        // Configure audio_pins under /soc/gpio@7e200000 so pinctrl-bcm2835 succeeds when vchiq probes
+        if (self.findNode("audio_pins") orelse self.findNode("/soc/gpio@7e200000/audio_pins")) |ap| {
+            try ap.setCellsProp(self.allocator, "brcm,pins", &.{ 40, 45 });
+            try ap.setU32Prop(self.allocator, "brcm,function", 4); // ALT0 (PWM0/PWM1)
+            try ap.setU32Prop(self.allocator, "brcm,pull", 0);
+        }
+        if (self.findNode("vchiq") orelse self.findNode("/soc/mailbox@7e00b840")) |vchiq_node| {
+            try vchiq_node.setStringProp(self.allocator, "status", "okay");
+            if (vchiq_node.findChild("audio")) |audio_child| {
+                try audio_child.setStringProp(self.allocator, "status", if (enabled) "okay" else "disabled");
+                try audio_child.setU32Prop(self.allocator, "brcm,enable-headphones", if (enabled) 1 else 0);
+            }
+        }
+        if (self.findNode("audio")) |audio_node| {
+            try audio_node.setStringProp(self.allocator, "status", if (enabled) "okay" else "disabled");
+            try audio_node.setU32Prop(self.allocator, "brcm,enable-headphones", if (enabled) 1 else 0);
+        }
+
+        // Update snd_bcm2835.enable_headphones in /chosen/bootargs
+        const chosen = try self.findOrCreateNode("/chosen");
+        const cur_bootargs = chosen.getStringProp("bootargs") orelse "";
+        var clean_buf: std.ArrayList(u8) = .empty;
+        var tok = std.mem.tokenizeScalar(u8, cur_bootargs, ' ');
+        while (tok.next()) |part| {
+            if (std.mem.startsWith(u8, part, "snd_bcm2835.enable_headphones=")) continue;
+            if (clean_buf.items.len > 0) try clean_buf.append(self.allocator, ' ');
+            try clean_buf.appendSlice(self.allocator, part);
+        }
+        if (clean_buf.items.len > 0) try clean_buf.append(self.allocator, ' ');
+        try clean_buf.appendSlice(
+            self.allocator,
+            if (enabled) "snd_bcm2835.enable_headphones=1" else "snd_bcm2835.enable_headphones=0",
+        );
+        try chosen.setStringProp(self.allocator, "bootargs", clean_buf.items);
     }
 
     pub fn setBuiltInUsbHub(self: *Tree, hub_kind: HubKind) !void {
@@ -348,6 +387,13 @@ pub const Tree = struct {
         }
         if (self.root.getStringProp("model")) |m| {
             try self.setBuiltInUsbHub(HubKind.fromModel(m));
+        }
+
+        // Configure audio_pins so /soc/mailbox@7e00b840 (vchiq) probes without pinctrl errors
+        if (self.findNode("audio_pins") orelse self.findNode("/soc/gpio@7e200000/audio_pins")) |ap| {
+            try ap.setCellsProp(self.allocator, "brcm,pins", &.{ 40, 45 });
+            try ap.setU32Prop(self.allocator, "brcm,function", 4);
+            try ap.setU32Prop(self.allocator, "brcm,pull", 0);
         }
 
         // 4. Enable vc4-kms-v3d nodes (equivalent to dtoverlay=vc4-kms-v3d)

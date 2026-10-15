@@ -34,6 +34,8 @@ pub const DmaController = struct {
         stride: u32 = 0,
         nextconbk: u32 = 0,
         debug: u32 = 0,
+        cb_loaded: bool = false,
+        audio_byte_rem_fp: u64 = 0,
     };
 
     channels: [NUM_CHANNELS]Channel = [_]Channel{.{}} ** NUM_CHANNELS,
@@ -101,6 +103,7 @@ pub const DmaController = struct {
                 }
                 if ((val & CS_ABORT) != 0) {
                     c.conblk_ad = c.nextconbk;
+                    c.cb_loaded = false;
                     c.cs &= ~CS_ACTIVE;
                 }
                 // W1C bits: CS_END (bit 1) and CS_INT (bit 2)
@@ -117,7 +120,10 @@ pub const DmaController = struct {
                     self.stepChannel(ch, ram, mmio);
                 }
             },
-            0x04 => c.conblk_ad = val,
+            0x04 => {
+                c.conblk_ad = val;
+                c.cb_loaded = false;
+            },
             0x20 => c.debug = val & ~@as(u32, 7),
             else => {},
         }
@@ -131,6 +137,28 @@ pub const DmaController = struct {
         }
     }
 
+    fn isPacedAudioPermap(permap: u5) bool {
+        // PERMAP 5 = PWM audio, PERMAP 17 = VC4 HDMI MAI audio-rx
+        return permap == 5 or permap == 17;
+    }
+
+    fn loadCbHeader(c: *Channel, ram: []const u8) bool {
+        const cb_phys = c.conblk_ad & 0x1FFFFFFF;
+        if (cb_phys + 32 > ram.len) {
+            c.cs &= ~CS_ACTIVE;
+            c.cb_loaded = false;
+            return false;
+        }
+        c.ti = std.mem.readInt(u32, ram[cb_phys + 0 ..][0..4], .little);
+        c.source_ad = std.mem.readInt(u32, ram[cb_phys + 4 ..][0..4], .little);
+        c.dest_ad = std.mem.readInt(u32, ram[cb_phys + 8 ..][0..4], .little);
+        c.txfr_len = std.mem.readInt(u32, ram[cb_phys + 12 ..][0..4], .little);
+        c.stride = std.mem.readInt(u32, ram[cb_phys + 16 ..][0..4], .little);
+        c.nextconbk = std.mem.readInt(u32, ram[cb_phys + 20 ..][0..4], .little);
+        c.cb_loaded = true;
+        return true;
+    }
+
     fn stepChannel(self: *DmaController, ch: usize, ram: []u8, mmio: ?MmioIo) void {
         if (self.stepping) return;
         self.stepping = true;
@@ -140,26 +168,22 @@ pub const DmaController = struct {
         var max_cbs: usize = 1024;
 
         while ((c.cs & CS_ACTIVE) != 0 and c.conblk_ad != 0 and max_cbs > 0) : (max_cbs -= 1) {
-            const cb_phys = c.conblk_ad & 0x1FFFFFFF;
-            if (cb_phys + 32 > ram.len) {
-                c.cs &= ~CS_ACTIVE;
-                break;
+            if (!c.cb_loaded) {
+                if (!loadCbHeader(c, ram)) break;
             }
 
-            c.ti = std.mem.readInt(u32, ram[cb_phys + 0 ..][0..4], .little);
-            c.source_ad = std.mem.readInt(u32, ram[cb_phys + 4 ..][0..4], .little);
-            c.dest_ad = std.mem.readInt(u32, ram[cb_phys + 8 ..][0..4], .little);
-            c.txfr_len = std.mem.readInt(u32, ram[cb_phys + 12 ..][0..4], .little);
-            c.stride = std.mem.readInt(u32, ram[cb_phys + 16 ..][0..4], .little);
-            c.nextconbk = std.mem.readInt(u32, ram[cb_phys + 20 ..][0..4], .little);
-
-            // Check if gated by peripheral DREQ (e.g. PERMAP 13 = SDHOST)
+            // Check if gated by peripheral DREQ (e.g. PERMAP 13 = SDHOST, PERMAP 17 = HDMI MAI, PERMAP 5 = PWM)
             const permap: u5 = @truncate((c.ti >> 16) & 0x1f);
             const uses_dreq = (c.ti & ((1 << 6) | (1 << 10))) != 0;
             if (uses_dreq and permap != 0) {
+                if (isPacedAudioPermap(permap)) {
+                    // Audio DMA channels are stepped incrementally at the audio sample rate via advanceAudio()
+                    // so cyclic ALSA ring buffers report accurate DMA_SOURCE_AD pointers and period IRQs.
+                    return;
+                }
                 if (mmio) |m| {
                     if (!m.dreqReadyFn(m.ctx, permap)) {
-                        // Keep channel CS_ACTIVE; it will run once the peripheral DREQ is ready
+                        c.cb_loaded = false;
                         return;
                     }
                 }
@@ -168,6 +192,7 @@ pub const DmaController = struct {
             self.executeTransfer(c, ram, mmio);
 
             c.txfr_len = 0;
+            c.cb_loaded = false;
             c.cs |= CS_END;
             if ((c.ti & TI_INT_EN) != 0) {
                 c.cs |= CS_INT;
@@ -178,6 +203,84 @@ pub const DmaController = struct {
             if (c.conblk_ad == 0) {
                 c.cs &= ~CS_ACTIVE;
                 break;
+            }
+        }
+    }
+
+    /// Steps active cyclic audio DMA channels (`PERMAP = 17` HDMI MAI or `PERMAP = 5` PWM)
+    /// proportionally to `elapsed_us` at `hdmi_sample_rate` (2 subframes * 4 bytes = 8 bytes per stereo frame).
+    pub fn advanceAudio(self: *DmaController, elapsed_us: u64, hdmi_sample_rate: u32, ram: []u8, mmio: MmioIo) void {
+        if (elapsed_us == 0) return;
+        const rate: u64 = @max(hdmi_sample_rate, 8_000);
+        const bytes_per_sec: u64 = rate * 8; // 2 channels * 4 bytes per 32-bit subframe
+
+        for (0..NUM_CHANNELS) |ch| {
+            var c = &self.channels[ch];
+            if ((c.cs & CS_ACTIVE) == 0 or c.conblk_ad == 0) continue;
+
+            if (!c.cb_loaded) {
+                if (!loadCbHeader(c, ram)) continue;
+            }
+
+            const permap: u5 = @truncate((c.ti >> 16) & 0x1f);
+            const uses_dreq = (c.ti & ((1 << 6) | (1 << 10))) != 0;
+            if (!uses_dreq or !isPacedAudioPermap(permap)) continue;
+
+            c.audio_byte_rem_fp += elapsed_us * bytes_per_sec;
+            var bytes_to_transfer: u32 = @intCast((c.audio_byte_rem_fp / 1_000_000) & ~@as(u64, 3));
+            c.audio_byte_rem_fp -= @as(u64, bytes_to_transfer) * 1_000_000;
+
+            const s_inc = (c.ti & TI_S_INC) != 0;
+            const d_inc = (c.ti & TI_D_INC) != 0;
+            const s_ign = (c.ti & TI_S_IGNORE) != 0;
+            const d_ign = (c.ti & TI_D_IGNORE) != 0;
+
+            var safety: usize = 64;
+            while (bytes_to_transfer >= 4 and (c.cs & CS_ACTIVE) != 0 and c.conblk_ad != 0 and safety > 0) : (safety -= 1) {
+                if (!c.cb_loaded) {
+                    if (!loadCbHeader(c, ram)) break;
+                }
+
+                while (bytes_to_transfer >= 4 and c.txfr_len >= 4) {
+                    var word: u32 = 0;
+                    if (!s_ign) {
+                        if (isPeripAddr(c.source_ad)) {
+                            word = mmio.read32Fn(mmio.ctx, c.source_ad);
+                        } else {
+                            const sp = c.source_ad & 0x1FFFFFFF;
+                            if (sp + 4 <= ram.len) word = std.mem.readInt(u32, ram[sp..][0..4], .little);
+                        }
+                    }
+                    if (!d_ign) {
+                        if (isPeripAddr(c.dest_ad)) {
+                            mmio.write32Fn(mmio.ctx, c.dest_ad, word);
+                        } else {
+                            const dp = c.dest_ad & 0x1FFFFFFF;
+                            if (dp + 4 <= ram.len) std.mem.writeInt(u32, ram[dp..][0..4], word, .little);
+                        }
+                    }
+                    if (s_inc) c.source_ad +%= 4;
+                    if (d_inc) c.dest_ad +%= 4;
+                    c.txfr_len -= 4;
+                    bytes_to_transfer -= 4;
+                }
+
+                if (c.txfr_len < 4) {
+                    c.txfr_len = 0;
+                    c.cb_loaded = false;
+                    c.cs |= CS_END;
+                    if ((c.ti & TI_INT_EN) != 0) {
+                        c.cs |= CS_INT;
+                        self.int_status |= (@as(u32, 1) << @intCast(ch));
+                    }
+                    c.conblk_ad = c.nextconbk;
+                    if (c.conblk_ad == 0) {
+                        c.cs &= ~CS_ACTIVE;
+                        break;
+                    }
+                    // Immediately load the next CB header so BCM2835_DMA_SOURCE_AD stays inside a valid CB
+                    _ = loadCbHeader(c, ram);
+                }
             }
         }
     }

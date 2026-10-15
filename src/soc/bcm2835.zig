@@ -14,6 +14,7 @@ const v3d_mod = @import("../vc4/v3d.zig");
 const hvs_mod = @import("../vc4/hvs.zig");
 const pv_mod = @import("../vc4/pixelvalve.zig");
 const hdmi_mod = @import("../vc4/hdmi.zig");
+const audio_mod = @import("audio.zig");
 
 /// Complete BCM2835 SoC Bus & Peripherals for Raspberry Pi Zero 1.
 /// Directly satisfies the `Bus` concept required by `Arm1176(Bcm2835)`.
@@ -54,6 +55,9 @@ pub const Bcm2835 = struct {
     pv2: pv_mod.PixelValve = .{},
     hdmi: hdmi_mod.Hdmi = .{},
     txp: hdmi_mod.Txp = .{},
+    audio_fifo: audio_mod.AudioFifo = .{},
+    vchiq: audio_mod.Vchiq = .{},
+    pwm: audio_mod.PwmAudio = .{},
 
     display_width: u16 = 1280,
     display_height: u16 = 720,
@@ -119,6 +123,7 @@ pub const Bcm2835 = struct {
         var b2: u32 = 0;
 
         if (self.mailbox.irqPending()) b0 |= (1 << 1); // Basic bit 1 = ARM Mailbox
+        if (self.vchiq.irqPending()) b0 |= (1 << 2); // Basic bit 2 = ARM Doorbell 0 (VCHIQ)
 
         // System timer channels 0..3 -> Bank 1 bits 0..3
         b1 |= (self.timer.cs & 0xf);
@@ -195,6 +200,13 @@ pub const Bcm2835 = struct {
     /// this state controls whether analog/PWM audio output is played on the host.
     pub fn setAudioConnected(self: *Bcm2835, connected: bool) void {
         self.audio_connected = connected;
+    }
+
+    /// Advances paced audio DMA channels (`vc4-hdmi` MAI and `bcm2835-pwm`) and VCHIQ `AUDS` completions.
+    pub fn advanceAudio(self: *Bcm2835, elapsed_us: u64) void {
+        if (elapsed_us == 0) return;
+        self.dma.advanceAudio(elapsed_us, self.hdmi.maiSampleRate(), self.ram, self.dmaMmio());
+        self.vchiq.advanceAudio(elapsed_us, self.ram);
     }
 
     /// Composites the current HDMI frame (`width * height` pixels of `0xFFRRGGBB`) from HVS or Mailbox FB.
@@ -317,6 +329,9 @@ pub const Bcm2835 = struct {
             self.updateIrqs();
             return self.intc.read32(addr - INTC_BASE);
         }
+        if (addr >= audio_mod.Vchiq.BASE_ADDR and addr < audio_mod.Vchiq.BASE_ADDR + audio_mod.Vchiq.SIZE) {
+            return self.vchiq.read32(addr - audio_mod.Vchiq.BASE_ADDR);
+        }
         if (addr >= mailbox_mod.Mailbox.BASE_ADDR and addr < mailbox_mod.Mailbox.BASE_ADDR + mailbox_mod.Mailbox.SIZE) {
             return self.mailbox.read32(addr - mailbox_mod.Mailbox.BASE_ADDR);
         }
@@ -346,6 +361,9 @@ pub const Bcm2835 = struct {
         }
         if (addr >= pv_mod.PixelValve.PV1_BASE and addr < pv_mod.PixelValve.PV1_BASE + pv_mod.PixelValve.SIZE) {
             return self.pv1.read32(addr - pv_mod.PixelValve.PV1_BASE);
+        }
+        if (addr >= audio_mod.PwmAudio.BASE_ADDR and addr < audio_mod.PwmAudio.BASE_ADDR + audio_mod.PwmAudio.SIZE) {
+            return self.pwm.read32(addr - audio_mod.PwmAudio.BASE_ADDR);
         }
         if (addr >= pm_mod.Thermal.BASE_ADDR and addr < pm_mod.Thermal.BASE_ADDR + pm_mod.Thermal.SIZE) {
             return self.thermal.read32(addr - pm_mod.Thermal.BASE_ADDR);
@@ -394,8 +412,17 @@ pub const Bcm2835 = struct {
             self.asb.write32(addr - pm_mod.AsbBridge.BASE_ADDR, val);
         } else if (addr >= INTC_BASE and addr < INTC_BASE + INTC_SIZE) {
             self.intc.write32(addr - INTC_BASE, val);
+        } else if (addr >= audio_mod.Vchiq.BASE_ADDR and addr < audio_mod.Vchiq.BASE_ADDR + audio_mod.Vchiq.SIZE) {
+            self.vchiq.write32(
+                addr - audio_mod.Vchiq.BASE_ADDR,
+                val,
+                self.ram,
+                &self.audio_fifo,
+                self.audio_connected,
+                self.hdmi.connected,
+            );
         } else if (addr >= mailbox_mod.Mailbox.BASE_ADDR and addr < mailbox_mod.Mailbox.BASE_ADDR + mailbox_mod.Mailbox.SIZE) {
-            self.mailbox.write32(addr - mailbox_mod.Mailbox.BASE_ADDR, val, self.ram);
+            self.mailbox.write32WithVchiq(addr - mailbox_mod.Mailbox.BASE_ADDR, val, self.ram, &self.vchiq);
         } else if (addr >= pm_mod.PowerManager.BASE_ADDR and addr < pm_mod.PowerManager.BASE_ADDR + pm_mod.PowerManager.SIZE) {
             self.pm.write32(addr - pm_mod.PowerManager.BASE_ADDR, val);
         } else if (addr >= cprman_mod.Cprman.BASE_ADDR and addr < cprman_mod.Cprman.BASE_ADDR + cprman_mod.Cprman.SIZE) {
@@ -418,6 +445,8 @@ pub const Bcm2835 = struct {
             self.pv0.write32(addr - pv_mod.PixelValve.PV0_BASE, val);
         } else if (addr >= pv_mod.PixelValve.PV1_BASE and addr < pv_mod.PixelValve.PV1_BASE + pv_mod.PixelValve.SIZE) {
             self.pv1.write32(addr - pv_mod.PixelValve.PV1_BASE, val);
+        } else if (addr >= audio_mod.PwmAudio.BASE_ADDR and addr < audio_mod.PwmAudio.BASE_ADDR + audio_mod.PwmAudio.SIZE) {
+            self.pwm.write32(addr - audio_mod.PwmAudio.BASE_ADDR, val, &self.audio_fifo, self.audio_connected);
         } else if (addr >= pm_mod.Thermal.BASE_ADDR and addr < pm_mod.Thermal.BASE_ADDR + pm_mod.Thermal.SIZE) {
             self.thermal.write32(addr - pm_mod.Thermal.BASE_ADDR, val);
         } else if (addr >= uart_mod.AuxMiniUart.BASE_ADDR and addr < uart_mod.AuxMiniUart.BASE_ADDR + uart_mod.AuxMiniUart.SIZE) {
@@ -433,7 +462,7 @@ pub const Bcm2835 = struct {
         } else if (addr >= pv_mod.PixelValve.PV2_BASE and addr < pv_mod.PixelValve.PV2_BASE + pv_mod.PixelValve.SIZE) {
             self.pv2.write32(addr - pv_mod.PixelValve.PV2_BASE, val);
         } else if (addr >= hdmi_mod.Hdmi.HD_BASE and addr < hdmi_mod.Hdmi.HD_BASE + hdmi_mod.Hdmi.HD_SIZE) {
-            self.hdmi.writeHd32(addr - hdmi_mod.Hdmi.HD_BASE, val);
+            self.hdmi.writeHd32(addr - hdmi_mod.Hdmi.HD_BASE, val, &self.audio_fifo);
         } else if (addr >= hdmi_mod.Hdmi.HDMI_BASE and addr < hdmi_mod.Hdmi.HDMI_BASE + hdmi_mod.Hdmi.HDMI_SIZE) {
             self.hdmi.writeHdmi32(addr - hdmi_mod.Hdmi.HDMI_BASE, val);
         } else if (addr >= dwc2_mod.Dwc2Controller.BASE_ADDR and addr < dwc2_mod.Dwc2Controller.BASE_ADDR + dwc2_mod.Dwc2Controller.SIZE) {
@@ -483,4 +512,55 @@ test "Bcm2835 DMA block write to SDHOST (CMD24) completes without recursion" {
     try std.testing.expectEqual(@as(u32, 0xDEADBEEF), std.mem.readInt(u32, disk[1020..1024], .little));
     try std.testing.expect(soc.dma.channelIrqPending(0));
 }
+
+test "Bcm2835 cyclic vc4-hdmi audio DMA (PERMAP 17 -> HD_MAI_DATA) unpacks IEC958 stereo frames" {
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    var soc = Bcm2835.init(ram, 1280, 720);
+
+    // Configure HD_MAI_FMT (0x2080801c) for 48000 Hz (sr_enum = 9 in bits [15:8])
+    soc.write32(0x2080801c, 9 << 8);
+    soc.write32(0x20808014, hdmi_mod.Hdmi.HD_MAI_CTL_ENABLE | (2 << 4));
+
+    // Write 2 stereo IEC958 frames (16 bytes = 4 subframes) at RAM 0x2000:
+    // Frame 0: Left = 0x2345 (preamble 0x8), Right = -0x2345 (0xdcbb, preamble 0x4)
+    // Frame 1: Left = 0x1111 (preamble 0x2), Right = -0x1111 (0xeeef, preamble 0x4)
+    std.mem.writeInt(u32, ram[0x2000..0x2004], (@as(u32, 0x2345) << 12) | 0x8, .little);
+    std.mem.writeInt(u32, ram[0x2004..0x2008], (@as(u32, @as(u16, @bitCast(@as(i16, -0x2345)))) << 12) | 0x4, .little);
+    std.mem.writeInt(u32, ram[0x2008..0x200c], (@as(u32, 0x1111) << 12) | 0x2, .little);
+    std.mem.writeInt(u32, ram[0x200c..0x2010], (@as(u32, @as(u16, @bitCast(@as(i16, -0x1111)))) << 12) | 0x4, .little);
+
+    // Cyclic DMA CB at 0x400 pointing back to 0xc0000400, PERMAP=17 (HDMI MAI), D_DREQ, S_INC, INT_EN
+    const cb: u32 = 0x400;
+    const ti: u32 = dma_mod.DmaController.TI_S_INC | dma_mod.DmaController.TI_INT_EN | (1 << 6) | (17 << 16);
+    std.mem.writeInt(u32, ram[cb + 0 ..][0..4], ti, .little);
+    std.mem.writeInt(u32, ram[cb + 4 ..][0..4], 0xc0002000, .little);
+    std.mem.writeInt(u32, ram[cb + 8 ..][0..4], 0x7e808020, .little); // HD_MAI_DATA
+    std.mem.writeInt(u32, ram[cb + 12 ..][0..4], 16, .little); // 16 bytes = 2 stereo frames
+    std.mem.writeInt(u32, ram[cb + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[cb + 20 ..][0..4], 0xc0000400, .little); // cyclic loop
+
+    soc.write32(0x20007004, 0xc0000400); // Ch0 CONBLK_AD
+    soc.write32(0x20007000, dma_mod.DmaController.CS_ACTIVE); // Ch0 CS = ACTIVE
+
+    // Immediately after arming, SOURCE_AD should point to start of CB0 (0xc0002000) without draining CBs synchronously
+    try std.testing.expectEqual(@as(u32, 0xc0002000), soc.read32(0x2000700c));
+    try std.testing.expectEqual(@as(u32, 0), soc.audio_fifo.availableFrames());
+
+    // Advance 42 us (~2 frames at 48 kHz = 41.67 us) -> completes the 16-byte period CB and wraps back to 0xc0002000
+    soc.advanceAudio(42);
+    try std.testing.expect(soc.dma.channelIrqPending(0));
+    try std.testing.expectEqual(@as(u32, 2), soc.audio_fifo.availableFrames());
+
+    var samples: [4]i16 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), soc.audio_fifo.popFrames(&samples));
+    try std.testing.expectEqual(@as(i16, 0x2345), samples[0]);
+    try std.testing.expectEqual(@as(i16, -0x2345), samples[1]);
+    try std.testing.expectEqual(@as(i16, 0x1111), samples[2]);
+    try std.testing.expectEqual(@as(i16, -0x1111), samples[3]);
+}
+
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const audio_mod = @import("audio.zig");
 
 /// BCM2835 VideoCore Mailbox (`0x2000b880`) and Property Tags (`channel 8`)
 /// Also tracks legacy/simple framebuffer configuration if requested by firmware fb drivers.
@@ -79,13 +80,17 @@ pub const Mailbox = struct {
     }
 
     pub fn write32(self: *Mailbox, offset: u32, val: u32, ram: []u8) void {
+        self.write32WithVchiq(offset, val, ram, null);
+    }
+
+    pub fn write32WithVchiq(self: *Mailbox, offset: u32, val: u32, ram: []u8, vchiq: ?*audio_mod.Vchiq) void {
         switch (offset) {
             0x00, 0x20 => {
                 const channel: u4 = @truncate(val & 0xF);
                 const data_bus = val & ~@as(u32, 0xF);
                 const phys = data_bus & 0x1FFFFFFF;
                 if (channel == 8) {
-                    self.processPropertyTags(phys, ram);
+                    self.processPropertyTags(phys, ram, vchiq);
                 } else if (channel == 1) {
                     self.processLegacyFramebuffer(phys, ram);
                 }
@@ -137,7 +142,7 @@ pub const Mailbox = struct {
         };
     }
 
-    fn processPropertyTags(self: *Mailbox, phys: u32, ram: []u8) void {
+    fn processPropertyTags(self: *Mailbox, phys: u32, ram: []u8, vchiq: ?*audio_mod.Vchiq) void {
         if (phys + 12 > ram.len) return;
         const total_size = std.mem.readInt(u32, ram[phys..][0..4], .little);
         if (total_size < 12 or phys + total_size > ram.len) return;
@@ -419,6 +424,12 @@ pub const Mailbox = struct {
                     writeU32(ram, payload, 0, buf_size, self.fb_virt_x);
                     writeU32(ram, payload, 4, buf_size, self.fb_virt_y);
                     resp_len = 8;
+                },
+                0x00048010 => { // RPI_FIRMWARE_VCHIQ_INIT
+                    const channel_base = readU32(ram, payload, 0, buf_size);
+                    const status: u32 = if (vchiq) |v| v.initSlotZero(channel_base, ram) else 0;
+                    writeU32(ram, payload, 0, buf_size, status);
+                    resp_len = 4;
                 },
                 0x00060001 => { // Get DMA channels
                     writeU32(ram, payload, 0, buf_size, 0x00007f35);
