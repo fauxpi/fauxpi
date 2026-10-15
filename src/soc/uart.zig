@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_posix = @import("../host/posix.zig");
 const spi_mod = @import("spi.zig");
 
 /// ARM PrimeCell PL011 UART0 (`0x20201000`, size `0x1000` for AMBA PeriphID at `0xfe0..0xffc`).
@@ -93,7 +94,7 @@ pub const Pl011Uart = struct {
                 }
                 if (self.stdout_enabled) {
                     const buf = [1]u8{ch};
-                    _ = std.os.linux.write(std.os.linux.STDOUT_FILENO, &buf, 1);
+                    host_posix.writeStdout(&buf);
                 }
                 self.ris |= INT_TX;
             },
@@ -222,7 +223,7 @@ pub const AuxMiniUart = struct {
                     const ch: u8 = @truncate(val);
                     if (self.stdout_enabled) {
                         const buf = [1]u8{ch};
-                        _ = std.os.linux.write(std.os.linux.STDOUT_FILENO, &buf, 1);
+                        host_posix.writeStdout(&buf);
                     }
                     if ((self.ier & 2) != 0) self.tx_irq_pending = true;
                 }

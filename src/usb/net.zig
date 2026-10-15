@@ -1,5 +1,5 @@
 const std = @import("std");
-const linux = std.os.linux;
+const host_posix = @import("../host/posix.zig");
 
 /// User-mode NAT / SLIRP virtual network stack for CDC-ECM USB Ethernet.
 /// Provides virtual gateway `10.0.2.2` (`52:55:0a:00:02:02`), DHCP server (`10.0.2.15/24`),
@@ -20,7 +20,7 @@ pub const VirtualNetwork = struct {
 
     pub const UdpSession = struct {
         active: bool = false,
-        fd: linux.fd_t = -1,
+        fd: host_posix.fd_t = -1,
         guest_mac: [6]u8 = DEFAULT_GUEST_MAC,
         guest_ip: [4]u8 = DEFAULT_GUEST_IP,
         guest_port: u16 = 0,
@@ -37,7 +37,7 @@ pub const VirtualNetwork = struct {
 
     pub const TcpConn = struct {
         state: TcpState = .unused,
-        fd: linux.fd_t = -1,
+        fd: host_posix.fd_t = -1,
         guest_mac: [6]u8 = DEFAULT_GUEST_MAC,
         guest_ip: [4]u8 = DEFAULT_GUEST_IP,
         guest_port: u16 = 0,
@@ -70,13 +70,13 @@ pub const VirtualNetwork = struct {
     pub fn deinit(self: *VirtualNetwork) void {
         for (&self.udp_sessions) |*s| {
             if (s.active and s.fd >= 0) {
-                _ = linux.close(s.fd);
+                host_posix.close(s.fd);
             }
             s.* = .{};
         }
         for (&self.tcp_conns) |*c| {
             if (c.state != .unused and c.fd >= 0) {
-                _ = linux.close(c.fd);
+                host_posix.close(c.fd);
             }
             c.* = .{};
         }
@@ -340,10 +340,9 @@ pub const VirtualNetwork = struct {
         rep[3] = 0xec; // Precision (-20)
         @memcpy(rep[12..16], "LOCL");
 
-        var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
-        _ = linux.clock_gettime(.REALTIME, &ts);
-        const ntp_sec: u32 = @truncate(@as(u64, @intCast(@max(ts.sec, 0))) + 2_208_988_800);
-        const ntp_frac: u32 = @truncate((@as(u64, @intCast(@max(ts.nsec, 0))) << 32) / 1_000_000_000);
+        const ts = host_posix.realtimeSecNsec();
+        const ntp_sec: u32 = @truncate(ts.sec + 2_208_988_800);
+        const ntp_frac: u32 = @truncate((ts.nsec << 32) / 1_000_000_000);
 
         // Reference Timestamp (16..24)
         std.mem.writeInt(u32, rep[16..20], ntp_sec, .big);
@@ -365,14 +364,12 @@ pub const VirtualNetwork = struct {
         if (self.dns_resolved) return self.host_dns_ip;
         self.dns_resolved = true;
 
-        const fd_rc = linux.openat(linux.AT.FDCWD, "/etc/resolv.conf", .{ .ACCMODE = .RDONLY }, 0);
-        if (linux.errno(fd_rc) != .SUCCESS) return self.host_dns_ip;
-        const fd: linux.fd_t = @intCast(fd_rc);
-        defer _ = linux.close(fd);
+        const fd = host_posix.openRead("/etc/resolv.conf") catch return self.host_dns_ip;
+        defer host_posix.close(fd);
 
         var buf: [2048]u8 = undefined;
-        const n_rc = linux.read(fd, &buf, buf.len);
-        if (linux.errno(n_rc) != .SUCCESS or n_rc == 0) return self.host_dns_ip;
+        const n_rc = host_posix.read(fd, &buf) catch return self.host_dns_ip;
+        if (n_rc == 0) return self.host_dns_ip;
 
         var lines = std.mem.splitScalar(u8, buf[0..n_rc], '\n');
         while (lines.next()) |line| {
@@ -422,13 +419,12 @@ pub const VirtualNetwork = struct {
         if (session_idx == null) {
             const s = &self.udp_sessions[oldest_idx];
             if (s.active and s.fd >= 0) {
-                _ = linux.close(s.fd);
+                host_posix.close(s.fd);
             }
-            const sock_rc = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
-            if (linux.errno(sock_rc) != .SUCCESS) return;
+            const sock_fd = host_posix.socketNonBlock(false) catch return;
             s.* = .{
                 .active = true,
-                .fd = @intCast(sock_rc),
+                .fd = sock_fd,
                 .guest_mac = self.guest_mac,
                 .guest_ip = src_ip,
                 .guest_port = src_port,
@@ -445,11 +441,7 @@ pub const VirtualNetwork = struct {
         s.guest_mac = self.guest_mac;
 
         const real_ip = self.mapTargetIp(dst_ip, dst_port);
-        var addr: linux.sockaddr.in = .{
-            .port = std.mem.nativeToBig(u16, dst_port),
-            .addr = @bitCast(real_ip),
-        };
-        _ = linux.sendto(s.fd, data.ptr, data.len, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
+        _ = host_posix.sendtoIpv4NonBlock(s.fd, data, real_ip, dst_port);
     }
 
     fn handleTcp(self: *VirtualNetwork, src_ip: [4]u8, dst_ip: [4]u8, payload: []const u8) void {
@@ -486,21 +478,13 @@ pub const VirtualNetwork = struct {
             const idx = conn_idx orelse self.allocTcpConn();
             self.closeTcpConn(idx);
 
-            const sock_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM | linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC, 0);
-            if (linux.errno(sock_rc) != .SUCCESS) {
+            const fd = host_posix.socketNonBlock(true) catch {
                 self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, 0, seq +% 1, 0x14, &.{}); // RST|ACK
                 return;
-            }
-            const fd: linux.fd_t = @intCast(sock_rc);
-            const real_ip = self.mapTargetIp(dst_ip, dst_port);
-            var addr: linux.sockaddr.in = .{
-                .port = std.mem.nativeToBig(u16, dst_port),
-                .addr = @bitCast(real_ip),
             };
-            const conn_rc = linux.connect(fd, @ptrCast(&addr), @sizeOf(linux.sockaddr.in));
-            const err = linux.errno(conn_rc);
-            if (err != .SUCCESS and err != .INPROGRESS and err != .AGAIN) {
-                _ = linux.close(fd);
+            const real_ip = self.mapTargetIp(dst_ip, dst_port);
+            if (host_posix.connectIpv4NonBlock(fd, real_ip, dst_port) == .failed) {
+                host_posix.close(fd);
                 self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, 0, seq +% 1, 0x14, &.{}); // RST|ACK
                 return;
             }
@@ -553,7 +537,7 @@ pub const VirtualNetwork = struct {
             }
             self.flushTcpTx(idx);
             if (c.fd >= 0) {
-                _ = linux.shutdown(c.fd, linux.SHUT.WR);
+                host_posix.shutdownWrite(c.fd);
             }
             self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, c.my_seq, c.guest_seq, 0x10, &.{});
         }
@@ -575,7 +559,7 @@ pub const VirtualNetwork = struct {
     fn closeTcpConn(self: *VirtualNetwork, idx: usize) void {
         const c = &self.tcp_conns[idx];
         if (c.state != .unused and c.fd >= 0) {
-            _ = linux.close(c.fd);
+            host_posix.close(c.fd);
         }
         c.* = .{};
     }
@@ -583,10 +567,8 @@ pub const VirtualNetwork = struct {
     fn flushTcpTx(self: *VirtualNetwork, idx: usize) void {
         const c = &self.tcp_conns[idx];
         if (c.state == .unused or c.fd < 0 or c.tx_len == 0) return;
-        const rc = linux.sendto(c.fd, &c.tx_buf, c.tx_len, linux.MSG.DONTWAIT | linux.MSG.NOSIGNAL, null, 0);
-        const err = linux.errno(rc);
-        if (err == .SUCCESS and rc > 0) {
-            const sent: usize = @intCast(rc);
+        const sent = host_posix.sendtoIpv4NonBlock(c.fd, c.tx_buf[0..c.tx_len], null, 0);
+        if (sent > 0) {
             if (sent < c.tx_len) {
                 std.mem.copyForwards(u8, &c.tx_buf, c.tx_buf[sent..c.tx_len]);
             }
@@ -594,17 +576,17 @@ pub const VirtualNetwork = struct {
         }
     }
 
-    pub fn fillPollFds(self: *const VirtualNetwork, out: []linux.pollfd) usize {
+    pub fn fillPollFds(self: *const VirtualNetwork, out: []host_posix.pollfd) usize {
         var n: usize = 0;
         for (&self.udp_sessions) |*s| {
             if (s.active and s.fd >= 0 and n < out.len) {
-                out[n] = .{ .fd = s.fd, .events = linux.POLL.IN, .revents = 0 };
+                out[n] = .{ .fd = s.fd, .events = host_posix.POLL.IN, .revents = 0 };
                 n += 1;
             }
         }
         for (&self.tcp_conns) |*c| {
             if (c.state != .unused and c.fd >= 0 and n < out.len) {
-                const ev: i16 = if (c.tx_len > 0) (linux.POLL.IN | linux.POLL.OUT) else linux.POLL.IN;
+                const ev: i16 = if (c.tx_len > 0) (host_posix.POLL.IN | host_posix.POLL.OUT) else host_posix.POLL.IN;
                 out[n] = .{ .fd = c.fd, .events = ev, .revents = 0 };
                 n += 1;
             }
@@ -622,10 +604,12 @@ pub const VirtualNetwork = struct {
             if (self.rx_count >= RX_QUEUE_CAP - 2) break;
 
             var buf: [1472]u8 = undefined;
-            const rc = linux.recvfrom(s.fd, &buf, buf.len, linux.MSG.DONTWAIT, null, null);
-            if (linux.errno(rc) == .SUCCESS and rc > 0) {
-                s.last_tick = self.tick_count;
-                self.sendUdpPacket(s.dst_ip, s.dst_port, s.guest_ip, s.guest_port, buf[0..rc]);
+            switch (host_posix.recvNonBlock(s.fd, &buf)) {
+                .data => |rc| {
+                    s.last_tick = self.tick_count;
+                    self.sendUdpPacket(s.dst_ip, s.dst_port, s.guest_ip, s.guest_port, buf[0..rc]);
+                },
+                else => {},
             }
         }
 
@@ -640,27 +624,26 @@ pub const VirtualNetwork = struct {
             }
 
             var buf: [1400]u8 = undefined;
-            const rc = linux.recvfrom(c.fd, &buf, buf.len, linux.MSG.DONTWAIT, null, null);
-            const err = linux.errno(rc);
-            if (err == .SUCCESS) {
-                if (rc > 0) {
+            switch (host_posix.recvNonBlock(c.fd, &buf)) {
+                .data => |rc| {
                     c.last_tick = self.tick_count;
                     const seq = c.my_seq;
                     c.my_seq +%= @intCast(rc);
                     self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, seq, c.guest_seq, 0x18, buf[0..rc]); // PSH|ACK
-                } else {
+                },
+                .eof => {
                     // EOF from remote host -> send FIN|ACK and close
                     const seq = c.my_seq;
                     c.my_seq +%= 1;
                     self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, seq, c.guest_seq, 0x11, &.{}); // FIN|ACK
                     self.closeTcpConn(idx);
-                }
-            } else if (err == .AGAIN or err == .INPROGRESS) {
-                // Still waiting
-            } else {
-                // Connection refused / reset
-                self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.my_seq, c.guest_seq, 0x14, &.{}); // RST|ACK
-                self.closeTcpConn(idx);
+                },
+                .again => {},
+                .err => {
+                    // Connection refused / reset
+                    self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.my_seq, c.guest_seq, 0x14, &.{}); // RST|ACK
+                    self.closeTcpConn(idx);
+                },
             }
         }
     }

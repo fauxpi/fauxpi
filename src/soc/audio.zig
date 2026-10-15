@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_posix = @import("../host/posix.zig");
 
 /// Lock-free Single-Producer Single-Consumer (SPSC) stereo 16-bit PCM FIFO at 48 kHz.
 /// Producer: emulated BCM2835 SoC thread (`vc4-hdmi` MAI DMA, `vchiq` `AUDS`, or `bcm2835-pwm`).
@@ -53,12 +54,7 @@ pub const AudioFifo = struct {
     }
 
     pub fn wakeConsumer(self: *AudioFifo) void {
-        _ = std.os.linux.futex_4arg(
-            @ptrCast(&self.write_idx.raw),
-            .{ .cmd = .WAKE, .private = true },
-            1,
-            null,
-        );
+        host_posix.futexWake(&self.write_idx.raw);
     }
 
     pub fn waitForFrames(
@@ -79,12 +75,7 @@ pub const AudioFifo = struct {
         const r2 = self.read_idx.load(.acquire);
         if (!paused.load(.acquire) and w2 != r2) return;
 
-        _ = std.os.linux.futex_4arg(
-            @ptrCast(&self.write_idx.raw),
-            .{ .cmd = .WAIT, .private = true },
-            w2,
-            null,
-        );
+        host_posix.futexWait(&self.write_idx.raw, w2);
     }
 
     /// Pushes one stereo sample frame at `src_rate_hz`, resampling linearly to `HOST_SAMPLE_RATE` (48 kHz).

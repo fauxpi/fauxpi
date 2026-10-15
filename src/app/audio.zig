@@ -1,11 +1,13 @@
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
 const audio_mod = @import("../soc/audio.zig");
 
-/// Non-blocking host audio output player for Linux.
-/// Spawns a background playback thread that drains 48 kHz stereo S16_LE PCM frames
-/// from `AudioFifo` and streams them to PulseAudio/PipeWire (`libpulse-simple.so.0`)
-/// or ALSA (`libasound.so.2`).
+/// Non-blocking host audio output player for Linux and macOS.
+/// - On Linux: spawns a background playback thread that drains 48 kHz stereo S16_LE PCM frames
+///   from `AudioFifo` and streams them to PulseAudio/PipeWire (`libpulse-simple.so.0`)
+///   or ALSA (`libasound.so.2`).
+/// - On macOS: opens an `AudioToolbox` `AudioQueueNewOutput` stream (4x 512-frame buffers at 48 kHz)
+///   that pulls stereo S16_LE frames directly from `AudioFifo`.
 pub const HostAudioOutput = struct {
     const PaSimple = opaque {};
     const PaSampleSpec = extern struct {
@@ -23,18 +25,44 @@ pub const HostAudioOutput = struct {
 
     const SndPcm = opaque {};
 
+    const AudioQueueOpaque = opaque {};
+    const AudioStreamBasicDescription = extern struct {
+        mSampleRate: f64,
+        mFormatID: u32,
+        mFormatFlags: u32,
+        mBytesPerPacket: u32,
+        mFramesPerPacket: u32,
+        mBytesPerFrame: u32,
+        mChannelsPerFrame: u32,
+        mBitsPerChannel: u32,
+        mReserved: u32,
+    };
+    const AudioQueueBuffer = extern struct {
+        mAudioDataBytesCapacity: u32,
+        mAudioData: [*]u8,
+        mAudioDataByteSize: u32,
+        mUserData: ?*anyopaque,
+        mPacketDescriptionCapacity: u32,
+        mPacketDescriptions: ?*anyopaque,
+        mPacketDescriptionCount: u32,
+    };
+    const AudioQueueCallback = *const fn (?*anyopaque, *AudioQueueOpaque, *AudioQueueBuffer) callconv(.c) void;
+    const AQ_BUFFER_FRAMES: usize = 512;
+    const AQ_BUFFER_BYTES: u32 = AQ_BUFFER_FRAMES * 4;
+    const AQ_NUM_BUFFERS: usize = 4;
+
     fifo: *audio_mod.AudioFifo,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     paused: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
 
-    // PulseAudio simple API state
+    // PulseAudio simple API state (Linux)
     pa_lib: ?std.DynLib = null,
     pa_handle: ?*PaSimple = null,
     pa_simple_write: ?*const fn (*PaSimple, *const anyopaque, usize, *c_int) callconv(.c) c_int = null,
     pa_simple_free: ?*const fn (*PaSimple) callconv(.c) void = null,
 
-    // ALSA API fallback state
+    // ALSA API fallback state (Linux)
     alsa_lib: ?std.DynLib = null,
     alsa_handle: ?*SndPcm = null,
     snd_pcm_writei: ?*const fn (*SndPcm, *const anyopaque, c_ulong) callconv(.c) c_long = null,
@@ -42,12 +70,23 @@ pub const HostAudioOutput = struct {
     snd_pcm_prepare: ?*const fn (*SndPcm) callconv(.c) c_int = null,
     snd_pcm_close: ?*const fn (*SndPcm) callconv(.c) c_int = null,
 
+    // AudioToolbox AudioQueue state (macOS)
+    aq_lib: ?std.DynLib = null,
+    aq_handle: ?*AudioQueueOpaque = null,
+    aq_enqueue: ?*const fn (*AudioQueueOpaque, *AudioQueueBuffer, u32, ?*const anyopaque) callconv(.c) i32 = null,
+    aq_stop: ?*const fn (*AudioQueueOpaque, u8) callconv(.c) i32 = null,
+    aq_dispose: ?*const fn (*AudioQueueOpaque, u8) callconv(.c) i32 = null,
+
     pub fn create(allocator: std.mem.Allocator, fifo: *audio_mod.AudioFifo) !*HostAudioOutput {
         const self = try allocator.create(HostAudioOutput);
         self.* = .{ .fifo = fifo };
 
         self.running.store(true, .release);
-        self.thread = std.Thread.spawn(.{}, workerMain, .{self}) catch null;
+        if (builtin.os.tag == .macos) {
+            _ = self.tryOpenAudioToolbox();
+        } else {
+            self.thread = std.Thread.spawn(.{}, workerMain, .{self}) catch null;
+        }
         return self;
     }
 
@@ -68,6 +107,122 @@ pub const HostAudioOutput = struct {
         if (prev and !p) {
             self.fifo.wakeConsumer();
         }
+    }
+
+    fn audioQueueCallback(user_data: ?*anyopaque, aq: *AudioQueueOpaque, buf: *AudioQueueBuffer) callconv(.c) void {
+        const self: *HostAudioOutput = @ptrCast(@alignCast(user_data orelse return));
+        if (!self.running.load(.acquire)) return;
+
+        const out_i16: [*]i16 = @ptrCast(@alignCast(buf.mAudioData));
+        const total_samples = AQ_BUFFER_FRAMES * 2;
+        var filled_frames: usize = 0;
+
+        if (!self.paused.load(.acquire)) {
+            filled_frames = self.fifo.popFrames(out_i16[0..total_samples]);
+        }
+        if (filled_frames < AQ_BUFFER_FRAMES) {
+            @memset(out_i16[filled_frames * 2 .. total_samples], 0);
+        }
+        buf.mAudioDataByteSize = AQ_BUFFER_BYTES;
+        if (self.aq_enqueue) |enqueue_fn| {
+            _ = enqueue_fn(aq, buf, 0, null);
+        }
+    }
+
+    fn tryOpenAudioToolbox(self: *HostAudioOutput) bool {
+        var lib = std.DynLib.open("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox") catch return false;
+        const aq_new = lib.lookup(
+            *const fn (
+                *const AudioStreamBasicDescription,
+                AudioQueueCallback,
+                ?*anyopaque,
+                ?*anyopaque,
+                ?*anyopaque,
+                u32,
+                *?*AudioQueueOpaque,
+            ) callconv(.c) i32,
+            "AudioQueueNewOutput",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+        const aq_alloc_buf = lib.lookup(
+            *const fn (*AudioQueueOpaque, u32, *?*AudioQueueBuffer) callconv(.c) i32,
+            "AudioQueueAllocateBuffer",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+        const aq_enqueue = lib.lookup(
+            *const fn (*AudioQueueOpaque, *AudioQueueBuffer, u32, ?*const anyopaque) callconv(.c) i32,
+            "AudioQueueEnqueueBuffer",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+        const aq_start = lib.lookup(
+            *const fn (*AudioQueueOpaque, ?*const anyopaque) callconv(.c) i32,
+            "AudioQueueStart",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+        const aq_stop = lib.lookup(
+            *const fn (*AudioQueueOpaque, u8) callconv(.c) i32,
+            "AudioQueueStop",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+        const aq_dispose = lib.lookup(
+            *const fn (*AudioQueueOpaque, u8) callconv(.c) i32,
+            "AudioQueueDispose",
+        ) orelse {
+            lib.close();
+            return false;
+        };
+
+        const desc = AudioStreamBasicDescription{
+            .mSampleRate = @floatFromInt(audio_mod.AudioFifo.HOST_SAMPLE_RATE),
+            .mFormatID = 0x6C70636D, // 'lpcm' (kAudioFormatLinearPCM)
+            .mFormatFlags = 0x0C, // kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked
+            .mBytesPerPacket = 4,
+            .mFramesPerPacket = 1,
+            .mBytesPerFrame = 4,
+            .mChannelsPerFrame = 2,
+            .mBitsPerChannel = 16,
+            .mReserved = 0,
+        };
+
+        var queue: ?*AudioQueueOpaque = null;
+        if (aq_new(&desc, audioQueueCallback, self, null, null, 0, &queue) != 0 or queue == null) {
+            lib.close();
+            return false;
+        }
+
+        self.aq_lib = lib;
+        self.aq_handle = queue;
+        self.aq_enqueue = aq_enqueue;
+        self.aq_stop = aq_stop;
+        self.aq_dispose = aq_dispose;
+
+        for (0..AQ_NUM_BUFFERS) |_| {
+            var buf: ?*AudioQueueBuffer = null;
+            if (aq_alloc_buf(queue.?, AQ_BUFFER_BYTES, &buf) == 0 and buf != null) {
+                @memset(buf.?.mAudioData[0..AQ_BUFFER_BYTES], 0);
+                buf.?.mAudioDataByteSize = AQ_BUFFER_BYTES;
+                _ = aq_enqueue(queue.?, buf.?, 0, null);
+            }
+        }
+
+        if (aq_start(queue.?, null) != 0) {
+            _ = aq_dispose(queue.?, 1);
+            self.aq_handle = null;
+            lib.close();
+            self.aq_lib = null;
+            return false;
+        }
+        return true;
     }
 
     fn tryOpenPulse(self: *HostAudioOutput) bool {
@@ -200,6 +355,15 @@ pub const HostAudioOutput = struct {
     }
 
     fn closeBackend(self: *HostAudioOutput) void {
+        if (self.aq_handle) |q| {
+            if (self.aq_stop) |stop_fn| _ = stop_fn(q, 1);
+            if (self.aq_dispose) |disp_fn| _ = disp_fn(q, 1);
+            self.aq_handle = null;
+        }
+        if (self.aq_lib) |*lib| {
+            lib.close();
+            self.aq_lib = null;
+        }
         if (self.pa_handle) |h| {
             if (self.pa_simple_free) |free_fn| free_fn(h);
             self.pa_handle = null;

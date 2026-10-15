@@ -5,7 +5,7 @@
 //! in memory, storing only non-zero 64 KiB clusters.
 
 const std = @import("std");
-const linux = std.os.linux;
+const host_posix = @import("../host/posix.zig");
 
 pub const QCOW2_MAGIC: u32 = 0x514649fb; // "QFI\xfb"
 pub const QCOW2_VERSION: u32 = 3;
@@ -76,7 +76,7 @@ pub const SdCardSize = enum(u8) {
 
 pub const Qcow2Disk = struct {
     allocator: std.mem.Allocator,
-    fd: linux.fd_t,
+    fd: host_posix.fd_t,
     virtual_size: u64,
     next_cluster: u64 = 4,
     allocated_data_clusters: u64 = 0,
@@ -135,19 +135,9 @@ pub const Qcow2Disk = struct {
 
     /// Queries the size in bytes of a file on disk without reading it into memory.
     pub fn getFileSizeLinux(path: []const u8) !u64 {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (path.len >= path_buf.len) return error.NameTooLong;
-        @memcpy(path_buf[0..path.len], path);
-        path_buf[path.len] = 0;
-
-        const fd_rc = linux.openat(linux.AT.FDCWD, path_buf[0..path.len :0], .{ .ACCMODE = .RDONLY }, 0);
-        if (linux.errno(fd_rc) != .SUCCESS) return error.FileOpenFailed;
-        const fd: linux.fd_t = @intCast(fd_rc);
-        defer _ = linux.close(fd);
-
-        const end_rc = linux.lseek(fd, 0, linux.SEEK.END);
-        if (linux.errno(end_rc) != .SUCCESS) return error.FileSeekFailed;
-        return @intCast(end_rc);
+        const fd = try host_posix.openRead(path);
+        defer host_posix.close(fd);
+        return try host_posix.lseekEnd(fd);
     }
 
     /// Creates a new QCOW2 v3 disk of `virtual_size` bytes by streaming `image_path` in 64 KiB clusters.
@@ -168,23 +158,14 @@ pub const Qcow2Disk = struct {
         image_path: []const u8,
         backing_path: ?[]const u8,
     ) !Qcow2Disk {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (image_path.len >= path_buf.len) return error.NameTooLong;
-        @memcpy(path_buf[0..image_path.len], image_path);
-        path_buf[image_path.len] = 0;
+        const src_fd = try host_posix.openRead(image_path);
+        defer host_posix.close(src_fd);
 
-        const fd_rc = linux.openat(linux.AT.FDCWD, path_buf[0..image_path.len :0], .{ .ACCMODE = .RDONLY }, 0);
-        if (linux.errno(fd_rc) != .SUCCESS) return error.FileOpenFailed;
-        const src_fd: linux.fd_t = @intCast(fd_rc);
-        defer _ = linux.close(src_fd);
-
-        const end_rc = linux.lseek(src_fd, 0, linux.SEEK.END);
-        if (linux.errno(end_rc) != .SUCCESS) return error.FileSeekFailed;
-        const file_size: u64 = @intCast(end_rc);
+        const file_size = try host_posix.lseekEnd(src_fd);
 
         if (file_size > virtual_size) return error.ImageTooLarge;
 
-        _ = linux.lseek(src_fd, 0, linux.SEEK.SET);
+        host_posix.lseekSet(src_fd, 0);
 
         var disk = try initEmptyAtPath(allocator, virtual_size, backing_path);
         errdefer {
@@ -200,8 +181,7 @@ pub const Qcow2Disk = struct {
             const want: usize = @intCast(@min(@as(u64, CLUSTER_SIZE), file_size - off));
             var got: usize = 0;
             while (got < want) {
-                const rc = linux.read(src_fd, io_buf[got..want].ptr, want - got);
-                if (linux.errno(rc) != .SUCCESS) return error.FileReadFailed;
+                const rc = try host_posix.read(src_fd, io_buf[got..want]);
                 if (rc == 0) break;
                 got += rc;
             }
@@ -228,7 +208,7 @@ pub const Qcow2Disk = struct {
         if (virtual_size == 0) return error.InvalidSize;
         const fd = if (backing_path) |bp| try createFileFd(bp) else try createBackingFd();
         errdefer {
-            _ = linux.close(fd);
+            host_posix.close(fd);
             if (backing_path) |bp| unlinkFileLinux(bp);
         }
 
@@ -255,20 +235,8 @@ pub const Qcow2Disk = struct {
 
     /// Opens an existing QCOW2 v3 image file from disk for read/write persistence.
     pub fn openExistingFile(allocator: std.mem.Allocator, backing_path: []const u8) !Qcow2Disk {
-        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        if (backing_path.len >= path_buf.len) return error.NameTooLong;
-        @memcpy(path_buf[0..backing_path.len], backing_path);
-        path_buf[backing_path.len] = 0;
-
-        const fd_rc = linux.openat(
-            linux.AT.FDCWD,
-            path_buf[0..backing_path.len :0],
-            .{ .ACCMODE = .RDWR, .CLOEXEC = true },
-            0,
-        );
-        if (linux.errno(fd_rc) != .SUCCESS) return error.FileOpenFailed;
-        const fd: linux.fd_t = @intCast(fd_rc);
-        errdefer _ = linux.close(fd);
+        const fd = try host_posix.openReadWrite(backing_path);
+        errdefer host_posix.close(fd);
 
         var hdr: [104]u8 = undefined;
         try preadAll(fd, &hdr, 0);
@@ -305,8 +273,7 @@ pub const Qcow2Disk = struct {
         errdefer allocator.destroy(cluster_cache);
         @memset(cluster_cache, 0);
 
-        const end_rc = linux.lseek(fd, 0, linux.SEEK.END);
-        const file_size: u64 = if (linux.errno(end_rc) == .SUCCESS) @intCast(end_rc) else 4 * CLUSTER_SIZE;
+        const file_size: u64 = host_posix.lseekEnd(fd) catch (4 * CLUSTER_SIZE);
         var max_cluster: u64 = @max(4, (file_size + CLUSTER_SIZE - 1) / CLUSTER_SIZE);
         var data_clusters: u64 = 0;
 
@@ -347,7 +314,7 @@ pub const Qcow2Disk = struct {
     pub fn deinit(self: *Qcow2Disk) void {
         self.flush() catch {};
         if (self.fd >= 0) {
-            _ = linux.close(self.fd);
+            host_posix.close(self.fd);
             self.fd = -1;
         }
         self.allocator.free(self.l1_table);
@@ -583,7 +550,7 @@ pub const Qcow2Disk = struct {
         try pwriteAll(self.fd, &ref_blk, 2 * CLUSTER_SIZE);
 
         // Ensure file size covers metadata clusters 0..3 (256 KiB)
-        _ = linux.ftruncate(self.fd, @intCast(4 * CLUSTER_SIZE));
+        host_posix.ftruncate(self.fd, 4 * CLUSTER_SIZE);
     }
 };
 
@@ -594,79 +561,24 @@ fn isAllZero(buf: []const u8) bool {
     return true;
 }
 
-fn createFileFd(path: []const u8) !linux.fd_t {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len >= path_buf.len) return error.NameTooLong;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-
-    const rc = linux.openat(
-        linux.AT.FDCWD,
-        path_buf[0..path.len :0],
-        .{
-            .ACCMODE = .RDWR,
-            .CREAT = true,
-            .TRUNC = true,
-            .CLOEXEC = true,
-        },
-        0o644,
-    );
-    if (linux.errno(rc) != .SUCCESS) return error.FileOpenFailed;
-    return @intCast(rc);
+fn createFileFd(path: []const u8) !host_posix.fd_t {
+    return host_posix.openCreateTruncWrite(path, true);
 }
 
 pub fn unlinkFileLinux(path: []const u8) void {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len >= path_buf.len) return;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
-    _ = linux.unlinkat(linux.AT.FDCWD, path_buf[0..path.len :0], 0);
+    host_posix.unlinkFile(path);
 }
 
-fn createBackingFd() !linux.fd_t {
-    // Prefer an unlinked O_TMPFILE on disk (/var/tmp or /tmp) so large SD cards
-    // do not consume RAM; fall back to memfd_create if O_TMPFILE is unavailable.
-    const tmp_dirs = [_][:0]const u8{ "/var/tmp", "/tmp" };
-    for (tmp_dirs) |dir| {
-        const rc = linux.openat(
-            linux.AT.FDCWD,
-            dir,
-            .{
-                .ACCMODE = .RDWR,
-                .TMPFILE = true,
-                .CLOEXEC = true,
-            },
-            0o600,
-        );
-        if (linux.errno(rc) == .SUCCESS) {
-            return @intCast(rc);
-        }
-    }
-    const mfd_rc = linux.memfd_create("fauxpi-sdcard-qcow2", linux.MFD.CLOEXEC);
-    if (linux.errno(mfd_rc) != .SUCCESS) return error.FileOpenFailed;
-    return @intCast(mfd_rc);
+fn createBackingFd() !host_posix.fd_t {
+    return host_posix.createTempBackingFd();
 }
 
-fn preadAll(fd: linux.fd_t, buf: []u8, offset: u64) !void {
-    var done: usize = 0;
-    while (done < buf.len) {
-        const rc = linux.pread(fd, buf[done..].ptr, buf.len - done, @intCast(offset + done));
-        if (linux.errno(rc) != .SUCCESS) return error.DiskReadFailed;
-        if (rc == 0) {
-            @memset(buf[done..], 0);
-            return;
-        }
-        done += rc;
-    }
+fn preadAll(fd: host_posix.fd_t, buf: []u8, offset: u64) !void {
+    return host_posix.preadAll(fd, buf, offset);
 }
 
-fn pwriteAll(fd: linux.fd_t, buf: []const u8, offset: u64) !void {
-    var done: usize = 0;
-    while (done < buf.len) {
-        const rc = linux.pwrite(fd, buf[done..].ptr, buf.len - done, @intCast(offset + done));
-        if (linux.errno(rc) != .SUCCESS) return error.DiskWriteFailed;
-        done += rc;
-    }
+fn pwriteAll(fd: host_posix.fd_t, buf: []const u8, offset: u64) !void {
+    return host_posix.pwriteAll(fd, buf, offset);
 }
 
 const testing = std.testing;
@@ -727,7 +639,7 @@ test "QCOW2 persistent file creation and reopening via openExistingFile" {
     const allocator = testing.allocator;
 
     var rnd: [8]u8 = undefined;
-    _ = linux.getrandom(&rnd, rnd.len, 0);
+    host_posix.getRandomBytes(&rnd);
     var path_buf: [128]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "/tmp/fauxpi-test-{x}.qcow2", .{std.mem.readInt(u64, &rnd, .little)});
     defer unlinkFileLinux(path);

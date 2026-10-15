@@ -1,4 +1,5 @@
 const std = @import("std");
+const host_posix = @import("../host/posix.zig");
 pub const qcow2 = @import("qcow2.zig");
 
 /// BCM2835 SDHOST Controller (`brcm,bcm2835-sdhost`) at `0x20202000` (size `0x100`).
@@ -385,7 +386,7 @@ pub const SdHost = struct {
             const in_sec: usize = @intCast(offset % 512);
             if (self.sector_cache_lba != lba) {
                 @memset(&self.sector_cache, 0);
-                _ = std.os.linux.pread(fd, &self.sector_cache, 512, @intCast(lba * 512));
+                host_posix.preadAll(fd, &self.sector_cache, lba * 512) catch {};
                 self.sector_cache_lba = lba;
             }
             return self.sector_cache[in_sec];
@@ -404,7 +405,7 @@ pub const SdHost = struct {
         }
         if (self.image_fd) |fd| {
             const buf = [1]u8{b};
-            _ = std.os.linux.pwrite(fd, &buf, 1, @intCast(offset));
+            host_posix.pwriteAll(fd, &buf, offset) catch {};
             if (self.sector_cache_lba == offset / 512) {
                 self.sector_cache[@intCast(offset % 512)] = b;
             }

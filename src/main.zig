@@ -1,5 +1,6 @@
 const std = @import("std");
-const linux = std.os.linux;
+const builtin = @import("builtin");
+pub const host_posix = @import("host/posix.zig");
 
 pub const fat32 = @import("boot/fat32.zig");
 pub const fdt = @import("boot/fdt.zig");
@@ -41,8 +42,8 @@ pub const vc4_hvs = @import("vc4/hvs.zig");
 pub const vc4_pv = @import("vc4/pixelvalve.zig");
 pub const vc4_hdmi = @import("vc4/hdmi.zig");
 
-pub const wl_protocol = @import("wayland/protocol.zig");
-pub const wl_client = @import("wayland/client.zig");
+pub const wl_protocol = if (builtin.os.tag == .linux) @import("wayland/protocol.zig") else struct {};
+pub const wl_client = if (builtin.os.tag == .linux) @import("wayland/client.zig") else struct {};
 pub const font = @import("font/font.zig");
 pub const ui_board = @import("ui/board.zig");
 pub const ui_gpio_model = @import("ui/gpio_model.zig");
@@ -79,20 +80,11 @@ fn readSdImageLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 }
 
 fn readFileWithMinSizeLinux(allocator: std.mem.Allocator, path: []const u8, min_size: usize) ![]u8 {
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    if (path.len >= path_buf.len) return error.NameTooLong;
-    @memcpy(path_buf[0..path.len], path);
-    path_buf[path.len] = 0;
+    const fd = try host_posix.openRead(path);
+    defer host_posix.close(fd);
 
-    const fd_rc = linux.openat(linux.AT.FDCWD, path_buf[0..path.len :0], .{ .ACCMODE = .RDONLY }, 0);
-    if (linux.errno(fd_rc) != .SUCCESS) return error.FileOpenFailed;
-    const fd: linux.fd_t = @intCast(fd_rc);
-    defer _ = linux.close(fd);
-
-    const end_rc = linux.lseek(fd, 0, linux.SEEK.END);
-    if (linux.errno(end_rc) != .SUCCESS) return error.FileSeekFailed;
-    const file_size: usize = @intCast(end_rc);
-    _ = linux.lseek(fd, 0, linux.SEEK.SET);
+    const file_size: usize = @intCast(try host_posix.lseekEnd(fd));
+    host_posix.lseekSet(fd, 0);
 
     const alloc_size = @max(file_size, min_size);
     const buf = try allocator.alloc(u8, alloc_size);
@@ -100,10 +92,9 @@ fn readFileWithMinSizeLinux(allocator: std.mem.Allocator, path: []const u8, min_
 
     var off: usize = 0;
     while (off < file_size) {
-        const rc = linux.read(fd, buf[off..].ptr, file_size - off);
-        if (linux.errno(rc) != .SUCCESS) return error.FileReadFailed;
-        if (rc == 0) break;
-        off += rc;
+        const n = host_posix.read(fd, buf[off..file_size]) catch return error.FileReadFailed;
+        if (n == 0) break;
+        off += n;
     }
     if (alloc_size > off) {
         @memset(buf[off..alloc_size], 0);
@@ -112,9 +103,7 @@ fn readFileWithMinSizeLinux(allocator: std.mem.Allocator, path: []const u8, min_
 }
 
 fn monotonicNs() u64 {
-    var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+    return host_posix.monotonicNs();
 }
 
 fn printUsage() void {
@@ -130,12 +119,12 @@ fn printUsage() void {
         \\  --cmdline <string>  Additional kernel command line parameters
         \\  --width <px>        HDMI output width (default: 1280)
         \\  --height <px>       HDMI output height (default: 720)
-        \\  --headless          Run without opening a Wayland window
+        \\  --headless          Run without opening a desktop window
         \\  --max-steps <n>     Stop simulation after <n> ARM instructions
         \\  --help              Show this help message
         \\
     ;
-    _ = linux.write(linux.STDOUT_FILENO, msg.ptr, msg.len);
+    host_posix.writeStdout(msg);
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -333,7 +322,7 @@ fn resetCpusForBoard(
     }
 }
 
-fn syncWindowPeripheralsToSoc(w: *const window.WaylandWindow, soc: *Bcm2835) void {
+fn syncWindowPeripheralsToSoc(w: *const window.Window, soc: *Bcm2835) void {
     soc.setHdmiConnected(w.status.hdmi_connected);
     soc.setAudioConnected(w.status.audio_connected);
     soc.usb.hid.setHubKind(hid.HubKind.fromModel(w.status.model));
@@ -369,11 +358,11 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
     const initial_power = opts.power or opts.headless;
 
-    var wl_win: ?*window.WaylandWindow = null;
+    var wl_win: ?*window.Window = null;
     defer if (wl_win) |w| w.destroy();
 
     if (!opts.headless) {
-        wl_win = try window.WaylandWindow.create(gpa, environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
+        wl_win = try window.Window.create(gpa, environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
         wl_win.?.status.power_connected = opts.power;
         if (opts.sd_path) |sd_path| {
             const fsize = try qcow2.Qcow2Disk.getFileSizeLinux(sd_path);

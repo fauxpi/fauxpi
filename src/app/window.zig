@@ -1,13 +1,66 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 const client = @import("../wayland/client.zig");
 const protocol = @import("../wayland/protocol.zig");
 const UsbHidComposite = @import("../usb/hid.zig").UsbHidComposite;
 const Gpio = @import("../soc/gpio.zig").Gpio;
 const board_sheet = @import("../ui/board_sheet.zig");
+pub const macos_window = @import("macos_window.zig");
+
+/// Platform-native desktop window backend (`MacosWindow` on macOS, `WaylandWindow` on Linux).
+pub const Window = if (builtin.os.tag == .macos) macos_window.MacosWindow else WaylandWindow;
 
 extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
 extern "c" fn _exit(status: c_int) noreturn;
+
+pub const cursor_logical_dim: u32 = 24;
+pub const crosshair_logical_hot: i32 = 12;
+
+pub fn paintFaintCrosshairCursor(pixels: []u32, sc: u32) void {
+    const dim: usize = @as(usize, cursor_logical_dim) * @as(usize, sc);
+    @memset(pixels, 0x00000000);
+
+    const c: i32 = @intCast(crosshair_logical_hot);
+    // Premultiplied ARGB8888: faint ~22% white core with subtle ~11% dark halo
+    // so the crosshair is subtly visible on both dark and light HDMI frames without
+    // doubling up with the guest OS cursor.
+    const core_px: u32 = 0x38383838;
+    const halo_px: u32 = 0x1C000000;
+
+    var d: i32 = -5;
+    while (d <= 5) : (d += 1) {
+        if (d >= -1 and d <= 1) continue; // 3x3 gap around center tip
+        // Horizontal arm (y = c, x = c + d) + 1px halo above/below
+        fillScaledCursorPixel(pixels, dim, sc, c + d, c - 1, halo_px);
+        fillScaledCursorPixel(pixels, dim, sc, c + d, c, core_px);
+        fillScaledCursorPixel(pixels, dim, sc, c + d, c + 1, halo_px);
+        // Vertical arm (x = c, y = c + d) + 1px halo left/right
+        fillScaledCursorPixel(pixels, dim, sc, c - 1, c + d, halo_px);
+        fillScaledCursorPixel(pixels, dim, sc, c, c + d, core_px);
+        fillScaledCursorPixel(pixels, dim, sc, c + 1, c + d, halo_px);
+    }
+    // Subtle center dot
+    fillScaledCursorPixel(pixels, dim, sc, c, c, core_px);
+}
+
+fn fillScaledCursorPixel(pixels: []u32, dim: usize, sc: u32, lx: i32, ly: i32, color: u32) void {
+    if (lx < 0 or ly < 0) return;
+    const x0: usize = @as(usize, @intCast(lx)) * @as(usize, sc);
+    const y0: usize = @as(usize, @intCast(ly)) * @as(usize, sc);
+    const s: usize = sc;
+    var dy: usize = 0;
+    while (dy < s) : (dy += 1) {
+        const py = y0 + dy;
+        if (py >= dim) break;
+        var dx: usize = 0;
+        while (dx < s) : (dx += 1) {
+            const px = x0 + dx;
+            if (px >= dim) break;
+            pixels[py * dim + px] = color;
+        }
+    }
+}
 
 /// Wayland XDG-Shell desktop window with client-side TitleBar (`44px` logical),
 /// drop-down Board & GPIO Status Sheet, HiDPI buffer scale support (`1x`, `2x`, ...),
@@ -349,36 +402,6 @@ pub const WaylandWindow = struct {
         }
     }
 
-    const cursor_logical_dim: u32 = 24;
-    const crosshair_logical_hot: i32 = 12;
-
-    fn paintFaintCrosshairCursor(pixels: []u32, sc: u32) void {
-        const dim: usize = @as(usize, cursor_logical_dim) * @as(usize, sc);
-        @memset(pixels, 0x00000000);
-
-        const c: i32 = @intCast(crosshair_logical_hot);
-        // Premultiplied ARGB8888: faint ~22% white core with subtle ~11% dark halo
-        // so the crosshair is subtly visible on both dark and light HDMI frames without
-        // doubling up with the guest OS cursor.
-        const core_px: u32 = 0x38383838;
-        const halo_px: u32 = 0x1C000000;
-
-        var d: i32 = -5;
-        while (d <= 5) : (d += 1) {
-            if (d >= -1 and d <= 1) continue; // 3x3 gap around center tip
-            // Horizontal arm (y = c, x = c + d) + 1px halo above/below
-            fillScaledCursorPixel(pixels, dim, sc, c + d, c - 1, halo_px);
-            fillScaledCursorPixel(pixels, dim, sc, c + d, c, core_px);
-            fillScaledCursorPixel(pixels, dim, sc, c + d, c + 1, halo_px);
-            // Vertical arm (x = c, y = c + d) + 1px halo left/right
-            fillScaledCursorPixel(pixels, dim, sc, c - 1, c + d, halo_px);
-            fillScaledCursorPixel(pixels, dim, sc, c, c + d, core_px);
-            fillScaledCursorPixel(pixels, dim, sc, c + 1, c + d, halo_px);
-        }
-        // Subtle center dot
-        fillScaledCursorPixel(pixels, dim, sc, c, c, core_px);
-    }
-
     fn paintArrowCursor(pixels: []u32, sc: u32) void {
         const dim: usize = @as(usize, cursor_logical_dim) * @as(usize, sc);
         @memset(pixels, 0x00000000);
@@ -409,24 +432,6 @@ pub const WaylandWindow = struct {
                     else => continue,
                 };
                 fillScaledCursorPixel(pixels, dim, sc, @intCast(lx + 1), @intCast(ly + 1), color);
-            }
-        }
-    }
-
-    fn fillScaledCursorPixel(pixels: []u32, dim: usize, sc: u32, lx: i32, ly: i32, color: u32) void {
-        if (lx < 0 or ly < 0) return;
-        const x0: usize = @as(usize, @intCast(lx)) * @as(usize, sc);
-        const y0: usize = @as(usize, @intCast(ly)) * @as(usize, sc);
-        const s: usize = sc;
-        var dy: usize = 0;
-        while (dy < s) : (dy += 1) {
-            const py = y0 + dy;
-            if (py >= dim) break;
-            var dx: usize = 0;
-            while (dx < s) : (dx += 1) {
-                const px = x0 + dx;
-                if (px >= dim) break;
-                pixels[py * dim + px] = color;
             }
         }
     }
@@ -1209,6 +1214,7 @@ fn monotonicNs() u64 {
 }
 
 test "WaylandWindow keyboard repeat_info, serviceRepeat, keymap fd mmap, and leave release" {
+    if (builtin.os.tag != .linux) return;
     const testing = std.testing;
     var gpio: Gpio = .{};
     var hid: UsbHidComposite = .{};

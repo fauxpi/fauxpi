@@ -148,16 +148,16 @@ pub const GlRenderer = struct {
             return;
         }
 
-        self.glCreateShader = @ptrCast(eglGetProcAddress("glCreateShader"));
-        self.glShaderSource = @ptrCast(eglGetProcAddress("glShaderSource"));
-        self.glCompileShader = @ptrCast(eglGetProcAddress("glCompileShader"));
-        self.glGetShaderiv = @ptrCast(eglGetProcAddress("glGetShaderiv"));
-        self.glDeleteShader = @ptrCast(eglGetProcAddress("glDeleteShader"));
-        self.glCreateProgram = @ptrCast(eglGetProcAddress("glCreateProgram"));
-        self.glAttachShader = @ptrCast(eglGetProcAddress("glAttachShader"));
-        self.glLinkProgram = @ptrCast(eglGetProcAddress("glLinkProgram"));
-        self.glGetProgramiv = @ptrCast(eglGetProcAddress("glGetProgramiv"));
-        self.glUseProgram = @ptrCast(eglGetProcAddress("glUseProgram"));
+        self.glCreateShader = @ptrCast(@alignCast(eglGetProcAddress("glCreateShader")));
+        self.glShaderSource = @ptrCast(@alignCast(eglGetProcAddress("glShaderSource")));
+        self.glCompileShader = @ptrCast(@alignCast(eglGetProcAddress("glCompileShader")));
+        self.glGetShaderiv = @ptrCast(@alignCast(eglGetProcAddress("glGetShaderiv")));
+        self.glDeleteShader = @ptrCast(@alignCast(eglGetProcAddress("glDeleteShader")));
+        self.glCreateProgram = @ptrCast(@alignCast(eglGetProcAddress("glCreateProgram")));
+        self.glAttachShader = @ptrCast(@alignCast(eglGetProcAddress("glAttachShader")));
+        self.glLinkProgram = @ptrCast(@alignCast(eglGetProcAddress("glLinkProgram")));
+        self.glGetProgramiv = @ptrCast(@alignCast(eglGetProcAddress("glGetProgramiv")));
+        self.glUseProgram = @ptrCast(@alignCast(eglGetProcAddress("glUseProgram")));
 
         if (self.glCreateShader != null and self.glCreateProgram != null) {
             self.egl_lib = lib;

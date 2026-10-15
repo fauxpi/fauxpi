@@ -412,7 +412,7 @@ pub const Tree = struct {
             try chosen.setU32Prop(self.allocator, "linux,initrd-end", rd.end);
         }
         var rng_seed: [64]u8 = undefined;
-        _ = std.os.linux.getrandom(&rng_seed, rng_seed.len, 0);
+        @import("../host/posix.zig").getRandomBytes(&rng_seed);
         try chosen.setProp(self.allocator, "rng-seed", &rng_seed);
 
         // 2b. /system board revision (0x00900093 = Raspberry Pi Zero v1.3, 512MB) and serial

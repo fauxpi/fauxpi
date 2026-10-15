@@ -4,6 +4,7 @@
 //! USB Mouse, and Ethernet) is rendered visually and acts as a toggle button.
 
 const std = @import("std");
+const host_posix = @import("../host/posix.zig");
 const canvas_mod = @import("canvas.zig");
 const board = @import("board.zig");
 const gpio_model = @import("gpio_model.zig");
@@ -586,25 +587,49 @@ pub const BoardUi = struct {
         @memcpy(path_buf[0..dir_path.len], dir_path);
         path_buf[dir_path.len] = 0;
 
-        const fd_rc = std.os.linux.openat(
-            std.os.linux.AT.FDCWD,
-            path_buf[0..dir_path.len :0],
-            .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true },
-            0,
-        );
-        if (std.os.linux.errno(fd_rc) != .SUCCESS) return;
-        const dir_fd: std.os.linux.fd_t = @intCast(fd_rc);
-        defer _ = std.os.linux.close(dir_fd);
+        if (host_posix.is_linux) {
+            const fd_rc = std.os.linux.openat(
+                std.os.linux.AT.FDCWD,
+                path_buf[0..dir_path.len :0],
+                .{ .ACCMODE = .RDONLY, .DIRECTORY = true, .CLOEXEC = true },
+                0,
+            );
+            if (std.os.linux.errno(fd_rc) != .SUCCESS) return;
+            const dir_fd: std.os.linux.fd_t = @intCast(fd_rc);
+            defer _ = std.os.linux.close(dir_fd);
 
-        var dents_buf: [4096]u8 align(8) = undefined;
-        while (true) {
-            const n = std.os.linux.getdents64(dir_fd, &dents_buf, dents_buf.len);
-            if (std.os.linux.errno(n) != .SUCCESS or n == 0) break;
-            var at: usize = 0;
-            while (at < n) {
-                const reclen = std.mem.readInt(u16, dents_buf[at + 16 ..][0..2], .little);
-                const d_name = std.mem.sliceTo(dents_buf[at + 19 .. at + reclen], 0);
-                at += reclen;
+            var dents_buf: [4096]u8 align(8) = undefined;
+            while (true) {
+                const n = std.os.linux.getdents64(dir_fd, &dents_buf, dents_buf.len);
+                if (std.os.linux.errno(n) != .SUCCESS or n == 0) break;
+                var at: usize = 0;
+                while (at < n) {
+                    const reclen = std.mem.readInt(u16, dents_buf[at + 16 ..][0..2], .little);
+                    const d_name = std.mem.sliceTo(dents_buf[at + 19 .. at + reclen], 0);
+                    at += reclen;
+                    if (d_name.len <= ".qcow2".len or d_name[0] == '.') continue;
+                    if (!std.mem.endsWith(u8, d_name, ".qcow2")) continue;
+
+                    const card_name = d_name[0 .. d_name.len - ".qcow2".len];
+                    if (self.hasCardNamed(card_name)) continue;
+
+                    var full_buf: [std.fs.max_path_bytes]u8 = undefined;
+                    const full_path = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ dir_path, d_name }) catch continue;
+
+                    var disk = Qcow2Disk.openExistingFile(self.gpa, full_path) catch continue;
+                    const sz = SdCardSize.smallestFitting(disk.virtual_size) orelse .gb_32;
+                    const entry = makeNamedSdCardEntry(card_name, full_path, disk.diskAllocatedBytes(), sz, disk);
+                    self.sd_cards.append(self.gpa, entry) catch {
+                        disk.deinit();
+                        continue;
+                    };
+                }
+            }
+        } else {
+            const dir_ptr = std.c.opendir(path_buf[0..dir_path.len :0]) orelse return;
+            defer _ = std.c.closedir(dir_ptr);
+            while (std.c.readdir(dir_ptr)) |ent| {
+                const d_name = std.mem.sliceTo(&ent.name, 0);
                 if (d_name.len <= ".qcow2".len or d_name[0] == '.') continue;
                 if (!std.mem.endsWith(u8, d_name, ".qcow2")) continue;
 
@@ -720,27 +745,9 @@ pub const BoardUi = struct {
         );
 
         const path = self.settingsPath();
-        var path_z: [std.fs.max_path_bytes]u8 = undefined;
-        if (path.len >= path_z.len) return error.NameTooLong;
-        @memcpy(path_z[0..path.len], path);
-        path_z[path.len] = 0;
-
-        const fd_rc = std.os.linux.openat(
-            std.os.linux.AT.FDCWD,
-            path_z[0..path.len :0],
-            .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true },
-            0o644,
-        );
-        if (std.os.linux.errno(fd_rc) != .SUCCESS) return error.FileOpenFailed;
-        const fd: std.os.linux.fd_t = @intCast(fd_rc);
-        defer _ = std.os.linux.close(fd);
-
-        var written: usize = 0;
-        while (written < json_str.len) {
-            const rc = std.os.linux.write(fd, json_str[written..].ptr, json_str.len - written);
-            if (std.os.linux.errno(rc) != .SUCCESS) return error.FileWriteFailed;
-            written += rc;
-        }
+        const fd = try host_posix.openCreateTruncWrite(path, false);
+        defer host_posix.close(fd);
+        try host_posix.writeAll(fd, json_str);
     }
 
     /// Reads board settings from `$XDG_DATA_HOME/fauxpi/settings.json` into `self` and `status`.
@@ -749,26 +756,13 @@ pub const BoardUi = struct {
         if (self.settings_path_len == 0) return false;
         const path = self.settingsPath();
 
-        var path_z: [std.fs.max_path_bytes]u8 = undefined;
-        if (path.len >= path_z.len) return error.NameTooLong;
-        @memcpy(path_z[0..path.len], path);
-        path_z[path.len] = 0;
-
-        const fd_rc = std.os.linux.openat(
-            std.os.linux.AT.FDCWD,
-            path_z[0..path.len :0],
-            .{ .ACCMODE = .RDONLY, .CLOEXEC = true },
-            0,
-        );
-        if (std.os.linux.errno(fd_rc) != .SUCCESS) return false;
-        const fd: std.os.linux.fd_t = @intCast(fd_rc);
-        defer _ = std.os.linux.close(fd);
+        const fd = host_posix.openRead(path) catch return false;
+        defer host_posix.close(fd);
 
         var file_buf: [4096]u8 = undefined;
         var total: usize = 0;
         while (total < file_buf.len) {
-            const rc = std.os.linux.read(fd, file_buf[total..].ptr, file_buf.len - total);
-            if (std.os.linux.errno(rc) != .SUCCESS) return error.FileReadFailed;
+            const rc = try host_posix.read(fd, file_buf[total..]);
             if (rc == 0) break;
             total += rc;
         }
@@ -1304,7 +1298,7 @@ pub const BoardUi = struct {
 
     pub fn randomizeSerial(self: *BoardUi) void {
         var rnd: [4]u8 = undefined;
-        _ = std.os.linux.getrandom(&rnd, rnd.len, 0);
+        host_posix.getRandomBytes(&rnd);
         const low = std.mem.readInt(u32, &rnd, .big);
         _ = std.fmt.bufPrint(&self.serial_hex, "00000000{x:0>8}", .{low}) catch {};
         self.serial_len = 16;
@@ -1312,14 +1306,14 @@ pub const BoardUi = struct {
 
     pub fn randomizeMac(self: *BoardUi) void {
         var rnd: [3]u8 = undefined;
-        _ = std.os.linux.getrandom(&rnd, rnd.len, 0);
+        host_posix.getRandomBytes(&rnd);
         _ = std.fmt.bufPrint(&self.mac_hex, "B827EB{X:0>2}{X:0>2}{X:0>2}", .{ rnd[0], rnd[1], rnd[2] }) catch {};
         self.mac_len = 12;
     }
 
     pub fn randomizeWifiMac(self: *BoardUi) void {
         var rnd: [3]u8 = undefined;
-        _ = std.os.linux.getrandom(&rnd, rnd.len, 0);
+        host_posix.getRandomBytes(&rnd);
         _ = std.fmt.bufPrint(&self.wifi_mac_hex, "B827EB{X:0>2}{X:0>2}{X:0>2}", .{ rnd[0], rnd[1], rnd[2] }) catch {};
         self.wifi_mac_len = 12;
     }
@@ -1777,8 +1771,8 @@ pub const BoardUi = struct {
         const pt: Point = .{ x, y };
 
         self.board_btn_hovered = self.boardBtnRect(self.last_win_w).contains(pt);
-        self.max_btn_hovered = maxBtnRect(self.last_win_w).contains(pt);
-        self.close_btn_hovered = closeBtnRect(self.last_win_w).contains(pt);
+        self.max_btn_hovered = !host_posix.is_macos and maxBtnRect(self.last_win_w).contains(pt);
+        self.close_btn_hovered = !host_posix.is_macos and closeBtnRect(self.last_win_w).contains(pt);
 
         // Track hover over GPIO input switches in the GPIO box below the display
         self.hovered_gpio_input_idx = null;
@@ -1944,11 +1938,11 @@ pub const BoardUi = struct {
                     self.board_btn_pressed = true;
                     return .consumed;
                 }
-                if (maxBtnRect(self.last_win_w).contains(pt)) {
+                if (!host_posix.is_macos and maxBtnRect(self.last_win_w).contains(pt)) {
                     self.max_btn_pressed = true;
                     return .consumed;
                 }
-                if (closeBtnRect(self.last_win_w).contains(pt)) {
+                if (!host_posix.is_macos and closeBtnRect(self.last_win_w).contains(pt)) {
                     self.close_btn_pressed = true;
                     return .consumed;
                 }
@@ -1969,10 +1963,10 @@ pub const BoardUi = struct {
                     }
                     return .consumed;
                 }
-                if (self.max_btn_pressed and maxBtnRect(self.last_win_w).contains(pt)) {
+                if (!host_posix.is_macos and self.max_btn_pressed and maxBtnRect(self.last_win_w).contains(pt)) {
                     return .toggle_maximize;
                 }
-                if (self.close_btn_pressed and closeBtnRect(self.last_win_w).contains(pt)) {
+                if (!host_posix.is_macos and self.close_btn_pressed and closeBtnRect(self.last_win_w).contains(pt)) {
                     return .close;
                 }
                 return .consumed;
@@ -2344,25 +2338,27 @@ pub const BoardUi = struct {
             self.sheet_open,
         );
 
-        // Right buttons: Maximize/Restore and Close
-        paintBarButton(
-            c,
-            t,
-            maxBtnRect(win_w),
-            if (self.maximized) .filter_none else .crop_square,
-            self.max_btn_hovered,
-            self.max_btn_pressed,
-            false,
-        );
-        paintBarButton(
-            c,
-            t,
-            closeBtnRect(win_w),
-            .close,
-            self.close_btn_hovered,
-            self.close_btn_pressed,
-            false,
-        );
+        // Right buttons: Maximize/Restore and Close (omitted on macOS where native traffic lights are on the left)
+        if (!host_posix.is_macos) {
+            paintBarButton(
+                c,
+                t,
+                maxBtnRect(win_w),
+                if (self.maximized) .filter_none else .crop_square,
+                self.max_btn_hovered,
+                self.max_btn_pressed,
+                false,
+            );
+            paintBarButton(
+                c,
+                t,
+                closeBtnRect(win_w),
+                .close,
+                self.close_btn_hovered,
+                self.close_btn_pressed,
+                false,
+            );
+        }
 
         if (self.title_cache.len != total_px) {
             if (self.title_cache.len > 0) self.gpa.free(self.title_cache);
@@ -4676,27 +4672,11 @@ pub const XkbKeymap = struct {
 };
 
 pub fn ensureDirPathLinux(path: []const u8) void {
-    if (path.len == 0 or path.len >= std.fs.max_path_bytes) return;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    @memcpy(buf[0..path.len], path);
-
-    var i: usize = 1;
-    while (i <= path.len) : (i += 1) {
-        if (i == path.len or buf[i] == '/') {
-            const saved = if (i < path.len) buf[i] else 0;
-            buf[i] = 0;
-            _ = std.os.linux.mkdirat(std.os.linux.AT.FDCWD, buf[0..i :0], 0o755);
-            if (i < path.len) buf[i] = saved;
-        }
-    }
+    host_posix.ensureDirPath(path);
 }
 
 pub fn fileExistsLinux(path: []const u8) bool {
-    if (path.len == 0 or path.len >= std.fs.max_path_bytes) return false;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    @memcpy(buf[0..path.len], path);
-    buf[path.len] = 0;
-    return std.os.linux.errno(std.os.linux.faccessat(std.os.linux.AT.FDCWD, buf[0..path.len :0], std.os.linux.F_OK, 0)) == .SUCCESS;
+    return host_posix.fileExists(path);
 }
 
 const testing = std.testing;
@@ -5055,25 +5035,23 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
 }
 
 test "BoardUi persistent images and settings.json with custom and default card names" {
-    const os = std.os.linux;
-
     const tmp_dir: [:0]const u8 = "/tmp/fauxpi-test-xdg-data";
     const tmp_images_dir: [:0]const u8 = "/tmp/fauxpi-test-xdg-data/images";
     const tmp_settings_path: [:0]const u8 = "/tmp/fauxpi-test-xdg-data/settings.json";
     defer {
-        _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Card 1.qcow2", 0);
-        _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Card 2.qcow2", 0);
-        _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Custom OS.qcow2", 0);
-        _ = os.unlinkat(os.AT.FDCWD, tmp_settings_path, 0);
-        _ = os.unlinkat(os.AT.FDCWD, tmp_images_dir, os.AT.REMOVEDIR);
-        _ = os.unlinkat(os.AT.FDCWD, tmp_dir, os.AT.REMOVEDIR);
+        host_posix.unlinkFile("/tmp/fauxpi-test-xdg-data/images/Card 1.qcow2");
+        host_posix.unlinkFile("/tmp/fauxpi-test-xdg-data/images/Card 2.qcow2");
+        host_posix.unlinkFile("/tmp/fauxpi-test-xdg-data/images/Custom OS.qcow2");
+        host_posix.unlinkFile(tmp_settings_path);
+        host_posix.removeDir(tmp_images_dir);
+        host_posix.removeDir(tmp_dir);
     }
-    _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Card 1.qcow2", 0);
-    _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Card 2.qcow2", 0);
-    _ = os.unlinkat(os.AT.FDCWD, "/tmp/fauxpi-test-xdg-data/images/Custom OS.qcow2", 0);
-    _ = os.unlinkat(os.AT.FDCWD, tmp_settings_path, 0);
-    _ = os.unlinkat(os.AT.FDCWD, tmp_images_dir, os.AT.REMOVEDIR);
-    _ = os.unlinkat(os.AT.FDCWD, tmp_dir, os.AT.REMOVEDIR);
+    host_posix.unlinkFile("/tmp/fauxpi-test-xdg-data/images/Card 1.qcow2");
+    host_posix.unlinkFile("/tmp/fauxpi-test-xdg-data/images/Card 2.qcow2");
+    host_posix.unlinkFile("/tmp/fauxpi-test-xdg-data/images/Custom OS.qcow2");
+    host_posix.unlinkFile(tmp_settings_path);
+    host_posix.removeDir(tmp_images_dir);
+    host_posix.removeDir(tmp_dir);
 
     // 1. Initialize first BoardUi with tmp_dir and create cards + modify settings
     {
