@@ -586,9 +586,9 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
         qpu.W.sfu_recip, qpu.W.sfu_recipsqrt, qpu.W.sfu_exp, qpu.W.sfu_log => {
             for (&s.acc[4], value) |*o, v| o.* = u(switch (waddr) {
                 qpu.W.sfu_recip => 1.0 / f(v),
-                qpu.W.sfu_recipsqrt => 1.0 / @sqrt(@max(f(v), 1e-20)),
+                qpu.W.sfu_recipsqrt => 1.0 / @sqrt(f(v)),
                 qpu.W.sfu_exp => std.math.exp2(f(v)),
-                else => std.math.log2(@max(f(v), 1e-20)),
+                else => std.math.log2(f(v)),
             });
         },
         qpu.W.tmu0_s, qpu.W.tmu0_t, qpu.W.tmu0_r, qpu.W.tmu0_b, qpu.W.tmu1_s, qpu.W.tmu1_t, qpu.W.tmu1_r, qpu.W.tmu1_b => {

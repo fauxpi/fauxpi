@@ -36,7 +36,7 @@ pub const V3d = struct {
         config_b2: u8 = 0x00,
     };
 
-    pub const MAX_PREBINNED_TRIS = 256;
+    pub const MAX_PREBINNED_TRIS = 2048;
 
     pub const PreparedDraw = struct {
         fs_code_phys: u32 = 0,
@@ -61,9 +61,7 @@ pub const V3d = struct {
         min_y: u32,
         max_x: u32,
         max_y: u32,
-        inv_area: f32,
-        dw0_dx: f32,
-        dw1_dx: f32,
+        area: f32,
         v: [3]ShadedVertex,
     };
 
@@ -545,7 +543,6 @@ pub const V3d = struct {
                 const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
                     (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
                 if (@abs(area) < 1e-6) continue;
-                const inv_area = 1.0 / area;
 
                 const clip_min_x: f32 = @floatFromInt(draw.clip_x);
                 const clip_min_y: f32 = @floatFromInt(draw.clip_y);
@@ -564,15 +561,19 @@ pub const V3d = struct {
                     .min_y = @intFromFloat(min_fy),
                     .max_x = @intFromFloat(max_fx),
                     .max_y = @intFromFloat(max_fy),
-                    .inv_area = inv_area,
-                    .dw0_dx = (verts[1].y - verts[2].y) * inv_area,
-                    .dw1_dx = (verts[2].y - verts[0].y) * inv_area,
+                    .area = area,
                     .v = verts,
                 };
                 self.shaded_tris_len += 1;
             }
         }
     }
+
+    const PendingTileLoad = struct {
+        addr: u32,
+        tiling: u2,
+        format: u2,
+    };
 
     fn executeRcl(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) void {
         var pc = start_bus & 0x1FFFFFFF;
@@ -590,6 +591,8 @@ pub const V3d = struct {
 
         var cur_tile_x: u32 = 0;
         var cur_tile_y: u32 = 0;
+        var has_tile_coords: bool = false;
+        var pending_load: ?PendingTileLoad = null;
         var tile_loaded: bool = false;
         var tile_rendered: bool = false;
 
@@ -629,6 +632,8 @@ pub const V3d = struct {
                     self.storeTileToRam(ram, fb_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, r_tiling, ls_format);
                     tile_loaded = false;
                     tile_rendered = false;
+                    has_tile_coords = false;
+                    pending_load = null;
                     pc += 1;
                 },
                 28 => { // STORE_TILE_BUFFER_GENERAL (7 bytes)
@@ -649,6 +654,10 @@ pub const V3d = struct {
                     }
                     if ((bits & (1 << 15)) == 0) {
                         // Last store for tile
+                        tile_loaded = false;
+                        tile_rendered = false;
+                        has_tile_coords = false;
+                        pending_load = null;
                     }
                     pc += 7;
                 },
@@ -660,11 +669,20 @@ pub const V3d = struct {
                     if (buf_kind == 1) { // Load color buffer from memory into tile buffer
                         const ls_tiling: u2 = @truncate((bits >> 4) & 3);
                         const ls_format: u2 = @truncate((bits >> 8) & 3);
-                        self.loadTileFromRam(ram, addr_word & ~@as(u32, 0xf), fb_width, fb_height, cur_tile_x, cur_tile_y, 64, ls_tiling, ls_format);
-                        self.tile_color_solid = null;
-                        self.tile_depth_valid = false;
-                        self.tile_clear_zs = clear_zs;
-                        tile_loaded = true;
+                        const load_addr = addr_word & ~@as(u32, 0xf);
+                        if (has_tile_coords) {
+                            self.loadTileFromRam(ram, load_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, 64, ls_tiling, ls_format);
+                            self.tile_color_solid = null;
+                            self.tile_depth_valid = false;
+                            self.tile_clear_zs = clear_zs;
+                            tile_loaded = true;
+                        } else {
+                            pending_load = .{
+                                .addr = load_addr,
+                                .tiling = ls_tiling,
+                                .format = ls_format,
+                            };
+                        }
                     }
                     pc += 7;
                 },
@@ -694,7 +712,15 @@ pub const V3d = struct {
                     if (pc + 3 > end) break;
                     cur_tile_x = ram[pc + 1];
                     cur_tile_y = ram[pc + 2];
-                    if (!tile_loaded) {
+                    has_tile_coords = true;
+                    if (pending_load) |pl| {
+                        self.loadTileFromRam(ram, pl.addr, fb_width, fb_height, cur_tile_x, cur_tile_y, 64, pl.tiling, pl.format);
+                        self.tile_color_solid = null;
+                        self.tile_depth_valid = false;
+                        self.tile_clear_zs = clear_zs;
+                        tile_loaded = true;
+                        pending_load = null;
+                    } else if (!tile_loaded) {
                         self.tile_color_solid = clear_color0;
                         self.tile_depth_valid = false;
                         self.tile_clear_zs = clear_zs;
@@ -1064,7 +1090,6 @@ pub const V3d = struct {
             const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
                 (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
             if (@abs(area) < 1e-6) continue;
-            const inv_area = 1.0 / area;
 
             const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), @as(f32, @floatFromInt(draw.clip_x)));
             const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), @as(f32, @floatFromInt(draw.clip_y)));
@@ -1078,13 +1103,28 @@ pub const V3d = struct {
                 .min_y = @intFromFloat(min_fy),
                 .max_x = @intFromFloat(max_fx),
                 .max_y = @intFromFloat(max_fy),
-                .inv_area = inv_area,
-                .dw0_dx = (verts[1].y - verts[2].y) * inv_area,
-                .dw1_dx = (verts[2].y - verts[0].y) * inv_area,
+                .area = area,
                 .v = verts,
             };
             self.rasterizeShadedTriangleInTile(ram, draw, &tri, fs_code, fs_unifs, fs_num_varyings, tile_px_x, tile_px_y, tile_size);
         }
+    }
+
+    fn edge(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32) f32 {
+        return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    }
+
+    fn canonicalEdge(ax: f32, ay: f32, bx: f32, by: f32, cx: f32, cy: f32) f32 {
+        if (ax > bx or (ax == bx and ay > by)) {
+            return -edge(bx, by, ax, ay, cx, cy);
+        }
+        return edge(ax, ay, bx, by, cx, cy);
+    }
+
+    fn topLeft(ax: f32, ay: f32, bx: f32, by: f32, area_sign: f32) bool {
+        const dx = (bx - ax) * area_sign;
+        const dy = (by - ay) * area_sign;
+        return (dy == 0 and dx < 0) or dy > 0;
     }
 
     fn rasterizeShadedTriangleInTile(
@@ -1111,9 +1151,7 @@ pub const V3d = struct {
         self.ensureTileMaterialized(need_depth);
 
         const v = &tri.v;
-        const inv_area = tri.inv_area;
-        const dw0_dx = tri.dw0_dx;
-        const dw1_dx = tri.dw1_dx;
+        const area_sign = std.math.sign(tri.area);
         const n_var = @min(@as(usize, num_varyings), 16);
 
         // Batch up to 16 covered pixels per SIMD QPU invocation
@@ -1124,7 +1162,7 @@ pub const V3d = struct {
         var frag_x_vec: qpu_sim.Vec = qpu_sim.splat(0);
         var frag_y_vec: qpu_sim.Vec = qpu_sim.splat(0);
         var tlb_in: qpu_sim.Vec = qpu_sim.splat(0);
-        var vary_vecs: [16]qpu_sim.Vec = undefined;
+        var vary_vecs: [16]qpu_sim.Vec = [_]qpu_sim.Vec{qpu_sim.splat(0)} ** 16;
         var batch_len: usize = 0;
 
         const flushBatch = struct {
@@ -1133,26 +1171,39 @@ pub const V3d = struct {
                 count: usize,
                 b_idx: *const [16]u32,
                 bz: *const [16]f32,
-                fw: qpu_sim.Vec,
-                fz: qpu_sim.Vec,
-                fx: qpu_sim.Vec,
-                fy: qpu_sim.Vec,
-                tin: qpu_sim.Vec,
-                vvecs: []const qpu_sim.Vec,
+                fw: *qpu_sim.Vec,
+                fz: *qpu_sim.Vec,
+                fx: *qpu_sim.Vec,
+                fy: *qpu_sim.Vec,
+                tin: *qpu_sim.Vec,
+                vvecs: []qpu_sim.Vec,
                 fcode: []const qpu.Inst,
                 funifs: []const u32,
                 mem: []const u8,
                 z_upd: bool,
             ) void {
+                if (count < 16 and count > 0) {
+                    const last = count - 1;
+                    for (count..16) |lane| {
+                        fw[lane] = fw[last];
+                        fz[lane] = fz[last];
+                        fx[lane] = fx[last];
+                        fy[lane] = fy[last];
+                        tin[lane] = tin[last];
+                        for (vvecs) |*vv| {
+                            vv[lane] = vv[last];
+                        }
+                    }
+                }
                 const res = qpu_sim.run(fcode, .{
                     .uniforms = funifs,
                     .varyings = vvecs,
-                    .frag_w = fw,
-                    .frag_z = fz,
-                    .frag_x = fx,
-                    .frag_y = fy,
+                    .frag_w = fw.*,
+                    .frag_z = fz.*,
+                    .frag_x = fx.*,
+                    .frag_y = fy.*,
                     .texture_memory = mem,
-                    .tlb_color_in = tin,
+                    .tlb_color_in = tin.*,
                 }) catch return;
                 if (res.tlb_color) |colors| {
                     for (0..count) |i| {
@@ -1166,22 +1217,28 @@ pub const V3d = struct {
             }
         }.f;
 
-        const fx_start = @as(f32, @floatFromInt(x_start)) + 0.5;
         var py = y_start;
         while (py < y_end) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
-            var w0 = ((v[1].x - fx_start) * (v[2].y - fy) - (v[1].y - fy) * (v[2].x - fx_start)) * inv_area;
-            var w1 = ((v[2].x - fx_start) * (v[0].y - fy) - (v[2].y - fy) * (v[0].x - fx_start)) * inv_area;
             const row_base = (py - tile_px_y) * tile_size;
 
             var px = x_start;
-            while (px < x_end) : ({
-                px += 1;
-                w0 += dw0_dx;
-                w1 += dw1_dx;
-            }) {
-                const w2 = 1.0 - w0 - w1;
-                if (w0 < -1e-5 or w1 < -1e-5 or w2 < -1e-5) continue;
+            while (px < x_end) : (px += 1) {
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const e0 = canonicalEdge(v[1].x, v[1].y, v[2].x, v[2].y, fx, fy) * area_sign;
+                const e1 = canonicalEdge(v[2].x, v[2].y, v[0].x, v[0].y, fx, fy) * area_sign;
+                const e2 = canonicalEdge(v[0].x, v[0].y, v[1].x, v[1].y, fx, fy) * area_sign;
+
+                if (e0 < 0 or (e0 == 0 and !topLeft(v[1].x, v[1].y, v[2].x, v[2].y, area_sign))) continue;
+                if (e1 < 0 or (e1 == 0 and !topLeft(v[2].x, v[2].y, v[0].x, v[0].y, area_sign))) continue;
+                if (e2 < 0 or (e2 == 0 and !topLeft(v[0].x, v[0].y, v[1].x, v[1].y, area_sign))) continue;
+
+                const sum = e0 + e1 + e2;
+                if (sum <= 0) continue;
+                const inv_sum = 1.0 / sum;
+                const w0 = e0 * inv_sum;
+                const w1 = e1 * inv_sum;
+                const w2 = e2 * inv_sum;
 
                 const z = w0 * v[0].z + w1 * v[1].z + w2 * v[2].z;
                 const tile_idx = row_base + (px - tile_px_x);
@@ -1227,11 +1284,11 @@ pub const V3d = struct {
                         batch_len,
                         &batch_idx,
                         &batch_z,
-                        frag_w,
-                        frag_z,
-                        frag_x_vec,
-                        frag_y_vec,
-                        tlb_in,
+                        &frag_w,
+                        &frag_z,
+                        &frag_x_vec,
+                        &frag_y_vec,
+                        &tlb_in,
                         vary_vecs[0..n_var],
                         fs_code,
                         fs_unifs,
@@ -1249,11 +1306,11 @@ pub const V3d = struct {
                 batch_len,
                 &batch_idx,
                 &batch_z,
-                frag_w,
-                frag_z,
-                frag_x_vec,
-                frag_y_vec,
-                tlb_in,
+                &frag_w,
+                &frag_z,
+                &frag_x_vec,
+                &frag_y_vec,
+                &tlb_in,
                 vary_vecs[0..n_var],
                 fs_code,
                 fs_unifs,
@@ -1388,3 +1445,62 @@ test "V3D BCL + RCL execution renders triangle into T-tiled framebuffer" {
     const center_off = 0x10000 + (32 * 64 + 32) * 4;
     try std.testing.expectEqual(@as(u32, 0xffff0000), std.mem.readInt(u32, ram[center_off..][0..4], .little));
 }
+
+test "V3D quad top-left to bottom-right diagonal shades each pixel exactly once" {
+    var v3d = V3d{};
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 256 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    // FS reads existing tile color via tlb_read into r4, adds 0x00101010, and writes back to tlb_color_all.
+    // Any double-shaded pixel on the shared diagonal will become 0xff202020, and any missed pixel will remain 0xff000000.
+    var fs: qpu.Program(16) = .{};
+    fs.emit(qpu.nop(.color_load));
+    fs.emit(try qpu.loadImm(.{ .add_dst = qpu.wr(0), .value = 0x00101010 }));
+    fs.emit(try qpu.alu(.{ .add = .{ .op = .add, .dst = qpu.tlb_color_all, .a = qpu.r(4), .b = qpu.r(0) } }));
+    fs.end(.fragment);
+
+    v3d.tile_color_solid = 0xff000000;
+    const draw = V3d.DrawCall{};
+
+    // Square quad [10, 30] x [10, 30] split along top-left (10,10) to bottom-right (30,30) diagonal:
+    // Triangle 1: (10, 10) -> (30, 10) -> (30, 30)
+    const tri1 = V3d.ShadedTriangle{
+        .draw_idx = 0,
+        .min_x = 10,
+        .min_y = 10,
+        .max_x = 30,
+        .max_y = 30,
+        .area = (30.0 - 10.0) * (30.0 - 10.0),
+        .v = .{
+            .{ .x = 10.0, .y = 10.0 },
+            .{ .x = 30.0, .y = 10.0 },
+            .{ .x = 30.0, .y = 30.0 },
+        },
+    };
+    // Triangle 2: (10, 10) -> (30, 30) -> (10, 30)
+    const tri2 = V3d.ShadedTriangle{
+        .draw_idx = 0,
+        .min_x = 10,
+        .min_y = 10,
+        .max_x = 30,
+        .max_y = 30,
+        .area = (30.0 - 10.0) * (30.0 - 10.0),
+        .v = .{
+            .{ .x = 10.0, .y = 10.0 },
+            .{ .x = 30.0, .y = 30.0 },
+            .{ .x = 10.0, .y = 30.0 },
+        },
+    };
+
+    v3d.rasterizeShadedTriangleInTile(ram, draw, &tri1, fs.code(), &.{}, 0, 0, 0, 64);
+    v3d.rasterizeShadedTriangleInTile(ram, draw, &tri2, fs.code(), &.{}, 0, 0, 0, 64);
+
+    for (10..30) |y| {
+        for (10..30) |x| {
+            try std.testing.expectEqual(@as(u32, 0xff101010), v3d.tile_color[y * 64 + x]);
+        }
+    }
+}
+
