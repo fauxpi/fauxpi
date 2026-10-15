@@ -47,6 +47,10 @@ pub const Mailbox = struct {
     board_serial: u64 = 0x00000000fa000001,
     mac_address: [6]u8 = .{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 },
 
+    /// Firmware GPIO expander state (pins 128..135; 128 = ACT LED on Pi 3 / Zero 2 W, 135 = PWR LED)
+    exp_gpio_state: [8]u1 = .{ 0, 1, 1, 1, 1, 1, 1, 1 },
+    exp_act_latch: bool = false,
+
     pub fn irqPending(self: *const Mailbox) bool {
         return (self.config & MBOX_IHAVEDATAIRQEN) != 0 and self.fifo_count > 0;
     }
@@ -331,8 +335,19 @@ pub const Mailbox = struct {
                 0x00030041, 0x00038041 => { // Get/Set GPIO state (expander/firmware GPIO)
                     const gpio = readU32(ram, payload, 0, buf_size);
                     const val = readU32(ram, payload, 4, buf_size);
+                    var cur: u32 = 0;
+                    if (gpio >= 128 and gpio < 136) {
+                        const idx: usize = gpio - 128;
+                        if (tag_id == 0x00038041) {
+                            self.exp_gpio_state[idx] = if (val != 0) 1 else 0;
+                            if (idx == 0 and val != 0) self.exp_act_latch = true;
+                        }
+                        cur = self.exp_gpio_state[idx];
+                    } else if (tag_id == 0x00038041) {
+                        cur = val;
+                    }
                     writeU32(ram, payload, 0, buf_size, gpio);
-                    writeU32(ram, payload, 4, buf_size, if (tag_id == 0x00038041) val else 0);
+                    writeU32(ram, payload, 4, buf_size, cur);
                     resp_len = 8;
                 },
                 0x00038042 => { // Set SDHOST clock

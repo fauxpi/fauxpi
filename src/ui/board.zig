@@ -62,6 +62,10 @@ pub const Kind = enum {
     sd,
     /// The Compute Modules' edge connector.
     edge,
+    /// Green activity LED (blinks on SD card activity).
+    act_led,
+    /// Red 5V power LED.
+    pwr_led,
 };
 
 pub const Part = struct {
@@ -165,8 +169,8 @@ fn header(kind: Kind, cx: f32, cy: f32, cols: u8) Part {
 const b_plus_holes = [_][2]f32{ .{ 3.5, 3.5 }, .{ 61.5, 3.5 }, .{ 3.5, 52.5 }, .{ 61.5, 52.5 } };
 
 /// The connectors of the B+ layout and the A+ layout: GPIO, power, HDMI,
-/// audio and video, camera, display and the microSD card (underneath).
-fn plusConnectors() [7]Part {
+/// audio and video, camera, display, microSD card (underneath), and ACT/PWR LEDs.
+fn plusConnectors() [9]Part {
     return .{
         header(.gpio, 32.5, 3.5, 20),
         facing(at(.power, 10.6, 54.1, 7.6, 5.6), .bottom),
@@ -175,10 +179,12 @@ fn plusConnectors() [7]Part {
         at(.camera, 45, 44.5, 4, 22),
         at(.display, 3.6, 28, 4, 22),
         under(facing(at(.micro_sd, 6.5, 28, 15, 12), .left)),
+        at(.act_led, 2.0, 43.0, 1.8, 1.2),
+        at(.pwr_led, 2.0, 46.2, 1.8, 1.2),
     };
 }
 
-fn bPlus(comptime extra: []const Part) [10 + extra.len]Part {
+fn bPlus(comptime extra: []const Part) [12 + extra.len]Part {
     return plusConnectors() ++ [_]Part{
         facing(at(.usb_double, 78.4, 9, 17.4, 13.1), .right),
         facing(at(.usb_double, 78.4, 27, 17.4, 13.1), .right),
@@ -262,7 +268,7 @@ const pi5_b: Board = .{ .width = 85, .height = 56, .holes = &b_plus_holes, .part
 
 // --- The A+ layout (65 × 56): the 1 A+ and 3 A+ ---------------------------------
 
-fn aPlus(comptime extra: []const Part) [8 + extra.len]Part {
+fn aPlus(comptime extra: []const Part) [10 + extra.len]Part {
     return plusConnectors() ++ [_]Part{
         facing(at(.usb, 60.2, 24.55, 14, 13.1), .right),
     } ++ extra[0..extra.len].*;
@@ -311,7 +317,7 @@ const pi1_a: Board = .{ .width = 85, .height = 56, .corner = 0.5, .holes = &pi1_
 
 const zero_holes = [_][2]f32{ .{ 3.5, 3.5 }, .{ 61.5, 3.5 }, .{ 3.5, 26.5 }, .{ 61.5, 26.5 } };
 
-fn zero(comptime extra: []const Part) [6 + extra.len]Part {
+fn zero(comptime extra: []const Part) [7 + extra.len]Part {
     return [_]Part{
         header(.gpio_holes, 32.5, 3.5, 20),
         facing(at(.mini_hdmi, 12.4, 26.9, 11.2, 7.5), .bottom),
@@ -319,6 +325,7 @@ fn zero(comptime extra: []const Part) [6 + extra.len]Part {
         facing(at(.power, 54, 28.1, 7.6, 5.6), .bottom),
         facing(at(.micro_sd, 6.75, 13.3, 13.5, 11.5), .left),
         at(.camera, 63.2, 15, 3.6, 17),
+        at(.act_led, 59.2, 22.5, 1.8, 1.2),
     } ++ extra[0..extra.len].*;
 }
 
@@ -461,6 +468,8 @@ pub fn describe(p: *const Part) struct { title: []const u8, about: []const u8 } 
         .micro_sd => .{ .title = "microSD card", .about = "Where Dazzle and your files are kept" },
         .sd => .{ .title = "SD card", .about = "Where Dazzle and your files are kept" },
         .edge => .{ .title = "Edge connector", .about = "Plugs into a carrier board, which has the connectors" },
+        .act_led => .{ .title = "Activity LED", .about = "Blinks green when the SD card is being read or written" },
+        .pwr_led => .{ .title = "Power LED", .about = "Glows red when the board has 5 V power" },
     };
 }
 

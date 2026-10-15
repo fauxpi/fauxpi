@@ -75,6 +75,7 @@ pub const Gpio = struct {
     gpafen: u64 = 0,
     gppud: u32 = 0,
     gppudclk: [2]u32 = [_]u32{ 0, 0 },
+    act_pulse_latch: bool = false,
 
     pub fn effectiveLevels(self: *const Gpio) u64 {
         var out_mask: u64 = 0;
@@ -239,6 +240,7 @@ pub const Gpio = struct {
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },
             0x20 => { // GPSET1
+                if ((val & (1 << (47 - 32))) != 0) self.act_pulse_latch = true;
                 self.out_level |= (@as(u64, val & 0x3fffff) << 32);
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },
@@ -247,6 +249,7 @@ pub const Gpio = struct {
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },
             0x2c => { // GPCLR1
+                if ((val & (1 << (47 - 32))) != 0) self.act_pulse_latch = true;
                 self.out_level &= ~(@as(u64, val & 0x3fffff) << 32);
                 self.updateEdgeEvents(prev, self.effectiveLevels());
             },

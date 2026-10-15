@@ -62,6 +62,7 @@ pub const Bcm2835 = struct {
     display_width: u16 = 1280,
     display_height: u16 = 720,
     audio_connected: bool = true,
+    act_led_hold_frames: u8 = 0,
 
     pub fn init(ram: []u8, display_width: u16, display_height: u16) Bcm2835 {
         var soc = Bcm2835{
@@ -207,6 +208,42 @@ pub const Bcm2835 = struct {
         if (elapsed_us == 0) return;
         self.dma.advanceAudio(elapsed_us, self.hdmi.maiSampleRate(), self.ram, self.dmaMmio());
         self.vchiq.advanceAudio(elapsed_us, self.ram);
+    }
+
+    /// Samples the board `ACT` (green) and `PWR` (red) LED states for the 60 Hz UI frame.
+    pub fn sampleBoardLeds(self: *Bcm2835, power_connected: bool) struct { act_on: bool, pwr_on: bool } {
+        if (!power_connected) {
+            self.sdhost.activity_latch = false;
+            self.gpio.act_pulse_latch = false;
+            self.mailbox.exp_act_latch = false;
+            self.act_led_hold_frames = 0;
+            return .{ .act_on = false, .pwr_on = false };
+        }
+
+        const sd_active = self.sdhost.activity_latch;
+        self.sdhost.activity_latch = false;
+
+        const gpio47_pulse = self.gpio.act_pulse_latch;
+        self.gpio.act_pulse_latch = false;
+
+        const exp_pulse = self.mailbox.exp_act_latch;
+        self.mailbox.exp_act_latch = false;
+
+        if (sd_active or gpio47_pulse or exp_pulse) {
+            self.act_led_hold_frames = 2;
+        } else if (self.act_led_hold_frames > 0) {
+            self.act_led_hold_frames -= 1;
+        }
+
+        const gpio47_steady = (self.gpio.getPinFunction(47) == .output) and !self.gpio.getPinLevel(47);
+        const exp_steady = self.mailbox.exp_gpio_state[0] != 0;
+        const act_on = gpio47_steady or exp_steady or (self.act_led_hold_frames > 0);
+
+        const gpio35_off = (self.gpio.getPinFunction(35) == .output) and !self.gpio.getPinLevel(35);
+        const exp_pwr_off = self.mailbox.exp_gpio_state[7] == 0;
+        const pwr_on = !gpio35_off and !exp_pwr_off;
+
+        return .{ .act_on = act_on, .pwr_on = pwr_on };
     }
 
     /// Composites the current HDMI frame (`width * height` pixels of `0xFFRRGGBB`) from HVS or Mailbox FB.

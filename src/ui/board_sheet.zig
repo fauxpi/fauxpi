@@ -173,6 +173,8 @@ pub const SystemStatus = struct {
     usb_keyboard_connected: bool = true,
     usb_mouse_connected: bool = true,
     ethernet_connected: bool = true,
+    act_led_on: bool = false,
+    pwr_led_on: bool = false,
 };
 
 pub const Action = enum {
@@ -305,6 +307,8 @@ pub const BoardUi = struct {
         usb_keyboard_connected: bool = false,
         usb_mouse_connected: bool = false,
         ethernet_connected: bool = false,
+        act_led_on: bool = false,
+        pwr_led_on: bool = false,
     };
 
     gpa: std.mem.Allocator,
@@ -2226,6 +2230,8 @@ pub const BoardUi = struct {
                 .usb_keyboard_connected = status.usb_keyboard_connected,
                 .usb_mouse_connected = status.usb_mouse_connected,
                 .ethernet_connected = status.ethernet_connected,
+                .act_led_on = status.act_led_on,
+                .pwr_led_on = status.pwr_led_on,
             };
 
             if (self.board_cache.len != total_board_px or !std.meta.eql(self.board_cache_key, bkey)) {
@@ -2731,6 +2737,15 @@ pub const BoardUi = struct {
                 if (partOverhangsBoard(b, &part)) {
                     fillOverhangingPart(c, &part, pr, s, t.surface, t.on_surface.withAlpha(0.04));
                 }
+                if (part.kind == .act_led and status.power_connected and status.act_led_on) {
+                    const led_col = Color.rgb(0x22E55E);
+                    c.fillRoundedRect(pr.outset(1.0 * s), .all(0.9 * s), led_col.withAlpha(0.36));
+                    c.fillRoundedRect(pr, .all(0.25 * s), led_col);
+                } else if (part.kind == .pwr_led and status.power_connected and status.pwr_led_on) {
+                    const led_col = Color.rgb(0xF83B3B);
+                    c.fillRoundedRect(pr.outset(1.0 * s), .all(0.9 * s), led_col.withAlpha(0.36));
+                    c.fillRoundedRect(pr, .all(0.25 * s), led_col);
+                }
                 drawPart(c, &part, pr, s, if (part_hovered) t.primary else ink);
             }
             if (part_hovered) {
@@ -2964,6 +2979,16 @@ pub fn drawPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, ink: Color
             else
                 .{ .x = r.x + r.w * 0.35, .y = r.y + 1.2 * s, .w = r.w * 0.3, .h = r.h - 2.4 * s };
             c.fillRect(slot, ink);
+        },
+        .act_led, .pwr_led => {
+            c.strokeRoundedRect(r, .all(0.25 * s), line_w, ink);
+            const lens: Rect = .{
+                .x = r.x + r.w * 0.25,
+                .y = r.y + r.h * 0.2,
+                .w = r.w * 0.5,
+                .h = r.h * 0.6,
+            };
+            c.strokeRoundedRect(lens, .all(0.15 * s), line_w, ink.withAlpha(0.75));
         },
         .edge => {},
     }

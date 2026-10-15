@@ -65,6 +65,7 @@ pub const SdHost = struct {
     aux_pos: u32 = 0,
     sector_cache: [512]u8 = [_]u8{0} ** 512,
     sector_cache_lba: u64 = std.math.maxInt(u64),
+    activity_latch: bool = false,
 
     pub fn attachSlice(self: *SdHost, data: []const u8) void {
         self.detach();
@@ -200,6 +201,9 @@ pub const SdHost = struct {
     fn executeCommand(self: *SdHost, cmd_reg: u32) void {
         const cmd: u6 = @truncate(cmd_reg & SDCMD_CMD_MASK);
         self.sdhsts &= ~(SDHSTS_CMD_TIME_OUT | SDHSTS_CRC7_ERROR | SDHSTS_CRC16_ERROR | SDHSTS_REW_TIME_OUT);
+        if (self.image_const != null or self.image_fd != null or self.qcow2_disk != null) {
+            self.activity_latch = true;
+        }
 
         if (self.app_cmd) {
             self.app_cmd = false;

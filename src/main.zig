@@ -439,6 +439,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     w.status.cpu_busy_percent = 0.0;
                     w.status.temperature_c = @max(25.0, w.status.temperature_c - 0.05);
                     w.status.hdmi_active = false;
+                    w.status.act_led_on = false;
+                    w.status.pwr_led_on = w.status.power_connected;
                     w.compositeUi();
                     try w.present();
                 } else {
@@ -504,6 +506,9 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 soc.setHdmiConnected(w.status.hdmi_connected);
                 soc.setAudioConnected(w.status.audio_connected);
                 soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
+                const leds = soc.sampleBoardLeds(w.status.power_connected);
+                w.status.act_led_on = leds.act_on;
+                w.status.pwr_led_on = leds.pwr_on;
                 const disp_pixels = w.displayPixels();
                 w.status.hdmi_active = soc.renderDisplayFrame(disp_pixels, opts.width, opts.height);
                 w.compositeUi();
