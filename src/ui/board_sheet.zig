@@ -622,8 +622,7 @@ pub const BoardUi = struct {
             };
             if (rectContainsMm(eth_hit, pt)) return .ethernet;
 
-            // 2. USB Hub body & its connecting cable
-            if (rectContainsMm(hl.hub_rect, pt)) return .usb_hub;
+            // 2. USB Hub connecting cable (hub body itself is not clickable)
             if (hl.right_usb_plug) {
                 if (pt[0] >= drawing.width and pt[0] <= hl.hub_rect.x and
                     pt[1] >= hl.hub_rect.y and pt[1] <= hl.hub_rect.y + hl.hub_rect.h)
@@ -3082,10 +3081,10 @@ fn drawUsbHubAndPeripherals(
         c.strokeRect(hub_boot_rect, line_w, hub_ink);
     }
 
-    // 3. Three-Port USB Hub with Ethernet body
+    // 3. Three-Port USB Hub with Ethernet body (not highlighted when hovering USB hub cable/plug)
     c.fillRoundedRect(hub_r, .all(2.2 * s), surface_bg);
-    c.fillRoundedRect(hub_r, .all(2.2 * s), if (hub_hovered) accent.withAlpha(0.16) else ink.withAlpha(0.05));
-    c.strokeRoundedRect(hub_r, .all(2.2 * s), heavy_w, hub_ink);
+    c.fillRoundedRect(hub_r, .all(2.2 * s), ink.withAlpha(0.05));
+    c.strokeRoundedRect(hub_r, .all(2.2 * s), heavy_w, ink);
 
     // Draw the 3 USB-A ports and 1 RJ45 Ethernet port along the top edge of the hub
     const ports = [_]struct { rect: board.Rect, target: ?InteractiveTarget, is_eth: bool }{
@@ -3102,7 +3101,7 @@ fn drawUsbHubAndPeripherals(
             .h = p.rect.h * s,
         };
         const p_hovered = (p.target != null and hovered_target == p.target);
-        const p_ink = if (p_hovered) accent else hub_ink;
+        const p_ink = if (p_hovered) accent else ink;
         if (p_hovered) {
             c.fillRoundedRect(pr, .all(0.4 * s), accent.withAlpha(0.22));
         }
@@ -3311,11 +3310,16 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.toggle_power, ui.pointerButton(pwr_x, pwr_y, false, status, &hw));
     status.power_connected = true;
 
-    // 5. Clicking the USB Hub body (or USB OTG socket) returns .toggle_usb_hub
-    const hub_x = tr.x + 98.0 * tr.scale;
-    const hub_y = tr.y + 25.0 * tr.scale;
-    _ = ui.pointerButton(hub_x, hub_y, true, status, &hw);
-    try testing.expectEqual(Action.toggle_usb_hub, ui.pointerButton(hub_x, hub_y, false, status, &hw));
+    // 5. Clicking the USB Hub body does not toggle the hub (.consumed), while clicking the USB OTG socket/plug/cable returns .toggle_usb_hub
+    const hub_body_x = tr.x + 98.0 * tr.scale;
+    const hub_body_y = tr.y + 25.0 * tr.scale;
+    _ = ui.pointerButton(hub_body_x, hub_body_y, true, status, &hw);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(hub_body_x, hub_body_y, false, status, &hw));
+
+    const otg_x = tr.x + 41.4 * tr.scale;
+    const otg_y = tr.y + 28.1 * tr.scale;
+    _ = ui.pointerButton(otg_x, otg_y, true, status, &hw);
+    try testing.expectEqual(Action.toggle_usb_hub, ui.pointerButton(otg_x, otg_y, false, status, &hw));
     status.usb_hub_connected = false;
 
     // 6. Clicking the Keyboard, Mouse, and Ethernet plugs on the USB Hub toggles each one
