@@ -28,11 +28,15 @@ const line_w: f32 = 1.25;
 const heavy_w: f32 = 1.75;
 
 pub const BoardModel = enum {
+    pi_1_a_plus,
+    pi_1_b_plus,
     pi_zero,
     pi_zero_w,
     pi_zero_2_w,
 
     pub const all = [_]BoardModel{
+        .pi_1_a_plus,
+        .pi_1_b_plus,
         .pi_zero,
         .pi_zero_w,
         .pi_zero_2_w,
@@ -40,6 +44,8 @@ pub const BoardModel = enum {
 
     pub fn windowTitle(self: BoardModel) []const u8 {
         return switch (self) {
+            .pi_1_a_plus => "Raspberry Pi 1 Model A+",
+            .pi_1_b_plus => "Raspberry Pi 1 Model B+",
             .pi_zero => "Raspberry Pi Zero",
             .pi_zero_w => "Raspberry Pi Zero W",
             .pi_zero_2_w => "Raspberry Pi Zero 2 W",
@@ -48,6 +54,8 @@ pub const BoardModel = enum {
 
     pub fn dtModel(self: BoardModel) []const u8 {
         return switch (self) {
+            .pi_1_a_plus => "Raspberry Pi Model A Plus Rev 1.1",
+            .pi_1_b_plus => "Raspberry Pi Model B Plus Rev 1.2",
             .pi_zero => "Raspberry Pi Zero Rev 1.3",
             .pi_zero_w => "Raspberry Pi Zero W Rev 1.1",
             .pi_zero_2_w => "Raspberry Pi Zero 2 W Rev 1.0",
@@ -56,6 +64,8 @@ pub const BoardModel = enum {
 
     pub fn boardRevision(self: BoardModel) u32 {
         return switch (self) {
+            .pi_1_a_plus => 0x00900021,
+            .pi_1_b_plus => 0x00900032,
             .pi_zero => 0x00900093,
             .pi_zero_w => 0x009000c1,
             .pi_zero_2_w => 0x00902120,
@@ -64,14 +74,23 @@ pub const BoardModel = enum {
 
     pub fn hasWireless(self: BoardModel) bool {
         return switch (self) {
-            .pi_zero => false,
+            .pi_1_a_plus, .pi_1_b_plus, .pi_zero => false,
             .pi_zero_w, .pi_zero_2_w => true,
+        };
+    }
+
+    pub fn usesExternalUsbHub(self: BoardModel) bool {
+        return switch (self) {
+            .pi_1_b_plus => false,
+            .pi_1_a_plus, .pi_zero, .pi_zero_w, .pi_zero_2_w => true,
         };
     }
 
     pub fn fromModel(model: []const u8) BoardModel {
         if (std.mem.indexOf(u8, model, "Zero 2 W") != null) return .pi_zero_2_w;
         if (std.mem.indexOf(u8, model, "Zero W") != null) return .pi_zero_w;
+        if (std.mem.indexOf(u8, model, "Model B Plus") != null or std.mem.indexOf(u8, model, "Model B+") != null) return .pi_1_b_plus;
+        if (std.mem.indexOf(u8, model, "Model A Plus") != null or std.mem.indexOf(u8, model, "Model A+") != null) return .pi_1_a_plus;
         return .pi_zero;
     }
 };
@@ -138,7 +157,8 @@ pub const InteractiveTarget = enum {
 /// Geometry of the 3-port USB Hub with Ethernet and external cables in board millimetres (`mm`).
 pub const HubLayout = struct {
     pub const sd_ext_left_mm: f32 = 17.5;
-    pub const bottom_ext_mm: f32 = 18.0; // extends below y=30 to y=48
+    pub const bottom_ext_mm: f32 = 18.0; // extends 18mm below board.height
+    pub const right_ext_mm: f32 = 19.0; // extends 19mm past board.width on B boards
 
     pub const hub_rect: board.Rect = .{ .x = 73.0, .y = 14.0, .w = 50.0, .h = 16.0 };
     pub const kbd_port_rect: board.Rect = .{ .x = 75.2, .y = 14.0, .w = 8.6, .h = 5.2 };
@@ -151,6 +171,45 @@ pub const HubLayout = struct {
     pub const usb_cable_horiz_y: f32 = 45.2;
     pub const usb_cable_turn_r: f32 = 3.5;
     pub const hub_cable_x: f32 = 98.0;
+
+    pub const BoardHubLayout = struct {
+        has_external_hub: bool,
+        right_usb_plug: bool,
+        hub_rect: board.Rect,
+        kbd_port_rect: board.Rect,
+        mouse_port_rect: board.Rect,
+        spare_port_rect: board.Rect,
+        eth_port_rect: board.Rect,
+        bottom_cable_max_y: f32,
+        right_cable_max_x: f32,
+    };
+
+    pub fn forBoard(drawing: *const board.Board) BoardHubLayout {
+        var has_onboard_eth = false;
+        var has_right_usb = false;
+        for (drawing.parts) |p| {
+            if (p.kind == .ethernet) has_onboard_eth = true;
+            if (p.kind == .usb and p.faces == .right) has_right_usb = true;
+        }
+        const dx: f32 = if (has_right_usb) 13.0 else 0.0;
+        const dy: f32 = if (has_right_usb) 2.55 else 0.0;
+        const shift = struct {
+            fn f(r: board.Rect, sx: f32, sy: f32) board.Rect {
+                return .{ .x = r.x + sx, .y = r.y + sy, .w = r.w, .h = r.h };
+            }
+        }.f;
+        return .{
+            .has_external_hub = !has_onboard_eth,
+            .right_usb_plug = has_right_usb,
+            .hub_rect = shift(hub_rect, dx, dy),
+            .kbd_port_rect = shift(kbd_port_rect, dx, dy),
+            .mouse_port_rect = shift(mouse_port_rect, dx, dy),
+            .spare_port_rect = shift(spare_port_rect, dx, dy),
+            .eth_port_rect = shift(eth_port_rect, dx, dy),
+            .bottom_cable_max_y = drawing.height + bottom_ext_mm,
+            .right_cable_max_x = drawing.width + right_ext_mm,
+        };
+    }
 };
 
 pub const BoardUi = struct {
@@ -295,10 +354,14 @@ pub const BoardUi = struct {
 
     pub fn boardBoundsWithPeripherals(drawing: *const board.Board) board.Rect {
         var r = drawing.bounds();
+        const hl = HubLayout.forBoard(drawing);
         const x0 = @min(r.x, -HubLayout.sd_ext_left_mm);
         const y0 = @min(r.y, HubLayout.top_cable_min_y);
-        const x1 = @max(r.x + r.w, HubLayout.hub_rect.x + HubLayout.hub_rect.w + 1.0);
-        const y1 = @max(r.y + r.h, HubLayout.bottom_cable_max_y);
+        const x1 = if (hl.has_external_hub)
+            @max(r.x + r.w, hl.hub_rect.x + hl.hub_rect.w + 1.0)
+        else
+            @max(r.x + r.w, hl.right_cable_max_x);
+        const y1 = @max(r.y + r.h, hl.bottom_cable_max_y);
         r.x = x0;
         r.y = y0;
         r.w = x1 - x0;
@@ -320,45 +383,58 @@ pub const BoardUi = struct {
 
     /// Hit-tests interactive connectors and peripherals at `pt` (in board millimetres).
     pub fn targetAt(drawing: *const board.Board, pt: [2]f32, sd_connected: bool) ?InteractiveTarget {
-        // 1. Downstream ports & plugs on the 3-port USB Hub with Ethernet
-        const kbd_hit: board.Rect = .{
-            .x = HubLayout.kbd_port_rect.x,
-            .y = HubLayout.top_cable_min_y,
-            .w = HubLayout.kbd_port_rect.w,
-            .h = (HubLayout.kbd_port_rect.y + HubLayout.kbd_port_rect.h) - HubLayout.top_cable_min_y,
-        };
-        if (rectContainsMm(kbd_hit, pt)) return .usb_keyboard;
+        const hl = HubLayout.forBoard(drawing);
 
-        const mouse_hit: board.Rect = .{
-            .x = HubLayout.mouse_port_rect.x,
-            .y = HubLayout.top_cable_min_y,
-            .w = HubLayout.mouse_port_rect.w,
-            .h = (HubLayout.mouse_port_rect.y + HubLayout.mouse_port_rect.h) - HubLayout.top_cable_min_y,
-        };
-        if (rectContainsMm(mouse_hit, pt)) return .usb_mouse;
+        if (hl.has_external_hub) {
+            // 1. Downstream ports & plugs on the 3-port USB Hub with Ethernet
+            const kbd_hit: board.Rect = .{
+                .x = hl.kbd_port_rect.x,
+                .y = HubLayout.top_cable_min_y,
+                .w = hl.kbd_port_rect.w,
+                .h = (hl.kbd_port_rect.y + hl.kbd_port_rect.h) - HubLayout.top_cable_min_y,
+            };
+            if (rectContainsMm(kbd_hit, pt)) return .usb_keyboard;
 
-        const eth_hit: board.Rect = .{
-            .x = HubLayout.eth_port_rect.x,
-            .y = HubLayout.top_cable_min_y,
-            .w = HubLayout.eth_port_rect.w,
-            .h = (HubLayout.eth_port_rect.y + HubLayout.eth_port_rect.h) - HubLayout.top_cable_min_y,
-        };
-        if (rectContainsMm(eth_hit, pt)) return .ethernet;
+            const mouse_hit: board.Rect = .{
+                .x = hl.mouse_port_rect.x,
+                .y = HubLayout.top_cable_min_y,
+                .w = hl.mouse_port_rect.w,
+                .h = (hl.mouse_port_rect.y + hl.mouse_port_rect.h) - HubLayout.top_cable_min_y,
+            };
+            if (rectContainsMm(mouse_hit, pt)) return .usb_mouse;
 
-        // 2. USB Hub body & its curved cable
-        if (rectContainsMm(HubLayout.hub_rect, pt)) return .usb_hub;
-        if (pt[0] >= 40.0 and pt[0] <= HubLayout.hub_cable_x + 3.0 and
-            pt[1] >= 42.0 and pt[1] <= HubLayout.bottom_cable_max_y)
-        {
-            return .usb_hub;
-        }
-        if (pt[0] >= HubLayout.hub_cable_x - 3.0 and pt[0] <= HubLayout.hub_cable_x + 3.0 and
-            pt[1] >= HubLayout.hub_rect.y + HubLayout.hub_rect.h and pt[1] <= HubLayout.usb_cable_horiz_y + 2.0)
-        {
-            return .usb_hub;
+            const eth_hit: board.Rect = .{
+                .x = hl.eth_port_rect.x,
+                .y = HubLayout.top_cable_min_y,
+                .w = hl.eth_port_rect.w,
+                .h = (hl.eth_port_rect.y + hl.eth_port_rect.h) - HubLayout.top_cable_min_y,
+            };
+            if (rectContainsMm(eth_hit, pt)) return .ethernet;
+
+            // 2. USB Hub body & its connecting cable
+            if (rectContainsMm(hl.hub_rect, pt)) return .usb_hub;
+            if (hl.right_usb_plug) {
+                if (pt[0] >= drawing.width and pt[0] <= hl.hub_rect.x and
+                    pt[1] >= hl.hub_rect.y and pt[1] <= hl.hub_rect.y + hl.hub_rect.h)
+                {
+                    return .usb_hub;
+                }
+            } else {
+                if (pt[0] >= 40.0 and pt[0] <= HubLayout.hub_cable_x + 3.0 and
+                    pt[1] >= 42.0 and pt[1] <= hl.bottom_cable_max_y)
+                {
+                    return .usb_hub;
+                }
+                if (pt[0] >= HubLayout.hub_cable_x - 3.0 and pt[0] <= HubLayout.hub_cable_x + 3.0 and
+                    pt[1] >= hl.hub_rect.y + hl.hub_rect.h and pt[1] <= HubLayout.usb_cable_horiz_y + 2.0)
+                {
+                    return .usb_hub;
+                }
+            }
         }
 
         // 3. Connectors on the Raspberry Pi board itself (plus their plugs/cards)
+        var usb_double_idx: usize = 0;
         for (drawing.parts) |p| {
             switch (p.kind) {
                 .micro_sd, .sd => {
@@ -377,7 +453,7 @@ pub const BoardUi = struct {
                         .x = p.rect.x,
                         .y = p.rect.y,
                         .w = p.rect.w,
-                        .h = HubLayout.bottom_cable_max_y - p.rect.y,
+                        .h = hl.bottom_cable_max_y - p.rect.y,
                     };
                     if (rectContainsMm(hdmi_hit, pt)) return .hdmi;
                 },
@@ -386,18 +462,55 @@ pub const BoardUi = struct {
                         .x = p.rect.x,
                         .y = p.rect.y,
                         .w = p.rect.w,
-                        .h = HubLayout.bottom_cable_max_y - p.rect.y,
+                        .h = hl.bottom_cable_max_y - p.rect.y,
                     };
                     if (rectContainsMm(pwr_hit, pt)) return .power;
                 },
-                .usb_otg, .usb, .usb_double => {
+                .usb_otg => {
                     const usb_hit: board.Rect = .{
                         .x = p.rect.x,
                         .y = p.rect.y,
                         .w = p.rect.w,
-                        .h = HubLayout.bottom_cable_max_y - p.rect.y,
+                        .h = hl.bottom_cable_max_y - p.rect.y,
                     };
                     if (rectContainsMm(usb_hit, pt)) return .usb_hub;
+                },
+                .usb => {
+                    if (hl.has_external_hub) {
+                        const usb_hit: board.Rect = .{
+                            .x = p.rect.x,
+                            .y = p.rect.y,
+                            .w = hl.hub_rect.x - p.rect.x,
+                            .h = p.rect.h,
+                        };
+                        if (rectContainsMm(usb_hit, pt)) return .usb_hub;
+                    }
+                },
+                .usb_double => {
+                    const idx = usb_double_idx;
+                    usb_double_idx += 1;
+                    if (!hl.has_external_hub) {
+                        const usb_hit: board.Rect = .{
+                            .x = p.rect.x,
+                            .y = p.rect.y,
+                            .w = hl.right_cable_max_x - p.rect.x,
+                            .h = p.rect.h,
+                        };
+                        if (rectContainsMm(usb_hit, pt)) {
+                            return if (idx == 0) .usb_keyboard else .usb_mouse;
+                        }
+                    }
+                },
+                .ethernet => {
+                    if (!hl.has_external_hub) {
+                        const eth_hit: board.Rect = .{
+                            .x = p.rect.x,
+                            .y = p.rect.y,
+                            .w = hl.right_cable_max_x - p.rect.x,
+                            .h = p.rect.h,
+                        };
+                        if (rectContainsMm(eth_hit, pt)) return .ethernet;
+                    }
                 },
                 else => {},
             }
@@ -609,8 +722,9 @@ pub const BoardUi = struct {
         const row_dhcp_y: f32 = if (has_wifi) (panel_y + 246.0) else (panel_y + 196.0);
         self.dhcp_toggle_rect = .{ .x = right_x - 52.0, .y = row_dhcp_y, .w = 52.0, .h = 28.0 };
 
+        const menu_Bottom: f32 = if (self.board_menu_open) (self.board_menu_rect.y + self.board_menu_rect.h + 16.0) else 0.0;
         const total_h: f32 = if (self.settings_open)
-            (panel_y + panel_h + 16.0) - sheet_y
+            @max(panel_y + panel_h + 16.0, menu_Bottom) - sheet_y
         else
             (btn_y + btn_h + 14.0) - sheet_y;
 
@@ -1488,12 +1602,21 @@ pub const BoardUi = struct {
         for (b.parts) |part| {
             if (part.underside) drawPart(c, &part, map(tr, part.rect), s, ink.withAlpha(0.35));
         }
+        const hl = HubLayout.forBoard(b);
+        var usb_double_idx: usize = 0;
         for (b.parts) |part| {
             const part_hovered = switch (part.kind) {
                 .micro_sd, .sd => self.hovered_target == .sd_connector or (status.sd_connected and self.hovered_target == .sd_card),
                 .mini_hdmi, .hdmi, .micro_hdmi => self.hovered_target == .hdmi,
                 .power, .usb_c_power => self.hovered_target == .power,
-                .usb_otg, .usb, .usb_double => self.hovered_target == .usb_hub,
+                .usb_otg => self.hovered_target == .usb_hub,
+                .usb => hl.has_external_hub and self.hovered_target == .usb_hub,
+                .usb_double => blk: {
+                    const idx = usb_double_idx;
+                    usb_double_idx += 1;
+                    break :blk !hl.has_external_hub and (self.hovered_target == if (idx == 0) InteractiveTarget.usb_keyboard else InteractiveTarget.usb_mouse);
+                },
+                .ethernet => !hl.has_external_hub and self.hovered_target == .ethernet,
                 else => false,
             };
             const pr = map(tr, part.rect);
@@ -1505,7 +1628,8 @@ pub const BoardUi = struct {
             }
         }
 
-        const max_y = tr.y + HubLayout.bottom_cable_max_y * s;
+        const max_y = tr.y + hl.bottom_cable_max_y * s;
+        const max_x = tr.x + hl.right_cable_max_x * s;
 
         // 1. Micro-SD card (connected into slot or pulled out to the left)
         for (b.parts) |part| {
@@ -1524,26 +1648,66 @@ pub const BoardUi = struct {
             }
         }
 
-        // 2. USB OTG plug, curved cable, and 3-port USB Hub with Ethernet
-        //    (drawn before the Power cable so the straight Power cable cleanly crosses over the horizontal USB cable)
-        for (b.parts) |part| {
-            if (part.kind == .usb_otg) {
-                drawUsbHubAndPeripherals(
-                    c,
-                    tr.x,
-                    tr.y,
-                    s,
-                    map(tr, part.rect),
-                    ink,
-                    t.primary,
-                    t.surface,
-                    status,
-                    self.hovered_target,
-                );
+        // 2. USB peripherals:
+        //    - On Zero / A+ boards (`hl.has_external_hub`): external 3-port USB Hub with Ethernet
+        //    - On B boards (`!hl.has_external_hub`): direct USB Keyboard, USB Mouse, and Ethernet plugs on the board's sockets
+        if (hl.has_external_hub) {
+            for (b.parts) |part| {
+                if (part.kind == .usb_otg or (part.kind == .usb and part.faces == .right)) {
+                    drawUsbHubAndPeripherals(
+                        c,
+                        tr.x,
+                        tr.y,
+                        s,
+                        map(tr, part.rect),
+                        hl,
+                        ink,
+                        t.primary,
+                        t.surface,
+                        status,
+                        self.hovered_target,
+                    );
+                }
+            }
+        } else {
+            var direct_usb_idx: usize = 0;
+            for (b.parts) |part| {
+                if (part.kind == .usb_double) {
+                    const idx = direct_usb_idx;
+                    direct_usb_idx += 1;
+                    const is_kbd = (idx == 0);
+                    const hovered = (self.hovered_target == if (is_kbd) InteractiveTarget.usb_keyboard else InteractiveTarget.usb_mouse);
+                    drawRightPlugAndCable(
+                        c,
+                        map(tr, part.rect),
+                        max_x,
+                        s,
+                        if (hovered) t.primary else ink,
+                        t.primary,
+                        t.surface,
+                        if (is_kbd) .keyboard else .mouse,
+                        if (is_kbd) status.usb_keyboard_connected else status.usb_mouse_connected,
+                        hovered,
+                    );
+                } else if (part.kind == .ethernet) {
+                    const hovered = (self.hovered_target == .ethernet);
+                    drawRightPlugAndCable(
+                        c,
+                        map(tr, part.rect),
+                        max_x,
+                        s,
+                        if (hovered) t.primary else ink,
+                        t.primary,
+                        t.surface,
+                        .lan,
+                        status.ethernet_connected,
+                        hovered,
+                    );
+                }
             }
         }
 
-        // 3. Mini HDMI and Power cables & plugs
+        // 3. HDMI and Power cables & plugs on the bottom edge
         for (b.parts) |part| {
             const is_hdmi = (part.kind == .mini_hdmi or part.kind == .hdmi or part.kind == .micro_hdmi);
             const is_power = (part.kind == .power or part.kind == .usb_c_power);
@@ -1995,7 +2159,111 @@ fn drawCableBend90(
     c.restoreClip(old_clip);
 }
 
-/// Draws the USB OTG plug, the curved USB cable (down -> right -> up), the 3-port USB Hub with Ethernet,
+/// Draws a right-facing plug and horizontal cable extending rightward (used on B boards for direct
+/// USB Keyboard, USB Mouse, and Ethernet connections, and on A+ boards for the USB Hub plug).
+pub fn drawRightPlugAndCable(
+    c: *Canvas,
+    port_r: Rect,
+    max_x: f32,
+    s: f32,
+    ink: Color,
+    accent: Color,
+    surface_bg: Color,
+    icon: Icon,
+    connected: bool,
+    hovered: bool,
+) void {
+    const cy = port_r.y + port_r.h * 0.5;
+    const sock_right = port_r.x + port_r.w;
+
+    const plug_h = @min(port_r.h * 0.78, 10.2 * s);
+    const plug_w = 5.4 * s;
+    const tip_h = plug_h * 0.58;
+    const tip_w = 2.2 * s;
+    const boot_h = @min(plug_h * 0.42, 3.6 * s);
+    const boot_w = 1.6 * s;
+    const cable_h = @min(plug_h * 0.24, 2.0 * s);
+
+    const gap: f32 = if (connected) 0.0 else 2.2 * s;
+    const body_x = if (connected) sock_right + 0.2 * s else sock_right + gap + tip_w;
+
+    // Exposed metal USB-A / RJ45 connector tip to the left of the plug body when disconnected
+    if (!connected) {
+        const tip_rect: Rect = .{
+            .x = sock_right + gap,
+            .y = cy - tip_h * 0.5,
+            .w = tip_w,
+            .h = tip_h,
+        };
+        c.fillRoundedRect(tip_rect, .{ .tl = 0.3 * s, .bl = 0.3 * s, .tr = 0, .br = 0 }, surface_bg);
+        if (hovered) {
+            c.fillRoundedRect(tip_rect, .{ .tl = 0.3 * s, .bl = 0.3 * s, .tr = 0, .br = 0 }, accent.withAlpha(0.22));
+        }
+        c.strokeRoundedRect(tip_rect, .{ .tl = 0.3 * s, .bl = 0.3 * s, .tr = 0, .br = 0 }, line_w, ink);
+
+        const notch_w = @max(1.0, tip_w * 0.45);
+        const notch_x = tip_rect.x + (tip_w - notch_w) * 0.5;
+        c.fillRect(.{ .x = notch_x, .y = cy - tip_h * 0.22 - line_w * 0.5, .w = notch_w, .h = line_w }, ink.withAlpha(0.75));
+        c.fillRect(.{ .x = notch_x, .y = cy + tip_h * 0.22 - line_w * 0.5, .w = notch_w, .h = line_w }, ink.withAlpha(0.75));
+    }
+
+    // Overmolded plug housing
+    const body_rect: Rect = .{
+        .x = body_x,
+        .y = cy - plug_h * 0.5,
+        .w = plug_w,
+        .h = plug_h,
+    };
+    const body_radii: Radii = .{
+        .tl = if (connected) 0.2 * s else 0.6 * s,
+        .bl = if (connected) 0.2 * s else 0.6 * s,
+        .tr = 1.0 * s,
+        .br = 1.0 * s,
+    };
+    c.fillRoundedRect(body_rect, body_radii, surface_bg);
+    c.fillRoundedRect(body_rect, body_radii, if (hovered) accent.withAlpha(0.26) else ink.withAlpha(0.08));
+    c.strokeRoundedRect(body_rect, body_radii, heavy_w, ink);
+
+    const icon_sz = 3.5 * s;
+    c.drawIcon(
+        icon,
+        body_rect.x + (body_rect.w - icon_sz) * 0.5,
+        body_rect.y + (body_rect.h - icon_sz) * 0.5,
+        icon_sz,
+        ink,
+    );
+
+    const boot_x = body_rect.x + body_rect.w;
+    if (boot_x + boot_w <= max_x) {
+        const boot_rect: Rect = .{
+            .x = boot_x,
+            .y = cy - boot_h * 0.5,
+            .w = boot_w,
+            .h = boot_h,
+        };
+        c.fillRect(boot_rect, surface_bg);
+        if (hovered) {
+            c.fillRect(boot_rect, accent.withAlpha(0.20));
+        }
+        c.strokeRect(boot_rect, line_w, ink);
+    }
+
+    const cable_x = boot_x + boot_w;
+    if (cable_x < max_x) {
+        const cable_rect: Rect = .{
+            .x = cable_x,
+            .y = cy - cable_h * 0.5,
+            .w = max_x - cable_x,
+            .h = cable_h,
+        };
+        c.fillRect(cable_rect, surface_bg);
+        c.fillRect(cable_rect, if (hovered) accent.withAlpha(0.22) else ink.withAlpha(0.14));
+        c.fillRect(.{ .x = cable_rect.x, .y = cable_rect.y, .w = cable_rect.w, .h = line_w }, ink);
+        c.fillRect(.{ .x = cable_rect.x, .y = cable_rect.y + cable_rect.h - line_w, .w = cable_rect.w, .h = line_w }, ink);
+    }
+}
+
+/// Draws the USB plug, connecting cable, the 3-port USB Hub with Ethernet,
 /// and the Keyboard, Mouse, and Ethernet plugs/cables plugged into the top of the hub.
 fn drawUsbHubAndPeripherals(
     c: *Canvas,
@@ -2003,6 +2271,7 @@ fn drawUsbHubAndPeripherals(
     ty: f32,
     s: f32,
     otg_r: Rect,
+    hl: HubLayout.BoardHubLayout,
     ink: Color,
     accent: Color,
     surface_bg: Color,
@@ -2013,153 +2282,184 @@ fn drawUsbHubAndPeripherals(
     const hub_ink = if (hub_hovered) accent else ink;
     const hub_tint = if (hub_hovered) accent.withAlpha(0.22) else ink.withAlpha(0.14);
 
-    // 1. USB OTG micro-USB plug below the Pi Zero's USB OTG socket
-    const otg_cx = otg_r.x + otg_r.w * 0.5;
-    const sock_bottom = otg_r.y + otg_r.h;
-    const plug_w = otg_r.w * 0.88;
-    const plug_h = 5.4 * s;
-    const tip_w = otg_r.w * 0.56;
-    const tip_h = 2.2 * s;
-    const boot_w = otg_r.w * 0.42;
-    const boot_h = 1.6 * s;
-    const cable_w = otg_r.w * 0.24;
-
-    const gap: f32 = if (status.usb_hub_connected) 0.0 else 2.2 * s;
-    const body_y = if (status.usb_hub_connected) sock_bottom + 0.2 * s else sock_bottom + gap + tip_h;
-
-    if (!status.usb_hub_connected) {
-        const tip_rect: Rect = .{
-            .x = otg_cx - tip_w * 0.5,
-            .y = sock_bottom + gap,
-            .w = tip_w,
-            .h = tip_h,
-        };
-        c.fillRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, surface_bg);
-        if (hub_hovered) {
-            c.fillRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, accent.withAlpha(0.22));
-        }
-        c.strokeRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, line_w, hub_ink);
-
-        const notch_h = @max(1.0, tip_h * 0.45);
-        const notch_y = tip_rect.y + (tip_h - notch_h) * 0.5;
-        c.fillRect(.{ .x = otg_cx - tip_w * 0.22 - line_w * 0.5, .y = notch_y, .w = line_w, .h = notch_h }, hub_ink.withAlpha(0.75));
-        c.fillRect(.{ .x = otg_cx + tip_w * 0.22 - line_w * 0.5, .y = notch_y, .w = line_w, .h = notch_h }, hub_ink.withAlpha(0.75));
-    }
-
-    const body_rect: Rect = .{
-        .x = otg_cx - plug_w * 0.5,
-        .y = body_y,
-        .w = plug_w,
-        .h = plug_h,
-    };
-    const body_radii: Radii = .{
-        .tl = if (status.usb_hub_connected) 0.2 * s else 0.6 * s,
-        .tr = if (status.usb_hub_connected) 0.2 * s else 0.6 * s,
-        .br = 1.0 * s,
-        .bl = 1.0 * s,
-    };
-    c.fillRoundedRect(body_rect, body_radii, surface_bg);
-    c.fillRoundedRect(body_rect, body_radii, if (hub_hovered) accent.withAlpha(0.26) else ink.withAlpha(0.08));
-    c.strokeRoundedRect(body_rect, body_radii, heavy_w, hub_ink);
-
-    const otg_icon_sz = 3.5 * s;
-    c.drawIcon(
-        .usb,
-        body_rect.x + (body_rect.w - otg_icon_sz) * 0.5,
-        body_rect.y + (body_rect.h - otg_icon_sz) * 0.5,
-        otg_icon_sz,
-        hub_ink,
-    );
-
-    const boot_y = body_rect.y + body_rect.h;
-    const boot_rect: Rect = .{
-        .x = otg_cx - boot_w * 0.5,
-        .y = boot_y,
-        .w = boot_w,
-        .h = boot_h,
-    };
-    c.fillRect(boot_rect, surface_bg);
-    if (hub_hovered) {
-        c.fillRect(boot_rect, accent.withAlpha(0.20));
-    }
-    c.strokeRect(boot_rect, line_w, hub_ink);
-
-    // 2. Curved USB cable: down from boot, 90° curve right, horizontal run, 90° curve up into the USB Hub
-    const r_turn = HubLayout.usb_cable_turn_r * s;
-    const y_horiz = ty + HubLayout.usb_cable_horiz_y * s;
-    const y_turn = y_horiz - r_turn;
-    const hub_cable_x = tx + HubLayout.hub_cable_x * s;
     const hub_r: Rect = .{
-        .x = tx + HubLayout.hub_rect.x * s,
-        .y = ty + HubLayout.hub_rect.y * s,
-        .w = HubLayout.hub_rect.w * s,
-        .h = HubLayout.hub_rect.h * s,
-    };
-    const hub_boot_rect: Rect = .{
-        .x = hub_cable_x - boot_w * 0.5,
-        .y = hub_r.y + hub_r.h,
-        .w = boot_w,
-        .h = boot_h,
+        .x = tx + hl.hub_rect.x * s,
+        .y = ty + hl.hub_rect.y * s,
+        .w = hl.hub_rect.w * s,
+        .h = hl.hub_rect.h * s,
     };
 
-    // Vertical drop below USB OTG boot down to y_turn
-    const drop_start_y = boot_y + boot_h;
-    if (y_turn > drop_start_y) {
-        const seg1: Rect = .{
-            .x = otg_cx - cable_w * 0.5,
-            .y = drop_start_y,
-            .w = cable_w,
-            .h = y_turn - drop_start_y,
+    if (hl.right_usb_plug) {
+        // Right-facing USB-A port on A+ boards: plug into right edge and run cable horizontally into left side of Hub
+        const boot_w = 1.6 * s;
+        const boot_h = 3.6 * s;
+        const cy = otg_r.y + otg_r.h * 0.5;
+        drawRightPlugAndCable(
+            c,
+            otg_r,
+            hub_r.x - boot_w,
+            s,
+            hub_ink,
+            accent,
+            surface_bg,
+            .usb,
+            status.usb_hub_connected,
+            hub_hovered,
+        );
+        const hub_left_boot: Rect = .{
+            .x = hub_r.x - boot_w,
+            .y = cy - boot_h * 0.5,
+            .w = boot_w,
+            .h = boot_h,
         };
-        c.fillRect(seg1, surface_bg);
-        c.fillRect(seg1, hub_tint);
-        c.fillRect(.{ .x = seg1.x, .y = seg1.y, .w = line_w, .h = seg1.h }, hub_ink);
-        c.fillRect(.{ .x = seg1.x + seg1.w - line_w, .y = seg1.y, .w = line_w, .h = seg1.h }, hub_ink);
-    }
+        c.fillRect(hub_left_boot, surface_bg);
+        if (hub_hovered) {
+            c.fillRect(hub_left_boot, accent.withAlpha(0.20));
+        }
+        c.strokeRect(hub_left_boot, line_w, hub_ink);
+    } else {
+        // 1. USB OTG micro-USB plug below the Pi Zero's USB OTG socket
+        const otg_cx = otg_r.x + otg_r.w * 0.5;
+        const sock_bottom = otg_r.y + otg_r.h;
+        const plug_w = otg_r.w * 0.88;
+        const plug_h = 5.4 * s;
+        const tip_w = otg_r.w * 0.56;
+        const tip_h = 2.2 * s;
+        const boot_w = otg_r.w * 0.42;
+        const boot_h = 1.6 * s;
+        const cable_w = otg_r.w * 0.24;
 
-    // 90° bend from vertical (going down) to horizontal (going right)
-    const turn1_cx = otg_cx + r_turn;
-    drawCableBend90(c, .{ turn1_cx, y_turn }, r_turn, cable_w, .bottom_left, hub_ink, hub_tint, surface_bg);
+        const gap: f32 = if (status.usb_hub_connected) 0.0 else 2.2 * s;
+        const body_y = if (status.usb_hub_connected) sock_bottom + 0.2 * s else sock_bottom + gap + tip_h;
 
-    // Horizontal segment going right
-    const turn2_cx = hub_cable_x - r_turn;
-    if (turn2_cx > turn1_cx) {
-        const seg2: Rect = .{
-            .x = turn1_cx,
-            .y = y_horiz - cable_w * 0.5,
-            .w = turn2_cx - turn1_cx,
-            .h = cable_w,
+        if (!status.usb_hub_connected) {
+            const tip_rect: Rect = .{
+                .x = otg_cx - tip_w * 0.5,
+                .y = sock_bottom + gap,
+                .w = tip_w,
+                .h = tip_h,
+            };
+            c.fillRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, surface_bg);
+            if (hub_hovered) {
+                c.fillRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, accent.withAlpha(0.22));
+            }
+            c.strokeRoundedRect(tip_rect, .{ .tl = 0.3 * s, .tr = 0.3 * s, .br = 0, .bl = 0 }, line_w, hub_ink);
+
+            const notch_h = @max(1.0, tip_h * 0.45);
+            const notch_y = tip_rect.y + (tip_h - notch_h) * 0.5;
+            c.fillRect(.{ .x = otg_cx - tip_w * 0.22 - line_w * 0.5, .y = notch_y, .w = line_w, .h = notch_h }, hub_ink.withAlpha(0.75));
+            c.fillRect(.{ .x = otg_cx + tip_w * 0.22 - line_w * 0.5, .y = notch_y, .w = line_w, .h = notch_h }, hub_ink.withAlpha(0.75));
+        }
+
+        const body_rect: Rect = .{
+            .x = otg_cx - plug_w * 0.5,
+            .y = body_y,
+            .w = plug_w,
+            .h = plug_h,
         };
-        c.fillRect(seg2, surface_bg);
-        c.fillRect(seg2, hub_tint);
-        c.fillRect(.{ .x = seg2.x, .y = seg2.y, .w = seg2.w, .h = line_w }, hub_ink);
-        c.fillRect(.{ .x = seg2.x, .y = seg2.y + seg2.h - line_w, .w = seg2.w, .h = line_w }, hub_ink);
-    }
-
-    // 90° bend from horizontal (going right) to vertical (going up)
-    drawCableBend90(c, .{ turn2_cx, y_turn }, r_turn, cable_w, .bottom_right, hub_ink, hub_tint, surface_bg);
-
-    // Vertical segment going up into the bottom of the USB Hub
-    const up_top_y = hub_boot_rect.y + hub_boot_rect.h;
-    if (y_turn > up_top_y) {
-        const seg3: Rect = .{
-            .x = hub_cable_x - cable_w * 0.5,
-            .y = up_top_y,
-            .w = cable_w,
-            .h = y_turn - up_top_y,
+        const body_radii: Radii = .{
+            .tl = if (status.usb_hub_connected) 0.2 * s else 0.6 * s,
+            .tr = if (status.usb_hub_connected) 0.2 * s else 0.6 * s,
+            .br = 1.0 * s,
+            .bl = 1.0 * s,
         };
-        c.fillRect(seg3, surface_bg);
-        c.fillRect(seg3, hub_tint);
-        c.fillRect(.{ .x = seg3.x, .y = seg3.y, .w = line_w, .h = seg3.h }, hub_ink);
-        c.fillRect(.{ .x = seg3.x + seg3.w - line_w, .y = seg3.y, .w = line_w, .h = seg3.h }, hub_ink);
-    }
+        c.fillRoundedRect(body_rect, body_radii, surface_bg);
+        c.fillRoundedRect(body_rect, body_radii, if (hub_hovered) accent.withAlpha(0.26) else ink.withAlpha(0.08));
+        c.strokeRoundedRect(body_rect, body_radii, heavy_w, hub_ink);
 
-    // Hub bottom strain-relief boot
-    c.fillRect(hub_boot_rect, surface_bg);
-    if (hub_hovered) {
-        c.fillRect(hub_boot_rect, accent.withAlpha(0.20));
+        const otg_icon_sz = 3.5 * s;
+        c.drawIcon(
+            .usb,
+            body_rect.x + (body_rect.w - otg_icon_sz) * 0.5,
+            body_rect.y + (body_rect.h - otg_icon_sz) * 0.5,
+            otg_icon_sz,
+            hub_ink,
+        );
+
+        const boot_y = body_rect.y + body_rect.h;
+        const boot_rect: Rect = .{
+            .x = otg_cx - boot_w * 0.5,
+            .y = boot_y,
+            .w = boot_w,
+            .h = boot_h,
+        };
+        c.fillRect(boot_rect, surface_bg);
+        if (hub_hovered) {
+            c.fillRect(boot_rect, accent.withAlpha(0.20));
+        }
+        c.strokeRect(boot_rect, line_w, hub_ink);
+
+        // 2. Curved USB cable: down from boot, 90° curve right, horizontal run, 90° curve up into the USB Hub
+        const r_turn = HubLayout.usb_cable_turn_r * s;
+        const y_horiz = ty + HubLayout.usb_cable_horiz_y * s;
+        const y_turn = y_horiz - r_turn;
+        const hub_cable_x = tx + HubLayout.hub_cable_x * s;
+        const hub_boot_rect: Rect = .{
+            .x = hub_cable_x - boot_w * 0.5,
+            .y = hub_r.y + hub_r.h,
+            .w = boot_w,
+            .h = boot_h,
+        };
+
+        // Vertical drop below USB OTG boot down to y_turn
+        const drop_start_y = boot_y + boot_h;
+        if (y_turn > drop_start_y) {
+            const seg1: Rect = .{
+                .x = otg_cx - cable_w * 0.5,
+                .y = drop_start_y,
+                .w = cable_w,
+                .h = y_turn - drop_start_y,
+            };
+            c.fillRect(seg1, surface_bg);
+            c.fillRect(seg1, hub_tint);
+            c.fillRect(.{ .x = seg1.x, .y = seg1.y, .w = line_w, .h = seg1.h }, hub_ink);
+            c.fillRect(.{ .x = seg1.x + seg1.w - line_w, .y = seg1.y, .w = line_w, .h = seg1.h }, hub_ink);
+        }
+
+        // 90° bend from vertical (going down) to horizontal (going right)
+        const turn1_cx = otg_cx + r_turn;
+        drawCableBend90(c, .{ turn1_cx, y_turn }, r_turn, cable_w, .bottom_left, hub_ink, hub_tint, surface_bg);
+
+        // Horizontal segment going right
+        const turn2_cx = hub_cable_x - r_turn;
+        if (turn2_cx > turn1_cx) {
+            const seg2: Rect = .{
+                .x = turn1_cx,
+                .y = y_horiz - cable_w * 0.5,
+                .w = turn2_cx - turn1_cx,
+                .h = cable_w,
+            };
+            c.fillRect(seg2, surface_bg);
+            c.fillRect(seg2, hub_tint);
+            c.fillRect(.{ .x = seg2.x, .y = seg2.y, .w = seg2.w, .h = line_w }, hub_ink);
+            c.fillRect(.{ .x = seg2.x, .y = seg2.y + seg2.h - line_w, .w = seg2.w, .h = line_w }, hub_ink);
+        }
+
+        // 90° bend from horizontal (going right) to vertical (going up)
+        drawCableBend90(c, .{ turn2_cx, y_turn }, r_turn, cable_w, .bottom_right, hub_ink, hub_tint, surface_bg);
+
+        // Vertical segment going up into the bottom of the USB Hub
+        const up_top_y = hub_boot_rect.y + hub_boot_rect.h;
+        if (y_turn > up_top_y) {
+            const seg3: Rect = .{
+                .x = hub_cable_x - cable_w * 0.5,
+                .y = up_top_y,
+                .w = cable_w,
+                .h = y_turn - up_top_y,
+            };
+            c.fillRect(seg3, surface_bg);
+            c.fillRect(seg3, hub_tint);
+            c.fillRect(.{ .x = seg3.x, .y = seg3.y, .w = line_w, .h = seg3.h }, hub_ink);
+            c.fillRect(.{ .x = seg3.x + seg3.w - line_w, .y = seg3.y, .w = line_w, .h = seg3.h }, hub_ink);
+        }
+
+        // Hub bottom strain-relief boot
+        c.fillRect(hub_boot_rect, surface_bg);
+        if (hub_hovered) {
+            c.fillRect(hub_boot_rect, accent.withAlpha(0.20));
+        }
+        c.strokeRect(hub_boot_rect, line_w, hub_ink);
     }
-    c.strokeRect(hub_boot_rect, line_w, hub_ink);
 
     // 3. Three-Port USB Hub with Ethernet body
     c.fillRoundedRect(hub_r, .all(2.2 * s), surface_bg);
@@ -2168,10 +2468,10 @@ fn drawUsbHubAndPeripherals(
 
     // Draw the 3 USB-A ports and 1 RJ45 Ethernet port along the top edge of the hub
     const ports = [_]struct { rect: board.Rect, target: ?InteractiveTarget, is_eth: bool }{
-        .{ .rect = HubLayout.kbd_port_rect, .target = .usb_keyboard, .is_eth = false },
-        .{ .rect = HubLayout.mouse_port_rect, .target = .usb_mouse, .is_eth = false },
-        .{ .rect = HubLayout.spare_port_rect, .target = null, .is_eth = false },
-        .{ .rect = HubLayout.eth_port_rect, .target = .ethernet, .is_eth = true },
+        .{ .rect = hl.kbd_port_rect, .target = .usb_keyboard, .is_eth = false },
+        .{ .rect = hl.mouse_port_rect, .target = .usb_mouse, .is_eth = false },
+        .{ .rect = hl.spare_port_rect, .target = null, .is_eth = false },
+        .{ .rect = hl.eth_port_rect, .target = .ethernet, .is_eth = true },
     };
     for (ports) |p| {
         const pr: Rect = .{
@@ -2200,10 +2500,10 @@ fn drawUsbHubAndPeripherals(
     const min_y = ty + HubLayout.top_cable_min_y * s;
 
     const kbd_r: Rect = .{
-        .x = tx + HubLayout.kbd_port_rect.x * s,
-        .y = ty + HubLayout.kbd_port_rect.y * s,
-        .w = HubLayout.kbd_port_rect.w * s,
-        .h = HubLayout.kbd_port_rect.h * s,
+        .x = tx + hl.kbd_port_rect.x * s,
+        .y = ty + hl.kbd_port_rect.y * s,
+        .w = hl.kbd_port_rect.w * s,
+        .h = hl.kbd_port_rect.h * s,
     };
     const kbd_hov = (hovered_target == .usb_keyboard);
     drawTopPlugAndCable(
@@ -2220,10 +2520,10 @@ fn drawUsbHubAndPeripherals(
     );
 
     const mouse_r: Rect = .{
-        .x = tx + HubLayout.mouse_port_rect.x * s,
-        .y = ty + HubLayout.mouse_port_rect.y * s,
-        .w = HubLayout.mouse_port_rect.w * s,
-        .h = HubLayout.mouse_port_rect.h * s,
+        .x = tx + hl.mouse_port_rect.x * s,
+        .y = ty + hl.mouse_port_rect.y * s,
+        .w = hl.mouse_port_rect.w * s,
+        .h = hl.mouse_port_rect.h * s,
     };
     const mouse_hov = (hovered_target == .usb_mouse);
     drawTopPlugAndCable(
@@ -2240,10 +2540,10 @@ fn drawUsbHubAndPeripherals(
     );
 
     const eth_r: Rect = .{
-        .x = tx + HubLayout.eth_port_rect.x * s,
-        .y = ty + HubLayout.eth_port_rect.y * s,
-        .w = HubLayout.eth_port_rect.w * s,
-        .h = HubLayout.eth_port_rect.h * s,
+        .x = tx + hl.eth_port_rect.x * s,
+        .y = ty + hl.eth_port_rect.y * s,
+        .w = hl.eth_port_rect.w * s,
+        .h = hl.eth_port_rect.h * s,
     };
     const eth_hov = (hovered_target == .ethernet);
     drawTopPlugAndCable(
@@ -2396,16 +2696,49 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     _ = ui.pointerButton(ser_r.x + 10, ser_r.y + 10, false, status, &hw);
     try testing.expectEqual(@as(@TypeOf(ui.focused_field), .none), ui.focused_field);
 
-    // Powering down the board enables opening the Board menu and choosing Raspberry Pi Zero W or Zero 2 W
+    // Powering down the board enables opening the Board menu and choosing A+, B+, Zero W, or Zero 2 W
     status.power_connected = false;
     _ = ui.pointerButton(bm_btn.x + 10, bm_btn.y + 10, true, status, &hw);
     try testing.expectEqual(Action.consumed, ui.pointerButton(bm_btn.x + 10, bm_btn.y + 10, false, status, &hw));
     try testing.expect(ui.board_menu_open);
 
-    // Select item 1 (Raspberry Pi Zero W) from the open popup menu
+    // Select item 0 (Raspberry Pi 1 Model A+) from the open popup menu
+    const item0_y = ui.board_menu_rect.y + 4.0 + 0.0 * 32.0 + 16.0;
+    _ = ui.pointerButton(ui.board_menu_rect.x + 20, item0_y, true, status, &hw);
+    try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item0_y, false, status, &hw));
+    try testing.expectEqual(BoardModel.pi_1_a_plus, ui.selected_board_model);
+    status.board_model = ui.selected_board_model;
+    status.model = status.board_model.dtModel();
+    ui.updateLayout(win_w, win_h, status, &hw);
+    try testing.expectEqualStrings("Raspberry Pi 1 Model A+", ui.title);
+    try testing.expect(board.forModel(status.model).? == &board.pi1_a_plus);
+    try testing.expectEqual(@as(f32, 0.0), ui.wifi_mac_field_rect.w);
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+
+    // Select item 1 (Raspberry Pi 1 Model B+): B board has no external USB hub; USB & Ethernet ports are interactive directly
+    _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
+    _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, false, status, &hw);
     const item1_y = ui.board_menu_rect.y + 4.0 + 1.0 * 32.0 + 16.0;
     _ = ui.pointerButton(ui.board_menu_rect.x + 20, item1_y, true, status, &hw);
     try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item1_y, false, status, &hw));
+    try testing.expectEqual(BoardModel.pi_1_b_plus, ui.selected_board_model);
+    status.board_model = ui.selected_board_model;
+    status.model = status.board_model.dtModel();
+    ui.updateLayout(win_w, win_h, status, &hw);
+    try testing.expectEqualStrings("Raspberry Pi 1 Model B+", ui.title);
+    try testing.expect(board.forModel(status.model).? == &board.pi1_b_plus);
+    try testing.expect(!status.board_model.usesExternalUsbHub());
+    try testing.expectEqual(InteractiveTarget.usb_keyboard, BoardUi.targetAt(&board.pi1_b_plus, .{ 92.0, 9.0 }, true).?);
+    try testing.expectEqual(InteractiveTarget.usb_mouse, BoardUi.targetAt(&board.pi1_b_plus, .{ 92.0, 27.0 }, true).?);
+    try testing.expectEqual(InteractiveTarget.ethernet, BoardUi.targetAt(&board.pi1_b_plus, .{ 92.0, 45.75 }, true).?);
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+
+    // Select item 3 (Raspberry Pi Zero W) from the popup menu
+    _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
+    _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, false, status, &hw);
+    const item3_y = ui.board_menu_rect.y + 4.0 + 3.0 * 32.0 + 16.0;
+    _ = ui.pointerButton(ui.board_menu_rect.x + 20, item3_y, true, status, &hw);
+    try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item3_y, false, status, &hw));
     try testing.expectEqual(BoardModel.pi_zero_w, ui.selected_board_model);
     status.board_model = ui.selected_board_model;
     status.model = status.board_model.dtModel();
@@ -2415,12 +2748,12 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     // Wireless MAC row is now visible
     try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
 
-    // Open menu again and select item 2 (Raspberry Pi Zero 2 W)
-    _ = ui.pointerButton(bm_btn.x + 10, bm_btn.y + 10, true, status, &hw);
-    _ = ui.pointerButton(bm_btn.x + 10, bm_btn.y + 10, false, status, &hw);
-    const item2_y = ui.board_menu_rect.y + 4.0 + 2.0 * 32.0 + 16.0;
-    _ = ui.pointerButton(ui.board_menu_rect.x + 20, item2_y, true, status, &hw);
-    try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item2_y, false, status, &hw));
+    // Open menu again and select item 4 (Raspberry Pi Zero 2 W)
+    _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
+    _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, false, status, &hw);
+    const item4_y = ui.board_menu_rect.y + 4.0 + 4.0 * 32.0 + 16.0;
+    _ = ui.pointerButton(ui.board_menu_rect.x + 20, item4_y, true, status, &hw);
+    try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item4_y, false, status, &hw));
     try testing.expectEqual(BoardModel.pi_zero_2_w, ui.selected_board_model);
     status.board_model = ui.selected_board_model;
     status.model = status.board_model.dtModel();
@@ -2429,8 +2762,8 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expect(board.forModel(status.model).? == &board.pi_zero_2_w);
     try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
 
-    _ = ui.pointerButton(ser_r.x + 10, ser_r.y + 10, true, status, &hw);
-    _ = ui.pointerButton(ser_r.x + 10, ser_r.y + 10, false, status, &hw);
+    _ = ui.pointerButton(ui.serial_field_rect.x + 10, ui.serial_field_rect.y + 10, true, status, &hw);
+    _ = ui.pointerButton(ui.serial_field_rect.x + 10, ui.serial_field_rect.y + 10, false, status, &hw);
     try testing.expectEqual(@as(@TypeOf(ui.focused_field), .serial), ui.focused_field);
 
     const dhcp_r = ui.dhcp_toggle_rect;

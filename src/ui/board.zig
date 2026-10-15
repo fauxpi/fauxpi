@@ -186,7 +186,7 @@ fn bPlus(comptime extra: []const Part) [10 + extra.len]Part {
     } ++ extra[0..extra.len].*;
 }
 
-const pi1_b_plus: Board = .{ .width = 85, .height = 56, .holes = &b_plus_holes, .parts = &bPlus(&.{
+pub const pi1_b_plus: Board = .{ .width = 85, .height = 56, .holes = &b_plus_holes, .parts = &bPlus(&.{
     chip(.soc_with_ram, "BCM2835", 27, 24.6, 12),
     chip(.usb_ethernet, "LAN9514", 60, 22.3, 9),
 }) };
@@ -268,7 +268,7 @@ fn aPlus(comptime extra: []const Part) [8 + extra.len]Part {
     } ++ extra[0..extra.len].*;
 }
 
-const pi1_a_plus: Board = .{ .width = 65, .height = 56, .holes = &b_plus_holes, .parts = &aPlus(&.{
+pub const pi1_a_plus: Board = .{ .width = 65, .height = 56, .holes = &b_plus_holes, .parts = &aPlus(&.{
     chip(.soc_with_ram, "BCM2835", 27, 24.6, 12),
 }) };
 
@@ -412,8 +412,8 @@ pub fn forModel(model: []const u8) ?*const Board {
     if (has(model, "3 Model B")) return &pi3_b;
     // The 2 B v1.2 has the Pi 3's chip.
     if (has(model, "2 Model B")) return if (has(model, "Rev 1.2")) &pi2_b_v12 else &pi2_b;
-    if (has(model, "Model B Plus")) return &pi1_b_plus;
-    if (has(model, "Model A Plus")) return &pi1_a_plus;
+    if (has(model, "Model B Plus") or has(model, "Model B+")) return &pi1_b_plus;
+    if (has(model, "Model A Plus") or has(model, "Model A+")) return &pi1_a_plus;
     if (has(model, "Model B")) return &pi1_b;
     if (has(model, "Model A")) return &pi1_a;
     return null;

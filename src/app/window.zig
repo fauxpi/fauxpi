@@ -587,6 +587,10 @@ pub const WaylandWindow = struct {
         self.status.board_model = bm;
         self.status.model = bm.dtModel();
         self.ui.title = bm.windowTitle();
+        if (!bm.usesExternalUsbHub()) {
+            self.status.usb_hub_connected = true;
+            if (self.hid) |h| h.hub_connected = true;
+        }
         var m = self.toplevel.request(protocol.xdg_toplevel.request.set_title) catch return;
         m.string(self.ui.title).end();
     }
