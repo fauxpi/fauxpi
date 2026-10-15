@@ -1597,10 +1597,13 @@ pub const BoardUi = struct {
             };
             const pr = map(tr, part.rect);
             if (!part.underside) {
+                if (partOverhangsBoard(b, &part)) {
+                    fillOverhangingPart(c, &part, pr, s, t.surface, t.on_surface.withAlpha(0.04));
+                }
                 drawPart(c, &part, pr, s, if (part_hovered) t.primary else ink);
             }
             if (part_hovered) {
-                c.fillRoundedRect(pr, .all(0.6 * s), t.primary.withAlpha(0.22));
+                c.fillRoundedRect(pr, partRadius(&part, s), t.primary.withAlpha(0.22));
             }
         }
 
@@ -1719,6 +1722,35 @@ pub const BoardUi = struct {
         }
     }
 };
+
+fn partOverhangsBoard(b: *const board.Board, part: *const board.Part) bool {
+    if (part.underside) return false;
+    const r = part.rect;
+    return r.x < 0 or r.y < 0 or (r.x + r.w) > b.width or (r.y + r.h) > b.height;
+}
+
+fn partRadius(part: *const board.Part, s: f32) Radii {
+    return switch (part.kind) {
+        .usb, .usb_double, .ethernet, .hdmi, .mini_hdmi, .micro_hdmi, .power, .usb_c_power, .power_button, .usb_otg, .micro_sd, .sd => .all(0.4 * s),
+        .antenna, .camera, .display, .camera_display, .pcie => .all(0.3 * s),
+        else => .all(0.6 * s),
+    };
+}
+
+fn fillOverhangingPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, surface_bg: Color, board_tint: Color) void {
+    if (part.kind == .composite) {
+        const body: Rect = .{ .x = r.x, .y = r.y + r.h * 0.45, .w = r.w, .h = r.h * 0.55 };
+        const barrel: Rect = .{ .x = r.x + r.w * 0.2, .y = r.y, .w = r.w * 0.6, .h = r.h * 0.45 };
+        c.fillRoundedRect(body, .all(0.6 * s), surface_bg);
+        c.fillRoundedRect(body, .all(0.6 * s), board_tint);
+        c.fillRoundedRect(barrel, .all(0.4 * s), surface_bg);
+        c.fillRoundedRect(barrel, .all(0.4 * s), board_tint);
+        return;
+    }
+    const rad = partRadius(part, s);
+    c.fillRoundedRect(r, rad, surface_bg);
+    c.fillRoundedRect(r, rad, board_tint);
+}
 
 /// Draws a single board part, ported from `dazzle/src/apps/settings/board_view.zig`.
 pub fn drawPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, ink: Color) void {
@@ -2810,5 +2842,29 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     _ = ui.pointerButton(640, 740, true, status, &hw);
     _ = ui.pointerButton(640, 740, false, status, &hw);
     try testing.expect(!ui.sheet_open);
+
+    // 9. Verify board outline stops at the edge of overhanging connectors (e.g. HDMI on B+)
+    ui.sheet_open = true;
+    status.board_model = .pi_1_b_plus;
+    status.model = status.board_model.dtModel();
+    ui.updateLayout(win_w, win_h, status, &hw);
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+
+    const b_plus = &board.pi1_b_plus;
+    const b_tr = BoardUi.boardTransform(b_plus, ui.board_rect);
+    // Point on the board's bottom outline (y = b_plus.height = 56.0) just inside the HDMI connector's left wall
+    // (HDMI spans x = 24.4..39.6, inner slot spans x = 27.44..36.56; x = 25.9 is inside the HDMI body between wall and slot)
+    const inside_hdmi_x: u32 = @intFromFloat(@round(b_tr.x + 25.9 * b_tr.scale));
+    const board_bottom_y: u32 = @intFromFloat(@round(b_tr.y + (b_plus.height - 0.15) * b_tr.scale));
+    // Point on the board's bottom outline outside any connector (x = 20.0, between power and HDMI)
+    const outside_conn_x: u32 = @intFromFloat(@round(b_tr.x + 20.0 * b_tr.scale));
+    const px_inside_hdmi = pixels[board_bottom_y * win_w + inside_hdmi_x];
+    const px_board_outline = pixels[board_bottom_y * win_w + outside_conn_x];
+    // Sample interior board background at (x = 20.0, y = 48.0)
+    const interior_y: u32 = @intFromFloat(@round(b_tr.y + 48.0 * b_tr.scale));
+    const px_board_bg = pixels[interior_y * win_w + outside_conn_x];
+    try testing.expect(px_board_outline != px_board_bg);
+    try testing.expectEqual(px_board_bg, px_inside_hdmi);
 }
+
 
