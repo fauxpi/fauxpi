@@ -7,6 +7,9 @@ const pixel = @import("format.zig");
 
 pub const lanes = 16;
 pub const Vec = [lanes]u32;
+const VecU = @Vector(lanes, u32);
+const VecI = @Vector(lanes, i32);
+const VecF = @Vector(lanes, f32);
 
 pub fn splat(v: u32) Vec {
     return @splat(v);
@@ -64,8 +67,10 @@ pub const Error = error{
 const varying_c: f32 = 0.25;
 
 const State = struct {
-    ra: [32]Vec = std.mem.zeroes([32]Vec),
-    rb: [32]Vec = std.mem.zeroes([32]Vec),
+    ra: [32]Vec = undefined,
+    rb: [32]Vec = undefined,
+    ra_init: u32 = 0,
+    rb_init: u32 = 0,
     acc: [6]Vec = std.mem.zeroes([6]Vec),
     zero: [lanes]bool = @splat(false),
     neg: [lanes]bool = @splat(false),
@@ -100,26 +105,38 @@ fn isFloatInputMul(op: qpu.MulOp) bool {
     return op == .fmul;
 }
 
-fn unpack(v: u32, mode: u3, float_input: bool) Error!u32 {
-    return switch (mode) {
-        0 => v,
-        1 => blk: { // 16a
-            const lo: i16 = @bitCast(@as(u16, @truncate(v)));
-            break :blk if (float_input) u(@as(f32, @floatFromInt(lo))) else @bitCast(@as(i32, lo));
+fn unpackVec(v: Vec, mode: u3, float_input: bool) Vec {
+    if (mode == 0) return v;
+    var out: Vec = undefined;
+    switch (mode) {
+        0 => unreachable,
+        1 => { // 16a
+            for (0..lanes) |lane| {
+                const lo: i16 = @bitCast(@as(u16, @truncate(v[lane])));
+                out[lane] = if (float_input) u(@as(f32, @floatFromInt(lo))) else @bitCast(@as(i32, lo));
+            }
         },
-        2 => blk: { // 16b
-            const hi: i16 = @bitCast(@as(u16, @truncate(v >> 16)));
-            break :blk if (float_input) u(@as(f32, @floatFromInt(hi))) else @bitCast(@as(i32, hi));
+        2 => { // 16b
+            for (0..lanes) |lane| {
+                const hi: i16 = @bitCast(@as(u16, @truncate(v[lane] >> 16)));
+                out[lane] = if (float_input) u(@as(f32, @floatFromInt(hi))) else @bitCast(@as(i32, hi));
+            }
         },
-        3 => blk: { // 8d_rep
-            const byte: u8 = @truncate(v >> 24);
-            break :blk @as(u32, byte) * 0x01010101;
+        3 => { // 8d_rep
+            for (0..lanes) |lane| {
+                const byte: u8 = @truncate(v[lane] >> 24);
+                out[lane] = @as(u32, byte) * 0x01010101;
+            }
         },
-        4, 5, 6, 7 => blk: {
-            const byte: u8 = @truncate(v >> (@as(u5, mode - 4) * 8));
-            break :blk if (float_input) u(@as(f32, @floatFromInt(byte)) / 255.0) else byte;
+        4, 5, 6, 7 => {
+            const shift: u5 = @as(u5, mode - 4) * 8;
+            for (0..lanes) |lane| {
+                const byte: u8 = @truncate(v[lane] >> shift);
+                out[lane] = if (float_input) u(@as(f32, @floatFromInt(byte)) / 255.0) else byte;
+            }
         },
-    };
+    }
+    return out;
 }
 
 fn ftoi(x: f32) u32 {
@@ -128,35 +145,11 @@ fn ftoi(x: f32) u32 {
     return @bitCast(@as(i32, @intFromFloat(@trunc(clamped))));
 }
 
-fn addOp(op: qpu.AddOp, a: u32, b: u32) Error!u32 {
-    const ai: i32 = @bitCast(a);
-    const bi: i32 = @bitCast(b);
+fn addOpScalar(op: qpu.AddOp, a: u32, b: u32) u32 {
     return switch (op) {
-        .nop => 0,
-        .fadd => u(f(a) + f(b)),
-        .fsub => u(f(a) - f(b)),
-        .fmin => u(@min(f(a), f(b))),
-        .fmax => u(@max(f(a), f(b))),
-        .fminabs => u(@min(@abs(f(a)), @abs(f(b)))),
-        .fmaxabs => u(@max(@abs(f(a)), @abs(f(b)))),
-        .ftoi => ftoi(f(a)),
-        .itof => u(@floatFromInt(ai)),
-        .add => a +% b,
-        .sub => a -% b,
-        .shr => a >> @truncate(b),
-        .asr => @bitCast(ai >> @truncate(b)),
-        .ror => std.math.rotr(u32, a, @as(u5, @truncate(b))),
-        .shl => a << @truncate(b),
-        .min => @bitCast(@min(ai, bi)),
-        .max => @bitCast(@max(ai, bi)),
-        .@"and" => a & b,
-        .@"or" => a | b,
-        .xor => a ^ b,
-        .not => ~a,
-        .clz => @clz(a),
         .v8adds => blk: {
             var res: u32 = 0;
-            for (0..4) |i| {
+            inline for (0..4) |i| {
                 const shift: u5 = @intCast(i * 8);
                 const ba: u16 = @truncate((a >> shift) & 0xff);
                 const bb: u16 = @truncate((b >> shift) & 0xff);
@@ -166,7 +159,7 @@ fn addOp(op: qpu.AddOp, a: u32, b: u32) Error!u32 {
         },
         .v8subs => blk: {
             var res: u32 = 0;
-            for (0..4) |i| {
+            inline for (0..4) |i| {
                 const shift: u5 = @intCast(i * 8);
                 const ba: i16 = @intCast((a >> shift) & 0xff);
                 const bb: i16 = @intCast((b >> shift) & 0xff);
@@ -178,14 +171,73 @@ fn addOp(op: qpu.AddOp, a: u32, b: u32) Error!u32 {
     };
 }
 
-fn mulOp(op: qpu.MulOp, a: u32, b: u32) Error!u32 {
+fn addOpVec(op: qpu.AddOp, a: Vec, b: Vec) Vec {
+    const au: VecU = a;
+    const bu: VecU = b;
+    const ai: VecI = @bitCast(au);
+    const bi: VecI = @bitCast(bu);
+    const af: VecF = @bitCast(au);
+    const bf: VecF = @bitCast(bu);
     return switch (op) {
-        .nop => 0,
-        .fmul => u(f(a) * f(b)),
-        .mul24 => (a & 0xffffff) *% (b & 0xffffff),
+        .nop => splat(0),
+        .fadd => @bitCast(af + bf),
+        .fsub => @bitCast(af - bf),
+        .fmin => @bitCast(@min(af, bf)),
+        .fmax => @bitCast(@max(af, bf)),
+        .fminabs => @bitCast(@min(@abs(af), @abs(bf))),
+        .fmaxabs => @bitCast(@max(@abs(af), @abs(bf))),
+        .ftoi => blk: {
+            var res: Vec = undefined;
+            for (0..lanes) |l| res[l] = ftoi(f(a[l]));
+            break :blk res;
+        },
+        .itof => blk: {
+            const vf: VecF = @floatFromInt(ai);
+            break :blk @bitCast(vf);
+        },
+        .add => au +% bu,
+        .sub => au -% bu,
+        .shr => blk: {
+            var res: Vec = undefined;
+            for (0..lanes) |l| res[l] = a[l] >> @truncate(b[l]);
+            break :blk res;
+        },
+        .asr => blk: {
+            var res: Vec = undefined;
+            for (0..lanes) |l| res[l] = @bitCast(@as(i32, @bitCast(a[l])) >> @truncate(b[l]));
+            break :blk res;
+        },
+        .ror => blk: {
+            var res: Vec = undefined;
+            for (0..lanes) |l| res[l] = std.math.rotr(u32, a[l], @as(u5, @truncate(b[l])));
+            break :blk res;
+        },
+        .shl => blk: {
+            var res: Vec = undefined;
+            for (0..lanes) |l| res[l] = a[l] << @truncate(b[l]);
+            break :blk res;
+        },
+        .min => @bitCast(@min(ai, bi)),
+        .max => @bitCast(@max(ai, bi)),
+        .@"and" => au & bu,
+        .@"or" => au | bu,
+        .xor => au ^ bu,
+        .not => ~au,
+        .clz => @clz(au),
+        .v8adds, .v8subs => blk: {
+            var res: Vec = undefined;
+            for (0..lanes) |l| res[l] = addOpScalar(op, a[l], b[l]);
+            break :blk res;
+        },
+        else => splat(0),
+    };
+}
+
+fn mulOpScalar(op: qpu.MulOp, a: u32, b: u32) u32 {
+    return switch (op) {
         .v8muld => blk: {
             var res: u32 = 0;
-            for (0..4) |i| {
+            inline for (0..4) |i| {
                 const shift: u5 = @intCast(i * 8);
                 const ba: u32 = (a >> shift) & 0xff;
                 const bb: u32 = (b >> shift) & 0xff;
@@ -195,7 +247,7 @@ fn mulOp(op: qpu.MulOp, a: u32, b: u32) Error!u32 {
         },
         .v8min => blk: {
             var res: u32 = 0;
-            for (0..4) |i| {
+            inline for (0..4) |i| {
                 const shift: u5 = @intCast(i * 8);
                 res |= @min((a >> shift) & 0xff, (b >> shift) & 0xff) << shift;
             }
@@ -203,14 +255,32 @@ fn mulOp(op: qpu.MulOp, a: u32, b: u32) Error!u32 {
         },
         .v8max => blk: {
             var res: u32 = 0;
-            for (0..4) |i| {
+            inline for (0..4) |i| {
                 const shift: u5 = @intCast(i * 8);
                 res |= @max((a >> shift) & 0xff, (b >> shift) & 0xff) << shift;
             }
             break :blk res;
         },
-        .v8adds => addOp(.v8adds, a, b),
-        .v8subs => addOp(.v8subs, a, b),
+        .v8adds => addOpScalar(.v8adds, a, b),
+        .v8subs => addOpScalar(.v8subs, a, b),
+        else => 0,
+    };
+}
+
+fn mulOpVec(op: qpu.MulOp, a: Vec, b: Vec) Vec {
+    const au: VecU = a;
+    const bu: VecU = b;
+    const af: VecF = @bitCast(au);
+    const bf: VecF = @bitCast(bu);
+    return switch (op) {
+        .nop => splat(0),
+        .fmul => @bitCast(af * bf),
+        .mul24 => (au & @as(VecU, @splat(0xffffff))) *% (bu & @as(VecU, @splat(0xffffff))),
+        .v8muld, .v8min, .v8max, .v8adds, .v8subs => blk: {
+            var res: Vec = undefined;
+            for (0..lanes) |l| res[l] = mulOpScalar(op, a[l], b[l]);
+            break :blk res;
+        },
     };
 }
 
@@ -218,8 +288,8 @@ pub fn smallImm(v: u6) u32 {
     return switch (v) {
         0...15 => v,
         16...31 => @bitCast(@as(i32, v) - 32),
-        32...39 => u(std.math.pow(f32, 2.0, @floatFromInt(@as(i32, v) - 32))),
-        40...47 => u(std.math.pow(f32, 2.0, @floatFromInt(@as(i32, v) - 48))),
+        32...39 => @as(u32, (@as(u32, 127) + @as(u32, v - 32)) << 23),
+        40...47 => @as(u32, (@as(u32, 127) - @as(u32, 48 - v)) << 23),
         else => 0,
     };
 }
@@ -241,11 +311,32 @@ fn condPasses(cond: qpu.Cond, s: *const State, lane: usize) bool {
     };
 }
 
+inline fn resolveMuxVec(
+    m: qpu.Mux,
+    s: *const State,
+    old_r4: Vec,
+    va: Vec,
+    vb: Vec,
+    pm: bool,
+    raddr_a: u6,
+    unpack_mode: u3,
+    float_input: bool,
+) Vec {
+    return switch (m) {
+        .r0, .r1, .r2, .r3, .r5 => s.acc[@intFromEnum(m)],
+        .r4 => if (pm and unpack_mode != 0) unpackVec(old_r4, unpack_mode, float_input) else old_r4,
+        .a => if (!pm and raddr_a < 32 and unpack_mode != 0) unpackVec(va, unpack_mode, float_input) else va,
+        .b => vb,
+    };
+}
+
 pub fn run(code: []const qpu.Inst, env: Env) Error!Result {
     var s: State = .{};
     var r: Result = .{};
     s.ra[qpu.R.frag_payload_zw] = env.frag_w;
     s.rb[qpu.R.frag_payload_zw] = env.frag_z;
+    s.ra_init = @as(u32, 1) << qpu.R.frag_payload_zw;
+    s.rb_init = @as(u32, 1) << qpu.R.frag_payload_zw;
 
     var end_at: ?usize = null;
     var ip: usize = 0;
@@ -297,19 +388,22 @@ pub fn run(code: []const qpu.Inst, env: Env) Error!Result {
             const old_r4 = s.acc[4];
             const reads_vary = (uses_a and raddr_a == qpu.R.vary) or (sig != .small_imm and uses_b and raddr_b == qpu.R.vary);
 
-            for (0..lanes) |lane| {
-                var in: [4]u32 = undefined;
-                for (muxes, 0..) |m, i| {
-                    const float_input = if (i < 2) isFloatInputAdd(add_op) else isFloatInputMul(mul_op);
-                    in[i] = switch (m) {
-                        .r0, .r1, .r2, .r3, .r5 => s.acc[@intFromEnum(m)][lane],
-                        .r4 => if (pm) try unpack(old_r4[lane], unpack_mode, float_input) else old_r4[lane],
-                        .a => if (!pm and raddr_a < 32) try unpack(va[lane], unpack_mode, float_input) else va[lane],
-                        .b => vb[lane],
-                    };
-                }
-                add_result[lane] = try addOp(add_op, in[0], in[1]);
-                mul_result[lane] = try mulOp(mul_op, in[2], in[3]);
+            if (add_op != .nop) {
+                const flt_add = isFloatInputAdd(add_op);
+                const in0 = resolveMuxVec(muxes[0], &s, old_r4, va, vb, pm, raddr_a, unpack_mode, flt_add);
+                const in1 = resolveMuxVec(muxes[1], &s, old_r4, va, vb, pm, raddr_a, unpack_mode, flt_add);
+                add_result = addOpVec(add_op, in0, in1);
+            } else {
+                add_result = splat(0);
+            }
+
+            if (mul_op != .nop) {
+                const flt_mul = isFloatInputMul(mul_op);
+                const in2 = resolveMuxVec(muxes[2], &s, old_r4, va, vb, pm, raddr_a, unpack_mode, flt_mul);
+                const in3 = resolveMuxVec(muxes[3], &s, old_r4, va, vb, pm, raddr_a, unpack_mode, flt_mul);
+                mul_result = mulOpVec(mul_op, in2, in3);
+            } else {
+                mul_result = splat(0);
             }
 
             if (inst & (1 << 45) != 0) {
@@ -326,8 +420,12 @@ pub fn run(code: []const qpu.Inst, env: Env) Error!Result {
         const waddr_mul = qpu.getWaddrMul(inst);
         const a_pack: u4 = if (!pm) pack else 0;
         const mul_pack: u4 = if (pm) pack else 0;
-        try write(&s, &r, env, waddr_add, if (ws) .b else .a, add_result, cond_add, if (!ws) a_pack else 0, 0);
-        try write(&s, &r, env, waddr_mul, if (ws) .a else .b, mul_result, cond_mul, if (ws) a_pack else 0, mul_pack);
+        if (waddr_add != qpu.W.nop and cond_add != .never) {
+            try write(&s, &r, env, waddr_add, if (ws) .b else .a, add_result, cond_add, if (!ws) a_pack else 0, 0);
+        }
+        if (waddr_mul != qpu.W.nop and cond_mul != .never) {
+            try write(&s, &r, env, waddr_mul, if (ws) .a else .b, mul_result, cond_mul, if (ws) a_pack else 0, mul_pack);
+        }
 
         switch (sig) {
             .load_tmu0, .load_tmu1 => {
@@ -356,7 +454,14 @@ pub fn run(code: []const qpu.Inst, env: Env) Error!Result {
 const File = enum { a, b };
 
 fn readPort(s: *State, r: *Result, env: Env, raddr: u6, file: File) Error!Vec {
-    if (raddr < 32) return if (file == .a) s.ra[raddr] else s.rb[raddr];
+    if (raddr < 32) {
+        const bit = @as(u32, 1) << @intCast(raddr);
+        if (file == .a) {
+            return if ((s.ra_init & bit) != 0) s.ra[raddr] else splat(0);
+        } else {
+            return if ((s.rb_init & bit) != 0) s.rb[raddr] else splat(0);
+        }
+    }
     switch (raddr) {
         qpu.R.nop => return splat(0),
         qpu.R.unif => {
@@ -367,10 +472,10 @@ fn readPort(s: *State, r: *Result, env: Env, raddr: u6, file: File) Error!Vec {
         qpu.R.vary => {
             if (r.varyings_read >= env.varyings.len) return splat(0);
             defer r.varyings_read += 1;
-            var v: Vec = undefined;
-            for (&v, env.varyings[r.varyings_read], env.frag_w) |*out, value, w|
-                out.* = u((f(value) - varying_c) / f(w));
-            return v;
+            const val_f: VecF = @bitCast(env.varyings[r.varyings_read]);
+            const w_f: VecF = @bitCast(env.frag_w);
+            const c_f: VecF = @splat(varying_c);
+            return @bitCast((val_f - c_f) / w_f);
         },
         qpu.R.vpm => {
             if (r.vpm_words_read >= env.vpm_in.len) return splat(0);
@@ -379,9 +484,7 @@ fn readPort(s: *State, r: *Result, env: Env, raddr: u6, file: File) Error!Vec {
             return env.vpm_in[r.vpm_words_read];
         },
         qpu.R.elem_qpu => {
-            var v: Vec = undefined;
-            for (&v, 0..) |*e, i| e.* = @intCast(i);
-            return v;
+            return .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         },
         qpu.R.xy_pixel_coord => return if (file == .a) env.frag_x else env.frag_y,
         qpu.R.vpm_ld_busy, qpu.R.vpm_ld_wait, qpu.R.mutex_acquire => return splat(0),
@@ -393,12 +496,43 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
     if (waddr == qpu.W.nop or cond == .never) return;
 
     const dst: ?*Vec = switch (waddr) {
-        0...31 => if (file == .a) &s.ra[waddr] else &s.rb[waddr],
+        0...31 => blk: {
+            const bit = @as(u32, 1) << @intCast(waddr);
+            if (file == .a) {
+                if ((s.ra_init & bit) == 0) {
+                    s.ra_init |= bit;
+                    if (cond != .always or a_pack != 0 or mul_pack != 0) {
+                        s.ra[waddr] = splat(0);
+                    }
+                }
+                break :blk &s.ra[waddr];
+            } else {
+                if ((s.rb_init & bit) == 0) {
+                    s.rb_init |= bit;
+                    if (cond != .always or a_pack != 0 or mul_pack != 0) {
+                        s.rb[waddr] = splat(0);
+                    }
+                }
+                break :blk &s.rb[waddr];
+            }
+        },
         qpu.W.acc0...qpu.W.acc0 + 3 => &s.acc[waddr - qpu.W.acc0],
         qpu.W.acc5 => &s.acc[5],
         else => null,
     };
     if (dst) |d| {
+        if (cond == .always and a_pack == 0 and mul_pack == 0) {
+            d.* = value;
+            return;
+        }
+        if (cond == .always and a_pack == 0 and mul_pack >= 4 and mul_pack <= 7) {
+            const shift: u5 = @as(u5, @intCast(mul_pack - 4)) * 8;
+            const mask = @as(u32, 0xff) << shift;
+            for (0..lanes) |lane| {
+                d[lane] = (d[lane] & ~mask) | (@as(u32, unorm8(f(value[lane]))) << shift);
+            }
+            return;
+        }
         for (0..lanes) |lane| {
             if (!condPasses(cond, s, lane)) continue;
             const v = value[lane];
@@ -483,9 +617,10 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
                     p0 -= i * texture_base;
                 }
             }
+            const cfg = texture.decodeConfig(p0, t.params[1]);
             var texel: Vec = undefined;
             for (&texel, value, t.coord_t) |*o, sc, tc|
-                o.* = sample(memory, p0, t.params[1], f(sc), f(tc)) catch 0xff000000;
+                o.* = sampleConfig(memory, cfg, f(sc), f(tc)) catch 0xff000000;
             t.fifo[t.fifo_len] = texel;
             t.fifo_len += 1;
             t.param_count = 0;
@@ -499,7 +634,10 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
 pub const texture_base: u32 = 1 << 28;
 
 pub fn sample(memory: []const u8, p0: u32, p1: u32, s: f32, t: f32) Error!u32 {
-    const p = texture.decodeConfig(p0, p1);
+    return sampleConfig(memory, texture.decodeConfig(p0, p1), s, t);
+}
+
+fn sampleConfig(memory: []const u8, p: texture.Config, s: f32, t: f32) Error!u32 {
     const cpp: u32 = switch (p.type) {
         .rgba8888, .rgbx8888, .rgba32r => 4,
         .rgb565 => 2,
@@ -522,10 +660,16 @@ pub fn sample(memory: []const u8, p0: u32, p1: u32, s: f32, t: f32) Error!u32 {
         const y = try wrap(y0 + @as(f32, @floatFromInt(k >> 1)), p.height, p.wrap_t);
         c[k] = try fetch(memory, p, cpp, x, y);
     }
-    for (0..4) |byte| {
+    const w00 = (1 - ax) * (1 - ay);
+    const w10 = ax * (1 - ay);
+    const w01 = (1 - ax) * ay;
+    const w11 = ax * ay;
+    inline for (0..4) |byte| {
         const sh: u5 = @intCast(byte * 8);
-        var v: f32 = 0;
-        for (c, [4]f32{ (1 - ax) * (1 - ay), ax * (1 - ay), (1 - ax) * ay, ax * ay }) |cc, k| v += @as(f32, @floatFromInt(cc >> sh & 0xff)) * k;
+        const v = @as(f32, @floatFromInt((c[0] >> sh) & 0xff)) * w00 +
+            @as(f32, @floatFromInt((c[1] >> sh) & 0xff)) * w10 +
+            @as(f32, @floatFromInt((c[2] >> sh) & 0xff)) * w01 +
+            @as(f32, @floatFromInt((c[3] >> sh) & 0xff)) * w11;
         out |= @as(u32, @intFromFloat(@round(v))) << sh;
     }
     return out;
@@ -567,32 +711,36 @@ pub fn referenceTexelOffset(width: u32, height: u32, x: u32, y: u32) u32 {
 }
 
 pub fn referenceTexelOffsetOf(cpp: u32, width: u32, height: u32, x: u32, y: u32) u32 {
-    const uw: u32 = if (cpp == 4) 4 else 8;
-    const uh: u32 = if (cpp == 1) 8 else 4;
-    const in_utile = ((y % uh) * uw + (x % uw)) * cpp;
-    if (width <= 4 * uw or height <= 4 * uh) {
-        const utiles_per_row = (width + uw - 1) / uw;
-        return ((y / uh) * utiles_per_row + x / uw) * 64 + in_utile;
+    const uw_shift: u5 = if (cpp == 4) 2 else 3;
+    const uh_shift: u5 = if (cpp == 1) 3 else 2;
+    const uw: u32 = @as(u32, 1) << uw_shift;
+    const uh: u32 = @as(u32, 1) << uh_shift;
+    const cpp_shift: u5 = switch (cpp) {
+        4 => 2,
+        2 => 1,
+        else => 0,
+    };
+    const in_utile = (((y & (uh - 1)) << uw_shift) | (x & (uw - 1))) << cpp_shift;
+    if (width <= (uw << 2) or height <= (uh << 2)) {
+        const utiles_per_row = (width + uw - 1) >> uw_shift;
+        return (((y >> uh_shift) * utiles_per_row + (x >> uw_shift)) << 6) + in_utile;
     }
-    const tile_w = 8 * uw;
-    const tile_h = 8 * uh;
-    const tiles_per_row = (width + tile_w - 1) / tile_w;
-    const tile_row = y / tile_h;
-    const tile_col = if (tile_row % 2 == 0) x / tile_w else tiles_per_row - 1 - x / tile_w;
-    const tile_base = (tile_row * tiles_per_row + tile_col) * 4096;
+    const tile_w_shift: u5 = uw_shift + 3;
+    const tile_h_shift: u5 = uh_shift + 3;
+    const tile_w: u32 = @as(u32, 1) << tile_w_shift;
+    const tiles_per_row = (width + tile_w - 1) >> tile_w_shift;
+    const tile_row = y >> tile_h_shift;
+    const tile_col = if ((tile_row & 1) == 0) (x >> tile_w_shift) else tiles_per_row - 1 - (x >> tile_w_shift);
+    const tile_base = (tile_row * tiles_per_row + tile_col) << 12;
 
-    const sub_col = (x / (4 * uw)) % 2;
-    const sub_row = (y / (4 * uh)) % 2;
-    const Pos = struct { col: u32, row: u32 };
-    const even = [4]Pos{ .{ .col = 0, .row = 0 }, .{ .col = 0, .row = 1 }, .{ .col = 1, .row = 1 }, .{ .col = 1, .row = 0 } };
-    const odd = [4]Pos{ .{ .col = 1, .row = 1 }, .{ .col = 1, .row = 0 }, .{ .col = 0, .row = 0 }, .{ .col = 0, .row = 1 } };
-    const order = if (tile_row % 2 == 0) &even else &odd;
-    var sub_index: u32 = 0;
-    for (order, 0..) |pos, i| {
-        if (pos.col == sub_col and pos.row == sub_row) sub_index = @intCast(i);
-    }
-    const utile_in_sub = ((y / uh) % 4) * 4 + (x / uw) % 4;
-    return tile_base + sub_index * 1024 + utile_in_sub * 64 + in_utile;
+    const sub_col = (x >> (uw_shift + 2)) & 1;
+    const sub_row = (y >> (uh_shift + 2)) & 1;
+    const stile_index = (sub_row << 1) | sub_col;
+    const even_map = [4]u32{ 0, 3, 1, 2 };
+    const odd_map = [4]u32{ 2, 1, 3, 0 };
+    const sub_index = if ((tile_row & 1) == 0) even_map[stile_index] else odd_map[stile_index];
+    const utile_in_sub = (((y >> uh_shift) & 3) << 2) | ((x >> uw_shift) & 3);
+    return tile_base + (sub_index << 10) + (utile_in_sub << 6) + in_utile;
 }
 
 pub fn packColor(r: f32, g: f32, b: f32, a: f32) u32 {

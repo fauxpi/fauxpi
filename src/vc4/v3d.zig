@@ -36,6 +36,37 @@ pub const V3d = struct {
         config_b2: u8 = 0x00,
     };
 
+    pub const MAX_PREBINNED_TRIS = 256;
+
+    pub const PreparedDraw = struct {
+        fs_code_phys: u32 = 0,
+        fs_code_len: u16 = 0,
+        fs_unif_phys: u32 = 0,
+        fs_unif_len: u16 = 0,
+        fs_num_varyings: u8 = 0,
+        valid: bool = false,
+    };
+
+    pub const ShadedVertex = struct {
+        x: f32 = 0,
+        y: f32 = 0,
+        z: f32 = 0.5,
+        inv_w: f32 = 1.0,
+        persp_varyings: [16]f32 = [_]f32{0} ** 16,
+    };
+
+    pub const ShadedTriangle = struct {
+        draw_idx: u16,
+        min_x: u32,
+        min_y: u32,
+        max_x: u32,
+        max_y: u32,
+        inv_area: f32,
+        dw0_dx: f32,
+        dw1_dx: f32,
+        v: [3]ShadedVertex,
+    };
+
     scratch: u32 = 0,
     l2cactl: u32 = 0,
     slcactl: u32 = 0,
@@ -84,6 +115,15 @@ pub const V3d = struct {
     // Tile buffer (64x64 pixels max per tile)
     tile_color: [64 * 64]u32 = [_]u32{0} ** (64 * 64),
     tile_depth: [64 * 64]f32 = [_]f32{1.0} ** (64 * 64),
+    tile_color_solid: ?u32 = null,
+    tile_depth_valid: bool = false,
+    tile_clear_zs: f32 = 1.0,
+
+    // Pre-shaded & pre-binned state for the current RCL frame
+    prep_draws: [256]PreparedDraw = undefined,
+    shaded_tris: [MAX_PREBINNED_TRIS]ShadedTriangle = undefined,
+    shaded_tris_len: usize = 0,
+    overflow_draw_start: usize = 0,
 
     gl: GlRenderer = .{},
     gl_initialized: bool = false,
@@ -339,11 +379,14 @@ pub const V3d = struct {
         const max_bytes = ram.len - phys;
         const max_insts = @min(max_bytes / 8, out_buf.len);
         for (0..max_insts) |i| {
-            out_buf[i] = std.mem.readInt(u64, ram[phys + i * 8 ..][0..8], .little);
-        }
-        for (out_buf[0..max_insts], 0..) |inst, i| {
-            if (qpu.getSig(inst) == .prog_end or qpu.getSig(inst) == .color_load_end) {
+            const inst = std.mem.readInt(u64, ram[phys + i * 8 ..][0..8], .little);
+            out_buf[i] = inst;
+            const sig = qpu.getSig(inst);
+            if (sig == .prog_end or sig == .color_load_end) {
                 const len = @min(i + 3, max_insts);
+                for (i + 1..len) |j| {
+                    out_buf[j] = std.mem.readInt(u64, ram[phys + j * 8 ..][0..8], .little);
+                }
                 return out_buf[0..len];
             }
         }
@@ -360,10 +403,183 @@ pub const V3d = struct {
         return out_buf[0..max_words];
     }
 
+    /// Pre-shades and bins triangles across all draw calls once per frame before tile loop.
+    fn prepareDrawsForFrame(self: *V3d, ram: []const u8) void {
+        self.shaded_tris_len = 0;
+        self.overflow_draw_start = self.draws_len;
+
+        var vs_buf: [512]qpu.Inst = undefined;
+        var fs_buf: [512]qpu.Inst = undefined;
+        var vs_unif_buf: [128]u32 = undefined;
+
+        for (self.draws[0..self.draws_len], 0..) |draw, draw_idx| {
+            self.prep_draws[draw_idx] = .{};
+            if (draw.count < 3) continue;
+            const rec_phys = draw.shader_rec_addr & 0x1FFFFFFF;
+            if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) continue;
+
+            const fs_num_varyings = ram[rec_phys + 3];
+            const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & 0x1FFFFFFF;
+            const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & 0x1FFFFFFF;
+            const vs_attr_mask = ram[rec_phys + 14];
+            const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & 0x1FFFFFFF;
+            const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & 0x1FFFFFFF;
+
+            const vs_code = extractQpuProgram(ram, vs_code_phys, &vs_buf);
+            const fs_code = extractQpuProgram(ram, fs_code_phys, &fs_buf);
+            if (vs_code.len == 0 or fs_code.len == 0) continue;
+
+            const vs_unifs = extractUniforms(ram, vs_unif_phys, &vs_unif_buf);
+            const max_unif_words: u16 = if (fs_unif_phys < ram.len) @intCast(@min((ram.len - fs_unif_phys) / 4, 128)) else 0;
+
+            self.prep_draws[draw_idx] = .{
+                .fs_code_phys = fs_code_phys,
+                .fs_code_len = @intCast(fs_code.len),
+                .fs_unif_phys = fs_unif_phys,
+                .fs_unif_len = max_unif_words,
+                .fs_num_varyings = fs_num_varyings,
+                .valid = true,
+            };
+
+            const num_tris: u32 = switch (draw.mode) {
+                4 => draw.count / 3,
+                5, 6 => if (draw.count >= 3) draw.count - 2 else 0,
+                else => 0,
+            };
+
+            if (self.shaded_tris_len + num_tris > MAX_PREBINNED_TRIS) {
+                self.overflow_draw_start = draw_idx;
+                break;
+            }
+
+            var tri_idx: u32 = 0;
+            while (tri_idx < num_tris) : (tri_idx += 1) {
+                var v_indices: [3]u32 = undefined;
+                switch (draw.mode) {
+                    4 => {
+                        v_indices[0] = tri_idx * 3 + 0;
+                        v_indices[1] = tri_idx * 3 + 1;
+                        v_indices[2] = tri_idx * 3 + 2;
+                    },
+                    5 => {
+                        if ((tri_idx & 1) == 0) {
+                            v_indices[0] = tri_idx + 0;
+                            v_indices[1] = tri_idx + 1;
+                            v_indices[2] = tri_idx + 2;
+                        } else {
+                            v_indices[0] = tri_idx + 1;
+                            v_indices[1] = tri_idx + 0;
+                            v_indices[2] = tri_idx + 2;
+                        }
+                    },
+                    6 => {
+                        v_indices[0] = 0;
+                        v_indices[1] = tri_idx + 1;
+                        v_indices[2] = tri_idx + 2;
+                    },
+                    else => continue,
+                }
+
+                for (&v_indices) |*vi| {
+                    if (draw.indexed) {
+                        const idx_base = draw.index_buffer_addr & 0x1FFFFFFF;
+                        if (draw.u16_indices) {
+                            const off = idx_base + vi.* * 2;
+                            vi.* = if (off + 2 <= ram.len) std.mem.readInt(u16, ram[off..][0..2], .little) else 0;
+                        } else {
+                            const off = idx_base + vi.*;
+                            vi.* = if (off < ram.len) ram[off] else 0;
+                        }
+                    } else {
+                        vi.* += draw.first_or_offset;
+                    }
+                }
+
+                var vpm_in: [32]qpu_sim.Vec = [_]qpu_sim.Vec{qpu_sim.splat(0)} ** 32;
+                var vpm_words: usize = 0;
+                for (0..draw.num_attrs) |ai| {
+                    if (vs_attr_mask != 0 and (vs_attr_mask & (@as(u8, 1) << @intCast(ai))) == 0) continue;
+                    const a_off = rec_phys + 36 + ai * 8;
+                    const attr_base = std.mem.readInt(u32, ram[a_off..][0..4], .little) & 0x1FFFFFFF;
+                    const attr_bytes: u32 = @as(u32, ram[a_off + 4]) + 1;
+                    const attr_stride: u32 = ram[a_off + 5];
+                    const words = (attr_bytes + 3) / 4;
+                    for (0..words) |w_i| {
+                        if (vpm_words >= vpm_in.len) break;
+                        for (0..3) |lane| {
+                            const v_addr = attr_base + v_indices[lane] * attr_stride + @as(u32, @intCast(w_i * 4));
+                            if (v_addr + 4 <= ram.len) {
+                                vpm_in[vpm_words][lane] = std.mem.readInt(u32, ram[v_addr..][0..4], .little);
+                            }
+                        }
+                        vpm_words += 1;
+                    }
+                }
+
+                const vs_res = qpu_sim.run(vs_code, .{
+                    .uniforms = vs_unifs,
+                    .vpm_in = vpm_in[0..vpm_words],
+                }) catch continue;
+                if (vs_res.vpm_out_len < 3) continue;
+
+                var verts: [3]ShadedVertex = .{ .{}, .{}, .{} };
+                const n_var = @min(@as(usize, fs_num_varyings), 16);
+                for (0..3) |lane| {
+                    const xy_packed = vs_res.vpm_out[0][lane];
+                    const xs: i16 = @bitCast(@as(u16, @truncate(xy_packed)));
+                    const ys: i16 = @bitCast(@as(u16, @truncate(xy_packed >> 16)));
+                    verts[lane].x = @as(f32, @floatFromInt(xs)) / 16.0 + draw.vp_x;
+                    verts[lane].y = @as(f32, @floatFromInt(ys)) / 16.0 + draw.vp_y;
+                    verts[lane].z = @bitCast(vs_res.vpm_out[1][lane]);
+                    const raw_inv_w: f32 = @bitCast(vs_res.vpm_out[2][lane]);
+                    const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
+                    verts[lane].inv_w = inv_w;
+                    for (0..n_var) |vi| {
+                        if (3 + vi < vs_res.vpm_out_len) {
+                            const raw_v: f32 = @bitCast(vs_res.vpm_out[3 + vi][lane]);
+                            verts[lane].persp_varyings[vi] = raw_v * inv_w;
+                        }
+                    }
+                }
+
+                const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
+                    (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
+                if (@abs(area) < 1e-6) continue;
+                const inv_area = 1.0 / area;
+
+                const clip_min_x: f32 = @floatFromInt(draw.clip_x);
+                const clip_min_y: f32 = @floatFromInt(draw.clip_y);
+                const clip_max_x: f32 = @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w);
+                const clip_max_y: f32 = @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h);
+
+                const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
+                const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
+                const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
+                const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
+                if (min_fx >= max_fx or min_fy >= max_fy) continue;
+
+                self.shaded_tris[self.shaded_tris_len] = .{
+                    .draw_idx = @intCast(draw_idx),
+                    .min_x = @intFromFloat(min_fx),
+                    .min_y = @intFromFloat(min_fy),
+                    .max_x = @intFromFloat(max_fx),
+                    .max_y = @intFromFloat(max_fy),
+                    .inv_area = inv_area,
+                    .dw0_dx = (verts[1].y - verts[2].y) * inv_area,
+                    .dw1_dx = (verts[2].y - verts[0].y) * inv_area,
+                    .v = verts,
+                };
+                self.shaded_tris_len += 1;
+            }
+        }
+    }
+
     fn executeRcl(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) void {
         var pc = start_bus & 0x1FFFFFFF;
         const end = end_bus & 0x1FFFFFFF;
         if (end > ram.len) return;
+
+        self.prepareDrawsForFrame(ram);
 
         var fb_addr: u32 = 0;
         var fb_width: u32 = 0;
@@ -390,8 +606,9 @@ pub const V3d = struct {
                     if (pc + 5 > end) break;
                     const tile_size: u32 = 64;
                     if (!tile_loaded) {
-                        @memset(&self.tile_color, clear_color0);
-                        @memset(&self.tile_depth, clear_zs);
+                        self.tile_color_solid = clear_color0;
+                        self.tile_depth_valid = false;
+                        self.tile_clear_zs = clear_zs;
                         tile_loaded = true;
                     }
                     self.renderDrawsIntoTile(ram, cur_tile_x * tile_size, cur_tile_y * tile_size, tile_size);
@@ -401,8 +618,9 @@ pub const V3d = struct {
                 24, 25 => { // STORE_MS_TILE_BUFFER / STORE_MS_TILE_BUFFER_AND_EOF (1 byte)
                     const tile_size: u32 = 64;
                     if (!tile_loaded) {
-                        @memset(&self.tile_color, clear_color0);
-                        @memset(&self.tile_depth, clear_zs);
+                        self.tile_color_solid = clear_color0;
+                        self.tile_depth_valid = false;
+                        self.tile_clear_zs = clear_zs;
                         tile_loaded = true;
                     }
                     const r_format: u2 = @truncate((fb_flags >> 2) & 3);
@@ -421,7 +639,7 @@ pub const V3d = struct {
                     if (buf_kind == 1) { // Color buffer store
                         const tile_size: u32 = 64;
                         if (!tile_loaded) {
-                            @memset(&self.tile_color, clear_color0);
+                            self.tile_color_solid = clear_color0;
                             tile_loaded = true;
                         }
                         const ls_tiling: u2 = @truncate((bits >> 4) & 3);
@@ -443,7 +661,9 @@ pub const V3d = struct {
                         const ls_tiling: u2 = @truncate((bits >> 4) & 3);
                         const ls_format: u2 = @truncate((bits >> 8) & 3);
                         self.loadTileFromRam(ram, addr_word & ~@as(u32, 0xf), fb_width, fb_height, cur_tile_x, cur_tile_y, 64, ls_tiling, ls_format);
-                        @memset(&self.tile_depth, clear_zs);
+                        self.tile_color_solid = null;
+                        self.tile_depth_valid = false;
+                        self.tile_clear_zs = clear_zs;
                         tile_loaded = true;
                     }
                     pc += 7;
@@ -475,8 +695,9 @@ pub const V3d = struct {
                     cur_tile_x = ram[pc + 1];
                     cur_tile_y = ram[pc + 2];
                     if (!tile_loaded) {
-                        @memset(&self.tile_color, clear_color0);
-                        @memset(&self.tile_depth, clear_zs);
+                        self.tile_color_solid = clear_color0;
+                        self.tile_depth_valid = false;
+                        self.tile_clear_zs = clear_zs;
                         tile_loaded = true;
                     }
                     pc += 3;
@@ -504,6 +725,37 @@ pub const V3d = struct {
         const cpp: u32 = if (is_565) 2 else 4;
         const x0 = tile_x * tile_size;
         const y0 = tile_y * tile_size;
+
+        if (!is_565 and tile_size == 64 and x0 + 64 <= fb_w and y0 + 64 <= fb_h) {
+            if (tiling == 0) {
+                for (0..64) |ty| {
+                    const py = y0 + @as(u32, @intCast(ty));
+                    const off = base + (py * fb_w + x0) * 4;
+                    if (off + 256 <= ram.len) {
+                        @memcpy(std.mem.sliceAsBytes(self.tile_color[ty * 64 ..][0..64]), ram[off..][0..256]);
+                    }
+                }
+                return;
+            } else {
+                for (0..16) |uy| {
+                    for (0..16) |ux| {
+                        const px = x0 + @as(u32, @intCast(ux * 4));
+                        const py = y0 + @as(u32, @intCast(uy * 4));
+                        const utile_off = base + texture.texelOffsetOf(.argb8888, fb_w, fb_h, px, py);
+                        if (utile_off + 64 <= ram.len) {
+                            inline for (0..4) |ry| {
+                                const dst_idx = (uy * 4 + ry) * 64 + ux * 4;
+                                @memcpy(
+                                    std.mem.sliceAsBytes(self.tile_color[dst_idx..][0..4]),
+                                    ram[utile_off + ry * 16 ..][0..16],
+                                );
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
 
         for (0..tile_size) |ty| {
             const py = y0 + @as(u32, @intCast(ty));
@@ -544,6 +796,65 @@ pub const V3d = struct {
         const x0 = tile_x * tile_size;
         const y0 = tile_y * tile_size;
 
+        if (!is_565 and tile_size == 64 and x0 + 64 <= fb_w and y0 + 64 <= fb_h) {
+            if (tiling == 0) {
+                if (self.tile_color_solid) |solid_c| {
+                    var solid_row: [64]u32 = @splat(solid_c);
+                    const row_bytes = std.mem.asBytes(&solid_row);
+                    for (0..64) |ty| {
+                        const py = y0 + @as(u32, @intCast(ty));
+                        const off = base + (py * fb_w + x0) * 4;
+                        if (off + 256 <= ram.len) {
+                            @memcpy(ram[off..][0..256], row_bytes);
+                        }
+                    }
+                } else {
+                    for (0..64) |ty| {
+                        const py = y0 + @as(u32, @intCast(ty));
+                        const off = base + (py * fb_w + x0) * 4;
+                        if (off + 256 <= ram.len) {
+                            @memcpy(ram[off..][0..256], std.mem.sliceAsBytes(self.tile_color[ty * 64 ..][0..64]));
+                        }
+                    }
+                }
+                return;
+            } else {
+                if (self.tile_color_solid) |solid_c| {
+                    var solid_utile: [16]u32 = @splat(solid_c);
+                    const utile_bytes = std.mem.asBytes(&solid_utile);
+                    for (0..16) |uy| {
+                        for (0..16) |ux| {
+                            const px = x0 + @as(u32, @intCast(ux * 4));
+                            const py = y0 + @as(u32, @intCast(uy * 4));
+                            const utile_off = base + texture.texelOffsetOf(.argb8888, fb_w, fb_h, px, py);
+                            if (utile_off + 64 <= ram.len) {
+                                @memcpy(ram[utile_off..][0..64], utile_bytes);
+                            }
+                        }
+                    }
+                } else {
+                    for (0..16) |uy| {
+                        for (0..16) |ux| {
+                            const px = x0 + @as(u32, @intCast(ux * 4));
+                            const py = y0 + @as(u32, @intCast(uy * 4));
+                            const utile_off = base + texture.texelOffsetOf(.argb8888, fb_w, fb_h, px, py);
+                            if (utile_off + 64 <= ram.len) {
+                                inline for (0..4) |ry| {
+                                    const src_idx = (uy * 4 + ry) * 64 + ux * 4;
+                                    @memcpy(
+                                        ram[utile_off + ry * 16 ..][0..16],
+                                        std.mem.sliceAsBytes(self.tile_color[src_idx..][0..4]),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
+        const solid_565 = if (self.tile_color_solid) |sc| format_mod.toRgb565(sc) else 0;
         for (0..tile_size) |ty| {
             const py = y0 + @as(u32, @intCast(ty));
             if (py >= fb_h) continue;
@@ -554,10 +865,11 @@ pub const V3d = struct {
                     (py * fb_w + px) * cpp
                 else
                     texture.texelOffsetOf(fmt, fb_w, fb_h, px, py);
-                const c = self.tile_color[ty * tile_size + tx];
+                const c = self.tile_color_solid orelse self.tile_color[ty * tile_size + tx];
                 if (off + cpp <= ram.len) {
                     if (is_565) {
-                        std.mem.writeInt(u16, ram[off..][0..2], format_mod.toRgb565(c), .little);
+                        const c565 = if (self.tile_color_solid != null) solid_565 else format_mod.toRgb565(c);
+                        std.mem.writeInt(u16, ram[off..][0..2], c565, .little);
                     } else {
                         std.mem.writeInt(u32, ram[off..][0..4], c, .little);
                     }
@@ -566,17 +878,67 @@ pub const V3d = struct {
         }
     }
 
-    const ShadedVertex = struct {
-        x: f32 = 0,
-        y: f32 = 0,
-        z: f32 = 0.5,
-        inv_w: f32 = 1.0,
-        varyings: [16]f32 = [_]f32{0} ** 16,
-    };
+    fn ensureTileMaterialized(self: *V3d, need_depth: bool) void {
+        if (self.tile_color_solid) |c| {
+            @memset(&self.tile_color, c);
+            self.tile_color_solid = null;
+        }
+        if (need_depth and !self.tile_depth_valid) {
+            @memset(&self.tile_depth, self.tile_clear_zs);
+            self.tile_depth_valid = true;
+        }
+    }
 
     fn renderDrawsIntoTile(self: *V3d, ram: []const u8, tile_px_x: u32, tile_px_y: u32, tile_size: u32) void {
-        for (self.draws[0..self.draws_len]) |draw| {
-            self.renderDrawIntoTile(ram, draw, tile_px_x, tile_px_y, tile_size);
+        const tile_end_x = tile_px_x + tile_size;
+        const tile_end_y = tile_px_y + tile_size;
+
+        var fs_buf: [512]qpu.Inst = undefined;
+        var fs_unif_buf: [128]u32 = undefined;
+        var cur_draw_idx: ?u16 = null;
+        var cur_fs_code: []const qpu.Inst = &.{};
+        var cur_fs_unifs: []const u32 = &.{};
+
+        for (self.shaded_tris[0..self.shaded_tris_len]) |*tri| {
+            if (tri.max_x <= tile_px_x or tri.min_x >= tile_end_x or
+                tri.max_y <= tile_px_y or tri.min_y >= tile_end_y)
+            {
+                continue;
+            }
+
+            const prep = self.prep_draws[tri.draw_idx];
+            if (!prep.valid) continue;
+
+            if (cur_draw_idx == null or cur_draw_idx.? != tri.draw_idx) {
+                cur_draw_idx = tri.draw_idx;
+                for (0..prep.fs_code_len) |i| {
+                    fs_buf[i] = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
+                }
+                cur_fs_code = fs_buf[0..prep.fs_code_len];
+                for (0..prep.fs_unif_len) |i| {
+                    fs_unif_buf[i] = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
+                }
+                cur_fs_unifs = fs_unif_buf[0..prep.fs_unif_len];
+            }
+
+            const draw = self.draws[tri.draw_idx];
+            self.rasterizeShadedTriangleInTile(
+                ram,
+                draw,
+                tri,
+                cur_fs_code,
+                cur_fs_unifs,
+                prep.fs_num_varyings,
+                tile_px_x,
+                tile_px_y,
+                tile_size,
+            );
+        }
+
+        if (self.overflow_draw_start < self.draws_len) {
+            for (self.draws[self.overflow_draw_start..self.draws_len]) |draw| {
+                self.renderDrawIntoTile(ram, draw, tile_px_x, tile_px_y, tile_size);
+            }
         }
     }
 
@@ -603,10 +965,9 @@ pub const V3d = struct {
         const vs_unifs = extractUniforms(ram, vs_unif_phys, &vs_unif_buf);
         const fs_unifs = extractUniforms(ram, fs_unif_phys, &fs_unif_buf);
 
-        // Process primitives in batches of triangles
         const num_tris: u32 = switch (draw.mode) {
-            4 => draw.count / 3, // triangles
-            5, 6 => if (draw.count >= 3) draw.count - 2 else 0, // strip / fan
+            4 => draw.count / 3,
+            5, 6 => if (draw.count >= 3) draw.count - 2 else 0,
             else => 0,
         };
 
@@ -653,7 +1014,6 @@ pub const V3d = struct {
                 }
             }
 
-            // Load attributes for the 3 vertices into VPM input vectors (lanes 0, 1, 2)
             var vpm_in: [32]qpu_sim.Vec = [_]qpu_sim.Vec{qpu_sim.splat(0)} ** 32;
             var vpm_words: usize = 0;
             for (0..draw.num_attrs) |ai| {
@@ -682,6 +1042,7 @@ pub const V3d = struct {
             if (vs_res.vpm_out_len < 3) continue;
 
             var verts: [3]ShadedVertex = .{ .{}, .{}, .{} };
+            const n_var = @min(@as(usize, fs_num_varyings), 16);
             for (0..3) |lane| {
                 const xy_packed = vs_res.vpm_out[0][lane];
                 const xs: i16 = @bitCast(@as(u16, @truncate(xy_packed)));
@@ -689,24 +1050,48 @@ pub const V3d = struct {
                 verts[lane].x = @as(f32, @floatFromInt(xs)) / 16.0 + draw.vp_x;
                 verts[lane].y = @as(f32, @floatFromInt(ys)) / 16.0 + draw.vp_y;
                 verts[lane].z = @bitCast(vs_res.vpm_out[1][lane]);
-                const inv_w: f32 = @bitCast(vs_res.vpm_out[2][lane]);
-                verts[lane].inv_w = if (inv_w == 0.0) 1.0 else inv_w;
-                for (0..@min(@as(usize, fs_num_varyings), 16)) |vi| {
+                const raw_inv_w: f32 = @bitCast(vs_res.vpm_out[2][lane]);
+                const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
+                verts[lane].inv_w = inv_w;
+                for (0..n_var) |vi| {
                     if (3 + vi < vs_res.vpm_out_len) {
-                        verts[lane].varyings[vi] = @bitCast(vs_res.vpm_out[3 + vi][lane]);
+                        const raw_v: f32 = @bitCast(vs_res.vpm_out[3 + vi][lane]);
+                        verts[lane].persp_varyings[vi] = raw_v * inv_w;
                     }
                 }
             }
 
-            self.rasterizeTriangleInTile(ram, draw, verts, fs_code, fs_unifs, fs_num_varyings, tile_px_x, tile_px_y, tile_size);
+            const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
+                (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
+            if (@abs(area) < 1e-6) continue;
+            const inv_area = 1.0 / area;
+
+            const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), @as(f32, @floatFromInt(draw.clip_x)));
+            const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), @as(f32, @floatFromInt(draw.clip_y)));
+            const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), @as(f32, @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w)));
+            const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), @as(f32, @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h)));
+            if (min_fx >= max_fx or min_fy >= max_fy) continue;
+
+            const tri = ShadedTriangle{
+                .draw_idx = 0,
+                .min_x = @intFromFloat(min_fx),
+                .min_y = @intFromFloat(min_fy),
+                .max_x = @intFromFloat(max_fx),
+                .max_y = @intFromFloat(max_fy),
+                .inv_area = inv_area,
+                .dw0_dx = (verts[1].y - verts[2].y) * inv_area,
+                .dw1_dx = (verts[2].y - verts[0].y) * inv_area,
+                .v = verts,
+            };
+            self.rasterizeShadedTriangleInTile(ram, draw, &tri, fs_code, fs_unifs, fs_num_varyings, tile_px_x, tile_px_y, tile_size);
         }
     }
 
-    fn rasterizeTriangleInTile(
+    fn rasterizeShadedTriangleInTile(
         self: *V3d,
         ram: []const u8,
         draw: DrawCall,
-        v: [3]ShadedVertex,
+        tri: *const ShadedTriangle,
         fs_code: []const qpu.Inst,
         fs_unifs: []const u32,
         num_varyings: u8,
@@ -714,44 +1099,39 @@ pub const V3d = struct {
         tile_px_y: u32,
         tile_size: u32,
     ) void {
-        // Compute bounding box clipped to both the current tile and the BCL clip window
-        const min_fx = @max(@floor(@min(v[0].x, @min(v[1].x, v[2].x))), @as(f32, @floatFromInt(@max(tile_px_x, draw.clip_x))));
-        const min_fy = @max(@floor(@min(v[0].y, @min(v[1].y, v[2].y))), @as(f32, @floatFromInt(@max(tile_px_y, draw.clip_y))));
-        const max_fx = @min(@ceil(@max(v[0].x, @max(v[1].x, v[2].x))), @as(f32, @floatFromInt(@min(tile_px_x + tile_size, @as(u32, draw.clip_x) + draw.clip_w))));
-        const max_fy = @min(@ceil(@max(v[0].y, @max(v[1].y, v[2].y))), @as(f32, @floatFromInt(@min(tile_px_y + tile_size, @as(u32, draw.clip_y) + draw.clip_h))));
+        const x_start = @max(tri.min_x, tile_px_x);
+        const y_start = @max(tri.min_y, tile_px_y);
+        const x_end = @min(tri.max_x, tile_px_x + tile_size);
+        const y_end = @min(tri.max_y, tile_px_y + tile_size);
+        if (x_start >= x_end or y_start >= y_end) return;
 
-        if (min_fx >= max_fx or min_fy >= max_fy) return;
+        const depth_func: u3 = @truncate((draw.config_b1 >> 4) & 7);
+        const z_updates = (draw.config_b1 & 0x80) != 0;
+        const need_depth = (depth_func != 7) or z_updates;
+        self.ensureTileMaterialized(need_depth);
 
-        const area = (v[1].x - v[0].x) * (v[2].y - v[0].y) - (v[1].y - v[0].y) * (v[2].x - v[0].x);
-        if (@abs(area) < 1e-6) return;
-        const inv_area = 1.0 / area;
-
-        const x_start: u32 = @intFromFloat(min_fx);
-        const y_start: u32 = @intFromFloat(min_fy);
-        const x_end: u32 = @intFromFloat(max_fx);
-        const y_end: u32 = @intFromFloat(max_fy);
+        const v = &tri.v;
+        const inv_area = tri.inv_area;
+        const dw0_dx = tri.dw0_dx;
+        const dw1_dx = tri.dw1_dx;
+        const n_var = @min(@as(usize, num_varyings), 16);
 
         // Batch up to 16 covered pixels per SIMD QPU invocation
-        var batch_x: [16]u32 = undefined;
-        var batch_y: [16]u32 = undefined;
+        var batch_idx: [16]u32 = undefined;
         var batch_z: [16]f32 = undefined;
         var frag_w: qpu_sim.Vec = qpu_sim.splatF(1.0);
         var frag_z: qpu_sim.Vec = qpu_sim.splat(0);
         var frag_x_vec: qpu_sim.Vec = qpu_sim.splat(0);
         var frag_y_vec: qpu_sim.Vec = qpu_sim.splat(0);
         var tlb_in: qpu_sim.Vec = qpu_sim.splat(0);
-        var vary_vecs: [16]qpu_sim.Vec = [_]qpu_sim.Vec{qpu_sim.splat(0)} ** 16;
+        var vary_vecs: [16]qpu_sim.Vec = undefined;
         var batch_len: usize = 0;
-
-        const depth_func: u3 = @truncate((draw.config_b1 >> 4) & 7);
-        const z_updates = (draw.config_b1 & 0x80) != 0;
 
         const flushBatch = struct {
             fn f(
                 v3d_self: *V3d,
                 count: usize,
-                bx: *const [16]u32,
-                by: *const [16]u32,
+                b_idx: *const [16]u32,
                 bz: *const [16]f32,
                 fw: qpu_sim.Vec,
                 fz: qpu_sim.Vec,
@@ -762,9 +1142,6 @@ pub const V3d = struct {
                 fcode: []const qpu.Inst,
                 funifs: []const u32,
                 mem: []const u8,
-                tpx: u32,
-                tpy: u32,
-                tsize: u32,
                 z_upd: bool,
             ) void {
                 const res = qpu_sim.run(fcode, .{
@@ -779,9 +1156,7 @@ pub const V3d = struct {
                 }) catch return;
                 if (res.tlb_color) |colors| {
                     for (0..count) |i| {
-                        const tx = bx[i] - tpx;
-                        const ty = by[i] - tpy;
-                        const idx = ty * tsize + tx;
+                        const idx = b_idx[i];
                         v3d_self.tile_color[idx] = colors[i];
                         if (z_upd) {
                             v3d_self.tile_depth[idx] = bz[i];
@@ -791,46 +1166,46 @@ pub const V3d = struct {
             }
         }.f;
 
-        var aligned_fs_buf: [512]qpu.Inst = undefined;
-        const f_len = @min(fs_code.len, aligned_fs_buf.len);
-        @memcpy(aligned_fs_buf[0..f_len], fs_code[0..f_len]);
-        const aligned_fs = aligned_fs_buf[0..f_len];
-
+        const fx_start = @as(f32, @floatFromInt(x_start)) + 0.5;
         var py = y_start;
         while (py < y_end) : (py += 1) {
+            const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            var w0 = ((v[1].x - fx_start) * (v[2].y - fy) - (v[1].y - fy) * (v[2].x - fx_start)) * inv_area;
+            var w1 = ((v[2].x - fx_start) * (v[0].y - fy) - (v[2].y - fy) * (v[0].x - fx_start)) * inv_area;
+            const row_base = (py - tile_px_y) * tile_size;
+
             var px = x_start;
-            while (px < x_end) : (px += 1) {
-                const fx = @as(f32, @floatFromInt(px)) + 0.5;
-                const fy = @as(f32, @floatFromInt(py)) + 0.5;
-
-                const w0 = ((v[1].x - fx) * (v[2].y - fy) - (v[1].y - fy) * (v[2].x - fx)) * inv_area;
-                const w1 = ((v[2].x - fx) * (v[0].y - fy) - (v[2].y - fy) * (v[0].x - fx)) * inv_area;
+            while (px < x_end) : ({
+                px += 1;
+                w0 += dw0_dx;
+                w1 += dw1_dx;
+            }) {
                 const w2 = 1.0 - w0 - w1;
-
                 if (w0 < -1e-5 or w1 < -1e-5 or w2 < -1e-5) continue;
 
                 const z = w0 * v[0].z + w1 * v[1].z + w2 * v[2].z;
-                const tile_idx = (py - tile_px_y) * tile_size + (px - tile_px_x);
-                const cur_z = self.tile_depth[tile_idx];
+                const tile_idx = row_base + (px - tile_px_x);
 
-                const depth_pass = switch (depth_func) {
-                    0 => false, // never
-                    1 => z < cur_z, // less
-                    2 => z == cur_z, // equal
-                    3 => z <= cur_z, // lequal
-                    4 => z > cur_z, // greater
-                    5 => z != cur_z, // notequal
-                    6 => z >= cur_z, // gequal
-                    7 => true, // always
-                };
-                if (!depth_pass) continue;
+                if (depth_func != 7) {
+                    const cur_z = self.tile_depth[tile_idx];
+                    const depth_pass = switch (depth_func) {
+                        0 => false, // never
+                        1 => z < cur_z, // less
+                        2 => z == cur_z, // equal
+                        3 => z <= cur_z, // lequal
+                        4 => z > cur_z, // greater
+                        5 => z != cur_z, // notequal
+                        6 => z >= cur_z, // gequal
+                        7 => true, // always
+                    };
+                    if (!depth_pass) continue;
+                }
 
                 const interp_inv_w = w0 * v[0].inv_w + w1 * v[1].inv_w + w2 * v[2].inv_w;
                 const w_val = if (@abs(interp_inv_w) > 1e-12) (1.0 / interp_inv_w) else 1.0;
 
                 const lane = batch_len;
-                batch_x[lane] = px;
-                batch_y[lane] = py;
+                batch_idx[lane] = tile_idx;
                 batch_z[lane] = z;
                 frag_w[lane] = @bitCast(w_val);
                 frag_z[lane] = @bitCast(z);
@@ -838,10 +1213,10 @@ pub const V3d = struct {
                 frag_y_vec[lane] = py;
                 tlb_in[lane] = self.tile_color[tile_idx];
 
-                for (0..@min(@as(usize, num_varyings), 16)) |vi| {
-                    const p_val = (w0 * v[0].varyings[vi] * v[0].inv_w +
-                        w1 * v[1].varyings[vi] * v[1].inv_w +
-                        w2 * v[2].varyings[vi] * v[2].inv_w) * w_val;
+                for (0..n_var) |vi| {
+                    const p_val = (w0 * v[0].persp_varyings[vi] +
+                        w1 * v[1].persp_varyings[vi] +
+                        w2 * v[2].persp_varyings[vi]) * w_val;
                     vary_vecs[vi][lane] = @bitCast(p_val);
                 }
 
@@ -850,21 +1225,17 @@ pub const V3d = struct {
                     flushBatch(
                         self,
                         batch_len,
-                        &batch_x,
-                        &batch_y,
+                        &batch_idx,
                         &batch_z,
                         frag_w,
                         frag_z,
                         frag_x_vec,
                         frag_y_vec,
                         tlb_in,
-                        vary_vecs[0..@min(@as(usize, num_varyings), 16)],
-                        aligned_fs,
+                        vary_vecs[0..n_var],
+                        fs_code,
                         fs_unifs,
                         ram,
-                        tile_px_x,
-                        tile_px_y,
-                        tile_size,
                         z_updates,
                     );
                     batch_len = 0;
@@ -876,21 +1247,17 @@ pub const V3d = struct {
             flushBatch(
                 self,
                 batch_len,
-                &batch_x,
-                &batch_y,
+                &batch_idx,
                 &batch_z,
                 frag_w,
                 frag_z,
                 frag_x_vec,
                 frag_y_vec,
                 tlb_in,
-                vary_vecs[0..@min(@as(usize, num_varyings), 16)],
-                aligned_fs,
+                vary_vecs[0..n_var],
+                fs_code,
                 fs_unifs,
                 ram,
-                tile_px_x,
-                tile_px_y,
-                tile_size,
                 z_updates,
             );
         }

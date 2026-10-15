@@ -121,17 +121,17 @@ pub fn tiledPitch(format: Format, width: u32, height: u32) u32 {
 }
 
 fn tSubtileOffset(utile_x: u32, utile_y: u32, utile_stride: u32) u32 {
-    const tile_stride = utile_stride / 8;
-    var tile_x = utile_x / 8;
-    const tile_y = utile_y / 8;
-    const odd_row = tile_y & 1 != 0;
+    const tile_stride = utile_stride >> 3;
+    var tile_x = utile_x >> 3;
+    const tile_y = utile_y >> 3;
+    const odd_row = (tile_y & 1) != 0;
     if (odd_row) tile_x = tile_stride - tile_x - 1;
-    const tile_offset = 4096 * (tile_y * tile_stride + tile_x);
+    const tile_offset = (tile_y * tile_stride + tile_x) << 12;
 
-    const stile_index = ((utile_y / 4) & 1) << 1 | ((utile_x / 4) & 1);
+    const stile_index = ((utile_y >> 2) & 1) << 1 | ((utile_x >> 2) & 1);
     const odd_map = [4]u32{ 2, 1, 3, 0 };
     const even_map = [4]u32{ 0, 3, 1, 2 };
-    return tile_offset + 1024 * (if (odd_row) odd_map else even_map)[stile_index];
+    return tile_offset + ((if (odd_row) odd_map else even_map)[stile_index] << 10);
 }
 
 pub fn texelOffset(width: u32, height: u32, x: u32, y: u32) u32 {
@@ -139,18 +139,26 @@ pub fn texelOffset(width: u32, height: u32, x: u32, y: u32) u32 {
 }
 
 pub fn texelOffsetOf(format: Format, width: u32, height: u32, x: u32, y: u32) u32 {
-    const uw = format.utileWidth();
-    const uh = format.utileHeight();
     const cpp = format.bytesPerPixel();
-    const in_utile = ((y % uh) * uw + x % uw) * cpp;
-    if (isLtOf(format, width, height)) {
-        const row_stride = std.mem.alignForward(u32, width, uw) * cpp;
-        return (y - y % uh) * row_stride + (x / uw) * 64 + in_utile;
+    const uw_shift: u5 = if (cpp == 4) 2 else 3;
+    const uh_shift: u5 = if (cpp == 1) 3 else 2;
+    const uw: u32 = @as(u32, 1) << uw_shift;
+    const uh: u32 = @as(u32, 1) << uh_shift;
+    const cpp_shift: u5 = switch (cpp) {
+        4 => 2,
+        2 => 1,
+        else => 0,
+    };
+    const in_utile = (((y & (uh - 1)) << uw_shift) | (x & (uw - 1))) << cpp_shift;
+    if (width <= (uw << 2) or height <= (uh << 2)) {
+        const row_stride = ((width + uw - 1) & ~(uw - 1)) << cpp_shift;
+        return (y & ~(uh - 1)) * row_stride + ((x >> uw_shift) << 6) + in_utile;
     }
-    const utile_stride = std.mem.alignForward(u32, width, 8 * uw) / uw;
-    const utile_x = x / uw;
-    const utile_y = y / uh;
-    const in_subtile = ((utile_y % 4) * 4 + utile_x % 4) * 64;
+    const tile_w = uw << 3;
+    const utile_stride = ((width + tile_w - 1) & ~(tile_w - 1)) >> uw_shift;
+    const utile_x = x >> uw_shift;
+    const utile_y = y >> uh_shift;
+    const in_subtile = (((utile_y & 3) << 2) | (utile_x & 3)) << 6;
     return tSubtileOffset(utile_x & ~@as(u32, 3), utile_y & ~@as(u32, 3), utile_stride) + in_subtile + in_utile;
 }
 
