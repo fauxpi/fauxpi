@@ -151,63 +151,27 @@ pub const Bcm2835 = struct {
 
     /// Updates all interrupt lines on `IntController` from peripheral states.
     pub fn updateIrqs(self: *Bcm2835) void {
-        var b0: u32 = 0;
-        var b1: u32 = 0;
-        var b2: u32 = 0;
+        const b0: u32 = (@as(u32, @intFromBool(self.arm_timer.irqPending())) << 0) |
+            (@as(u32, @intFromBool(self.mailbox.irqPending())) << 1) |
+            (@as(u32, @intFromBool(self.vchiq.irqPending())) << 2);
 
-        if (self.arm_timer.irqPending()) b0 |= (1 << 0); // Basic bit 0 = ARM Timer (SP804)
-        if (self.mailbox.irqPending()) b0 |= (1 << 1); // Basic bit 1 = ARM Mailbox
-        if (self.vchiq.irqPending()) b0 |= (1 << 2); // Basic bit 2 = ARM Doorbell 0 (VCHIQ)
+        const b1: u32 = (self.timer.cs & 0xf) |
+            (@as(u32, @intFromBool(self.usb.irqPending())) << 9) |
+            (@as(u32, @intFromBool(self.v3d.irqPending())) << 10) |
+            (self.dma.irqMask13() << 16) |
+            (@as(u32, @intFromBool(self.aux_uart.irqPending())) << 29);
 
-        // System timer channels 0..3 -> Bank 1 bits 0..3
-        b1 |= (self.timer.cs & 0xf);
-
-        // USB DWC2 -> Bank 1 bit 9
-        if (self.usb.irqPending()) b1 |= (1 << 9);
-
-        // V3D -> Bank 1 bit 10
-        if (self.v3d.irqPending()) b1 |= (1 << 10);
-
-        // DMA channels 0..12 -> Bank 1 bits 16..28
-        for (0..13) |ch| {
-            if (self.dma.channelIrqPending(ch)) {
-                b1 |= (@as(u32, 1) << @intCast(16 + ch));
-            }
-        }
-
-        // AUX Mini-UART1 -> Bank 1 bit 29
-        if (self.aux_uart.irqPending()) b1 |= (1 << 29);
-
-        // HVS Scaler -> Bank 2 bit 1 (IRQ 33)
-        if (self.hvs.irqPending()) b2 |= (1 << 1);
-
-        // PixelValves: PV2 -> Bank 2 bit 10 (42), PV0 -> Bank 2 bit 13 (45), PV1 -> Bank 2 bit 14 (46)
-        if (self.pv2.irqPending()) b2 |= (1 << 10);
-        if (self.pv0.irqPending()) b2 |= (1 << 13);
-        if (self.pv1.irqPending()) b2 |= (1 << 14);
-
-        // GPIO -> Bank 2 bits 17..20
-        if (self.gpio.irqPending()) b2 |= (1 << 20);
-
-        // I2C BSC0/1/2 -> Bank 2 bit 21 (IRQ 53)
-        if (self.bsc0.irqPending() or self.bsc1.irqPending() or self.bsc2.irqPending()) {
-            b2 |= (1 << 21);
-        }
-
-        // SPI0 -> Bank 2 bit 22 (IRQ 54)
-        if (self.spi0.irqPending()) b2 |= (1 << 22);
-
-        // PCM / I2S -> Bank 2 bit 23 (IRQ 55)
-        if (self.i2s.irqPending()) b2 |= (1 << 23);
-
-        // SDHOST -> Bank 2 bit 24 (IRQ 56)
-        if (self.sdhost.irqPending()) b2 |= (1 << 24);
-
-        // PL011 UART0 -> Bank 2 bit 25 (IRQ 57)
-        if (self.uart0.irqPending()) b2 |= (1 << 25);
-
-        // Arasan SDHCI (mmc@7e300000 / mmcnr@7e300000) -> Bank 2 bit 30 (IRQ 62)
-        if (self.sdhci.irqPending()) b2 |= (1 << 30);
+        const b2: u32 = (@as(u32, @intFromBool(self.hvs.irqPending())) << 1) |
+            (@as(u32, @intFromBool(self.pv2.irqPending())) << 10) |
+            (@as(u32, @intFromBool(self.pv0.irqPending())) << 13) |
+            (@as(u32, @intFromBool(self.pv1.irqPending())) << 14) |
+            (@as(u32, @intFromBool(self.gpio.irqPending())) << 20) |
+            (@as(u32, @intFromBool(self.bsc0.irqPending() or self.bsc1.irqPending() or self.bsc2.irqPending())) << 21) |
+            (@as(u32, @intFromBool(self.spi0.irqPending())) << 22) |
+            (@as(u32, @intFromBool(self.i2s.irqPending())) << 23) |
+            (@as(u32, @intFromBool(self.sdhost.irqPending())) << 24) |
+            (@as(u32, @intFromBool(self.uart0.irqPending())) << 25) |
+            (@as(u32, @intFromBool(self.sdhci.irqPending())) << 30);
 
         self.intc.raw_level[0] = b0;
         self.intc.raw_level[1] = b1;

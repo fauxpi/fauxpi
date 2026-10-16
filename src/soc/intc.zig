@@ -58,7 +58,7 @@ pub const IntController = struct {
     }
 
     pub inline fn hasPendingIrq(self: *const IntController) bool {
-        return (self.pendingBank(0) != 0) or (self.pendingBank(1) != 0) or (self.pendingBank(2) != 0);
+        return ((self.raw_level[0] & self.enabled[0]) | (self.raw_level[1] & self.enabled[1]) | (self.raw_level[2] & self.enabled[2])) != 0;
     }
 
     pub inline fn hasPendingFiq(self: *const IntController) bool {

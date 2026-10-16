@@ -39,6 +39,7 @@ pub const LocalIntc = struct {
     timer_int_control: [4]u32 = @splat(0),
     mailbox_int_control: [4]u32 = @splat(0),
     mailboxes: [4][4]u32 = @splat(@splat(0)),
+    mailbox_nonzero_mask: [4]u4 = @splat(0),
 
     /// Latched per-core ARMv7 Generic Timer output lines (`[0]=CNTPS`, `[1]=CNTPNS`, `[2]=CNTHP`, `[3]=CNTV`).
     core_timer_lines: [4]u4 = @splat(0),
@@ -46,27 +47,13 @@ pub const LocalIntc = struct {
     /// Secondary core (`1..3`) entry address written via `LOCAL_MAILBOX3_SET1..3`.
     core_wakeup_addr: [4]u32 = @splat(0),
 
-    fn mailboxNonZeroMask(self: *const LocalIntc, cpu: u2) u32 {
-        var mask: u32 = 0;
-        for (0..4) |mb| {
-            if (self.mailboxes[cpu][mb] != 0) {
-                mask |= (@as(u32, 1) << @intCast(mb));
-            }
-        }
-        return mask;
-    }
-
-    pub fn irqPendingForCore(
+    pub inline fn irqPendingForCore(
         self: *const LocalIntc,
         cpu: u2,
         gpu_irq_pending: bool,
     ) u32 {
-        var pending: u32 = 0;
-        const t_en = self.timer_int_control[cpu] & 0x0f;
-        pending |= (@as(u32, self.core_timer_lines[cpu]) & t_en);
-
-        const m_en = self.mailbox_int_control[cpu] & 0x0f;
-        pending |= (self.mailboxNonZeroMask(cpu) & m_en) << 4;
+        var pending: u32 = (@as(u32, self.core_timer_lines[cpu]) & (self.timer_int_control[cpu] & 0x0f)) |
+            ((@as(u32, self.mailbox_nonzero_mask[cpu]) & (self.mailbox_int_control[cpu] & 0x0f)) << 4);
 
         const gpu_irq_cpu: u2 = @truncate(self.gpu_routing);
         if (gpu_irq_pending and gpu_irq_cpu == cpu) {
@@ -75,17 +62,13 @@ pub const LocalIntc = struct {
         return pending;
     }
 
-    pub fn fiqPendingForCore(
+    pub inline fn fiqPendingForCore(
         self: *const LocalIntc,
         cpu: u2,
         gpu_fiq_pending: bool,
     ) u32 {
-        var pending: u32 = 0;
-        const t_en = (self.timer_int_control[cpu] >> 4) & 0x0f;
-        pending |= (@as(u32, self.core_timer_lines[cpu]) & t_en);
-
-        const m_en = (self.mailbox_int_control[cpu] >> 4) & 0x0f;
-        pending |= (self.mailboxNonZeroMask(cpu) & m_en) << 4;
+        var pending: u32 = (@as(u32, self.core_timer_lines[cpu]) & ((self.timer_int_control[cpu] >> 4) & 0x0f)) |
+            ((@as(u32, self.mailbox_nonzero_mask[cpu]) & ((self.mailbox_int_control[cpu] >> 4) & 0x0f)) << 4);
 
         const gpu_fiq_cpu: u2 = @truncate(self.gpu_routing >> 2);
         if (gpu_fiq_pending and gpu_fiq_cpu == cpu) {
@@ -99,6 +82,7 @@ pub const LocalIntc = struct {
         if (addr != 0) {
             self.core_wakeup_addr[cpu] = 0;
             self.mailboxes[cpu][3] = 0;
+            self.mailbox_nonzero_mask[cpu] &= ~(@as(u4, 1) << 3);
             return addr;
         }
         return null;
@@ -172,6 +156,9 @@ pub const LocalIntc = struct {
                 const cpu: usize = rel / 16;
                 const mb: usize = (rel / 4) % 4;
                 self.mailboxes[cpu][mb] |= val;
+                if (self.mailboxes[cpu][mb] != 0) {
+                    self.mailbox_nonzero_mask[cpu] |= (@as(u4, 1) << @intCast(mb));
+                }
                 if (cpu > 0 and mb == 3 and self.mailboxes[cpu][3] != 0) {
                     self.core_wakeup_addr[cpu] = self.mailboxes[cpu][3];
                 }
@@ -181,6 +168,9 @@ pub const LocalIntc = struct {
                 const cpu: usize = rel / 16;
                 const mb: usize = (rel / 4) % 4;
                 self.mailboxes[cpu][mb] &= ~val;
+                if (self.mailboxes[cpu][mb] == 0) {
+                    self.mailbox_nonzero_mask[cpu] &= ~(@as(u4, 1) << @intCast(mb));
+                }
             },
             else => {},
         }

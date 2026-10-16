@@ -40,6 +40,8 @@ pub const DmaController = struct {
 
     channels: [NUM_CHANNELS]Channel = [_]Channel{.{}} ** NUM_CHANNELS,
     int_status: u32 = 0,
+    cs_int_mask: u16 = 0,
+    active_mask: u16 = 0,
     enable: u32 = 0x7fff,
     stepping: bool = false,
 
@@ -51,9 +53,13 @@ pub const DmaController = struct {
         dreqReadyFn: *const fn (ctx: *anyopaque, permap: u5) bool,
     };
 
-    pub fn channelIrqPending(self: *const DmaController, ch: usize) bool {
+    pub inline fn channelIrqPending(self: *const DmaController, ch: usize) bool {
         if (ch >= NUM_CHANNELS) return false;
-        return (self.channels[ch].cs & CS_INT) != 0;
+        return (self.cs_int_mask & (@as(u16, 1) << @intCast(ch))) != 0;
+    }
+
+    pub inline fn irqMask13(self: *const DmaController) u32 {
+        return self.cs_int_mask & 0x1fff;
     }
 
     pub fn read32(self: *const DmaController, offset: u32) u32 {
@@ -93,31 +99,39 @@ pub const DmaController = struct {
         const reg = offset % 0x100;
         if (ch >= NUM_CHANNELS) return;
 
+        const ch_bit = @as(u16, 1) << @intCast(ch);
         var c = &self.channels[ch];
         switch (reg) {
             0x00 => { // CS
                 if ((val & CS_RESET) != 0) {
                     c.* = .{};
                     self.int_status &= ~(@as(u32, 1) << @intCast(ch));
+                    self.cs_int_mask &= ~ch_bit;
+                    self.active_mask &= ~ch_bit;
                     return;
                 }
                 if ((val & CS_ABORT) != 0) {
                     c.conblk_ad = c.nextconbk;
                     c.cb_loaded = false;
                     c.cs &= ~CS_ACTIVE;
+                    self.active_mask &= ~ch_bit;
                 }
                 // W1C bits: CS_END (bit 1) and CS_INT (bit 2)
                 if ((val & CS_END) != 0) c.cs &= ~CS_END;
                 if ((val & CS_INT) != 0) {
                     c.cs &= ~CS_INT;
                     self.int_status &= ~(@as(u32, 1) << @intCast(ch));
+                    self.cs_int_mask &= ~ch_bit;
                 }
                 // Update writable control bits (ACTIVE, priority, panic priority, wait)
                 const writable_mask: u32 = CS_ACTIVE | 0x30ff0000;
                 c.cs = (c.cs & ~writable_mask) | (val & writable_mask);
 
                 if ((c.cs & CS_ACTIVE) != 0) {
+                    self.active_mask |= ch_bit;
                     self.stepChannel(ch, ram, mmio);
+                } else {
+                    self.active_mask &= ~ch_bit;
                 }
             },
             0x04 => {
@@ -130,9 +144,13 @@ pub const DmaController = struct {
     }
 
     pub fn stepAllActive(self: *DmaController, ram: []u8, mmio: ?MmioIo) void {
-        for (0..NUM_CHANNELS) |ch| {
+        var mask = self.active_mask;
+        while (mask != 0) : (mask &= mask - 1) {
+            const ch: usize = @ctz(mask);
             if ((self.channels[ch].cs & CS_ACTIVE) != 0) {
                 self.stepChannel(ch, ram, mmio);
+            } else {
+                self.active_mask &= ~(@as(u16, 1) << @intCast(ch));
             }
         }
     }
@@ -164,12 +182,16 @@ pub const DmaController = struct {
         self.stepping = true;
         defer self.stepping = false;
 
+        const ch_bit = @as(u16, 1) << @intCast(ch);
         var c = &self.channels[ch];
         var max_cbs: usize = 16384;
 
         while ((c.cs & CS_ACTIVE) != 0 and c.conblk_ad != 0 and max_cbs > 0) : (max_cbs -= 1) {
             if (!c.cb_loaded) {
-                if (!loadCbHeader(c, ram)) break;
+                if (!loadCbHeader(c, ram)) {
+                    self.active_mask &= ~ch_bit;
+                    break;
+                }
             }
 
             // Check if gated by peripheral DREQ (e.g. PERMAP 13 = SDHOST, PERMAP 17 = HDMI MAI, PERMAP 5 = PWM)
@@ -197,29 +219,43 @@ pub const DmaController = struct {
             if ((c.ti & TI_INT_EN) != 0) {
                 c.cs |= CS_INT;
                 self.int_status |= (@as(u32, 1) << @intCast(ch));
+                self.cs_int_mask |= ch_bit;
             }
 
             c.conblk_ad = c.nextconbk;
             if (c.conblk_ad == 0) {
                 c.cs &= ~CS_ACTIVE;
+                self.active_mask &= ~ch_bit;
                 break;
             }
+        }
+        if ((c.cs & CS_ACTIVE) == 0) {
+            self.active_mask &= ~ch_bit;
         }
     }
 
     /// Steps active cyclic audio DMA channels (`PERMAP = 17` HDMI MAI or `PERMAP = 5` PWM)
     /// proportionally to `elapsed_us` at `hdmi_sample_rate` (2 subframes * 4 bytes = 8 bytes per stereo frame).
     pub fn advanceAudio(self: *DmaController, elapsed_us: u64, hdmi_sample_rate: u32, ram: []u8, mmio: MmioIo) void {
-        if (elapsed_us == 0) return;
+        if (elapsed_us == 0 or self.active_mask == 0) return;
         const rate: u64 = @max(hdmi_sample_rate, 8_000);
         const bytes_per_sec: u64 = rate * 8; // 2 channels * 4 bytes per 32-bit subframe
 
-        for (0..NUM_CHANNELS) |ch| {
+        var mask = self.active_mask;
+        while (mask != 0) : (mask &= mask - 1) {
+            const ch: usize = @ctz(mask);
+            const ch_bit = @as(u16, 1) << @intCast(ch);
             var c = &self.channels[ch];
-            if ((c.cs & CS_ACTIVE) == 0 or c.conblk_ad == 0) continue;
+            if ((c.cs & CS_ACTIVE) == 0 or c.conblk_ad == 0) {
+                if ((c.cs & CS_ACTIVE) == 0) self.active_mask &= ~ch_bit;
+                continue;
+            }
 
             if (!c.cb_loaded) {
-                if (!loadCbHeader(c, ram)) continue;
+                if (!loadCbHeader(c, ram)) {
+                    self.active_mask &= ~ch_bit;
+                    continue;
+                }
             }
 
             const permap: u5 = @truncate((c.ti >> 16) & 0x1f);
@@ -238,7 +274,10 @@ pub const DmaController = struct {
             var safety: usize = 64;
             while (bytes_to_transfer >= 4 and (c.cs & CS_ACTIVE) != 0 and c.conblk_ad != 0 and safety > 0) : (safety -= 1) {
                 if (!c.cb_loaded) {
-                    if (!loadCbHeader(c, ram)) break;
+                    if (!loadCbHeader(c, ram)) {
+                        self.active_mask &= ~ch_bit;
+                        break;
+                    }
                 }
 
                 while (bytes_to_transfer >= 4 and c.txfr_len >= 4) {
@@ -272,14 +311,18 @@ pub const DmaController = struct {
                     if ((c.ti & TI_INT_EN) != 0) {
                         c.cs |= CS_INT;
                         self.int_status |= (@as(u32, 1) << @intCast(ch));
+                        self.cs_int_mask |= ch_bit;
                     }
                     c.conblk_ad = c.nextconbk;
                     if (c.conblk_ad == 0) {
                         c.cs &= ~CS_ACTIVE;
+                        self.active_mask &= ~ch_bit;
                         break;
                     }
                     // Immediately load the next CB header so BCM2835_DMA_SOURCE_AD stays inside a valid CB
-                    _ = loadCbHeader(c, ram);
+                    if (!loadCbHeader(c, ram)) {
+                        self.active_mask &= ~ch_bit;
+                    }
                 }
             }
         }
