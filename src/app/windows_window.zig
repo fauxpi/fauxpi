@@ -1073,7 +1073,7 @@ pub const WindowsWindow = struct {
         ) orelse return;
 
         var file_buf: [std.fs.max_path_bytes]u8 = @splat(0);
-        const filter = "Disk Images (*.img;*.iso;*.bin;*.raw)\x00*.img;*.iso;*.bin;*.raw\x00All Files (*.*)\x00*.*\x00";
+        const filter = "Disk Images (*.img;*.img.xz;*.iso;*.bin;*.raw)\x00*.img;*.img.xz;*.xz;*.iso;*.bin;*.raw\x00All Files (*.*)\x00*.*\x00";
         var ofn: OPENFILENAMEA = .{
             .hwndOwner = self.hwnd,
             .lpstrFilter = filter,

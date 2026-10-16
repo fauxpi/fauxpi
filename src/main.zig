@@ -346,11 +346,19 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     defer if (headless_qcow2) |*d| d.deinit();
     var sd_image_buf: ?[]u8 = null;
     defer if (sd_image_buf) |b| gpa.free(b);
-    if (opts.sd_path) |sd_path| {
-        if (qcow2.Qcow2Disk.openExistingFile(gpa, sd_path)) |disk| {
-            headless_qcow2 = disk;
-        } else |_| {
-            sd_image_buf = try readSdImageLinux(gpa, sd_path);
+    if (opts.headless) {
+        if (opts.sd_path) |sd_path| {
+            if (qcow2.Qcow2Disk.openExistingFile(gpa, sd_path)) |disk| {
+                headless_qcow2 = disk;
+            } else |_| {
+                const fsize = try qcow2.Qcow2Disk.getFileSizeLinux(sd_path);
+                const card_sz = ui_board_sheet.SdCardSize.smallestFitting(@max(fsize, 256 * 1024 * 1024)) orelse .gb_32;
+                if (qcow2.Qcow2Disk.createFromImageFile(gpa, card_sz.bytes(), sd_path)) |disk| {
+                    headless_qcow2 = disk;
+                } else |_| {
+                    sd_image_buf = try readSdImageLinux(gpa, sd_path);
+                }
+            }
         }
     }
 

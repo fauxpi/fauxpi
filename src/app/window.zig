@@ -320,7 +320,7 @@ pub const WaylandWindow = struct {
                 "zenity",
                 "--file-selection",
                 "--title=Select SD Card Image",
-                "--file-filter=Disk Images (*.img, *.iso, *.bin, *.raw) | *.img *.iso *.bin *.raw",
+                "--file-filter=Disk Images (*.img, *.img.xz, *.iso, *.bin, *.raw) | *.img *.img.xz *.xz *.iso *.bin *.raw",
                 "--file-filter=All files | *",
             };
             _ = execvp("zenity", &zenity_argv);
@@ -331,7 +331,7 @@ pub const WaylandWindow = struct {
                 "Select SD Card Image",
                 "--getopenfilename",
                 ".",
-                "*.img *.iso *.bin *.raw|Disk Images (*.img, *.iso, *.bin, *.raw)\n*|All Files",
+                "*.img *.img.xz *.xz *.iso *.bin *.raw|Disk Images (*.img, *.img.xz, *.iso, *.bin, *.raw)\n*|All Files",
             };
             _ = execvp("kdialog", &kdialog_argv);
 

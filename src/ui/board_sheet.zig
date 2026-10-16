@@ -837,7 +837,7 @@ pub const BoardUi = struct {
         const n = @min(name_or_path.len, self.pending_sd_image_path_buf.len);
         @memcpy(self.pending_sd_image_path_buf[0..n], name_or_path[0..n]);
         self.pending_sd_image_path_len = n;
-        self.pending_sd_image_size = data.len;
+        self.pending_sd_image_size = Qcow2Disk.getSliceLogicalSize(data) catch data.len;
         self.pending_sd_image_slice = data;
         self.revalidatePendingSdImage();
     }
@@ -903,7 +903,8 @@ pub const BoardUi = struct {
         size: SdCardSize,
         image_bytes: []const u8,
     ) !usize {
-        if (image_bytes.len > size.bytes()) {
+        const logical_size = try Qcow2Disk.getSliceLogicalSize(image_bytes);
+        if (logical_size > size.bytes()) {
             self.new_card_size = size;
             self.setPendingSdImageSlice(label_or_path, image_bytes);
             return error.ImageTooLarge;
@@ -918,7 +919,7 @@ pub const BoardUi = struct {
         errdefer disk.deinit();
 
         const entry_path = qcow2_path orelse label_or_path;
-        const entry = makeNamedSdCardEntry(card_name, entry_path, image_bytes.len, size, disk);
+        const entry = makeNamedSdCardEntry(card_name, entry_path, logical_size, size, disk);
         try self.sd_cards.append(self.gpa, entry);
         const idx = self.sd_cards.items.len - 1;
         self.selected_sd_card_idx = idx;

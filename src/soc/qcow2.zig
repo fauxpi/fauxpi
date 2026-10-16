@@ -94,8 +94,29 @@ pub const Qcow2Disk = struct {
     cluster_cache: *[CLUSTER_SIZE]u8,
     cluster_dirty: bool = false,
 
-    /// Creates a new QCOW2 v3 disk of `virtual_size` bytes and populates it with `initial_image`.
-    /// Returns `error.ImageTooLarge` if `initial_image.len > virtual_size`.
+    /// XZ stream header magic bytes (`\xFD7zXZ\x00`).
+    pub const XZ_HEADER_MAGIC = [6]u8{ 0xFD, '7', 'z', 'X', 'Z', 0x00 };
+
+    pub fn isXzMagic(bytes: []const u8) bool {
+        return bytes.len >= 6 and std.mem.eql(u8, bytes[0..6], &XZ_HEADER_MAGIC);
+    }
+
+    pub fn isXzPath(path: []const u8) bool {
+        return std.ascii.endsWithIgnoreCase(path, ".xz");
+    }
+
+    /// Returns the logical (uncompressed) byte size of an in-memory disk image slice.
+    /// For XZ-compressed slices (`.img.xz`), parses the XZ Stream Footer and Index at the end of the slice.
+    pub fn getSliceLogicalSize(data: []const u8) !u64 {
+        if (isXzMagic(data)) {
+            return try readXzUncompressedSizeFromSlice(data);
+        }
+        return data.len;
+    }
+
+    /// Creates a new QCOW2 v3 disk of `virtual_size` bytes and populates it with `initial_image`
+    /// (raw `.img` bytes or XZ-compressed `.img.xz` bytes).
+    /// Returns `error.ImageTooLarge` if the logical uncompressed size exceeds `virtual_size`.
     pub fn createFromSlice(
         allocator: std.mem.Allocator,
         virtual_size: u64,
@@ -105,14 +126,15 @@ pub const Qcow2Disk = struct {
     }
 
     /// Creates a new QCOW2 v3 disk of `virtual_size` bytes backed by `backing_path` (or a temporary
-    /// unlinked file if `backing_path` is null) and populates it with `initial_image`.
+    /// unlinked file if `backing_path` is null) and populates it with `initial_image` (raw or `.xz`).
     pub fn createFromSliceAtPath(
         allocator: std.mem.Allocator,
         virtual_size: u64,
         initial_image: []const u8,
         backing_path: ?[]const u8,
     ) !Qcow2Disk {
-        if (initial_image.len > virtual_size) return error.ImageTooLarge;
+        const logical_size = try getSliceLogicalSize(initial_image);
+        if (logical_size > virtual_size) return error.ImageTooLarge;
 
         var disk = try initEmptyAtPath(allocator, virtual_size, backing_path);
         errdefer {
@@ -120,28 +142,46 @@ pub const Qcow2Disk = struct {
             if (backing_path) |bp| unlinkFileLinux(bp);
         }
 
-        var off: usize = 0;
-        while (off < initial_image.len) : (off += CLUSTER_SIZE) {
-            const rem = @min(CLUSTER_SIZE, initial_image.len - off);
-            const chunk = initial_image[off .. off + rem];
-            if (!isAllZero(chunk)) {
-                const vcluster: u64 = @intCast(off / CLUSTER_SIZE);
-                try disk.writeClusterSlice(vcluster, chunk);
+        if (isXzMagic(initial_image)) {
+            var reader: std.Io.Reader = .fixed(initial_image);
+            try streamXzToQcow2(allocator, &reader, &disk);
+        } else {
+            var off: usize = 0;
+            while (off < initial_image.len) : (off += CLUSTER_SIZE) {
+                const rem = @min(CLUSTER_SIZE, initial_image.len - off);
+                const chunk = initial_image[off .. off + rem];
+                if (!isAllZero(chunk)) {
+                    const vcluster: u64 = @intCast(off / CLUSTER_SIZE);
+                    try disk.writeClusterSlice(vcluster, chunk);
+                }
             }
         }
         try disk.flush();
         return disk;
     }
 
-    /// Queries the size in bytes of a file on disk without reading it into memory.
+    /// Queries the logical (uncompressed) size in bytes of an image file on disk without decompressing it.
+    /// For `.xz` / `.img.xz` files, reads the XZ Stream Footer and Index at the end of the file.
     pub fn getFileSizeLinux(path: []const u8) !u64 {
         const fd = try host_posix.openRead(path);
         defer host_posix.close(fd);
-        return try host_posix.lseekEnd(fd);
+        const raw_size = try host_posix.lseekEnd(fd);
+        if (raw_size >= 24) {
+            var magic: [6]u8 = undefined;
+            if (preadAll(fd, &magic, 0)) |_| {
+                if (isXzMagic(&magic)) {
+                    if (readXzUncompressedSizeFromFd(fd, raw_size)) |uncomp_size| {
+                        return uncomp_size;
+                    } else |_| {}
+                }
+            } else |_| {}
+        }
+        return raw_size;
     }
 
-    /// Creates a new QCOW2 v3 disk of `virtual_size` bytes by streaming `image_path` in 64 KiB clusters.
-    /// Returns `error.ImageTooLarge` if the file size of `image_path` exceeds `virtual_size`.
+    /// Creates a new QCOW2 v3 disk of `virtual_size` bytes by streaming `image_path` (raw `.img` or
+    /// XZ-compressed `.img.xz`) in 64 KiB clusters.
+    /// Returns `error.ImageTooLarge` if the uncompressed image size of `image_path` exceeds `virtual_size`.
     pub fn createFromImageFile(
         allocator: std.mem.Allocator,
         virtual_size: u64,
@@ -151,7 +191,8 @@ pub const Qcow2Disk = struct {
     }
 
     /// Creates a new QCOW2 v3 disk of `virtual_size` bytes backed by `backing_path` (or a temporary
-    /// unlinked file if `backing_path` is null) by streaming `image_path` in 64 KiB clusters.
+    /// unlinked file if `backing_path` is null) by streaming `image_path` (raw `.img` or `.img.xz`)
+    /// in 64 KiB clusters.
     pub fn createFromImageFileAtPath(
         allocator: std.mem.Allocator,
         virtual_size: u64,
@@ -161,9 +202,19 @@ pub const Qcow2Disk = struct {
         const src_fd = try host_posix.openRead(image_path);
         defer host_posix.close(src_fd);
 
-        const file_size = try host_posix.lseekEnd(src_fd);
+        const raw_file_size = try host_posix.lseekEnd(src_fd);
+        var header_magic: [6]u8 = @splat(0);
+        if (raw_file_size >= 6) {
+            preadAll(src_fd, &header_magic, 0) catch {};
+        }
+        const is_xz = isXzMagic(&header_magic);
 
-        if (file_size > virtual_size) return error.ImageTooLarge;
+        if (is_xz) {
+            const uncomp_size = try readXzUncompressedSizeFromFd(src_fd, raw_file_size);
+            if (uncomp_size > virtual_size) return error.ImageTooLarge;
+        } else {
+            if (raw_file_size > virtual_size) return error.ImageTooLarge;
+        }
 
         host_posix.lseekSet(src_fd, 0);
 
@@ -176,20 +227,25 @@ pub const Qcow2Disk = struct {
         const io_buf = try allocator.alloc(u8, CLUSTER_SIZE);
         defer allocator.free(io_buf);
 
-        var off: u64 = 0;
-        while (off < file_size) {
-            const want: usize = @intCast(@min(@as(u64, CLUSTER_SIZE), file_size - off));
-            var got: usize = 0;
-            while (got < want) {
-                const rc = try host_posix.read(src_fd, io_buf[got..want]);
-                if (rc == 0) break;
-                got += rc;
+        if (is_xz) {
+            var fd_reader = PosixFdReader.init(src_fd, io_buf);
+            try streamXzToQcow2(allocator, &fd_reader.reader, &disk);
+        } else {
+            var off: u64 = 0;
+            while (off < raw_file_size) {
+                const want: usize = @intCast(@min(@as(u64, CLUSTER_SIZE), raw_file_size - off));
+                var got: usize = 0;
+                while (got < want) {
+                    const rc = try host_posix.read(src_fd, io_buf[got..want]);
+                    if (rc == 0) break;
+                    got += rc;
+                }
+                if (got == 0) break;
+                if (!isAllZero(io_buf[0..got])) {
+                    try disk.writeClusterSlice(off / CLUSTER_SIZE, io_buf[0..got]);
+                }
+                off += got;
             }
-            if (got == 0) break;
-            if (!isAllZero(io_buf[0..got])) {
-                try disk.writeClusterSlice(off / CLUSTER_SIZE, io_buf[0..got]);
-            }
-            off += got;
         }
 
         try disk.flush();
@@ -581,6 +637,541 @@ fn pwriteAll(fd: host_posix.fd_t, buf: []const u8, offset: u64) !void {
     return host_posix.pwriteAll(fd, buf, offset);
 }
 
+const PosixFdReader = struct {
+    fd: host_posix.fd_t,
+    reader: std.Io.Reader,
+
+    pub fn init(fd: host_posix.fd_t, buffer: []u8) PosixFdReader {
+        return .{
+            .fd = fd,
+            .reader = .{
+                .vtable = &.{
+                    .stream = stream,
+                },
+                .buffer = buffer,
+                .seek = 0,
+                .end = 0,
+            },
+        };
+    }
+
+    fn stream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *PosixFdReader = @alignCast(@fieldParentPtr("reader", r));
+        const avail = w.buffer[w.end..];
+        const dest = limit.slice(avail);
+        if (dest.len == 0) return 0;
+        const n = host_posix.read(self.fd, dest) catch return error.ReadFailed;
+        if (n == 0) return error.EndOfStream;
+        w.end += n;
+        return n;
+    }
+};
+
+fn decodeXzVliSlice(buf: []const u8, pos: *usize) !u64 {
+    if (pos.* >= buf.len) return error.CorruptXzStream;
+    var result: u64 = 0;
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        if (pos.* >= buf.len) return error.CorruptXzStream;
+        const b = buf[pos.*];
+        pos.* += 1;
+        if (b == 0 and i > 0) return error.CorruptXzStream;
+        result |= @as(u64, b & 0x7F) << @intCast(i * 7);
+        if ((b & 0x80) == 0) return result;
+    }
+    return error.CorruptXzStream;
+}
+
+const XzIndexInfo = struct {
+    blocks_compressed_padded: u64,
+    uncompressed_size: u64,
+};
+
+fn parseXzIndexSlice(index_bytes: []const u8) !XzIndexInfo {
+    if (index_bytes.len < 8 or (index_bytes.len % 4) != 0) return error.CorruptXzStream;
+    if (index_bytes[0] != 0x00) return error.CorruptXzStream;
+
+    const declared_crc = std.mem.readInt(u32, index_bytes[index_bytes.len - 4 ..][0..4], .little);
+    const computed_crc = std.hash.Crc32.hash(index_bytes[0 .. index_bytes.len - 4]);
+    if (declared_crc != computed_crc) return error.WrongXzChecksum;
+
+    var pos: usize = 1;
+    const num_records = try decodeXzVliSlice(index_bytes[0 .. index_bytes.len - 4], &pos);
+    var blocks_size: u64 = 0;
+    var uncomp_size: u64 = 0;
+
+    var rec: u64 = 0;
+    while (rec < num_records) : (rec += 1) {
+        const unpadded = try decodeXzVliSlice(index_bytes[0 .. index_bytes.len - 4], &pos);
+        if (unpadded < 5) return error.CorruptXzStream;
+        const uncomp = try decodeXzVliSlice(index_bytes[0 .. index_bytes.len - 4], &pos);
+        blocks_size = try std.math.add(u64, blocks_size, (unpadded + 3) & ~@as(u64, 3));
+        uncomp_size = try std.math.add(u64, uncomp_size, uncomp);
+    }
+
+    const pad_end = index_bytes.len - 4;
+    if (pad_end - pos > 3) return error.CorruptXzStream;
+    for (index_bytes[pos..pad_end]) |b| {
+        if (b != 0) return error.CorruptXzStream;
+    }
+
+    return .{
+        .blocks_compressed_padded = blocks_size,
+        .uncompressed_size = uncomp_size,
+    };
+}
+
+/// Parses the XZ Stream Footer(s) and Index(es) from the end of an in-memory `.xz` slice
+/// to compute the total uncompressed size in O(number of blocks) time without decompressing.
+pub fn readXzUncompressedSizeFromSlice(data: []const u8) !u64 {
+    if (data.len < 24 or (data.len % 4) != 0) return error.CorruptXzStream;
+    if (!Qcow2Disk.isXzMagic(data)) return error.NotXzStream;
+
+    var pos: usize = data.len;
+    var total_uncompressed: u64 = 0;
+    var streams_found: usize = 0;
+
+    while (pos > 0) {
+        while (pos >= 4 and std.mem.eql(u8, data[pos - 4 .. pos], &.{ 0, 0, 0, 0 })) {
+            pos -= 4;
+        }
+        if (pos == 0) break;
+        if (pos < 24 or (pos % 4) != 0) return error.CorruptXzStream;
+
+        const footer = data[pos - 12 .. pos];
+        if (footer[10] != 'Y' or footer[11] != 'Z') return error.CorruptXzStream;
+        const footer_crc = std.mem.readInt(u32, footer[0..4], .little);
+        if (footer_crc != std.hash.Crc32.hash(footer[4..10])) return error.WrongXzChecksum;
+
+        const backward_size = std.mem.readInt(u32, footer[4..8], .little);
+        const index_size_u64 = (@as(u64, backward_size) + 1) * 4;
+        const footer_pos = pos - 12;
+        if (index_size_u64 > footer_pos or footer_pos - @as(usize, @intCast(index_size_u64)) < 12) {
+            return error.CorruptXzStream;
+        }
+        const index_size: usize = @intCast(index_size_u64);
+        const index_pos = footer_pos - index_size;
+        const idx_info = try parseXzIndexSlice(data[index_pos..footer_pos]);
+
+        if (idx_info.blocks_compressed_padded > index_pos or index_pos - @as(usize, @intCast(idx_info.blocks_compressed_padded)) < 12) {
+            return error.CorruptXzStream;
+        }
+        const header_pos = index_pos - @as(usize, @intCast(idx_info.blocks_compressed_padded)) - 12;
+        const header = data[header_pos .. header_pos + 12];
+        if (!Qcow2Disk.isXzMagic(header)) return error.CorruptXzStream;
+        if (header[6] != footer[8] or header[7] != footer[9]) return error.CorruptXzStream;
+
+        total_uncompressed = try std.math.add(u64, total_uncompressed, idx_info.uncompressed_size);
+        streams_found += 1;
+        pos = header_pos;
+    }
+
+    if (streams_found == 0) return error.CorruptXzStream;
+    return total_uncompressed;
+}
+
+/// Parses the XZ Stream Footer(s) and Index(es) from the end of an `.xz` file descriptor
+/// to compute the total uncompressed size in O(number of blocks) time without decompressing.
+pub fn readXzUncompressedSizeFromFd(fd: host_posix.fd_t, file_size: u64) !u64 {
+    if (file_size < 24 or (file_size % 4) != 0) return error.CorruptXzStream;
+
+    var pos: u64 = file_size;
+    var total_uncompressed: u64 = 0;
+    var streams_found: usize = 0;
+
+    while (pos > 0) {
+        // Skip trailing/inter-stream 4-byte zero padding
+        while (pos >= 4) {
+            var pad_buf: [4]u8 = undefined;
+            try preadAll(fd, &pad_buf, pos - 4);
+            if (!std.mem.eql(u8, &pad_buf, &.{ 0, 0, 0, 0 })) break;
+            pos -= 4;
+        }
+        if (pos == 0) break;
+        if (pos < 24 or (pos % 4) != 0) return error.CorruptXzStream;
+
+        var footer: [12]u8 = undefined;
+        try preadAll(fd, &footer, pos - 12);
+        if (footer[10] != 'Y' or footer[11] != 'Z') return error.CorruptXzStream;
+        const footer_crc = std.mem.readInt(u32, footer[0..4], .little);
+        if (footer_crc != std.hash.Crc32.hash(footer[4..10])) return error.WrongXzChecksum;
+
+        const backward_size = std.mem.readInt(u32, footer[4..8], .little);
+        const index_size: u64 = (@as(u64, backward_size) + 1) * 4;
+        const footer_pos = pos - 12;
+        if (index_size > footer_pos or footer_pos - index_size < 12 or index_size > 16 * 1024 * 1024) {
+            return error.CorruptXzStream;
+        }
+        const index_pos = footer_pos - index_size;
+
+        var stack_idx_buf: [4096]u8 = undefined;
+        var heap_idx_buf: ?[]u8 = null;
+        defer if (heap_idx_buf) |hb| std.heap.page_allocator.free(hb);
+        const idx_slice: []u8 = if (index_size <= stack_idx_buf.len)
+            stack_idx_buf[0..@intCast(index_size)]
+        else blk: {
+            heap_idx_buf = try std.heap.page_allocator.alloc(u8, @intCast(index_size));
+            break :blk heap_idx_buf.?;
+        };
+        try preadAll(fd, idx_slice, index_pos);
+        const idx_info = try parseXzIndexSlice(idx_slice);
+
+        if (idx_info.blocks_compressed_padded > index_pos or index_pos - idx_info.blocks_compressed_padded < 12) {
+            return error.CorruptXzStream;
+        }
+        const header_pos = index_pos - idx_info.blocks_compressed_padded - 12;
+        var header: [12]u8 = undefined;
+        try preadAll(fd, &header, header_pos);
+        if (!Qcow2Disk.isXzMagic(&header)) return error.CorruptXzStream;
+        if (header[6] != footer[8] or header[7] != footer[9]) return error.CorruptXzStream;
+
+        total_uncompressed = try std.math.add(u64, total_uncompressed, idx_info.uncompressed_size);
+        streams_found += 1;
+        pos = header_pos;
+    }
+
+    if (streams_found == 0) return error.CorruptXzStream;
+    return total_uncompressed;
+}
+
+const ClusterSink = struct {
+    disk: *Qcow2Disk,
+    cluster_buf: *[CLUSTER_SIZE]u8,
+    cluster_pos: usize = 0,
+    vcluster: u64 = 0,
+    total_written: u64 = 0,
+
+    pub fn writeByte(self: *ClusterSink, b: u8) !void {
+        self.cluster_buf[self.cluster_pos] = b;
+        self.cluster_pos += 1;
+        self.total_written += 1;
+        if (self.cluster_pos == CLUSTER_SIZE) {
+            try self.flushFullCluster();
+        }
+    }
+
+    fn flushFullCluster(self: *ClusterSink) !void {
+        if (self.total_written > self.disk.virtual_size) return error.ImageTooLarge;
+        if (!isAllZero(self.cluster_buf)) {
+            try self.disk.writeClusterSlice(self.vcluster, self.cluster_buf);
+        }
+        self.vcluster += 1;
+        self.cluster_pos = 0;
+    }
+
+    pub fn finish(self: *ClusterSink) !void {
+        if (self.total_written > self.disk.virtual_size) return error.ImageTooLarge;
+        if (self.cluster_pos > 0) {
+            const tail = self.cluster_buf[0..self.cluster_pos];
+            if (!isAllZero(tail)) {
+                try self.disk.writeClusterSlice(self.vcluster, tail);
+            }
+            self.cluster_pos = 0;
+        }
+    }
+};
+
+const StreamingLzma2Buffer = struct {
+    dict: []u8,
+    dict_pos: usize = 0,
+    len: usize = 0,
+    sink: *ClusterSink,
+
+    pub fn resetDict(self: *StreamingLzma2Buffer) void {
+        self.dict_pos = 0;
+        self.len = 0;
+    }
+
+    pub fn lastOr(self: *const StreamingLzma2Buffer, lit: u8) u8 {
+        if (self.len == 0) return lit;
+        const idx = if (self.dict_pos == 0) self.dict.len - 1 else self.dict_pos - 1;
+        return self.dict[idx];
+    }
+
+    pub fn lastN(self: *const StreamingLzma2Buffer, dist: usize) !u8 {
+        if (dist == 0 or dist > self.len or dist > self.dict.len) return error.CorruptInput;
+        const idx = if (self.dict_pos >= dist)
+            self.dict_pos - dist
+        else
+            self.dict.len - (dist - self.dict_pos);
+        return self.dict[idx];
+    }
+
+    pub fn appendByteDirect(self: *StreamingLzma2Buffer, b: u8) !void {
+        self.dict[self.dict_pos] = b;
+        self.dict_pos += 1;
+        if (self.dict_pos == self.dict.len) self.dict_pos = 0;
+        self.len += 1;
+        try self.sink.writeByte(b);
+    }
+
+    pub fn appendLiteral(
+        self: *StreamingLzma2Buffer,
+        _: std.mem.Allocator,
+        lit: u8,
+        _: *std.Io.Writer,
+    ) !void {
+        try self.appendByteDirect(lit);
+    }
+
+    pub fn appendLz(
+        self: *StreamingLzma2Buffer,
+        _: std.mem.Allocator,
+        match_len: usize,
+        dist: usize,
+        _: *std.Io.Writer,
+    ) !void {
+        if (dist == 0 or dist > self.len or dist > self.dict.len) return error.CorruptInput;
+        var src_pos = if (self.dict_pos >= dist)
+            self.dict_pos - dist
+        else
+            self.dict.len - (dist - self.dict_pos);
+        for (0..match_len) |_| {
+            const b = self.dict[src_pos];
+            src_pos += 1;
+            if (src_pos == self.dict.len) src_pos = 0;
+            try self.appendByteDirect(b);
+        }
+    }
+};
+
+fn takeXzVliCounted(reader: *std.Io.Reader, counter: *u64, hasher: *std.hash.Crc32) !u64 {
+    var result: u64 = 0;
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        const b = try reader.takeByte();
+        counter.* += 1;
+        hasher.update(&.{b});
+        if (b == 0 and i > 0) return error.CorruptInput;
+        result |= @as(u64, b & 0x7F) << @intCast(i * 7);
+        if ((b & 0x80) == 0) return result;
+    }
+    return error.CorruptInput;
+}
+
+fn xzCheckSize(check_id: u4) usize {
+    return if (check_id == 0) 0 else @as(usize, 4) << @intCast((check_id - 1) / 3);
+}
+
+fn decodeLzma2DictSize(props_byte: u8) !usize {
+    if ((props_byte & 0xC0) != 0) return error.CorruptInput;
+    const bits: u6 = @truncate(props_byte & 0x3F);
+    if (bits > 40) return error.CorruptInput;
+    return if (bits == 40)
+        0xFFFF_FFFF
+    else
+        (@as(usize, 2) | (bits & 1)) << @intCast(bits / 2 + 11);
+}
+
+/// Streams an XZ-compressed disk image (`.img.xz`) from `input` into `disk` in 64 KiB clusters
+/// using a bounded LZMA2 dictionary ring buffer without buffering the entire image in memory.
+pub fn streamXzToQcow2(
+    allocator: std.mem.Allocator,
+    input: *std.Io.Reader,
+    disk: *Qcow2Disk,
+) !void {
+    const cluster_buf = try allocator.create([CLUSTER_SIZE]u8);
+    defer allocator.destroy(cluster_buf);
+    @memset(cluster_buf, 0);
+
+    var sink: ClusterSink = .{
+        .disk = disk,
+        .cluster_buf = cluster_buf,
+    };
+
+    var dict_buf: []u8 = &.{};
+    defer if (dict_buf.len > 0) allocator.free(dict_buf);
+
+    var lzma_decode = try std.compress.lzma.Decode.init(allocator, .{ .lc = 0, .lp = 0, .pb = 0 });
+    defer lzma_decode.deinit(allocator);
+
+    var dummy_allocating = std.Io.Writer.Allocating.init(allocator);
+    defer dummy_allocating.deinit();
+
+    var streams_decoded: usize = 0;
+    stream_loop: while (true) {
+        const magic = try input.takeArray(6);
+        if (!std.mem.eql(u8, magic, &Qcow2Disk.XZ_HEADER_MAGIC)) return error.NotXzStream;
+
+        const stream_flags: [2]u8 = (try input.takeArray(2)).*;
+        const header_crc = try input.takeInt(u32, .little);
+        if (header_crc != std.hash.Crc32.hash(&stream_flags)) return error.WrongChecksum;
+        if (stream_flags[0] != 0 or (stream_flags[1] & 0xF0) != 0) return error.CorruptInput;
+        const check_id: u4 = @truncate(stream_flags[1] & 0x0F);
+        const check_len = xzCheckSize(check_id);
+
+        var block_count: u64 = 0;
+        while (true) {
+            const first_byte: usize = try input.peekByte();
+            if (first_byte == 0) break; // Index Indicator
+
+            const declared_header_size = first_byte * 4;
+            const header_bytes = try input.take(declared_header_size);
+            const declared_hdr_crc = try input.takeInt(u32, .little);
+            if (declared_hdr_crc != std.hash.Crc32.hash(header_bytes)) return error.WrongChecksum;
+
+            var hdr_pos: usize = 1;
+            const blk_flags = header_bytes[hdr_pos];
+            hdr_pos += 1;
+            const filter_count = @as(usize, blk_flags & 0x03) + 1;
+            if ((blk_flags & 0x3C) != 0 or filter_count != 1) return error.Unsupported;
+
+            const has_packed_size = (blk_flags & 0x40) != 0;
+            const has_unpacked_size = (blk_flags & 0x80) != 0;
+            const expected_packed_size: ?u64 = if (has_packed_size) try decodeXzVliSlice(header_bytes, &hdr_pos) else null;
+            const expected_unpacked_size: ?u64 = if (has_unpacked_size) try decodeXzVliSlice(header_bytes, &hdr_pos) else null;
+
+            const filter_id = try decodeXzVliSlice(header_bytes, &hdr_pos);
+            if (filter_id != 0x21) return error.Unsupported; // 0x21 = LZMA2
+            const props_size = try decodeXzVliSlice(header_bytes, &hdr_pos);
+            if (props_size != 1 or hdr_pos >= header_bytes.len) return error.CorruptInput;
+            const dict_size = try decodeLzma2DictSize(header_bytes[hdr_pos]);
+            hdr_pos += 1;
+
+            for (header_bytes[hdr_pos..]) |pad_b| {
+                if (pad_b != 0) return error.CorruptInput;
+            }
+
+            const needed_dict = @max(dict_size, 4096);
+            if (dict_buf.len < needed_dict) {
+                if (dict_buf.len > 0) allocator.free(dict_buf);
+                dict_buf = try allocator.alloc(u8, needed_dict);
+            }
+
+            var lzma2_buf: StreamingLzma2Buffer = .{
+                .dict = dict_buf[0..needed_dict],
+                .sink = &sink,
+            };
+
+            const before_unpacked = sink.total_written;
+            var packed_bytes_read: u64 = 0;
+
+            while (true) {
+                const status = try input.takeByte();
+                packed_bytes_read += 1;
+                if (status == 0) break;
+
+                if (status == 1 or status == 2) {
+                    const chunk_unpacked = @as(usize, try input.takeInt(u16, .big)) + 1;
+                    packed_bytes_read += 2 + chunk_unpacked;
+                    if (status == 1) lzma2_buf.resetDict();
+                    for (0..chunk_unpacked) |_| {
+                        try lzma2_buf.appendByteDirect(try input.takeByte());
+                    }
+                } else {
+                    if ((status & 0x80) == 0) return error.CorruptInput;
+                    const reset_mode: u2 = @truncate((status >> 5) & 0x03);
+                    const reset_dict = (reset_mode == 3);
+                    const reset_state = (reset_mode >= 1);
+                    const reset_props = (reset_mode >= 2);
+
+                    const chunk_unpacked: usize = (@as(usize, status & 0x1F) << 16) +
+                        @as(usize, try input.takeInt(u16, .big)) + 1;
+                    const chunk_packed: u64 = @as(u64, try input.takeInt(u16, .big)) + 1;
+                    packed_bytes_read += 4;
+
+                    if (reset_dict) lzma2_buf.resetDict();
+                    if (reset_state) {
+                        var new_props = lzma_decode.properties;
+                        if (reset_props) {
+                            var props = try input.takeByte();
+                            packed_bytes_read += 1;
+                            if (props >= 225) return error.CorruptInput;
+                            const lc: u4 = @intCast(props % 9);
+                            props /= 9;
+                            const lp: u3 = @intCast(props % 5);
+                            props /= 5;
+                            const pb: u3 = @intCast(props);
+                            if (lc + lp > 4) return error.CorruptInput;
+                            new_props = .{ .lc = lc, .lp = lp, .pb = pb };
+                        }
+                        try lzma_decode.resetState(allocator, new_props);
+                    }
+
+                    const target_len = lzma2_buf.len + chunk_unpacked;
+                    const start_packed = packed_bytes_read;
+                    var range_decoder = try std.compress.lzma.RangeDecoder.initCounting(input, &packed_bytes_read);
+                    while (lzma2_buf.len < target_len) {
+                        switch (try lzma_decode.process(input, &dummy_allocating, &lzma2_buf, &range_decoder, &packed_bytes_read)) {
+                            .more => continue,
+                            .finished => break,
+                        }
+                    }
+                    if (lzma2_buf.len != target_len) return error.DecompressedSizeMismatch;
+                    if (packed_bytes_read - start_packed != chunk_packed) return error.CompressedSizeMismatch;
+                }
+            }
+
+            const block_unpacked = sink.total_written - before_unpacked;
+            if (expected_packed_size) |s| {
+                if (s != packed_bytes_read) return error.CorruptInput;
+            }
+            if (expected_unpacked_size) |s| {
+                if (s != block_unpacked) return error.CorruptInput;
+            }
+
+            const block_pad_len: usize = @intCast((4 - (packed_bytes_read % 4)) % 4);
+            const block_pad = try input.take(block_pad_len);
+            for (block_pad) |b| {
+                if (b != 0) return error.CorruptInput;
+            }
+            if (check_len > 0) {
+                _ = try input.take(check_len);
+            }
+            block_count += 1;
+        }
+
+        // Parse Stream Index and Stream Footer
+        _ = try input.takeByte(); // 0x00 Index Indicator
+        var idx_counter: u64 = 1;
+        var idx_crc: std.hash.Crc32 = .init();
+        idx_crc.update(&.{0});
+
+        const record_count = try takeXzVliCounted(input, &idx_counter, &idx_crc);
+        if (record_count != block_count) return error.CorruptInput;
+        for (0..@intCast(record_count)) |_| {
+            _ = try takeXzVliCounted(input, &idx_counter, &idx_crc);
+            _ = try takeXzVliCounted(input, &idx_counter, &idx_crc);
+        }
+        const idx_pad_len: usize = @intCast((4 - (idx_counter % 4)) % 4);
+        const idx_pad = try input.take(idx_pad_len);
+        for (idx_pad) |b| {
+            if (b != 0) return error.CorruptInput;
+        }
+        idx_crc.update(idx_pad);
+        const declared_idx_crc = try input.takeInt(u32, .little);
+        if (declared_idx_crc != idx_crc.final()) return error.WrongChecksum;
+        const index_size = idx_counter + idx_pad_len + 4;
+
+        const footer = try input.takeArray(12);
+        const footer_crc = std.mem.readInt(u32, footer[0..4], .little);
+        if (footer_crc != std.hash.Crc32.hash(footer[4..10])) return error.WrongChecksum;
+        const backward_size = (@as(u64, std.mem.readInt(u32, footer[4..8], .little)) + 1) * 4;
+        if (backward_size != index_size) return error.CorruptInput;
+        if (footer[8] != stream_flags[0] or footer[9] != stream_flags[1]) return error.CorruptInput;
+        if (footer[10] != 'Y' or footer[11] != 'Z') return error.CorruptInput;
+
+        streams_decoded += 1;
+
+        // Check for trailing stream padding or another concatenated XZ stream
+        while (true) {
+            const next_b = input.peekByte() catch |err| switch (err) {
+                error.EndOfStream => break :stream_loop,
+                else => |e| return e,
+            };
+            if (next_b == 0) {
+                const pad4 = try input.takeArray(4);
+                if (!std.mem.eql(u8, pad4, &.{ 0, 0, 0, 0 })) return error.CorruptInput;
+                continue;
+            }
+            break;
+        }
+    }
+
+    if (streams_decoded == 0) return error.NotXzStream;
+    try sink.finish();
+}
+
 const testing = std.testing;
 
 test "QCOW2 sparse disk creation, size validation, and cluster allocation" {
@@ -680,4 +1271,157 @@ test "QCOW2 persistent file creation and reopening via openExistingFile" {
         try testing.expectEqual(@as(u8, 0x7E), reopened2.readByte(high_off));
         try testing.expectEqual(@as(u8, 0x99), reopened2.readByte(CLUSTER_SIZE * 5 + 7));
     }
+}
+
+fn encodeXzVli(val: u64, out: []u8) usize {
+    var v = val;
+    var i: usize = 0;
+    while (true) {
+        const b: u8 = @intCast(v & 0x7F);
+        v >>= 7;
+        if (v == 0) {
+            out[i] = b;
+            return i + 1;
+        }
+        out[i] = b | 0x80;
+        i += 1;
+    }
+}
+
+/// Builds a valid `.xz` archive containing `raw` using LZMA2 uncompressed chunks for unit testing.
+fn buildTestXzArchiveAlloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    // 1. Stream Header (12 bytes: magic + flags(CRC32=0x01) + crc32)
+    try out.appendSlice(allocator, &Qcow2Disk.XZ_HEADER_MAGIC);
+    const stream_flags = [2]u8{ 0x00, 0x01 };
+    try out.appendSlice(allocator, &stream_flags);
+    var crc_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_buf, std.hash.Crc32.hash(&stream_flags), .little);
+    try out.appendSlice(allocator, &crc_buf);
+
+    // 2. Block Header (8 bytes + 4-byte CRC32 = 12 bytes): 1 filter (LZMA2 = 0x21, dict props = 0x00 -> 4 KiB)
+    const blk_hdr = [8]u8{
+        0x02, // encoded header size: 2 * 4 = 8 bytes before CRC32
+        0x00, // flags: 1 filter, no explicit sizes in header
+        0x21, // Filter ID = LZMA2
+        0x01, // Size of properties = 1
+        0x00, // Dictionary size property (4 KiB)
+        0x00, 0x00, 0x00, // header padding
+    };
+    try out.appendSlice(allocator, &blk_hdr);
+    std.mem.writeInt(u32, &crc_buf, std.hash.Crc32.hash(&blk_hdr), .little);
+    try out.appendSlice(allocator, &crc_buf);
+
+    // 3. LZMA2 data chunks (max 64 KiB per uncompressed chunk)
+    var packed_len: u64 = 0;
+    var off: usize = 0;
+    var first = true;
+    while (off < raw.len) {
+        const chunk_len = @min(raw.len - off, 65536);
+        const status: u8 = if (first) 0x01 else 0x02;
+        first = false;
+        try out.append(allocator, status);
+        var len_be: [2]u8 = undefined;
+        std.mem.writeInt(u16, &len_be, @intCast(chunk_len - 1), .big);
+        try out.appendSlice(allocator, &len_be);
+        try out.appendSlice(allocator, raw[off .. off + chunk_len]);
+        packed_len += 3 + chunk_len;
+        off += chunk_len;
+    }
+    // End of LZMA2 stream marker (0x00)
+    try out.append(allocator, 0x00);
+    packed_len += 1;
+
+    // Block Padding to 4-byte boundary
+    const blk_pad = (4 - (packed_len % 4)) % 4;
+    for (0..@intCast(blk_pad)) |_| try out.append(allocator, 0x00);
+
+    // Block Check (CRC32, 4 bytes)
+    std.mem.writeInt(u32, &crc_buf, std.hash.Crc32.hash(raw), .little);
+    try out.appendSlice(allocator, &crc_buf);
+
+    const unpadded_size: u64 = 12 + packed_len + 4;
+
+    // 4. Index: 0x00 indicator + num_records(1) + unpadded_size + uncompressed_size + padding + CRC32
+    var idx_buf: [64]u8 = @splat(0);
+    var idx_len: usize = 0;
+    idx_buf[idx_len] = 0x00;
+    idx_len += 1;
+    idx_len += encodeXzVli(1, idx_buf[idx_len..]);
+    idx_len += encodeXzVli(unpadded_size, idx_buf[idx_len..]);
+    idx_len += encodeXzVli(raw.len, idx_buf[idx_len..]);
+    while ((idx_len % 4) != 0) : (idx_len += 1) {
+        idx_buf[idx_len] = 0x00;
+    }
+    const idx_crc = std.hash.Crc32.hash(idx_buf[0..idx_len]);
+    std.mem.writeInt(u32, idx_buf[idx_len..][0..4], idx_crc, .little);
+    idx_len += 4;
+    try out.appendSlice(allocator, idx_buf[0..idx_len]);
+
+    // 5. Stream Footer (12 bytes: CRC32 + backward_size + stream_flags + "YZ")
+    var footer: [12]u8 = undefined;
+    const backward_size: u32 = @intCast((idx_len / 4) - 1);
+    std.mem.writeInt(u32, footer[4..8], backward_size, .little);
+    footer[8] = stream_flags[0];
+    footer[9] = stream_flags[1];
+    footer[10] = 'Y';
+    footer[11] = 'Z';
+    std.mem.writeInt(u32, footer[0..4], std.hash.Crc32.hash(footer[4..10]), .little);
+    try out.appendSlice(allocator, &footer);
+
+    return out.toOwnedSlice(allocator);
+}
+
+test "QCOW2 creation and uncompressed size inspection from .img.xz file and slice" {
+    const allocator = testing.allocator;
+
+    // Build a 3-cluster (192 KiB) disk image with MBR signature in cluster 0, zeros in cluster 1, and data in cluster 2
+    const raw_len = CLUSTER_SIZE * 3;
+    const raw_img = try allocator.alloc(u8, raw_len);
+    defer allocator.free(raw_img);
+    @memset(raw_img, 0);
+    raw_img[510] = 0x55;
+    raw_img[511] = 0xAA;
+    std.mem.writeInt(u32, raw_img[CLUSTER_SIZE * 2 + 16 ..][0..4], 0xDEADBEEF, .little);
+
+    const xz_bytes = try buildTestXzArchiveAlloc(allocator, raw_img);
+    defer allocator.free(xz_bytes);
+
+    // 1. Verify XZ Index inspection returns exact uncompressed size (196,608 bytes) from slice
+    try testing.expectEqual(@as(u64, raw_len), try Qcow2Disk.getSliceLogicalSize(xz_bytes));
+
+    // 2. Write .img.xz to disk and verify getFileSizeLinux returns uncompressed size and createFromImageFile works
+    var rnd: [8]u8 = undefined;
+    host_posix.getRandomBytes(&rnd);
+    var xz_path_buf: [128]u8 = undefined;
+    const xz_path = try std.fmt.bufPrint(&xz_path_buf, "/tmp/fauxpi-test-{x}.img.xz", .{std.mem.readInt(u64, &rnd, .little)});
+    defer unlinkFileLinux(xz_path);
+
+    {
+        const fd = try host_posix.openCreateTruncWrite(xz_path, false);
+        defer host_posix.close(fd);
+        try host_posix.writeAll(fd, xz_bytes);
+    }
+
+    try testing.expectEqual(@as(u64, raw_len), try Qcow2Disk.getFileSizeLinux(xz_path));
+
+    // Rejects when uncompressed size (192 KiB) exceeds virtual_size (64 KiB)
+    try testing.expectError(
+        error.ImageTooLarge,
+        Qcow2Disk.createFromImageFile(allocator, CLUSTER_SIZE, xz_path),
+    );
+
+    // Streams .img.xz into a 4 GiB sparse QCOW2 disk, allocating only the 2 non-zero clusters
+    var disk = try Qcow2Disk.createFromImageFile(allocator, SdCardSize.gb_4.bytes(), xz_path);
+    defer disk.deinit();
+    try testing.expectEqual(@as(u64, 2), disk.allocated_data_clusters);
+    try testing.expectEqual(@as(u8, 0x55), disk.readByte(510));
+    try testing.expectEqual(@as(u8, 0xAA), disk.readByte(511));
+    try testing.expectEqual(@as(u8, 0x00), disk.readByte(CLUSTER_SIZE + 42));
+    try testing.expectEqual(@as(u8, 0xEF), disk.readByte(CLUSTER_SIZE * 2 + 16));
+    try testing.expectEqual(@as(u8, 0xBE), disk.readByte(CLUSTER_SIZE * 2 + 17));
+    try testing.expectEqual(@as(u8, 0xAD), disk.readByte(CLUSTER_SIZE * 2 + 18));
+    try testing.expectEqual(@as(u8, 0xDE), disk.readByte(CLUSTER_SIZE * 2 + 19));
 }
