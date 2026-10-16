@@ -1245,6 +1245,45 @@ pub const V3d = struct {
         return (dy == 0 and dx < 0) or dy > 0;
     }
 
+    const EdgeSetup = struct {
+        p0x: f32,
+        p0y: f32,
+        dx: f32,
+        dy: f32,
+        sign: f32,
+        is_top_left: bool,
+
+        inline fn init(ax: f32, ay: f32, bx: f32, by: f32, area_sign: f32) EdgeSetup {
+            const is_tl = topLeft(ax, ay, bx, by, area_sign);
+            if (ax > bx or (ax == bx and ay > by)) {
+                return .{
+                    .p0x = bx,
+                    .p0y = by,
+                    .dx = ax - bx,
+                    .dy = ay - by,
+                    .sign = -area_sign,
+                    .is_top_left = is_tl,
+                };
+            }
+            return .{
+                .p0x = ax,
+                .p0y = ay,
+                .dx = bx - ax,
+                .dy = by - ay,
+                .sign = area_sign,
+                .is_top_left = is_tl,
+            };
+        }
+
+        inline fn eval(self: EdgeSetup, row_term: f32, fx: f32) f32 {
+            return (row_term - self.dy * (fx - self.p0x)) * self.sign;
+        }
+
+        inline fn passes(self: EdgeSetup, val: f32) bool {
+            return val > 0 or (val == 0 and self.is_top_left);
+        }
+    };
+
     fn rasterizeShadedTriangleInTile(
         self: *V3d,
         ram: []const u8,
@@ -1286,8 +1325,33 @@ pub const V3d = struct {
         self.ensureTileMaterialized(need_depth);
 
         const v = &tri.v;
+        const abs_area = @abs(tri.area);
+        if (abs_area <= 0) return;
         const area_sign = std.math.sign(tri.area);
+        const inv_area = 1.0 / abs_area;
         const n_var = @min(@as(usize, num_varyings), 16);
+
+        const edge0 = EdgeSetup.init(v[1].x, v[1].y, v[2].x, v[2].y, area_sign);
+        const edge1 = EdgeSetup.init(v[2].x, v[2].y, v[0].x, v[0].y, area_sign);
+        const edge2 = EdgeSetup.init(v[0].x, v[0].y, v[1].x, v[1].y, area_sign);
+
+        const z2 = v[2].z;
+        const dz0 = v[0].z - z2;
+        const dz1 = v[1].z - z2;
+
+        const all_unit_w = (v[0].inv_w == 1.0 and v[1].inv_w == 1.0 and v[2].inv_w == 1.0);
+        const invw2 = v[2].inv_w;
+        const dinvw0 = v[0].inv_w - invw2;
+        const dinvw1 = v[1].inv_w - invw2;
+
+        var var2: [16]f32 = undefined;
+        var dvar0: [16]f32 = undefined;
+        var dvar1: [16]f32 = undefined;
+        for (0..n_var) |vi| {
+            var2[vi] = v[2].persp_varyings[vi];
+            dvar0[vi] = v[0].persp_varyings[vi] - var2[vi];
+            dvar1[vi] = v[1].persp_varyings[vi] - var2[vi];
+        }
 
         // Batch up to 16 covered pixels per SIMD QPU invocation
         var batch_idx: [16]u32 = undefined;
@@ -1355,27 +1419,29 @@ pub const V3d = struct {
         var py = y_start;
         while (py < y_end) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
+            const row_term0 = edge0.dx * (fy - edge0.p0y);
+            if (edge0.dy == 0 and !edge0.passes(row_term0 * edge0.sign)) continue;
+            const row_term1 = edge1.dx * (fy - edge1.p0y);
+            if (edge1.dy == 0 and !edge1.passes(row_term1 * edge1.sign)) continue;
+            const row_term2 = edge2.dx * (fy - edge2.p0y);
+            if (edge2.dy == 0 and !edge2.passes(row_term2 * edge2.sign)) continue;
+
             const row_base = (py - tile_px_y) * tile_size;
 
             var px = x_start;
             while (px < x_end) : (px += 1) {
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;
-                const e0 = canonicalEdge(v[1].x, v[1].y, v[2].x, v[2].y, fx, fy) * area_sign;
-                const e1 = canonicalEdge(v[2].x, v[2].y, v[0].x, v[0].y, fx, fy) * area_sign;
-                const e2 = canonicalEdge(v[0].x, v[0].y, v[1].x, v[1].y, fx, fy) * area_sign;
+                const e0 = edge0.eval(row_term0, fx);
+                if (!edge0.passes(e0)) continue;
+                const e1 = edge1.eval(row_term1, fx);
+                if (!edge1.passes(e1)) continue;
+                const e2 = edge2.eval(row_term2, fx);
+                if (!edge2.passes(e2)) continue;
 
-                if (e0 < 0 or (e0 == 0 and !topLeft(v[1].x, v[1].y, v[2].x, v[2].y, area_sign))) continue;
-                if (e1 < 0 or (e1 == 0 and !topLeft(v[2].x, v[2].y, v[0].x, v[0].y, area_sign))) continue;
-                if (e2 < 0 or (e2 == 0 and !topLeft(v[0].x, v[0].y, v[1].x, v[1].y, area_sign))) continue;
+                const w0 = e0 * inv_area;
+                const w1 = e1 * inv_area;
 
-                const sum = e0 + e1 + e2;
-                if (sum <= 0) continue;
-                const inv_sum = 1.0 / sum;
-                const w0 = e0 * inv_sum;
-                const w1 = e1 * inv_sum;
-                const w2 = e2 * inv_sum;
-
-                const z = w0 * v[0].z + w1 * v[1].z + w2 * v[2].z;
+                const z = z2 + w0 * dz0 + w1 * dz1;
                 const tile_idx = row_base + (px - tile_px_x);
 
                 if (depth_func != 7) {
@@ -1393,8 +1459,10 @@ pub const V3d = struct {
                     if (!depth_pass) continue;
                 }
 
-                const interp_inv_w = w0 * v[0].inv_w + w1 * v[1].inv_w + w2 * v[2].inv_w;
-                const w_val = if (@abs(interp_inv_w) > 1e-12) (1.0 / interp_inv_w) else 1.0;
+                const w_val: f32 = if (all_unit_w) 1.0 else blk: {
+                    const interp_inv_w = invw2 + w0 * dinvw0 + w1 * dinvw1;
+                    break :blk if (@abs(interp_inv_w) > 1e-12) (1.0 / interp_inv_w) else 1.0;
+                };
 
                 const lane = batch_len;
                 batch_idx[lane] = tile_idx;
@@ -1406,9 +1474,7 @@ pub const V3d = struct {
                 tlb_in[lane] = self.tile_color[tile_idx];
 
                 for (0..n_var) |vi| {
-                    const p_val = (w0 * v[0].persp_varyings[vi] +
-                        w1 * v[1].persp_varyings[vi] +
-                        w2 * v[2].persp_varyings[vi]) * w_val;
+                    const p_val = (var2[vi] + w0 * dvar0[vi] + w1 * dvar1[vi]) * w_val;
                     vary_vecs[vi][lane] = @bitCast(p_val);
                 }
 
