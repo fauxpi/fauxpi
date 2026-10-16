@@ -107,36 +107,29 @@ fn isFloatInputMul(op: qpu.MulOp) bool {
 
 fn unpackVec(v: Vec, mode: u3, float_input: bool) Vec {
     if (mode == 0) return v;
-    var out: Vec = undefined;
-    switch (mode) {
+    const vu: VecU = v;
+    return switch (mode) {
         0 => unreachable,
-        1 => { // 16a
-            for (0..lanes) |lane| {
-                const lo: i16 = @bitCast(@as(u16, @truncate(v[lane])));
-                out[lane] = if (float_input) u(@as(f32, @floatFromInt(lo))) else @bitCast(@as(i32, lo));
-            }
+        1 => blk: { // 16a
+            const shifted: VecI = @bitCast(vu << @as(@Vector(lanes, u5), @splat(16)));
+            const sext: VecI = shifted >> @as(@Vector(lanes, u5), @splat(16));
+            break :blk if (float_input) @bitCast(@as(VecF, @floatFromInt(sext))) else @bitCast(sext);
         },
-        2 => { // 16b
-            for (0..lanes) |lane| {
-                const hi: i16 = @bitCast(@as(u16, @truncate(v[lane] >> 16)));
-                out[lane] = if (float_input) u(@as(f32, @floatFromInt(hi))) else @bitCast(@as(i32, hi));
-            }
+        2 => blk: { // 16b
+            const sext: VecI = @as(VecI, @bitCast(vu)) >> @as(@Vector(lanes, u5), @splat(16));
+            break :blk if (float_input) @bitCast(@as(VecF, @floatFromInt(sext))) else @bitCast(sext);
         },
-        3 => { // 8d_rep
-            for (0..lanes) |lane| {
-                const byte: u8 = @truncate(v[lane] >> 24);
-                out[lane] = @as(u32, byte) * 0x01010101;
-            }
-        },
-        4, 5, 6, 7 => {
+        3 => (vu >> @as(@Vector(lanes, u5), @splat(24))) *% @as(VecU, @splat(0x01010101)), // 8d_rep
+        4, 5, 6, 7 => blk: {
             const shift: u5 = @as(u5, mode - 4) * 8;
-            for (0..lanes) |lane| {
-                const byte: u8 = @truncate(v[lane] >> shift);
-                out[lane] = if (float_input) u(@as(f32, @floatFromInt(byte)) / 255.0) else byte;
+            const bytes: VecU = (vu >> @as(@Vector(lanes, u5), @splat(shift))) & @as(VecU, @splat(0xff));
+            if (float_input) {
+                const vf: VecF = @floatFromInt(bytes);
+                break :blk @bitCast(vf * @as(VecF, @splat(1.0 / 255.0)));
             }
+            break :blk bytes;
         },
-    }
-    return out;
+    };
 }
 
 fn ftoi(x: f32) u32 {
@@ -297,6 +290,13 @@ pub fn smallImm(v: u6) u32 {
 fn unorm8(x: f32) u8 {
     const c = std.math.clamp(x, 0.0, 1.0);
     return @intFromFloat(@round(c * 255.0));
+}
+
+inline fn unorm8Vec(v: Vec) VecU {
+    const vf: VecF = @bitCast(v);
+    const clamped = @min(@max(vf, @as(VecF, @splat(0.0))), @as(VecF, @splat(1.0)));
+    const scaled = @round(clamped * @as(VecF, @splat(255.0)));
+    return @intFromFloat(scaled);
 }
 
 fn condPasses(cond: qpu.Cond, s: *const State, lane: usize) bool {
@@ -618,10 +618,17 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
         }
         if (cond == .always and a_pack == 0 and mul_pack >= 4 and mul_pack <= 7) {
             const shift: u5 = @as(u5, @intCast(mul_pack - 4)) * 8;
-            const mask = @as(u32, 0xff) << shift;
-            for (0..lanes) |lane| {
-                d[lane] = (d[lane] & ~mask) | (@as(u32, unorm8(f(value[lane]))) << shift);
-            }
+            const mask: VecU = @splat(@as(u32, 0xff) << shift);
+            const dv: VecU = d.*;
+            d.* = (dv & ~mask) | (unorm8Vec(value) << @as(@Vector(lanes, u5), @splat(shift)));
+            return;
+        }
+        if (cond == .always and (a_pack & 7) >= 4) {
+            const shift: u5 = @as(u5, @intCast((a_pack & 7) - 4)) * 8;
+            const mask: VecU = @splat(@as(u32, 0xff) << shift);
+            const dv: VecU = d.*;
+            const vv: VecU = value;
+            d.* = (dv & ~mask) | ((vv & @as(VecU, @splat(0xff))) << @as(@Vector(lanes, u5), @splat(shift)));
             return;
         }
         for (0..lanes) |lane| {
@@ -709,9 +716,31 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
                 }
             }
             const cfg = texture.decodeConfig(p0, t.params[1]);
+            const pt = PrecomputedTex.init(cfg) catch {
+                t.fifo[t.fifo_len] = splat(0xff000000);
+                t.fifo_len += 1;
+                t.param_count = 0;
+                t.coord_t = splat(0);
+                r.texture_samples += 1;
+                return;
+            };
             var texel: Vec = undefined;
-            for (&texel, value, t.coord_t) |*o, sc, tc|
-                o.* = sampleConfig(memory, cfg, f(sc), f(tc)) catch 0xff000000;
+            var prev_sc: u32 = 0;
+            var prev_tc: u32 = 0;
+            var prev_out: u32 = 0;
+            for (0..lanes) |lane| {
+                const sc = value[lane];
+                const tc = t.coord_t[lane];
+                if (lane > 0 and sc == prev_sc and tc == prev_tc) {
+                    texel[lane] = prev_out;
+                    continue;
+                }
+                const sampled = pt.sample(memory, f(sc), f(tc)) catch 0xff000000;
+                texel[lane] = sampled;
+                prev_sc = sc;
+                prev_tc = tc;
+                prev_out = sampled;
+            }
             t.fifo[t.fifo_len] = texel;
             t.fifo_len += 1;
             t.param_count = 0;
@@ -724,68 +753,145 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
 
 pub const texture_base: u32 = 1 << 28;
 
+const PrecomputedTex = struct {
+    cfg: texture.Config,
+    base_off: u32,
+    cpp: u32,
+    fw: f32,
+    fh: f32,
+    uw_shift: u5,
+    uh_shift: u5,
+    uw_mask: u32,
+    uh_mask: u32,
+    cpp_shift: u5,
+    is_small_microtile: bool,
+    utiles_per_row: u32,
+    tile_w_shift: u5,
+    tile_h_shift: u5,
+    tiles_per_row: u32,
+
+    inline fn init(p: texture.Config) Error!PrecomputedTex {
+        const cpp: u32 = switch (p.type) {
+            .rgba8888, .rgbx8888, .rgba32r => 4,
+            .rgb565 => 2,
+            .alpha, .luminance => 1,
+            else => return error.Unsupported,
+        };
+        const uw_shift: u5 = if (cpp == 4) 2 else 3;
+        const uh_shift: u5 = if (cpp == 1) 3 else 2;
+        const uw: u32 = @as(u32, 1) << uw_shift;
+        const uh: u32 = @as(u32, 1) << uh_shift;
+        const cpp_shift: u5 = switch (cpp) {
+            4 => 2,
+            2 => 1,
+            else => 0,
+        };
+        const tile_w_shift: u5 = uw_shift + 3;
+        const tile_h_shift: u5 = uh_shift + 3;
+        const tile_w: u32 = @as(u32, 1) << tile_w_shift;
+        return .{
+            .cfg = p,
+            .base_off = p.offset & 0x1FFFFFFF,
+            .cpp = cpp,
+            .fw = @floatFromInt(p.width),
+            .fh = @floatFromInt(p.height),
+            .uw_shift = uw_shift,
+            .uh_shift = uh_shift,
+            .uw_mask = uw - 1,
+            .uh_mask = uh - 1,
+            .cpp_shift = cpp_shift,
+            .is_small_microtile = (p.width <= (uw << 2) or p.height <= (uh << 2)),
+            .utiles_per_row = (p.width + uw - 1) >> uw_shift,
+            .tile_w_shift = tile_w_shift,
+            .tile_h_shift = tile_h_shift,
+            .tiles_per_row = (p.width + tile_w - 1) >> tile_w_shift,
+        };
+    }
+
+    inline fn texelOffset(pt: *const PrecomputedTex, x: u32, y: u32) u32 {
+        if (pt.cfg.type == .rgba32r) {
+            return (y * pt.cfg.width + x) << 2;
+        }
+        const in_utile = (((y & pt.uh_mask) << pt.uw_shift) | (x & pt.uw_mask)) << pt.cpp_shift;
+        if (pt.is_small_microtile) {
+            return (((y >> pt.uh_shift) * pt.utiles_per_row + (x >> pt.uw_shift)) << 6) + in_utile;
+        }
+        const tile_row = y >> pt.tile_h_shift;
+        const tile_col = if ((tile_row & 1) == 0) (x >> pt.tile_w_shift) else pt.tiles_per_row - 1 - (x >> pt.tile_w_shift);
+        const tile_base = (tile_row * pt.tiles_per_row + tile_col) << 12;
+
+        const sub_col = (x >> (pt.uw_shift + 2)) & 1;
+        const sub_row = (y >> (pt.uh_shift + 2)) & 1;
+        const stile_index = (sub_row << 1) | sub_col;
+        const even_map = [4]u32{ 0, 3, 1, 2 };
+        const odd_map = [4]u32{ 2, 1, 3, 0 };
+        const sub_index = if ((tile_row & 1) == 0) even_map[stile_index] else odd_map[stile_index];
+        const utile_in_sub = (((y >> pt.uh_shift) & 3) << 2) | ((x >> pt.uw_shift) & 3);
+        return tile_base + (sub_index << 10) + (utile_in_sub << 6) + in_utile;
+    }
+
+    inline fn fetchAt(pt: *const PrecomputedTex, memory: []const u8, x: u32, y: u32) Error!u32 {
+        const offset = pt.base_off + pt.texelOffset(x, y);
+        if (offset + pt.cpp > memory.len) return error.Unsupported;
+        if (pt.cpp == 4) {
+            const raw = std.mem.readInt(u32, memory[offset..][0..4], .little);
+            return if (pt.cfg.type == .rgbx8888) (raw | 0xff000000) else raw;
+        }
+        if (pt.cpp == 1) {
+            if (pt.cfg.type == .luminance) {
+                const l: u32 = memory[offset];
+                return 0xff000000 | (l << 16) | (l << 8) | l;
+            }
+            return @as(u32, memory[offset]) << 24;
+        }
+        return pixel.fromRgb565(std.mem.readInt(u16, memory[offset..][0..2], .little));
+    }
+
+    inline fn sample(pt: *const PrecomputedTex, memory: []const u8, s: f32, t: f32) Error!u32 {
+        const p = pt.cfg;
+        if (p.mag_filter == .nearest) {
+            return pt.fetchAt(memory, try wrap(@floor(s * pt.fw), p.width, p.wrap_s), try wrap(@floor(t * pt.fh), p.height, p.wrap_t));
+        }
+        const fx = s * pt.fw - 0.5;
+        const fy = t * pt.fh - 0.5;
+        const x0 = @floor(fx);
+        const y0 = @floor(fy);
+        const wx0 = try wrap(x0, p.width, p.wrap_s);
+        const wx1 = try wrap(x0 + 1.0, p.width, p.wrap_s);
+        const wy0 = try wrap(y0, p.height, p.wrap_t);
+        const wy1 = try wrap(y0 + 1.0, p.height, p.wrap_t);
+        const c00 = try pt.fetchAt(memory, wx0, wy0);
+        if (wx0 == wx1 and wy0 == wy1) return c00;
+        const c10 = if (wx1 == wx0) c00 else try pt.fetchAt(memory, wx1, wy0);
+        const c01 = if (wy1 == wy0) c00 else try pt.fetchAt(memory, wx0, wy1);
+        const c11 = if (wx1 == wx0) c01 else if (wy1 == wy0) c10 else try pt.fetchAt(memory, wx1, wy1);
+        if (c00 == c10 and c00 == c01 and c00 == c11) return c00;
+        const ax = fx - x0;
+        const ay = fy - y0;
+        const w00 = (1 - ax) * (1 - ay);
+        const w10 = ax * (1 - ay);
+        const w01 = (1 - ax) * ay;
+        const w11 = ax * ay;
+        var out: u32 = 0;
+        inline for (0..4) |byte| {
+            const sh: u5 = @intCast(byte * 8);
+            const v = @as(f32, @floatFromInt((c00 >> sh) & 0xff)) * w00 +
+                @as(f32, @floatFromInt((c10 >> sh) & 0xff)) * w10 +
+                @as(f32, @floatFromInt((c01 >> sh) & 0xff)) * w01 +
+                @as(f32, @floatFromInt((c11 >> sh) & 0xff)) * w11;
+            out |= @as(u32, @intFromFloat(@round(v))) << sh;
+        }
+        return out;
+    }
+};
+
 pub fn sample(memory: []const u8, p0: u32, p1: u32, s: f32, t: f32) Error!u32 {
     return sampleConfig(memory, texture.decodeConfig(p0, p1), s, t);
 }
 
 fn sampleConfig(memory: []const u8, p: texture.Config, s: f32, t: f32) Error!u32 {
-    const cpp: u32 = switch (p.type) {
-        .rgba8888, .rgbx8888, .rgba32r => 4,
-        .rgb565 => 2,
-        .alpha, .luminance => 1,
-        else => return error.Unsupported,
-    };
-    const w: f32 = @floatFromInt(p.width);
-    const h: f32 = @floatFromInt(p.height);
-    if (p.mag_filter == .nearest) return fetch(memory, p, cpp, try wrap(@floor(s * w), p.width, p.wrap_s), try wrap(@floor(t * h), p.height, p.wrap_t));
-    const fx = s * w - 0.5;
-    const fy = t * h - 0.5;
-    const x0 = @floor(fx);
-    const y0 = @floor(fy);
-    const ax = fx - x0;
-    const ay = fy - y0;
-    var out: u32 = 0;
-    var c: [4]u32 = undefined;
-    for (0..4) |k| {
-        const x = try wrap(x0 + @as(f32, @floatFromInt(k & 1)), p.width, p.wrap_s);
-        const y = try wrap(y0 + @as(f32, @floatFromInt(k >> 1)), p.height, p.wrap_t);
-        c[k] = try fetch(memory, p, cpp, x, y);
-    }
-    const w00 = (1 - ax) * (1 - ay);
-    const w10 = ax * (1 - ay);
-    const w01 = (1 - ax) * ay;
-    const w11 = ax * ay;
-    inline for (0..4) |byte| {
-        const sh: u5 = @intCast(byte * 8);
-        const v = @as(f32, @floatFromInt((c[0] >> sh) & 0xff)) * w00 +
-            @as(f32, @floatFromInt((c[1] >> sh) & 0xff)) * w10 +
-            @as(f32, @floatFromInt((c[2] >> sh) & 0xff)) * w01 +
-            @as(f32, @floatFromInt((c[3] >> sh) & 0xff)) * w11;
-        out |= @as(u32, @intFromFloat(@round(v))) << sh;
-    }
-    return out;
-}
-
-fn fetch(memory: []const u8, p: texture.Config, cpp: u32, x: u32, y: u32) Error!u32 {
-    const base_off = p.offset & 0x1FFFFFFF;
-    const tex_off = if (p.type == .rgba32r)
-        (y * p.width + x) * 4
-    else
-        referenceTexelOffsetOf(cpp, p.width, p.height, x, y);
-    const offset = base_off + tex_off;
-    if (offset + cpp > memory.len) return error.Unsupported;
-    if (cpp == 4) {
-        const raw = std.mem.readInt(u32, memory[offset..][0..4], .little);
-        return if (p.type == .rgbx8888) (raw | 0xff000000) else raw;
-    }
-    if (cpp == 1) {
-        if (p.type == .luminance) {
-            const l: u32 = memory[offset];
-            return 0xff000000 | (l << 16) | (l << 8) | l;
-        }
-        return @as(u32, memory[offset]) << 24;
-    }
-    return pixel.fromRgb565(std.mem.readInt(u16, memory[offset..][0..2], .little));
+    const pt = try PrecomputedTex.init(p);
+    return pt.sample(memory, s, t);
 }
 
 fn wrap(coord: f32, size: u32, mode: texture.Wrap) Error!u32 {
