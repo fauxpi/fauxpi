@@ -411,18 +411,32 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             ubfm_l,
             orr_reg64,
             orr_reg32,
+            orn_reg64,
+            orn_reg32,
             add_reg64,
             add_reg32,
+            adds_reg64,
+            adds_reg32,
             sub_reg64,
             sub_reg32,
             subs_reg64,
             subs_reg32,
             and_reg64,
             and_reg32,
+            bic_reg64,
+            bic_reg32,
             eor_reg64,
             eor_reg32,
             ands_reg64,
             ands_reg32,
+            add_lsl64,
+            add_lsl32,
+            sub_lsl64,
+            sub_lsl32,
+            orr_lsl64,
+            orr_lsr64,
+            csel,
+            madd_msub,
             ldr64_uimm,
             str64_uimm,
             ldr32_uimm,
@@ -555,30 +569,64 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     const imm6: u6 = @truncate(inst >> 10);
                     const rn: u8 = @truncate((inst >> 5) & 0x1f);
                     const rd: u8 = @truncate(inst & 0x1f);
-                    if (op1 == 0 and imm6 == 0) {
-                        if ((op2 & 0b1001) == 0) {
-                            // Unshifted non-inverted logical register
-                            const opc: u2 = (@as(u2, op0) << 1) | s;
-                            const op: A64Op = if (sf == 1) switch (opc) {
-                                0b00 => .and_reg64,
-                                0b01 => .orr_reg64,
-                                0b10 => .eor_reg64,
-                                0b11 => .ands_reg64,
-                            } else switch (opc) {
-                                0b00 => .and_reg32,
-                                0b01 => .orr_reg32,
-                                0b10 => .eor_reg32,
-                                0b11 => .ands_reg32,
-                            };
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .rm = rm };
-                        } else if ((op2 & 0b1001) == 0b1000) {
-                            // Unshifted add/sub register
-                            if (s == 0) {
-                                const op: A64Op = if (sf == 1) (if (op0 == 1) .sub_reg64 else .add_reg64) else (if (op0 == 1) .sub_reg32 else .add_reg32);
+                    if (op1 == 0) {
+                        if (imm6 == 0) {
+                            if ((op2 & 0b1001) == 0) {
+                                // Unshifted non-inverted logical register
+                                const opc: u2 = (@as(u2, op0) << 1) | s;
+                                const op: A64Op = if (sf == 1) switch (opc) {
+                                    0b00 => .and_reg64,
+                                    0b01 => .orr_reg64,
+                                    0b10 => .eor_reg64,
+                                    0b11 => .ands_reg64,
+                                } else switch (opc) {
+                                    0b00 => .and_reg32,
+                                    0b01 => .orr_reg32,
+                                    0b10 => .eor_reg32,
+                                    0b11 => .ands_reg32,
+                                };
                                 return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .rm = rm };
-                            } else if (op0 == 1) {
-                                return .{ .raw = inst, .op = @intFromEnum(if (sf == 1) A64Op.subs_reg64 else A64Op.subs_reg32), .rd = rd, .rn = rn, .rm = rm };
+                            } else if ((op2 & 0b1001) == 0b0001 and s == 0) {
+                                // Unshifted BIC / ORN (`MVN`)
+                                if (op0 == 0) {
+                                    return .{ .raw = inst, .op = @intFromEnum(if (sf == 1) A64Op.bic_reg64 else A64Op.bic_reg32), .rd = rd, .rn = rn, .rm = rm };
+                                } else {
+                                    return .{ .raw = inst, .op = @intFromEnum(if (sf == 1) A64Op.orn_reg64 else A64Op.orn_reg32), .rd = rd, .rn = rn, .rm = rm };
+                                }
+                            } else if ((op2 & 0b1001) == 0b1000) {
+                                // Unshifted add/sub register
+                                const op: A64Op = if (sf == 1)
+                                    (if (s == 1) (if (op0 == 1) .subs_reg64 else .adds_reg64) else (if (op0 == 1) .sub_reg64 else .add_reg64))
+                                else
+                                    (if (s == 1) (if (op0 == 1) .subs_reg32 else .adds_reg32) else (if (op0 == 1) .sub_reg32 else .add_reg32));
+                                return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .rm = rm };
                             }
+                        } else if (s == 0) {
+                            const shift_type: u2 = @truncate(inst >> 22);
+                            if ((op2 & 0b1001) == 0b1000 and shift_type == 0b00) {
+                                const op: A64Op = if (sf == 1) (if (op0 == 1) .sub_lsl64 else .add_lsl64) else (if (op0 == 1) .sub_lsl32 else .add_lsl32);
+                                return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
+                            } else if ((op2 & 0b1001) == 0 and sf == 1 and op0 == 1) {
+                                if (shift_type == 0b00) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.orr_lsl64), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
+                                } else if (shift_type == 0b01) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.orr_lsr64), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
+                                }
+                            }
+                        }
+                    } else if (s == 0) {
+                        if (op2 == 0b0100) {
+                            // CSEL / CSINC / CSINV / CSNEG
+                            const cond: u64 = (inst >> 12) & 0xf;
+                            const o2: u64 = (inst >> 10) & 1;
+                            const packed_imm: u64 = cond | (@as(u64, op0) << 4) | (o2 << 5) | (@as(u64, sf) << 6);
+                            return .{ .raw = inst, .op = @intFromEnum(A64Op.csel), .rd = rd, .rn = rn, .rm = rm, .imm = packed_imm };
+                        } else if (op2 == 0b1000 and op0 == 0) {
+                            // MADD / MSUB
+                            const o0: u64 = (inst >> 15) & 1;
+                            const ra: u64 = (inst >> 10) & 0x1f;
+                            const packed_imm: u64 = ra | (o0 << 5) | (@as(u64, sf) << 6);
+                            return .{ .raw = inst, .op = @intFromEnum(A64Op.madd_msub), .rd = rd, .rn = rn, .rm = rm, .imm = packed_imm };
                         }
                     }
                     return .{ .raw = inst, .op = @intFromEnum(A64Op.dp_reg_other) };
@@ -723,21 +771,38 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
 
             const SlotType = @TypeOf(cpu.icache[0]);
             var executed: usize = 0;
+            var priv: u1 = @intFromBool(currentEl(cpu) != 0);
+            var code_vbase: u64 = 0xffff_ffff_ffff_ffff;
+            var code_pbase: u32 = 0;
+
             while (executed < max_steps) {
                 if (cpu.mmu.halted_wfi or !cpu.is_aarch64) break;
 
                 const cur_pc = cpu.pc64;
-                const priv: u1 = @intFromBool(currentEl(cpu) != 0);
-                const islot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                const inst: u32 = if ((cur_pc & ~@as(u64, 0xfff)) == islot.r_vbase) blk: {
-                    const paddr = islot.pbase | @as(u32, @truncate(cur_pc & 0xffc));
-                    break :blk std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
-                } else fetchInst64(cpu, bus, cur_pc) catch {
-                    const target_el: u2 = @max(currentEl(cpu), 1);
-                    const esr = if (target_el >= 2) cpu.mmu.esr_el2 else cpu.mmu.esr_el1;
-                    takeException64(cpu, target_el, 0x000, esr, cur_pc, cur_pc);
-                    executed += 1;
-                    continue;
+                const inst: u32 = if ((cur_pc & ~@as(u64, 0xfff)) == code_vbase)
+                    std.mem.readInt(u32, bus.ram[(code_pbase | @as(u32, @truncate(cur_pc & 0xffc)))..][0..4], .little)
+                else blk: {
+                    const islot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                    if ((cur_pc & ~@as(u64, 0xfff)) == islot.x_vbase) {
+                        code_vbase = islot.x_vbase;
+                        code_pbase = islot.pbase;
+                        break :blk std.mem.readInt(u32, bus.ram[(islot.pbase | @as(u32, @truncate(cur_pc & 0xffc)))..][0..4], .little);
+                    }
+                    const fetched = fetchInst64(cpu, bus, cur_pc) catch {
+                        const target_el: u2 = @max(currentEl(cpu), 1);
+                        const esr = if (target_el >= 2) cpu.mmu.esr_el2 else cpu.mmu.esr_el1;
+                        takeException64(cpu, target_el, 0x000, esr, cur_pc, cur_pc);
+                        priv = 1;
+                        code_vbase = 0xffff_ffff_ffff_ffff;
+                        executed += 1;
+                        continue;
+                    };
+                    const islot2 = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                    if ((cur_pc & ~@as(u64, 0xfff)) == islot2.x_vbase) {
+                        code_vbase = islot2.x_vbase;
+                        code_pbase = islot2.pbase;
+                    }
+                    break :blk fetched;
                 };
 
                 cpu.last_inst = inst;
@@ -794,14 +859,20 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .ubfm_l => setX(cpu, @truncate(d.rd), (getX(cpu, @truncate(d.rn)) << @intCast(d.rm)) & d.imm),
                     .orr_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | getX(cpu, @truncate(d.rm))),
                     .orr_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) | getW(cpu, @truncate(d.rm))),
+                    .orn_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | ~getX(cpu, @truncate(d.rm))),
+                    .orn_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) | ~getW(cpu, @truncate(d.rm))),
                     .add_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) +% getX(cpu, @truncate(d.rm))),
                     .add_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) +% getW(cpu, @truncate(d.rm))),
+                    .adds_reg64 => addSub(cpu, 1, false, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 0, false),
+                    .adds_reg32 => addSub(cpu, 0, false, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 0, false),
                     .sub_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) -% getX(cpu, @truncate(d.rm))),
                     .sub_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) -% getW(cpu, @truncate(d.rm))),
                     .subs_reg64 => addSub(cpu, 1, true, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false),
                     .subs_reg32 => addSub(cpu, 0, true, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false),
                     .and_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) & getX(cpu, @truncate(d.rm))),
                     .and_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) & getW(cpu, @truncate(d.rm))),
+                    .bic_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) & ~getX(cpu, @truncate(d.rm))),
+                    .bic_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) & ~getW(cpu, @truncate(d.rm))),
                     .eor_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) ^ getX(cpu, @truncate(d.rm))),
                     .eor_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) ^ getW(cpu, @truncate(d.rm))),
                     .ands_reg64 => {
@@ -814,6 +885,38 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         setNzcv(cpu, (res >> 31) != 0, res == 0, false, false);
                         setW(cpu, @truncate(d.rd), res);
                     },
+                    .add_lsl64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @as(u6, @truncate(d.imm)))),
+                    .add_lsl32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) +% (getW(cpu, @truncate(d.rm)) << @as(u5, @truncate(d.imm)))),
+                    .sub_lsl64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) -% (getX(cpu, @truncate(d.rm)) << @as(u6, @truncate(d.imm)))),
+                    .sub_lsl32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) -% (getW(cpu, @truncate(d.rm)) << @as(u5, @truncate(d.imm)))),
+                    .orr_lsl64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | (getX(cpu, @truncate(d.rm)) << @as(u6, @truncate(d.imm)))),
+                    .orr_lsr64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | (getX(cpu, @truncate(d.rm)) >> @as(u6, @truncate(d.imm)))),
+                    .csel => {
+                        const cond: u4 = @truncate(d.imm);
+                        const inv = ((d.imm >> 4) & 1) != 0;
+                        const inc = ((d.imm >> 5) & 1) != 0;
+                        const sf = ((d.imm >> 6) & 1) != 0;
+                        var res: u64 = if (evalCond(cpu.pstate, cond))
+                            getX(cpu, @truncate(d.rn))
+                        else blk: {
+                            var v = getX(cpu, @truncate(d.rm));
+                            if (inv) v = ~v;
+                            if (inc) v +%= 1;
+                            break :blk v;
+                        };
+                        if (!sf) res &= 0xffff_ffff;
+                        setX(cpu, @truncate(d.rd), res);
+                    },
+                    .madd_msub => {
+                        const ra: u5 = @truncate(d.imm);
+                        const is_sub = ((d.imm >> 5) & 1) != 0;
+                        const sf = ((d.imm >> 6) & 1) != 0;
+                        const a = getX(cpu, @truncate(d.rn));
+                        const b = getX(cpu, @truncate(d.rm));
+                        const c = getX(cpu, ra);
+                        const res = if (is_sub) (c -% (a *% b)) else (c +% (a *% b));
+                        if (sf) setX(cpu, @truncate(d.rd), res) else setW(cpu, @truncate(d.rd), @truncate(res));
+                    },
                     .ldr64_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
                         const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
@@ -823,6 +926,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             const val = readData64(cpu, bus, addr) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             setX(cpu, @truncate(d.rd), val);
@@ -838,9 +943,17 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             writeData64(cpu, bus, addr, val) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
-                            if (checkInterrupts64(cpu, bus)) continue;
+                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                if (checkInterrupts64(cpu, bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                }
+                            }
                         }
                     },
                     .ldr32_uimm => {
@@ -852,6 +965,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             const val = readData32(cpu, bus, addr) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             setW(cpu, @truncate(d.rd), val);
@@ -867,9 +982,17 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             writeData32(cpu, bus, addr, val) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
-                            if (checkInterrupts64(cpu, bus)) continue;
+                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                if (checkInterrupts64(cpu, bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                }
+                            }
                         }
                     },
                     .ldr16_uimm => {
@@ -881,6 +1004,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             const val = readData16(cpu, bus, addr) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             setW(cpu, @truncate(d.rd), val);
@@ -896,9 +1021,17 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             writeData16(cpu, bus, addr, val) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
-                            if (checkInterrupts64(cpu, bus)) continue;
+                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                if (checkInterrupts64(cpu, bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                }
+                            }
                         }
                     },
                     .ldr8_uimm => {
@@ -910,6 +1043,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             const val = readData8(cpu, bus, addr) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             setW(cpu, @truncate(d.rd), val);
@@ -925,9 +1060,17 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             writeData8(cpu, bus, addr, val) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
-                            if (checkInterrupts64(cpu, bus)) continue;
+                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                if (checkInterrupts64(cpu, bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                }
+                            }
                         }
                     },
                     .ldp64_off, .ldp64_pre, .ldp64_post => {
@@ -944,10 +1087,14 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             const v1 = readData64(cpu, bus, addr) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             const v2 = readData64(cpu, bus, addr +% 8) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             setX(cpu, @truncate(d.rd), v1);
@@ -970,14 +1117,24 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             writeData64(cpu, bus, addr, v1) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             writeData64(cpu, bus, addr +% 8, v2) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             if (op != .stp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
-                            if (checkInterrupts64(cpu, bus)) continue;
+                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                if (checkInterrupts64(cpu, bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                }
+                            }
                         }
                     },
                     .ldp32_off => {
@@ -992,10 +1149,14 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             const v1 = readData32(cpu, bus, addr) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             const v2 = readData32(cpu, bus, addr +% 4) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             setW(cpu, @truncate(d.rd), v1);
@@ -1014,13 +1175,23 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         } else {
                             writeData32(cpu, bus, addr, v1) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                             writeData32(cpu, bus, addr +% 4, v2) catch {
                                 handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
-                            if (checkInterrupts64(cpu, bus)) continue;
+                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                if (checkInterrupts64(cpu, bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                }
+                            }
                         }
                     },
                     .b_imm => cpu.pc64 = cur_pc +% d.imm,
@@ -1057,16 +1228,30 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .load_store_other => {
                         executeLoadStore(cpu, bus, inst, cur_pc) catch {
                             handleAbort64(cpu, cur_pc);
+                            priv = 1;
+                            code_vbase = 0xffff_ffff_ffff_ffff;
                             continue;
                         };
-                        if (checkInterrupts64(cpu, bus)) continue;
+                        if (checkInterrupts64(cpu, bus)) {
+                            priv = 1;
+                            code_vbase = 0xffff_ffff_ffff_ffff;
+                            continue;
+                        }
                     },
                     .branch_sys_other => {
                         executeBranchSys(cpu, bus, inst, cur_pc) catch {
                             handleAbort64(cpu, cur_pc);
+                            priv = 1;
+                            code_vbase = 0xffff_ffff_ffff_ffff;
                             continue;
                         };
-                        if (checkInterrupts64(cpu, bus)) continue;
+                        if (checkInterrupts64(cpu, bus)) {
+                            priv = 1;
+                            code_vbase = 0xffff_ffff_ffff_ffff;
+                            continue;
+                        }
+                        priv = @intFromBool(currentEl(cpu) != 0);
+                        code_vbase = 0xffff_ffff_ffff_ffff;
                     },
                     .fp_simd => executeFpSimd(cpu, inst),
                     .nop => {},
