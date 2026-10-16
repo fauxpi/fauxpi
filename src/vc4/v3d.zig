@@ -70,6 +70,17 @@ pub const V3d = struct {
         v: [3]ShadedVertex,
     };
 
+    pub const LazyTileLoad = struct {
+        addr: u32,
+        fb_w: u32,
+        fb_h: u32,
+        tile_x: u32,
+        tile_y: u32,
+        tile_size: u32,
+        tiling: u2,
+        format: u2,
+    };
+
     scratch: u32 = 0,
     l2cactl: u32 = 0,
     slcactl: u32 = 0,
@@ -121,6 +132,9 @@ pub const V3d = struct {
     tile_color_solid: ?u32 = null,
     tile_depth_valid: bool = false,
     tile_clear_zs: f32 = 1.0,
+    lazy_load: ?LazyTileLoad = null,
+    loaded_from: ?LazyTileLoad = null,
+    tile_modified: bool = false,
 
     // Pre-shaded & pre-binned state for the current RCL frame
     prep_draws: [256]PreparedDraw = undefined,
@@ -131,6 +145,8 @@ pub const V3d = struct {
     shaded_tris: [MAX_PREBINNED_TRIS]ShadedTriangle = undefined,
     shaded_tris_len: usize = 0,
     overflow_draw_start: usize = 0,
+    tile_nonempty: [32]u32 = [_]u32{0} ** 32,
+    tile_tri_mask: [32 * 32][MAX_PREBINNED_TRIS / 64]u64 = undefined,
 
     gl: GlRenderer = .{},
     gl_initialized: bool = false,
@@ -416,6 +432,7 @@ pub const V3d = struct {
         self.prep_fs_insts_len = 0;
         self.prep_fs_unifs_len = 0;
         self.overflow_draw_start = self.draws_len;
+        self.tile_nonempty = [_]u32{0} ** 32;
 
         var vs_buf: [512]qpu.Inst = undefined;
         var fs_buf: [512]qpu.Inst = undefined;
@@ -594,16 +611,42 @@ pub const V3d = struct {
                     const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
                     if (min_fx >= max_fx or min_fy >= max_fy) continue;
 
-                    self.shaded_tris[self.shaded_tris_len] = .{
+                    const tri_slot = self.shaded_tris_len;
+                    const min_ux: u32 = @intFromFloat(min_fx);
+                    const min_uy: u32 = @intFromFloat(min_fy);
+                    const max_ux: u32 = @intFromFloat(max_fx);
+                    const max_uy: u32 = @intFromFloat(max_fy);
+                    self.shaded_tris[tri_slot] = .{
                         .draw_idx = @intCast(draw_idx),
-                        .min_x = @intFromFloat(min_fx),
-                        .min_y = @intFromFloat(min_fy),
-                        .max_x = @intFromFloat(max_fx),
-                        .max_y = @intFromFloat(max_fy),
+                        .min_x = min_ux,
+                        .min_y = min_uy,
+                        .max_x = max_ux,
+                        .max_y = max_uy,
                         .area = area,
                         .v = verts,
                     };
-                    self.shaded_tris_len += 1;
+                    self.shaded_tris_len = tri_slot + 1;
+
+                    // Spatially bin this triangle into overlapping 64x64 tiles
+                    const tx0 = @min(min_ux >> 6, 31);
+                    const ty0 = @min(min_uy >> 6, 31);
+                    const tx1 = @min((max_ux - 1) >> 6, 31);
+                    const ty1 = @min((max_uy - 1) >> 6, 31);
+                    const word_idx = tri_slot >> 6;
+                    const bit_mask = @as(u64, 1) << @intCast(tri_slot & 63);
+                    var ty: u32 = ty0;
+                    while (ty <= ty1) : (ty += 1) {
+                        var tx: u32 = tx0;
+                        while (tx <= tx1) : (tx += 1) {
+                            const tx_bit = @as(u32, 1) << @intCast(tx);
+                            const t_idx = ty * 32 + tx;
+                            if ((self.tile_nonempty[ty] & tx_bit) == 0) {
+                                @memset(&self.tile_tri_mask[t_idx], 0);
+                                self.tile_nonempty[ty] |= tx_bit;
+                            }
+                            self.tile_tri_mask[t_idx][word_idx] |= bit_mask;
+                        }
+                    }
                 }
             }
         }
@@ -677,6 +720,31 @@ pub const V3d = struct {
         format: u2,
     };
 
+    inline fn canSkipUnmodifiedStore(
+        self: *const V3d,
+        dst_addr: u32,
+        fb_w: u32,
+        fb_h: u32,
+        tile_x: u32,
+        tile_y: u32,
+        tile_size: u32,
+        tiling: u2,
+        format: u2,
+    ) bool {
+        if (self.tile_modified) return false;
+        const lf = self.loaded_from orelse return false;
+        const dst_is_565 = (format == 1 or format == 2);
+        const src_is_565 = (lf.format == 1 or lf.format == 2);
+        return (lf.addr & 0x1FFFFFFF) == (dst_addr & 0x1FFFFFFF) and
+            lf.fb_w == fb_w and
+            lf.fb_h == fb_h and
+            lf.tile_x == tile_x and
+            lf.tile_y == tile_y and
+            lf.tile_size == tile_size and
+            lf.tiling == tiling and
+            dst_is_565 == src_is_565;
+    }
+
     fn executeRcl(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) void {
         var pc = start_bus & 0x1FFFFFFF;
         const end = end_bus & 0x1FFFFFFF;
@@ -696,7 +764,9 @@ pub const V3d = struct {
         var has_tile_coords: bool = false;
         var pending_load: ?PendingTileLoad = null;
         var tile_loaded: bool = false;
-        var tile_rendered: bool = false;
+        self.lazy_load = null;
+        self.loaded_from = null;
+        self.tile_modified = false;
 
         while (pc < end) {
             const op = ram[pc];
@@ -711,31 +781,45 @@ pub const V3d = struct {
                     if (pc + 5 > end) break;
                     const tile_size: u32 = 64;
                     if (!tile_loaded) {
+                        self.lazy_load = null;
+                        self.loaded_from = null;
                         self.tile_color_solid = clear_color0;
                         self.tile_depth_valid = false;
                         self.tile_clear_zs = clear_zs;
+                        self.tile_modified = false;
                         tile_loaded = true;
                     }
                     self.renderDrawsIntoTile(ram, cur_tile_x * tile_size, cur_tile_y * tile_size, tile_size);
-                    tile_rendered = true;
                     pc += 5;
                 },
                 24, 25 => { // STORE_MS_TILE_BUFFER / STORE_MS_TILE_BUFFER_AND_EOF (1 byte)
                     const tile_size: u32 = 64;
                     if (!tile_loaded) {
+                        self.lazy_load = null;
+                        self.loaded_from = null;
                         self.tile_color_solid = clear_color0;
                         self.tile_depth_valid = false;
                         self.tile_clear_zs = clear_zs;
+                        self.tile_modified = false;
                         tile_loaded = true;
                     }
                     const r_format: u2 = @truncate((fb_flags >> 2) & 3);
                     const r_tiling: u2 = @truncate((fb_flags >> 6) & 3);
                     const ls_format: u2 = if (r_format == 1) 0 else 2;
-                    self.storeTileToRam(ram, fb_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, r_tiling, ls_format);
+                    if (!self.canSkipUnmodifiedStore(fb_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, r_tiling, ls_format)) {
+                        if (self.lazy_load) |ll| {
+                            self.lazy_load = null;
+                            self.loadTileFromRam(ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
+                            self.tile_color_solid = null;
+                        }
+                        self.storeTileToRam(ram, fb_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, r_tiling, ls_format);
+                    }
                     tile_loaded = false;
-                    tile_rendered = false;
                     has_tile_coords = false;
                     pending_load = null;
+                    self.lazy_load = null;
+                    self.loaded_from = null;
+                    self.tile_modified = false;
                     pc += 1;
                 },
                 28 => { // STORE_TILE_BUFFER_GENERAL (7 bytes)
@@ -746,20 +830,32 @@ pub const V3d = struct {
                     if (buf_kind == 1) { // Color buffer store
                         const tile_size: u32 = 64;
                         if (!tile_loaded) {
+                            self.lazy_load = null;
+                            self.loaded_from = null;
                             self.tile_color_solid = clear_color0;
+                            self.tile_modified = false;
                             tile_loaded = true;
                         }
                         const ls_tiling: u2 = @truncate((bits >> 4) & 3);
                         const ls_format: u2 = @truncate((bits >> 8) & 3);
                         const dst_addr = if ((addr_word & ~@as(u32, 0xf)) != 0) (addr_word & ~@as(u32, 0xf)) else fb_addr;
-                        self.storeTileToRam(ram, dst_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, ls_tiling, ls_format);
+                        if (!self.canSkipUnmodifiedStore(dst_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, ls_tiling, ls_format)) {
+                            if (self.lazy_load) |ll| {
+                                self.lazy_load = null;
+                                self.loadTileFromRam(ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
+                                self.tile_color_solid = null;
+                            }
+                            self.storeTileToRam(ram, dst_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, ls_tiling, ls_format);
+                        }
                     }
                     if ((bits & (1 << 15)) == 0) {
                         // Last store for tile
                         tile_loaded = false;
-                        tile_rendered = false;
                         has_tile_coords = false;
                         pending_load = null;
+                        self.lazy_load = null;
+                        self.loaded_from = null;
+                        self.tile_modified = false;
                     }
                     pc += 7;
                 },
@@ -773,10 +869,22 @@ pub const V3d = struct {
                         const ls_format: u2 = @truncate((bits >> 8) & 3);
                         const load_addr = addr_word & ~@as(u32, 0xf);
                         if (has_tile_coords) {
-                            self.loadTileFromRam(ram, load_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, 64, ls_tiling, ls_format);
+                            const ll = LazyTileLoad{
+                                .addr = load_addr,
+                                .fb_w = fb_width,
+                                .fb_h = fb_height,
+                                .tile_x = cur_tile_x,
+                                .tile_y = cur_tile_y,
+                                .tile_size = 64,
+                                .tiling = ls_tiling,
+                                .format = ls_format,
+                            };
+                            self.lazy_load = ll;
+                            self.loaded_from = ll;
                             self.tile_color_solid = null;
                             self.tile_depth_valid = false;
                             self.tile_clear_zs = clear_zs;
+                            self.tile_modified = false;
                             tile_loaded = true;
                         } else {
                             pending_load = .{
@@ -816,16 +924,31 @@ pub const V3d = struct {
                     cur_tile_y = ram[pc + 2];
                     has_tile_coords = true;
                     if (pending_load) |pl| {
-                        self.loadTileFromRam(ram, pl.addr, fb_width, fb_height, cur_tile_x, cur_tile_y, 64, pl.tiling, pl.format);
+                        const ll = LazyTileLoad{
+                            .addr = pl.addr,
+                            .fb_w = fb_width,
+                            .fb_h = fb_height,
+                            .tile_x = cur_tile_x,
+                            .tile_y = cur_tile_y,
+                            .tile_size = 64,
+                            .tiling = pl.tiling,
+                            .format = pl.format,
+                        };
+                        self.lazy_load = ll;
+                        self.loaded_from = ll;
                         self.tile_color_solid = null;
                         self.tile_depth_valid = false;
                         self.tile_clear_zs = clear_zs;
+                        self.tile_modified = false;
                         tile_loaded = true;
                         pending_load = null;
                     } else if (!tile_loaded) {
+                        self.lazy_load = null;
+                        self.loaded_from = null;
                         self.tile_color_solid = clear_color0;
                         self.tile_depth_valid = false;
                         self.tile_clear_zs = clear_zs;
+                        self.tile_modified = false;
                         tile_loaded = true;
                     }
                     pc += 3;
@@ -868,13 +991,22 @@ pub const V3d = struct {
                 }
                 return;
             } else if (tiling != 0 and (valid_w & 3) == 0) {
+                const is_lt = (fb_w <= 16 or fb_h <= 16);
+                const lt_row_stride = ((fb_w + 3) & ~@as(u32, 3)) << 2;
+                const utile_stride = ((fb_w + 31) & ~@as(u32, 31)) >> 2;
+                const base_ux = x0 >> 2;
+                const base_uy = y0 >> 2;
                 const utiles_x = valid_w >> 2;
                 const utiles_y = valid_h >> 2;
                 for (0..utiles_y) |uy| {
+                    const abs_uy = base_uy + @as(u32, @intCast(uy));
+                    var group_base: u32 = 0;
                     for (0..utiles_x) |ux| {
-                        const px = x0 + @as(u32, @intCast(ux * 4));
-                        const py = y0 + @as(u32, @intCast(uy * 4));
-                        const utile_off = base + texture.texelOffsetOf(.argb8888, fb_w, fb_h, px, py);
+                        const abs_ux = base_ux + @as(u32, @intCast(ux));
+                        if ((ux & 3) == 0) {
+                            group_base = base + texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, abs_ux & ~@as(u32, 3), abs_uy);
+                        }
+                        const utile_off = group_base + ((abs_ux & 3) << 6);
                         if (utile_off + 64 <= ram.len) {
                             inline for (0..4) |ry| {
                                 const dst_idx = (uy * 4 + ry) * 64 + ux * 4;
@@ -889,20 +1021,27 @@ pub const V3d = struct {
                 if ((valid_h & 3) == 0) return;
             }
         } else if (is_565 and tile_size == 64 and tiling != 0 and (valid_w & 7) == 0) {
+            const is_lt = (fb_w <= 32 or fb_h <= 16);
+            const lt_row_stride = ((fb_w + 7) & ~@as(u32, 7)) << 1;
+            const utile_stride = ((fb_w + 63) & ~@as(u32, 63)) >> 3;
+            const base_ux = x0 >> 3;
+            const base_uy = y0 >> 2;
             const utiles_x = valid_w >> 3;
             const utiles_y = valid_h >> 2;
             for (0..utiles_y) |uy| {
+                const abs_uy = base_uy + @as(u32, @intCast(uy));
+                var group_base: u32 = 0;
                 for (0..utiles_x) |ux| {
-                    const px = x0 + @as(u32, @intCast(ux * 8));
-                    const py = y0 + @as(u32, @intCast(uy * 4));
-                    const utile_off = base + texture.texelOffsetOf(.rgb565, fb_w, fb_h, px, py);
+                    const abs_ux = base_ux + @as(u32, @intCast(ux));
+                    if ((ux & 3) == 0) {
+                        group_base = base + texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, abs_ux & ~@as(u32, 3), abs_uy);
+                    }
+                    const utile_off = group_base + ((abs_ux & 3) << 6);
                     if (utile_off + 64 <= ram.len) {
                         inline for (0..4) |ry| {
                             const dst_row = self.tile_color[(uy * 4 + ry) * 64 + ux * 8 ..][0..8];
-                            const src_bytes = ram[utile_off + ry * 16 ..][0..16];
-                            inline for (0..8) |rx| {
-                                dst_row[rx] = format_mod.fromRgb565(std.mem.readInt(u16, src_bytes[rx * 2 ..][0..2], .little));
-                            }
+                            const p16_vec: @Vector(8, u16) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
+                            dst_row.* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
                         }
                     }
                 }
@@ -1079,8 +1218,13 @@ pub const V3d = struct {
         }
     }
 
-    fn ensureTileMaterialized(self: *V3d, need_depth: bool) void {
-        if (self.tile_color_solid) |c| {
+    fn ensureTileMaterialized(self: *V3d, ram: []const u8, need_depth: bool) void {
+        self.tile_modified = true;
+        if (self.lazy_load) |ll| {
+            self.lazy_load = null;
+            self.loadTileFromRam(ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
+            self.tile_color_solid = null;
+        } else if (self.tile_color_solid) |c| {
             @memset(&self.tile_color, c);
             self.tile_color_solid = null;
         }
@@ -1094,52 +1238,113 @@ pub const V3d = struct {
         const tile_end_x = tile_px_x + tile_size;
         const tile_end_y = tile_px_y + tile_size;
 
+        const use_spatial_bin = (tile_size == 64 and (tile_px_x & 63) == 0 and (tile_px_y & 63) == 0 and (tile_px_x >> 6) < 32 and (tile_px_y >> 6) < 32);
+        if (use_spatial_bin) {
+            const tx = tile_px_x >> 6;
+            const ty = tile_px_y >> 6;
+            if ((self.tile_nonempty[ty] & (@as(u32, 1) << @intCast(tx))) == 0 and self.overflow_draw_start >= self.draws_len) {
+                return;
+            }
+        }
+
         var fs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
         var fs_unif_buf: [128]u32 = undefined;
         var cur_draw_idx: ?u16 = null;
         var cur_fs_decoded: []const qpu_sim.DecodedInst = &.{};
         var cur_fs_unifs: []const u32 = &.{};
 
-        for (self.shaded_tris[0..self.shaded_tris_len]) |*tri| {
-            if (tri.max_x <= tile_px_x or tri.min_x >= tile_end_x or
-                tri.max_y <= tile_px_y or tri.min_y >= tile_end_y)
-            {
-                continue;
-            }
+        if (use_spatial_bin) {
+            const tx = tile_px_x >> 6;
+            const ty = tile_px_y >> 6;
+            if ((self.tile_nonempty[ty] & (@as(u32, 1) << @intCast(tx))) != 0) {
+                const t_idx = ty * 32 + tx;
+                const active_words = (self.shaded_tris_len + 63) >> 6;
+                for (0..active_words) |w_i| {
+                    var bits = self.tile_tri_mask[t_idx][w_i];
+                    while (bits != 0) {
+                        const bit_pos: usize = @ctz(bits);
+                        bits &= bits - 1;
+                        const tri_idx = (w_i << 6) + bit_pos;
+                        if (tri_idx >= self.shaded_tris_len) break;
+                        const tri = &self.shaded_tris[tri_idx];
+                        const prep = self.prep_draws[tri.draw_idx];
+                        if (!prep.valid) continue;
 
-            const prep = self.prep_draws[tri.draw_idx];
-            if (!prep.valid) continue;
+                        if (cur_draw_idx == null or cur_draw_idx.? != tri.draw_idx) {
+                            cur_draw_idx = tri.draw_idx;
+                            if (prep.fs_cached) {
+                                cur_fs_decoded = self.prep_fs_insts[prep.fs_inst_start..][0..prep.fs_code_len];
+                                cur_fs_unifs = self.prep_fs_unifs[prep.fs_unif_start..][0..prep.fs_unif_len];
+                            } else {
+                                for (0..prep.fs_code_len) |i| {
+                                    const raw_inst = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
+                                    fs_decoded_buf[i] = qpu_sim.decodeInst(raw_inst);
+                                }
+                                cur_fs_decoded = fs_decoded_buf[0..prep.fs_code_len];
+                                for (0..prep.fs_unif_len) |i| {
+                                    fs_unif_buf[i] = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
+                                }
+                                cur_fs_unifs = fs_unif_buf[0..prep.fs_unif_len];
+                            }
+                        }
 
-            if (cur_draw_idx == null or cur_draw_idx.? != tri.draw_idx) {
-                cur_draw_idx = tri.draw_idx;
-                if (prep.fs_cached) {
-                    cur_fs_decoded = self.prep_fs_insts[prep.fs_inst_start..][0..prep.fs_code_len];
-                    cur_fs_unifs = self.prep_fs_unifs[prep.fs_unif_start..][0..prep.fs_unif_len];
-                } else {
-                    for (0..prep.fs_code_len) |i| {
-                        const raw_inst = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
-                        fs_decoded_buf[i] = qpu_sim.decodeInst(raw_inst);
+                        const draw = self.draws[tri.draw_idx];
+                        self.rasterizeShadedTriangleDecodedInTile(
+                            ram,
+                            draw,
+                            tri,
+                            cur_fs_decoded,
+                            cur_fs_unifs,
+                            prep.fs_num_varyings,
+                            tile_px_x,
+                            tile_px_y,
+                            tile_size,
+                        );
                     }
-                    cur_fs_decoded = fs_decoded_buf[0..prep.fs_code_len];
-                    for (0..prep.fs_unif_len) |i| {
-                        fs_unif_buf[i] = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
-                    }
-                    cur_fs_unifs = fs_unif_buf[0..prep.fs_unif_len];
                 }
             }
+        } else {
+            for (self.shaded_tris[0..self.shaded_tris_len]) |*tri| {
+                if (tri.max_x <= tile_px_x or tri.min_x >= tile_end_x or
+                    tri.max_y <= tile_px_y or tri.min_y >= tile_end_y)
+                {
+                    continue;
+                }
 
-            const draw = self.draws[tri.draw_idx];
-            self.rasterizeShadedTriangleDecodedInTile(
-                ram,
-                draw,
-                tri,
-                cur_fs_decoded,
-                cur_fs_unifs,
-                prep.fs_num_varyings,
-                tile_px_x,
-                tile_px_y,
-                tile_size,
-            );
+                const prep = self.prep_draws[tri.draw_idx];
+                if (!prep.valid) continue;
+
+                if (cur_draw_idx == null or cur_draw_idx.? != tri.draw_idx) {
+                    cur_draw_idx = tri.draw_idx;
+                    if (prep.fs_cached) {
+                        cur_fs_decoded = self.prep_fs_insts[prep.fs_inst_start..][0..prep.fs_code_len];
+                        cur_fs_unifs = self.prep_fs_unifs[prep.fs_unif_start..][0..prep.fs_unif_len];
+                    } else {
+                        for (0..prep.fs_code_len) |i| {
+                            const raw_inst = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
+                            fs_decoded_buf[i] = qpu_sim.decodeInst(raw_inst);
+                        }
+                        cur_fs_decoded = fs_decoded_buf[0..prep.fs_code_len];
+                        for (0..prep.fs_unif_len) |i| {
+                            fs_unif_buf[i] = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
+                        }
+                        cur_fs_unifs = fs_unif_buf[0..prep.fs_unif_len];
+                    }
+                }
+
+                const draw = self.draws[tri.draw_idx];
+                self.rasterizeShadedTriangleDecodedInTile(
+                    ram,
+                    draw,
+                    tri,
+                    cur_fs_decoded,
+                    cur_fs_unifs,
+                    prep.fs_num_varyings,
+                    tile_px_x,
+                    tile_px_y,
+                    tile_size,
+                );
+            }
         }
 
         if (self.overflow_draw_start < self.draws_len) {
@@ -1401,7 +1606,7 @@ pub const V3d = struct {
         const depth_func: u3 = @truncate((draw.config_b1 >> 4) & 7);
         const z_updates = (draw.config_b1 & 0x80) != 0;
         const need_depth = (depth_func != 7) or z_updates;
-        self.ensureTileMaterialized(need_depth);
+        var tile_materialized = false;
 
         const v = &tri.v;
         const abs_area = @abs(tri.area);
@@ -1568,6 +1773,10 @@ pub const V3d = struct {
                         edge2.passes(edge2.eval(row_term2, fx0)) and
                         edge2.passes(edge2.eval(row_term2, fx15)))
                     {
+                        if (!tile_materialized) {
+                            self.ensureTileMaterialized(ram, need_depth);
+                            tile_materialized = true;
+                        }
                         const tile_idx = row_base + (px - tile_px_x);
                         const fx_vec = @as(@Vector(16, f32), @splat(fx0)) + lane_f_offsets;
                         const e0_vec = (@as(@Vector(16, f32), @splat(row_term0)) - @as(@Vector(16, f32), @splat(edge0.dy)) * (fx_vec - @as(@Vector(16, f32), @splat(edge0.p0x)))) * @as(@Vector(16, f32), @splat(edge0.sign));
@@ -1641,6 +1850,11 @@ pub const V3d = struct {
                 if (!edge1.passes(e1)) continue;
                 const e2 = edge2.eval(row_term2, fx);
                 if (!edge2.passes(e2)) continue;
+
+                if (!tile_materialized) {
+                    self.ensureTileMaterialized(ram, need_depth);
+                    tile_materialized = true;
+                }
 
                 const w0 = e0 * inv_area;
                 const w1 = e1 * inv_area;
