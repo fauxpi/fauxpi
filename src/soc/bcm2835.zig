@@ -149,19 +149,102 @@ pub const Bcm2835 = struct {
         self.write32(raw_addr, val);
     }
 
-    /// Updates all interrupt lines on `IntController` from peripheral states.
-    pub fn updateIrqs(self: *Bcm2835) void {
-        const b0: u32 = (@as(u32, @intFromBool(self.arm_timer.irqPending())) << 0) |
+    const MmioPage = enum(u8) {
+        none = 0,
+        timer,
+        txp,
+        dma,
+        asb,
+        page_00b,
+        pm,
+        cprman,
+        rng,
+        gpio,
+        uart0,
+        sdhost,
+        i2s,
+        spi0,
+        bsc0,
+        pv0,
+        pv1,
+        pwm,
+        thermal,
+        aux_uart,
+        sdhci,
+        hvs,
+        bsc1,
+        bsc2,
+        pv2,
+        hdmi_hd,
+        hdmi_core,
+        usb,
+        v3d,
+    };
+
+    const MMIO_PAGE_TABLE: [4096]MmioPage = blk: {
+        var table = [_]MmioPage{.none} ** 4096;
+        const Entry = struct { base: u32, size: u32, tag: MmioPage };
+        const entries = [_]Entry{
+            .{ .base = TIMER_BASE, .size = TIMER_SIZE, .tag = .timer },
+            .{ .base = hdmi_mod.Txp.BASE_ADDR, .size = hdmi_mod.Txp.SIZE, .tag = .txp },
+            .{ .base = dma_mod.DmaController.BASE_ADDR, .size = dma_mod.DmaController.SIZE, .tag = .dma },
+            .{ .base = pm_mod.AsbBridge.BASE_ADDR, .size = pm_mod.AsbBridge.SIZE, .tag = .asb },
+            .{ .base = INTC_BASE, .size = INTC_SIZE, .tag = .page_00b },
+            .{ .base = timer_mod.ArmTimer.BASE_ADDR, .size = timer_mod.ArmTimer.SIZE, .tag = .page_00b },
+            .{ .base = audio_mod.Vchiq.BASE_ADDR, .size = audio_mod.Vchiq.SIZE, .tag = .page_00b },
+            .{ .base = mailbox_mod.Mailbox.BASE_ADDR, .size = mailbox_mod.Mailbox.SIZE, .tag = .page_00b },
+            .{ .base = pm_mod.PowerManager.BASE_ADDR, .size = pm_mod.PowerManager.SIZE, .tag = .pm },
+            .{ .base = cprman_mod.Cprman.BASE_ADDR, .size = cprman_mod.Cprman.SIZE, .tag = .cprman },
+            .{ .base = pm_mod.Rng.BASE_ADDR, .size = pm_mod.Rng.SIZE, .tag = .rng },
+            .{ .base = gpio_mod.Gpio.BASE_ADDR, .size = gpio_mod.Gpio.SIZE, .tag = .gpio },
+            .{ .base = uart_mod.Pl011Uart.BASE_ADDR, .size = uart_mod.Pl011Uart.SIZE, .tag = .uart0 },
+            .{ .base = sdhost_mod.SdHost.BASE_ADDR, .size = sdhost_mod.SdHost.SIZE, .tag = .sdhost },
+            .{ .base = audio_mod.I2sPcm.BASE_ADDR, .size = audio_mod.I2sPcm.SIZE, .tag = .i2s },
+            .{ .base = spi_mod.Spi0.BASE_ADDR, .size = spi_mod.Spi0.SIZE, .tag = .spi0 },
+            .{ .base = i2c_mod.BscController.BSC0_BASE, .size = i2c_mod.BscController.SIZE, .tag = .bsc0 },
+            .{ .base = pv_mod.PixelValve.PV0_BASE, .size = pv_mod.PixelValve.SIZE, .tag = .pv0 },
+            .{ .base = pv_mod.PixelValve.PV1_BASE, .size = pv_mod.PixelValve.SIZE, .tag = .pv1 },
+            .{ .base = audio_mod.PwmAudio.BASE_ADDR, .size = audio_mod.PwmAudio.SIZE, .tag = .pwm },
+            .{ .base = pm_mod.Thermal.BASE_ADDR, .size = pm_mod.Thermal.SIZE, .tag = .thermal },
+            .{ .base = uart_mod.AuxMiniUart.BASE_ADDR, .size = uart_mod.AuxMiniUart.SIZE, .tag = .aux_uart },
+            .{ .base = sdhost_mod.ArasanSdhci.BASE_ADDR, .size = sdhost_mod.ArasanSdhci.SIZE, .tag = .sdhci },
+            .{ .base = hvs_mod.Hvs.BASE_ADDR, .size = hvs_mod.Hvs.SIZE, .tag = .hvs },
+            .{ .base = i2c_mod.BscController.BSC1_BASE, .size = i2c_mod.BscController.SIZE, .tag = .bsc1 },
+            .{ .base = i2c_mod.BscController.BSC2_BASE, .size = i2c_mod.BscController.SIZE, .tag = .bsc2 },
+            .{ .base = pv_mod.PixelValve.PV2_BASE, .size = pv_mod.PixelValve.SIZE, .tag = .pv2 },
+            .{ .base = hdmi_mod.Hdmi.HD_BASE, .size = hdmi_mod.Hdmi.HD_SIZE, .tag = .hdmi_hd },
+            .{ .base = hdmi_mod.Hdmi.HDMI_BASE, .size = hdmi_mod.Hdmi.HDMI_SIZE, .tag = .hdmi_core },
+            .{ .base = dwc2_mod.Dwc2Controller.BASE_ADDR, .size = dwc2_mod.Dwc2Controller.SIZE, .tag = .usb },
+            .{ .base = v3d_mod.V3d.BASE_ADDR, .size = v3d_mod.V3d.SIZE, .tag = .v3d },
+        };
+        for (entries) |e| {
+            const first_page = (e.base - PERIPH_BASE) >> 12;
+            const last_page = (e.base + e.size - 1 - PERIPH_BASE) >> 12;
+            var p = first_page;
+            while (p <= last_page) : (p += 1) {
+                std.debug.assert(table[p] == .none or table[p] == e.tag);
+                table[p] = e.tag;
+            }
+        }
+        break :blk table;
+    };
+
+    pub inline fn updateIrqsBank0(self: *Bcm2835) void {
+        self.intc.raw_level[0] = (@as(u32, @intFromBool(self.arm_timer.irqPending())) << 0) |
             (@as(u32, @intFromBool(self.mailbox.irqPending())) << 1) |
             (@as(u32, @intFromBool(self.vchiq.irqPending())) << 2);
+    }
 
-        const b1: u32 = (self.timer.cs & 0xf) |
+    pub inline fn updateIrqsBank1(self: *Bcm2835) void {
+        self.intc.raw_level[1] = (self.timer.cs & 0xf) |
             (@as(u32, @intFromBool(self.usb.irqPending())) << 9) |
             (@as(u32, @intFromBool(self.v3d.irqPending())) << 10) |
             (self.dma.irqMask13() << 16) |
             (@as(u32, @intFromBool(self.aux_uart.irqPending())) << 29);
+    }
 
-        const b2: u32 = (@as(u32, @intFromBool(self.hvs.irqPending())) << 1) |
+    pub inline fn updateIrqsBank2(self: *Bcm2835) void {
+        self.intc.raw_level[2] = (@as(u32, @intFromBool(self.hvs.irqPending())) << 1) |
             (@as(u32, @intFromBool(self.pv2.irqPending())) << 10) |
             (@as(u32, @intFromBool(self.pv0.irqPending())) << 13) |
             (@as(u32, @intFromBool(self.pv1.irqPending())) << 14) |
@@ -172,10 +255,13 @@ pub const Bcm2835 = struct {
             (@as(u32, @intFromBool(self.sdhost.irqPending())) << 24) |
             (@as(u32, @intFromBool(self.uart0.irqPending())) << 25) |
             (@as(u32, @intFromBool(self.sdhci.irqPending())) << 30);
+    }
 
-        self.intc.raw_level[0] = b0;
-        self.intc.raw_level[1] = b1;
-        self.intc.raw_level[2] = b2;
+    /// Updates all interrupt lines on `IntController` from peripheral states.
+    pub fn updateIrqs(self: *Bcm2835) void {
+        self.updateIrqsBank0();
+        self.updateIrqsBank1();
+        self.updateIrqsBank2();
     }
 
     /// Triggers 60 Hz vertical blanking on PixelValves and HVS.
@@ -197,7 +283,7 @@ pub const Bcm2835 = struct {
         // GPIO 46 (BCM2835) and GPIO 28 (BCM2837) are HDMI_HPD_N (active-low: 0 = connected, 1 = disconnected)
         self.gpio.setExternalPin(46, !connected);
         self.gpio.setExternalPin(28, !connected);
-        self.updateIrqs();
+        self.updateIrqsBank2();
     }
 
     /// Connects or disconnects the simulated 3.5 mm audio/video jack.
@@ -293,8 +379,8 @@ pub const Bcm2835 = struct {
     }
 
     inline fn isMmioAddr(addr: u32) bool {
-        return (addr >= PERIPH_BASE and addr < PERIPH_END) or
-            (addr >= local_intc_mod.LocalIntc.BASE_ADDR and addr < local_intc_mod.LocalIntc.BASE_ADDR + local_intc_mod.LocalIntc.SIZE);
+        return (addr -% PERIPH_BASE < (PERIPH_END - PERIPH_BASE)) or
+            (addr -% local_intc_mod.LocalIntc.BASE_ADDR < local_intc_mod.LocalIntc.SIZE);
     }
 
     pub fn read8(self: *Bcm2835, raw_addr: u32) u8 {
@@ -362,7 +448,56 @@ pub const Bcm2835 = struct {
     }
 
     pub fn readMmio32(self: *Bcm2835, addr: u32) u32 {
-        if (addr >= local_intc_mod.LocalIntc.BASE_ADDR and addr < local_intc_mod.LocalIntc.BASE_ADDR + local_intc_mod.LocalIntc.SIZE) {
+        const periph_off = addr -% PERIPH_BASE;
+        if (periph_off < (PERIPH_END - PERIPH_BASE)) {
+            return switch (MMIO_PAGE_TABLE[periph_off >> 12]) {
+                .none => 0,
+                .timer => if (addr -% TIMER_BASE < TIMER_SIZE) self.timer.read32(addr - TIMER_BASE) else 0,
+                .txp => if (addr -% hdmi_mod.Txp.BASE_ADDR < hdmi_mod.Txp.SIZE) self.txp.read32(addr - hdmi_mod.Txp.BASE_ADDR) else 0,
+                .dma => self.dma.read32(addr - dma_mod.DmaController.BASE_ADDR),
+                .asb => if (addr -% pm_mod.AsbBridge.BASE_ADDR < pm_mod.AsbBridge.SIZE) self.asb.read32(addr - pm_mod.AsbBridge.BASE_ADDR) else 0,
+                .page_00b => {
+                    if (addr -% INTC_BASE < INTC_SIZE) {
+                        self.updateIrqs();
+                        return self.intc.read32(addr - INTC_BASE);
+                    }
+                    if (addr -% timer_mod.ArmTimer.BASE_ADDR < timer_mod.ArmTimer.SIZE) {
+                        return self.arm_timer.read32(addr - timer_mod.ArmTimer.BASE_ADDR);
+                    }
+                    if (addr -% audio_mod.Vchiq.BASE_ADDR < audio_mod.Vchiq.SIZE) {
+                        return self.vchiq.read32(addr - audio_mod.Vchiq.BASE_ADDR);
+                    }
+                    if (addr -% mailbox_mod.Mailbox.BASE_ADDR < mailbox_mod.Mailbox.SIZE) {
+                        return self.mailbox.read32(addr - mailbox_mod.Mailbox.BASE_ADDR);
+                    }
+                    return 0;
+                },
+                .pm => if (addr -% pm_mod.PowerManager.BASE_ADDR < pm_mod.PowerManager.SIZE) self.pm.read32(addr - pm_mod.PowerManager.BASE_ADDR) else 0,
+                .cprman => self.cprman.read32(addr - cprman_mod.Cprman.BASE_ADDR),
+                .rng => if (addr -% pm_mod.Rng.BASE_ADDR < pm_mod.Rng.SIZE) self.rng.read32(addr - pm_mod.Rng.BASE_ADDR) else 0,
+                .gpio => if (addr -% gpio_mod.Gpio.BASE_ADDR < gpio_mod.Gpio.SIZE) self.gpio.read32(addr - gpio_mod.Gpio.BASE_ADDR) else 0,
+                .uart0 => self.uart0.read32(addr - uart_mod.Pl011Uart.BASE_ADDR),
+                .sdhost => if (addr -% sdhost_mod.SdHost.BASE_ADDR < sdhost_mod.SdHost.SIZE) self.sdhost.read32(addr - sdhost_mod.SdHost.BASE_ADDR) else 0,
+                .i2s => if (addr -% audio_mod.I2sPcm.BASE_ADDR < audio_mod.I2sPcm.SIZE) self.i2s.read32(addr - audio_mod.I2sPcm.BASE_ADDR) else 0,
+                .spi0 => if (addr -% spi_mod.Spi0.BASE_ADDR < spi_mod.Spi0.SIZE) self.spi0.read32(addr - spi_mod.Spi0.BASE_ADDR) else 0,
+                .bsc0 => if (addr -% i2c_mod.BscController.BSC0_BASE < i2c_mod.BscController.SIZE) self.bsc0.read32(addr - i2c_mod.BscController.BSC0_BASE) else 0,
+                .pv0 => if (addr -% pv_mod.PixelValve.PV0_BASE < pv_mod.PixelValve.SIZE) self.pv0.read32(addr - pv_mod.PixelValve.PV0_BASE) else 0,
+                .pv1 => if (addr -% pv_mod.PixelValve.PV1_BASE < pv_mod.PixelValve.SIZE) self.pv1.read32(addr - pv_mod.PixelValve.PV1_BASE) else 0,
+                .pwm => if (addr -% audio_mod.PwmAudio.BASE_ADDR < audio_mod.PwmAudio.SIZE) self.pwm.read32(addr - audio_mod.PwmAudio.BASE_ADDR) else 0,
+                .thermal => if (addr -% pm_mod.Thermal.BASE_ADDR < pm_mod.Thermal.SIZE) self.thermal.read32(addr - pm_mod.Thermal.BASE_ADDR) else 0,
+                .aux_uart => if (addr -% uart_mod.AuxMiniUart.BASE_ADDR < uart_mod.AuxMiniUart.SIZE) self.aux_uart.read32(addr - uart_mod.AuxMiniUart.BASE_ADDR) else 0,
+                .sdhci => if (addr -% sdhost_mod.ArasanSdhci.BASE_ADDR < sdhost_mod.ArasanSdhci.SIZE) self.sdhci.read32WithSd(addr - sdhost_mod.ArasanSdhci.BASE_ADDR, &self.sdhost) else 0,
+                .hvs => self.hvs.read32(addr - hvs_mod.Hvs.BASE_ADDR),
+                .bsc1 => if (addr -% i2c_mod.BscController.BSC1_BASE < i2c_mod.BscController.SIZE) self.bsc1.read32(addr - i2c_mod.BscController.BSC1_BASE) else 0,
+                .bsc2 => if (addr -% i2c_mod.BscController.BSC2_BASE < i2c_mod.BscController.SIZE) self.bsc2.read32(addr - i2c_mod.BscController.BSC2_BASE) else 0,
+                .pv2 => if (addr -% pv_mod.PixelValve.PV2_BASE < pv_mod.PixelValve.SIZE) self.pv2.read32(addr - pv_mod.PixelValve.PV2_BASE) else 0,
+                .hdmi_hd => if (addr -% hdmi_mod.Hdmi.HD_BASE < hdmi_mod.Hdmi.HD_SIZE) self.hdmi.readHd32(addr - hdmi_mod.Hdmi.HD_BASE) else 0,
+                .hdmi_core => if (addr -% hdmi_mod.Hdmi.HDMI_BASE < hdmi_mod.Hdmi.HDMI_SIZE) self.hdmi.readHdmi32(addr - hdmi_mod.Hdmi.HDMI_BASE) else 0,
+                .usb => self.usb.read32(addr - dwc2_mod.Dwc2Controller.BASE_ADDR),
+                .v3d => self.v3d.read32(addr - v3d_mod.V3d.BASE_ADDR),
+            };
+        }
+        if (addr -% local_intc_mod.LocalIntc.BASE_ADDR < local_intc_mod.LocalIntc.SIZE) {
             self.updateIrqs();
             return self.local_intc.read32(
                 addr - local_intc_mod.LocalIntc.BASE_ADDR,
@@ -371,192 +506,168 @@ pub const Bcm2835 = struct {
                 self.intc.hasPendingFiq(),
             );
         }
-        if (addr >= TIMER_BASE and addr < TIMER_BASE + TIMER_SIZE) {
-            return self.timer.read32(addr - TIMER_BASE);
-        }
-        if (addr >= hdmi_mod.Txp.BASE_ADDR and addr < hdmi_mod.Txp.BASE_ADDR + hdmi_mod.Txp.SIZE) {
-            return self.txp.read32(addr - hdmi_mod.Txp.BASE_ADDR);
-        }
-        if (addr >= dma_mod.DmaController.BASE_ADDR and addr < dma_mod.DmaController.BASE_ADDR + dma_mod.DmaController.SIZE) {
-            return self.dma.read32(addr - dma_mod.DmaController.BASE_ADDR);
-        }
-        if (addr >= pm_mod.AsbBridge.BASE_ADDR and addr < pm_mod.AsbBridge.BASE_ADDR + pm_mod.AsbBridge.SIZE) {
-            return self.asb.read32(addr - pm_mod.AsbBridge.BASE_ADDR);
-        }
-        if (addr >= INTC_BASE and addr < INTC_BASE + INTC_SIZE) {
-            self.updateIrqs();
-            return self.intc.read32(addr - INTC_BASE);
-        }
-        if (addr >= timer_mod.ArmTimer.BASE_ADDR and addr < timer_mod.ArmTimer.BASE_ADDR + timer_mod.ArmTimer.SIZE) {
-            return self.arm_timer.read32(addr - timer_mod.ArmTimer.BASE_ADDR);
-        }
-        if (addr >= audio_mod.Vchiq.BASE_ADDR and addr < audio_mod.Vchiq.BASE_ADDR + audio_mod.Vchiq.SIZE) {
-            return self.vchiq.read32(addr - audio_mod.Vchiq.BASE_ADDR);
-        }
-        if (addr >= mailbox_mod.Mailbox.BASE_ADDR and addr < mailbox_mod.Mailbox.BASE_ADDR + mailbox_mod.Mailbox.SIZE) {
-            return self.mailbox.read32(addr - mailbox_mod.Mailbox.BASE_ADDR);
-        }
-        if (addr >= pm_mod.PowerManager.BASE_ADDR and addr < pm_mod.PowerManager.BASE_ADDR + pm_mod.PowerManager.SIZE) {
-            return self.pm.read32(addr - pm_mod.PowerManager.BASE_ADDR);
-        }
-        if (addr >= cprman_mod.Cprman.BASE_ADDR and addr < cprman_mod.Cprman.BASE_ADDR + cprman_mod.Cprman.SIZE) {
-            return self.cprman.read32(addr - cprman_mod.Cprman.BASE_ADDR);
-        }
-        if (addr >= pm_mod.Rng.BASE_ADDR and addr < pm_mod.Rng.BASE_ADDR + pm_mod.Rng.SIZE) {
-            return self.rng.read32(addr - pm_mod.Rng.BASE_ADDR);
-        }
-        if (addr >= gpio_mod.Gpio.BASE_ADDR and addr < gpio_mod.Gpio.BASE_ADDR + gpio_mod.Gpio.SIZE) {
-            return self.gpio.read32(addr - gpio_mod.Gpio.BASE_ADDR);
-        }
-        if (addr >= uart_mod.Pl011Uart.BASE_ADDR and addr < uart_mod.Pl011Uart.BASE_ADDR + uart_mod.Pl011Uart.SIZE) {
-            return self.uart0.read32(addr - uart_mod.Pl011Uart.BASE_ADDR);
-        }
-        if (addr >= sdhost_mod.SdHost.BASE_ADDR and addr < sdhost_mod.SdHost.BASE_ADDR + sdhost_mod.SdHost.SIZE) {
-            return self.sdhost.read32(addr - sdhost_mod.SdHost.BASE_ADDR);
-        }
-        if (addr >= audio_mod.I2sPcm.BASE_ADDR and addr < audio_mod.I2sPcm.BASE_ADDR + audio_mod.I2sPcm.SIZE) {
-            return self.i2s.read32(addr - audio_mod.I2sPcm.BASE_ADDR);
-        }
-        if (addr >= spi_mod.Spi0.BASE_ADDR and addr < spi_mod.Spi0.BASE_ADDR + spi_mod.Spi0.SIZE) {
-            return self.spi0.read32(addr - spi_mod.Spi0.BASE_ADDR);
-        }
-        if (addr >= i2c_mod.BscController.BSC0_BASE and addr < i2c_mod.BscController.BSC0_BASE + i2c_mod.BscController.SIZE) {
-            return self.bsc0.read32(addr - i2c_mod.BscController.BSC0_BASE);
-        }
-        if (addr >= pv_mod.PixelValve.PV0_BASE and addr < pv_mod.PixelValve.PV0_BASE + pv_mod.PixelValve.SIZE) {
-            return self.pv0.read32(addr - pv_mod.PixelValve.PV0_BASE);
-        }
-        if (addr >= pv_mod.PixelValve.PV1_BASE and addr < pv_mod.PixelValve.PV1_BASE + pv_mod.PixelValve.SIZE) {
-            return self.pv1.read32(addr - pv_mod.PixelValve.PV1_BASE);
-        }
-        if (addr >= audio_mod.PwmAudio.BASE_ADDR and addr < audio_mod.PwmAudio.BASE_ADDR + audio_mod.PwmAudio.SIZE) {
-            return self.pwm.read32(addr - audio_mod.PwmAudio.BASE_ADDR);
-        }
-        if (addr >= pm_mod.Thermal.BASE_ADDR and addr < pm_mod.Thermal.BASE_ADDR + pm_mod.Thermal.SIZE) {
-            return self.thermal.read32(addr - pm_mod.Thermal.BASE_ADDR);
-        }
-        if (addr >= uart_mod.AuxMiniUart.BASE_ADDR and addr < uart_mod.AuxMiniUart.BASE_ADDR + uart_mod.AuxMiniUart.SIZE) {
-            return self.aux_uart.read32(addr - uart_mod.AuxMiniUart.BASE_ADDR);
-        }
-        if (addr >= sdhost_mod.ArasanSdhci.BASE_ADDR and addr < sdhost_mod.ArasanSdhci.BASE_ADDR + sdhost_mod.ArasanSdhci.SIZE) {
-            return self.sdhci.read32WithSd(addr - sdhost_mod.ArasanSdhci.BASE_ADDR, &self.sdhost);
-        }
-        if (addr >= hvs_mod.Hvs.BASE_ADDR and addr < hvs_mod.Hvs.BASE_ADDR + hvs_mod.Hvs.SIZE) {
-            return self.hvs.read32(addr - hvs_mod.Hvs.BASE_ADDR);
-        }
-        if (addr >= i2c_mod.BscController.BSC1_BASE and addr < i2c_mod.BscController.BSC1_BASE + i2c_mod.BscController.SIZE) {
-            return self.bsc1.read32(addr - i2c_mod.BscController.BSC1_BASE);
-        }
-        if (addr >= i2c_mod.BscController.BSC2_BASE and addr < i2c_mod.BscController.BSC2_BASE + i2c_mod.BscController.SIZE) {
-            return self.bsc2.read32(addr - i2c_mod.BscController.BSC2_BASE);
-        }
-        if (addr >= pv_mod.PixelValve.PV2_BASE and addr < pv_mod.PixelValve.PV2_BASE + pv_mod.PixelValve.SIZE) {
-            return self.pv2.read32(addr - pv_mod.PixelValve.PV2_BASE);
-        }
-        if (addr >= hdmi_mod.Hdmi.HD_BASE and addr < hdmi_mod.Hdmi.HD_BASE + hdmi_mod.Hdmi.HD_SIZE) {
-            return self.hdmi.readHd32(addr - hdmi_mod.Hdmi.HD_BASE);
-        }
-        if (addr >= hdmi_mod.Hdmi.HDMI_BASE and addr < hdmi_mod.Hdmi.HDMI_BASE + hdmi_mod.Hdmi.HDMI_SIZE) {
-            return self.hdmi.readHdmi32(addr - hdmi_mod.Hdmi.HDMI_BASE);
-        }
-        if (addr >= dwc2_mod.Dwc2Controller.BASE_ADDR and addr < dwc2_mod.Dwc2Controller.BASE_ADDR + dwc2_mod.Dwc2Controller.SIZE) {
-            return self.usb.read32(addr - dwc2_mod.Dwc2Controller.BASE_ADDR);
-        }
-        if (addr >= v3d_mod.V3d.BASE_ADDR and addr < v3d_mod.V3d.BASE_ADDR + v3d_mod.V3d.SIZE) {
-            return self.v3d.read32(addr - v3d_mod.V3d.BASE_ADDR);
-        }
         return 0;
     }
 
     pub fn writeMmio32(self: *Bcm2835, addr: u32, val: u32) void {
-        if (addr >= local_intc_mod.LocalIntc.BASE_ADDR and addr < local_intc_mod.LocalIntc.BASE_ADDR + local_intc_mod.LocalIntc.SIZE) {
-            self.local_intc.write32(addr - local_intc_mod.LocalIntc.BASE_ADDR, val);
-        } else if (addr >= TIMER_BASE and addr < TIMER_BASE + TIMER_SIZE) {
-            self.timer.write32(addr - TIMER_BASE, val, &self.intc);
-        } else if (addr >= hdmi_mod.Txp.BASE_ADDR and addr < hdmi_mod.Txp.BASE_ADDR + hdmi_mod.Txp.SIZE) {
-            self.txp.write32(addr - hdmi_mod.Txp.BASE_ADDR, val);
-        } else if (addr >= dma_mod.DmaController.BASE_ADDR and addr < dma_mod.DmaController.BASE_ADDR + dma_mod.DmaController.SIZE) {
-            self.dma.write32(addr - dma_mod.DmaController.BASE_ADDR, val, self.ram, self.dmaMmio());
-        } else if (addr >= pm_mod.AsbBridge.BASE_ADDR and addr < pm_mod.AsbBridge.BASE_ADDR + pm_mod.AsbBridge.SIZE) {
-            self.asb.write32(addr - pm_mod.AsbBridge.BASE_ADDR, val);
-        } else if (addr >= INTC_BASE and addr < INTC_BASE + INTC_SIZE) {
-            self.intc.write32(addr - INTC_BASE, val);
-        } else if (addr >= timer_mod.ArmTimer.BASE_ADDR and addr < timer_mod.ArmTimer.BASE_ADDR + timer_mod.ArmTimer.SIZE) {
-            self.arm_timer.write32(addr - timer_mod.ArmTimer.BASE_ADDR, val, &self.intc);
-        } else if (addr >= audio_mod.Vchiq.BASE_ADDR and addr < audio_mod.Vchiq.BASE_ADDR + audio_mod.Vchiq.SIZE) {
-            self.vchiq.write32(
-                addr - audio_mod.Vchiq.BASE_ADDR,
-                val,
-                self.ram,
-                &self.audio_fifo,
-                self.audio_connected,
-                self.hdmi.connected,
-            );
-        } else if (addr >= mailbox_mod.Mailbox.BASE_ADDR and addr < mailbox_mod.Mailbox.BASE_ADDR + mailbox_mod.Mailbox.SIZE) {
-            self.mailbox.write32WithVchiq(addr - mailbox_mod.Mailbox.BASE_ADDR, val, self.ram, &self.vchiq);
-        } else if (addr >= pm_mod.PowerManager.BASE_ADDR and addr < pm_mod.PowerManager.BASE_ADDR + pm_mod.PowerManager.SIZE) {
-            self.pm.write32(addr - pm_mod.PowerManager.BASE_ADDR, val);
-        } else if (addr >= cprman_mod.Cprman.BASE_ADDR and addr < cprman_mod.Cprman.BASE_ADDR + cprman_mod.Cprman.SIZE) {
-            self.cprman.write32(addr - cprman_mod.Cprman.BASE_ADDR, val);
-        } else if (addr >= pm_mod.Rng.BASE_ADDR and addr < pm_mod.Rng.BASE_ADDR + pm_mod.Rng.SIZE) {
-            self.rng.write32(addr - pm_mod.Rng.BASE_ADDR, val);
-        } else if (addr >= gpio_mod.Gpio.BASE_ADDR and addr < gpio_mod.Gpio.BASE_ADDR + gpio_mod.Gpio.SIZE) {
-            self.gpio.write32(addr - gpio_mod.Gpio.BASE_ADDR, val);
-            self.syncSdRoutingFromGpio();
-        } else if (addr >= uart_mod.Pl011Uart.BASE_ADDR and addr < uart_mod.Pl011Uart.BASE_ADDR + uart_mod.Pl011Uart.SIZE) {
-            self.uart0.write32(addr - uart_mod.Pl011Uart.BASE_ADDR, val);
-        } else if (addr >= sdhost_mod.SdHost.BASE_ADDR and addr < sdhost_mod.SdHost.BASE_ADDR + sdhost_mod.SdHost.SIZE) {
-            const offset = addr - sdhost_mod.SdHost.BASE_ADDR;
-            self.sdhost.write32(offset, val);
-            if (offset == 0x00 and self.sdhost.dreqReady()) {
-                self.dma.stepAllActive(self.ram, self.dmaMmio());
+        const periph_off = addr -% PERIPH_BASE;
+        if (periph_off < (PERIPH_END - PERIPH_BASE)) {
+            switch (MMIO_PAGE_TABLE[periph_off >> 12]) {
+                .none => {},
+                .timer => if (addr -% TIMER_BASE < TIMER_SIZE) {
+                    self.timer.write32(addr - TIMER_BASE, val, &self.intc);
+                    self.updateIrqsBank1();
+                },
+                .txp => if (addr -% hdmi_mod.Txp.BASE_ADDR < hdmi_mod.Txp.SIZE) {
+                    self.txp.write32(addr - hdmi_mod.Txp.BASE_ADDR, val);
+                },
+                .dma => {
+                    self.dma.write32(addr - dma_mod.DmaController.BASE_ADDR, val, self.ram, self.dmaMmio());
+                    if (!self.dma.stepping) {
+                        self.updateIrqsBank1();
+                        self.updateIrqsBank2();
+                    }
+                },
+                .asb => if (addr -% pm_mod.AsbBridge.BASE_ADDR < pm_mod.AsbBridge.SIZE) {
+                    self.asb.write32(addr - pm_mod.AsbBridge.BASE_ADDR, val);
+                },
+                .page_00b => {
+                    if (addr -% INTC_BASE < INTC_SIZE) {
+                        self.intc.write32(addr - INTC_BASE, val);
+                    } else if (addr -% timer_mod.ArmTimer.BASE_ADDR < timer_mod.ArmTimer.SIZE) {
+                        self.arm_timer.write32(addr - timer_mod.ArmTimer.BASE_ADDR, val, &self.intc);
+                        self.updateIrqsBank0();
+                    } else if (addr -% audio_mod.Vchiq.BASE_ADDR < audio_mod.Vchiq.SIZE) {
+                        self.vchiq.write32(
+                            addr - audio_mod.Vchiq.BASE_ADDR,
+                            val,
+                            self.ram,
+                            &self.audio_fifo,
+                            self.audio_connected,
+                            self.hdmi.connected,
+                        );
+                        self.updateIrqsBank0();
+                    } else if (addr -% mailbox_mod.Mailbox.BASE_ADDR < mailbox_mod.Mailbox.SIZE) {
+                        self.mailbox.write32WithVchiq(addr - mailbox_mod.Mailbox.BASE_ADDR, val, self.ram, &self.vchiq);
+                        self.updateIrqsBank0();
+                    }
+                },
+                .pm => if (addr -% pm_mod.PowerManager.BASE_ADDR < pm_mod.PowerManager.SIZE) {
+                    self.pm.write32(addr - pm_mod.PowerManager.BASE_ADDR, val);
+                },
+                .cprman => self.cprman.write32(addr - cprman_mod.Cprman.BASE_ADDR, val),
+                .rng => if (addr -% pm_mod.Rng.BASE_ADDR < pm_mod.Rng.SIZE) {
+                    self.rng.write32(addr - pm_mod.Rng.BASE_ADDR, val);
+                },
+                .gpio => if (addr -% gpio_mod.Gpio.BASE_ADDR < gpio_mod.Gpio.SIZE) {
+                    self.gpio.write32(addr - gpio_mod.Gpio.BASE_ADDR, val);
+                    self.syncSdRoutingFromGpio();
+                    self.updateIrqsBank2();
+                },
+                .uart0 => {
+                    self.uart0.write32(addr - uart_mod.Pl011Uart.BASE_ADDR, val);
+                    self.updateIrqsBank2();
+                },
+                .sdhost => if (addr -% sdhost_mod.SdHost.BASE_ADDR < sdhost_mod.SdHost.SIZE) {
+                    const offset = addr - sdhost_mod.SdHost.BASE_ADDR;
+                    self.sdhost.write32(offset, val);
+                    if (!self.dma.stepping) {
+                        if (offset == 0x00 and self.sdhost.dreqReady()) {
+                            self.dma.stepAllActive(self.ram, self.dmaMmio());
+                            self.updateIrqsBank1();
+                        }
+                        self.updateIrqsBank2();
+                    }
+                },
+                .i2s => if (addr -% audio_mod.I2sPcm.BASE_ADDR < audio_mod.I2sPcm.SIZE) {
+                    self.i2s.write32(addr - audio_mod.I2sPcm.BASE_ADDR, val, &self.audio_fifo, self.audio_connected);
+                    if (!self.dma.stepping) {
+                        if (self.i2s.rxDreqReady()) {
+                            self.dma.stepAllActive(self.ram, self.dmaMmio());
+                            self.updateIrqsBank1();
+                        }
+                        self.updateIrqsBank2();
+                    }
+                },
+                .spi0 => if (addr -% spi_mod.Spi0.BASE_ADDR < spi_mod.Spi0.SIZE) {
+                    self.spi0.write32(addr - spi_mod.Spi0.BASE_ADDR, val);
+                    if (!self.dma.stepping) {
+                        if (self.spi0.txDreqReady() or self.spi0.rxDreqReady()) {
+                            self.dma.stepAllActive(self.ram, self.dmaMmio());
+                            self.updateIrqsBank1();
+                        }
+                        self.updateIrqsBank2();
+                    }
+                },
+                .bsc0 => if (addr -% i2c_mod.BscController.BSC0_BASE < i2c_mod.BscController.SIZE) {
+                    self.bsc0.write32(addr - i2c_mod.BscController.BSC0_BASE, val);
+                    self.updateIrqsBank2();
+                },
+                .pv0 => if (addr -% pv_mod.PixelValve.PV0_BASE < pv_mod.PixelValve.SIZE) {
+                    self.pv0.write32(addr - pv_mod.PixelValve.PV0_BASE, val);
+                    self.updateIrqsBank2();
+                },
+                .pv1 => if (addr -% pv_mod.PixelValve.PV1_BASE < pv_mod.PixelValve.SIZE) {
+                    self.pv1.write32(addr - pv_mod.PixelValve.PV1_BASE, val);
+                    self.updateIrqsBank2();
+                },
+                .pwm => if (addr -% audio_mod.PwmAudio.BASE_ADDR < audio_mod.PwmAudio.SIZE) {
+                    self.pwm.write32(addr - audio_mod.PwmAudio.BASE_ADDR, val, &self.audio_fifo, self.audio_connected);
+                },
+                .thermal => if (addr -% pm_mod.Thermal.BASE_ADDR < pm_mod.Thermal.SIZE) {
+                    self.thermal.write32(addr - pm_mod.Thermal.BASE_ADDR, val);
+                },
+                .aux_uart => if (addr -% uart_mod.AuxMiniUart.BASE_ADDR < uart_mod.AuxMiniUart.SIZE) {
+                    self.aux_uart.write32(addr - uart_mod.AuxMiniUart.BASE_ADDR, val);
+                    self.updateIrqsBank1();
+                },
+                .sdhci => if (addr -% sdhost_mod.ArasanSdhci.BASE_ADDR < sdhost_mod.ArasanSdhci.SIZE) {
+                    const offset = addr - sdhost_mod.ArasanSdhci.BASE_ADDR;
+                    self.sdhci.write32WithSd(offset, val, &self.sdhost);
+                    if (!self.dma.stepping) {
+                        if (offset == 0x0c and self.sdhci.dreqReady()) {
+                            self.dma.stepAllActive(self.ram, self.dmaMmio());
+                            self.updateIrqsBank1();
+                        }
+                        self.updateIrqsBank2();
+                    }
+                },
+                .hvs => {
+                    self.hvs.write32(addr - hvs_mod.Hvs.BASE_ADDR, val);
+                    self.updateIrqsBank2();
+                },
+                .bsc1 => if (addr -% i2c_mod.BscController.BSC1_BASE < i2c_mod.BscController.SIZE) {
+                    self.bsc1.write32(addr - i2c_mod.BscController.BSC1_BASE, val);
+                    self.updateIrqsBank2();
+                },
+                .bsc2 => if (addr -% i2c_mod.BscController.BSC2_BASE < i2c_mod.BscController.SIZE) {
+                    self.bsc2.write32(addr - i2c_mod.BscController.BSC2_BASE, val);
+                    self.updateIrqsBank2();
+                },
+                .pv2 => if (addr -% pv_mod.PixelValve.PV2_BASE < pv_mod.PixelValve.SIZE) {
+                    self.pv2.write32(addr - pv_mod.PixelValve.PV2_BASE, val);
+                    self.updateIrqsBank2();
+                },
+                .hdmi_hd => if (addr -% hdmi_mod.Hdmi.HD_BASE < hdmi_mod.Hdmi.HD_SIZE) {
+                    self.hdmi.writeHd32(addr - hdmi_mod.Hdmi.HD_BASE, val, &self.audio_fifo);
+                },
+                .hdmi_core => if (addr -% hdmi_mod.Hdmi.HDMI_BASE < hdmi_mod.Hdmi.HDMI_SIZE) {
+                    self.hdmi.writeHdmi32(addr - hdmi_mod.Hdmi.HDMI_BASE, val);
+                },
+                .usb => {
+                    self.usb.write32(addr - dwc2_mod.Dwc2Controller.BASE_ADDR, val, self.ram);
+                    self.updateIrqsBank1();
+                },
+                .v3d => {
+                    self.v3d.write32(addr - v3d_mod.V3d.BASE_ADDR, val, self.ram);
+                    self.updateIrqsBank1();
+                },
             }
-        } else if (addr >= audio_mod.I2sPcm.BASE_ADDR and addr < audio_mod.I2sPcm.BASE_ADDR + audio_mod.I2sPcm.SIZE) {
-            self.i2s.write32(addr - audio_mod.I2sPcm.BASE_ADDR, val, &self.audio_fifo, self.audio_connected);
-            if (self.i2s.rxDreqReady()) {
-                self.dma.stepAllActive(self.ram, self.dmaMmio());
-            }
-        } else if (addr >= spi_mod.Spi0.BASE_ADDR and addr < spi_mod.Spi0.BASE_ADDR + spi_mod.Spi0.SIZE) {
-            self.spi0.write32(addr - spi_mod.Spi0.BASE_ADDR, val);
-            if (self.spi0.txDreqReady() or self.spi0.rxDreqReady()) {
-                self.dma.stepAllActive(self.ram, self.dmaMmio());
-            }
-        } else if (addr >= i2c_mod.BscController.BSC0_BASE and addr < i2c_mod.BscController.BSC0_BASE + i2c_mod.BscController.SIZE) {
-            self.bsc0.write32(addr - i2c_mod.BscController.BSC0_BASE, val);
-        } else if (addr >= pv_mod.PixelValve.PV0_BASE and addr < pv_mod.PixelValve.PV0_BASE + pv_mod.PixelValve.SIZE) {
-            self.pv0.write32(addr - pv_mod.PixelValve.PV0_BASE, val);
-        } else if (addr >= pv_mod.PixelValve.PV1_BASE and addr < pv_mod.PixelValve.PV1_BASE + pv_mod.PixelValve.SIZE) {
-            self.pv1.write32(addr - pv_mod.PixelValve.PV1_BASE, val);
-        } else if (addr >= audio_mod.PwmAudio.BASE_ADDR and addr < audio_mod.PwmAudio.BASE_ADDR + audio_mod.PwmAudio.SIZE) {
-            self.pwm.write32(addr - audio_mod.PwmAudio.BASE_ADDR, val, &self.audio_fifo, self.audio_connected);
-        } else if (addr >= pm_mod.Thermal.BASE_ADDR and addr < pm_mod.Thermal.BASE_ADDR + pm_mod.Thermal.SIZE) {
-            self.thermal.write32(addr - pm_mod.Thermal.BASE_ADDR, val);
-        } else if (addr >= uart_mod.AuxMiniUart.BASE_ADDR and addr < uart_mod.AuxMiniUart.BASE_ADDR + uart_mod.AuxMiniUart.SIZE) {
-            self.aux_uart.write32(addr - uart_mod.AuxMiniUart.BASE_ADDR, val);
-        } else if (addr >= sdhost_mod.ArasanSdhci.BASE_ADDR and addr < sdhost_mod.ArasanSdhci.BASE_ADDR + sdhost_mod.ArasanSdhci.SIZE) {
-            const offset = addr - sdhost_mod.ArasanSdhci.BASE_ADDR;
-            self.sdhci.write32WithSd(offset, val, &self.sdhost);
-            if (offset == 0x0c and self.sdhci.dreqReady()) {
-                self.dma.stepAllActive(self.ram, self.dmaMmio());
-            }
-        } else if (addr >= hvs_mod.Hvs.BASE_ADDR and addr < hvs_mod.Hvs.BASE_ADDR + hvs_mod.Hvs.SIZE) {
-            self.hvs.write32(addr - hvs_mod.Hvs.BASE_ADDR, val);
-        } else if (addr >= i2c_mod.BscController.BSC1_BASE and addr < i2c_mod.BscController.BSC1_BASE + i2c_mod.BscController.SIZE) {
-            self.bsc1.write32(addr - i2c_mod.BscController.BSC1_BASE, val);
-        } else if (addr >= i2c_mod.BscController.BSC2_BASE and addr < i2c_mod.BscController.BSC2_BASE + i2c_mod.BscController.SIZE) {
-            self.bsc2.write32(addr - i2c_mod.BscController.BSC2_BASE, val);
-        } else if (addr >= pv_mod.PixelValve.PV2_BASE and addr < pv_mod.PixelValve.PV2_BASE + pv_mod.PixelValve.SIZE) {
-            self.pv2.write32(addr - pv_mod.PixelValve.PV2_BASE, val);
-        } else if (addr >= hdmi_mod.Hdmi.HD_BASE and addr < hdmi_mod.Hdmi.HD_BASE + hdmi_mod.Hdmi.HD_SIZE) {
-            self.hdmi.writeHd32(addr - hdmi_mod.Hdmi.HD_BASE, val, &self.audio_fifo);
-        } else if (addr >= hdmi_mod.Hdmi.HDMI_BASE and addr < hdmi_mod.Hdmi.HDMI_BASE + hdmi_mod.Hdmi.HDMI_SIZE) {
-            self.hdmi.writeHdmi32(addr - hdmi_mod.Hdmi.HDMI_BASE, val);
-        } else if (addr >= dwc2_mod.Dwc2Controller.BASE_ADDR and addr < dwc2_mod.Dwc2Controller.BASE_ADDR + dwc2_mod.Dwc2Controller.SIZE) {
-            self.usb.write32(addr - dwc2_mod.Dwc2Controller.BASE_ADDR, val, self.ram);
-        } else if (addr >= v3d_mod.V3d.BASE_ADDR and addr < v3d_mod.V3d.BASE_ADDR + v3d_mod.V3d.SIZE) {
-            self.v3d.write32(addr - v3d_mod.V3d.BASE_ADDR, val, self.ram);
+            return;
         }
-        self.updateIrqs();
+        if (addr -% local_intc_mod.LocalIntc.BASE_ADDR < local_intc_mod.LocalIntc.SIZE) {
+            self.local_intc.write32(addr - local_intc_mod.LocalIntc.BASE_ADDR, val);
+        }
     }
 };
 
