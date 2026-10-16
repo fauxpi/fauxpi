@@ -293,7 +293,8 @@ pub const Mmu = struct {
         return self.walkAndFillTlb(ram, vaddr, access, is_priv, req_perm);
     }
 
-    /// Translates 64-bit virtual address `vaddr` using VMSAv8-64 4-level/3-level page tables.
+    /// Translates 64-bit virtual address `vaddr` using VMSAv8-64 4-level/3-level page tables
+    /// for the `EL1&0` translation regime.
     /// On fault, updates `FAR_EL1` and `ESR_EL1` and returns `error.Abort`.
     pub fn translate64(
         self: *Mmu,
@@ -302,10 +303,28 @@ pub const Mmu = struct {
         access: AccessKind,
         is_priv: bool,
     ) error{Abort}!u32 {
-        if (!self.isMmuEnabled()) {
+        return self.translate64AtEl(ram, vaddr, access, if (is_priv) 1 else 0);
+    }
+
+    /// Translates 64-bit virtual address `vaddr` at Exception Level `el` (`0..3`).
+    pub fn translate64AtEl(
+        self: *Mmu,
+        ram: []const u8,
+        vaddr: u64,
+        access: AccessKind,
+        el: u2,
+    ) error{Abort}!u32 {
+        const is_el2 = (el == 2) and ((self.hcr_el2 & (@as(u64, 1) << 34)) == 0);
+        const mmu_enabled = switch (el) {
+            0, 1 => (self.sctlr_el1 & 1) != 0 and self.isMmuEnabled(),
+            2 => if (is_el2) (self.sctlr_el2 & 1) != 0 else (self.sctlr_el1 & 1) != 0,
+            3 => (self.sctlr_el3 & 1) != 0,
+        };
+        if (!mmu_enabled) {
             return @truncate(vaddr);
         }
 
+        const is_priv = el != 0;
         const vpn: u52 = @truncate((vaddr & 0x00ff_ffff_ffff_ffff) >> 12);
         const idx: usize = @as(usize, @truncate(vpn)) & tlb_mask;
         const entry = &self.tlb[idx];
@@ -320,11 +339,11 @@ pub const Mmu = struct {
             if ((entry.perms & req_perm) != 0) {
                 return entry.ppn_base | @as(u32, @truncate(vaddr & 0xfff));
             }
-            self.recordFault64(vaddr, access, is_priv, 0b001100 | @as(u6, entry.level));
+            self.recordFault64AtEl(vaddr, access, el, 0b001100 | @as(u6, entry.level));
             return error.Abort;
         }
 
-        return self.walkAndFillTlb64(ram, vaddr, vpn, access, is_priv, req_perm);
+        return self.walkAndFillTlb64(ram, vaddr, vpn, access, el, req_perm);
     }
 
     noinline fn walkAndFillTlb(
@@ -666,14 +685,16 @@ pub const Mmu = struct {
         vaddr: u64,
         vpn: u52,
         access: AccessKind,
-        is_priv: bool,
+        el: u2,
         req_perm: u8,
     ) error{Abort}!u32 {
-        const use_ttbr1 = ((vaddr >> 55) & 1) != 0;
-        const tnsz_raw: u6 = if (use_ttbr1) @truncate(self.tcr_el1 >> 16) else @truncate(self.tcr_el1);
-        const epd: u1 = if (use_ttbr1) @truncate(self.tcr_el1 >> 23) else @truncate(self.tcr_el1 >> 7);
+        const is_el2 = (el == 2) and ((self.hcr_el2 & (@as(u64, 1) << 34)) == 0);
+        const use_ttbr1 = !is_el2 and (((vaddr >> 55) & 1) != 0);
+        const tcr = if (is_el2) self.tcr_el2 else self.tcr_el1;
+        const tnsz_raw: u6 = if (use_ttbr1) @truncate(tcr >> 16) else @truncate(tcr);
+        const epd: u1 = if (is_el2) 0 else if (use_ttbr1) @truncate(tcr >> 23) else @truncate(tcr >> 7);
         if (epd != 0 or tnsz_raw < 16 or tnsz_raw > 39) {
-            self.recordFault64(vaddr, access, is_priv, 0b000100);
+            self.recordFault64AtEl(vaddr, access, el, 0b000100);
             return error.Abort;
         }
 
@@ -683,11 +704,11 @@ pub const Mmu = struct {
         const top_shifted = clean_va >> va_bits;
         const expected_top: u64 = if (use_ttbr1) ((@as(u64, 1) << tnsz_raw) - 1) else 0;
         if (top_shifted != expected_top) {
-            self.recordFault64(vaddr, access, is_priv, 0b000100);
+            self.recordFault64AtEl(vaddr, access, el, 0b000100);
             return error.Abort;
         }
 
-        const ttbr: u64 = if (use_ttbr1) self.ttbr1_64 else self.ttbr0_64;
+        const ttbr: u64 = if (is_el2) self.ttbr0_el2 else if (use_ttbr1) self.ttbr1_64 else self.ttbr0_64;
         var table_base: u32 = @as(u32, @truncate(ttbr)) & 0xffff_f000;
         const start_level: u2 = if (tnsz_raw <= 24) 0 else if (tnsz_raw <= 33) 1 else 2;
 
@@ -713,14 +734,14 @@ pub const Mmu = struct {
             const idx: u32 = @truncate((clean_va >> shift) & idx_mask);
             const desc_addr: u32 = (table_base + idx * 8) & 0x1fff_ffff;
             if (desc_addr + 8 > ram.len) {
-                self.recordFault64(vaddr, access, is_priv, 0b000100 | @as(u6, level));
+                self.recordFault64AtEl(vaddr, access, el, 0b000100 | @as(u6, level));
                 return error.Abort;
             }
             const desc = std.mem.readInt(u64, ram[desc_addr..][0..8], .little);
             const dtype: u2 = @truncate(desc);
 
             if (dtype == 0b00 or dtype == 0b10) {
-                self.recordFault64(vaddr, access, is_priv, 0b000100 | @as(u6, level));
+                self.recordFault64AtEl(vaddr, access, el, 0b000100 | @as(u6, level));
                 return error.Abort;
             }
 
@@ -735,7 +756,7 @@ pub const Mmu = struct {
             if (dtype == 0b01) {
                 if (level == 0) {
                     // Block descriptors are not permitted at level 0 with 4 KB granule
-                    self.recordFault64(vaddr, access, is_priv, 0b000100);
+                    self.recordFault64AtEl(vaddr, access, el, 0b000100);
                     return error.Abort;
                 }
                 leaf_level = level;
@@ -758,7 +779,7 @@ pub const Mmu = struct {
 
         // Check Access Flag (AF = bit 10)
         if ((leaf_desc & (1 << 10)) == 0) {
-            self.recordFault64(vaddr, access, is_priv, 0b001000 | @as(u6, leaf_level));
+            self.recordFault64AtEl(vaddr, access, el, 0b001000 | @as(u6, leaf_level));
             return error.Abort;
         }
 
@@ -776,9 +797,10 @@ pub const Mmu = struct {
             perms &= ~(perm_priv_w | perm_user_w);
         }
 
+        const sctlr = if (is_el2) self.sctlr_el2 else self.sctlr_el1;
         const pxn = pxn_table or ((leaf_desc & (@as(u64, 1) << 53)) != 0);
         const uxn = xn_table or ((leaf_desc & (@as(u64, 1) << 54)) != 0);
-        const wxn = (self.sctlr_el1 & (1 << 19)) != 0 and ((perms & (perm_priv_w | perm_user_w)) != 0);
+        const wxn = (sctlr & (1 << 19)) != 0 and ((perms & (perm_priv_w | perm_user_w)) != 0);
 
         if (!pxn and !wxn and ((perms & perm_user_w) == 0) and (perms & perm_priv_r) != 0) {
             perms |= perm_priv_x;
@@ -798,7 +820,7 @@ pub const Mmu = struct {
         };
 
         if ((perms & req_perm) == 0) {
-            self.recordFault64(vaddr, access, is_priv, 0b001100 | @as(u6, leaf_level));
+            self.recordFault64AtEl(vaddr, access, el, 0b001100 | @as(u6, leaf_level));
             return error.Abort;
         }
 
@@ -806,14 +828,25 @@ pub const Mmu = struct {
     }
 
     pub fn recordFault64(self: *Mmu, vaddr: u64, access: AccessKind, is_priv: bool, fsc: u6) void {
-        self.far_el1 = vaddr;
-        self.dfar = @truncate(vaddr);
+        self.recordFault64AtEl(vaddr, access, if (is_priv) 1 else 0, fsc);
+    }
+
+    pub fn recordFault64AtEl(self: *Mmu, vaddr: u64, access: AccessKind, el: u2, fsc: u6) void {
+        const is_priv = el != 0;
         const ec: u32 = switch (access) {
             .fetch => if (is_priv) 0b100001 else 0b100000, // Instruction Abort (same/lower EL)
             .read, .write => if (is_priv) 0b100101 else 0b100100, // Data Abort (same/lower EL)
         };
         const wnr: u32 = if (access == .write) (1 << 6) else 0;
-        self.esr_el1 = (ec << 26) | (1 << 25) | wnr | @as(u32, fsc);
+        const esr = (ec << 26) | (1 << 25) | wnr | @as(u32, fsc);
+        if (el >= 2) {
+            self.far_el2 = vaddr;
+            self.esr_el2 = esr;
+        } else {
+            self.far_el1 = vaddr;
+            self.dfar = @truncate(vaddr);
+            self.esr_el1 = esr;
+        }
     }
 
     fn computeClientPerms(apx: u1, ap: u2, xn: bool, sctlr: u32, xp: bool) u8 {

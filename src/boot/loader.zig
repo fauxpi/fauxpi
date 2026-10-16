@@ -11,7 +11,7 @@ const fdt = @import("fdt.zig");
 const BoardModel = @import("../ui/board_sheet.zig").BoardModel;
 
 pub const kernel_load_addr: u32 = 0x0000_8000;
-pub const kernel64_load_addr: u32 = 0x0008_0000;
+pub const kernel64_load_addr: u32 = 0x0020_0000;
 pub const dtb_load_addr: u32 = 0x03f0_0000;
 pub const initrd_load_addr: u32 = 0x0400_0000;
 pub const arm64_image_magic: u32 = 0x644d_5241; // "ARM\x64" at byte offset 0x38
@@ -37,6 +37,7 @@ pub const BootConfig = struct {
     arm_64bit: ?bool = null,
     device_tree: ?[]const u8 = null,
     initramfs: ?[]const u8 = null,
+    auto_initramfs: bool = false,
     vc4_kms_v3d: bool = false,
 
     pub fn parse(text: []const u8) BootConfig {
@@ -101,6 +102,8 @@ pub const BootConfig = struct {
                 if (!cfg.kernel_explicit and board_model.isBcm2837()) {
                     cfg.kernel = if (is_64) "kernel8.img" else "kernel7.img";
                 }
+            } else if (std.mem.eql(u8, key, "auto_initramfs")) {
+                cfg.auto_initramfs = std.mem.eql(u8, val, "1") or std.ascii.eqlIgnoreCase(val, "true");
             } else if (std.mem.eql(u8, key, "device_tree")) {
                 cfg.device_tree = val;
             } else if (std.mem.eql(u8, key, "dtoverlay")) {
@@ -145,6 +148,7 @@ pub fn dtbCandidatesForModel(board_model: BoardModel) []const []const u8 {
             "bcm2835-rpi-zero.dtb",
         },
         .pi_3_a_plus => &.{
+            "bcm2710-rpi-3-a-plus.dtb",
             "bcm2837-rpi-3-a-plus.dtb",
             "bcm2710-rpi-3-b-plus.dtb",
             "bcm2837-rpi-3-b-plus.dtb",
@@ -225,6 +229,17 @@ pub fn loadFromSdImageForModel(
     const initrd_bytes: ?[]const u8 = if (cfg.initramfs) |rd_name| blk: {
         const p = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, rd_name });
         break :blk try fs.readFileAlloc(alloc, p);
+    } else if (cfg.auto_initramfs) blk: {
+        const auto_name = if (std.mem.indexOf(u8, cfg.kernel, "8") != null or (cfg.arm_64bit orelse board_model.isBcm2837()))
+            "initramfs8"
+        else if (std.mem.indexOf(u8, cfg.kernel, "7l") != null)
+            "initramfs7l"
+        else if (std.mem.indexOf(u8, cfg.kernel, "7") != null)
+            "initramfs7"
+        else
+            "initramfs";
+        const p = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, auto_name });
+        break :blk fs.readFileAlloc(alloc, p) catch null;
     } else null;
 
     const cmdline_path = try std.fmt.allocPrint(alloc, "{s}cmdline.txt", .{cfg.os_prefix});
@@ -474,7 +489,7 @@ fn tryDecompressArmZImage(allocator: std.mem.Allocator, kernel_bytes: []const u8
 pub fn loadDirect(
     allocator: std.mem.Allocator,
     ram: []u8,
-    kernel_bytes: []const u8,
+    raw_kernel_bytes: []const u8,
     dtb_bytes: []const u8,
     initrd_bytes: ?[]const u8,
     cmdline: []const u8,
@@ -483,6 +498,18 @@ pub fn loadDirect(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
+
+    const kernel_bytes = if (raw_kernel_bytes.len >= 18 and
+        raw_kernel_bytes[0] == 0x1f and
+        raw_kernel_bytes[1] == 0x8b and
+        raw_kernel_bytes[2] == 0x08)
+    blk: {
+        var in: std.Io.Reader = .fixed(raw_kernel_bytes);
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        var decomp: std.compress.flate.Decompress = .init(&in, .gzip, &.{});
+        _ = try decomp.reader.streamRemaining(&aw.writer);
+        break :blk aw.written();
+    } else raw_kernel_bytes;
 
     const is_aarch64 = isArm64KernelImage(kernel_bytes);
     const load_addr: u32 = if (is_aarch64) arm64KernelLoadOffset(kernel_bytes) else kernel_load_addr;

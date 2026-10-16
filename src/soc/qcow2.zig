@@ -431,7 +431,7 @@ pub const Qcow2Disk = struct {
                     const lba_start = std.mem.readInt(u32, entry[8..12], .little);
                     const lba_count = std.mem.readInt(u32, entry[12..16], .little);
                     const part_end = (@as(u64, lba_start) + @as(u64, lba_count)) * 512;
-                    needed_bytes = @min(self.virtual_size, @max(needed_bytes, @min(part_end, 256 * 1024 * 1024)));
+                    needed_bytes = @min(self.virtual_size, @max(needed_bytes, @min(part_end, 600 * 1024 * 1024)));
                     break;
                 }
             }

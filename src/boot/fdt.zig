@@ -405,7 +405,37 @@ pub const Tree = struct {
         // 2. /chosen bootargs, initrd, and rng-seed (initializes kernel CRNG immediately at boot)
         const chosen = try self.findOrCreateNode("/chosen");
         if (cmdline.len > 0) {
-            try chosen.setStringProp(self.allocator, "bootargs", cmdline);
+            const serial0_target = if (self.findNode("/aliases")) |aliases|
+                aliases.getStringProp("serial0")
+            else
+                null;
+            const serial0_is_aux = if (serial0_target) |st|
+                std.mem.indexOf(u8, st, "7e215040") != null
+            else
+                false;
+            const serial0_tty = if (serial0_is_aux) "ttyS0" else "ttyAMA0";
+            const serial1_tty = if (serial0_is_aux) "ttyAMA0" else "ttyS0";
+
+            var bootargs_buf: std.ArrayList(u8) = .empty;
+            if (serial0_is_aux and std.mem.indexOf(u8, cmdline, "8250.nr_uarts=") == null) {
+                try bootargs_buf.appendSlice(self.allocator, "8250.nr_uarts=1 ");
+            }
+            var i: usize = 0;
+            while (i < cmdline.len) {
+                if (std.mem.startsWith(u8, cmdline[i..], "console=serial0")) {
+                    try bootargs_buf.appendSlice(self.allocator, "console=");
+                    try bootargs_buf.appendSlice(self.allocator, serial0_tty);
+                    i += "console=serial0".len;
+                } else if (std.mem.startsWith(u8, cmdline[i..], "console=serial1")) {
+                    try bootargs_buf.appendSlice(self.allocator, "console=");
+                    try bootargs_buf.appendSlice(self.allocator, serial1_tty);
+                    i += "console=serial1".len;
+                } else {
+                    try bootargs_buf.append(self.allocator, cmdline[i]);
+                    i += 1;
+                }
+            }
+            try chosen.setStringProp(self.allocator, "bootargs", bootargs_buf.items);
         }
         if (initrd) |rd| {
             try chosen.setU32Prop(self.allocator, "linux,initrd-start", rd.start);
