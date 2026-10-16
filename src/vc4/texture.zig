@@ -120,7 +120,7 @@ pub fn tiledPitch(format: Format, width: u32, height: u32) u32 {
     return std.mem.alignForward(u32, width, align_w) * format.bytesPerPixel();
 }
 
-fn tSubtileOffset(utile_x: u32, utile_y: u32, utile_stride: u32) u32 {
+pub inline fn tSubtileOffset(utile_x: u32, utile_y: u32, utile_stride: u32) u32 {
     const tile_stride = utile_stride >> 3;
     var tile_x = utile_x >> 3;
     const tile_y = utile_y >> 3;
@@ -134,11 +134,27 @@ fn tSubtileOffset(utile_x: u32, utile_y: u32, utile_stride: u32) u32 {
     return tile_offset + ((if (odd_row) odd_map else even_map)[stile_index] << 10);
 }
 
+/// Returns the byte offset of the 4-utile horizontal group starting at `(ux_aligned4, uy)`
+/// for a format with `uh == 4` (`argb8888`, `xrgb8888`, `rgb565`).
+/// Within this 4-utile group (`k = ux & 3` in `0..4`), each 64-byte utile is at `return_value + k * 64`.
+pub inline fn utileGroupOffset(
+    is_lt: bool,
+    lt_row_stride: u32,
+    utile_stride: u32,
+    ux_aligned4: u32,
+    uy: u32,
+) u32 {
+    if (is_lt) {
+        return (uy << 2) * lt_row_stride + (ux_aligned4 << 6);
+    }
+    return tSubtileOffset(ux_aligned4, uy & ~@as(u32, 3), utile_stride) + ((uy & 3) << 8);
+}
+
 pub fn texelOffset(width: u32, height: u32, x: u32, y: u32) u32 {
     return texelOffsetOf(.xrgb8888, width, height, x, y);
 }
 
-pub fn texelOffsetOf(format: Format, width: u32, height: u32, x: u32, y: u32) u32 {
+pub inline fn texelOffsetOf(format: Format, width: u32, height: u32, x: u32, y: u32) u32 {
     const cpp = format.bytesPerPixel();
     const uw_shift: u5 = if (cpp == 4) 2 else 3;
     const uh_shift: u5 = if (cpp == 1) 3 else 2;

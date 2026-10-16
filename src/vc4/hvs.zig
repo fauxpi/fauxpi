@@ -339,9 +339,12 @@ pub const Hvs = struct {
         const max_dx = @min(dst_x + dst_w, out_w);
         if (dst_x >= max_dx or dst_y >= max_dy) return;
 
-        // Fast path 1: Unity 32-bit Linear plane
+        const span_w = max_dx - dst_x;
+        const span_h = max_dy - dst_y;
+
+        // Fast path 1a: Unity 32-bit Linear plane
         if (unity and tiling == 0 and !is_565) {
-            const span_w = max_dx - dst_x;
+            const opaque_mask: @Vector(4, u32) = @splat(0xFF000000);
             var py: u32 = dst_y;
             while (py < max_dy) : (py += 1) {
                 const sy = py - dst_y;
@@ -350,16 +353,42 @@ pub const Hvs = struct {
                 const dst_row = out_argb[py * out_w + dst_x ..][0..span_w];
                 const src_bytes = ram[row_off..][0 .. span_w * 4];
                 if (alpha_mode == 1) {
-                    @memcpy(std.mem.sliceAsBytes(dst_row), src_bytes);
-                    for (dst_row) |*p| p.* |= 0xFF000000;
+                    var x: u32 = 0;
+                    while (x + 4 <= span_w) : (x += 4) {
+                        const src_v: @Vector(4, u32) = @bitCast(src_bytes[x * 4 ..][0..16].*);
+                        dst_row[x..][0..4].* = @bitCast(src_v | opaque_mask);
+                    }
+                    while (x < span_w) : (x += 1) {
+                        dst_row[x] = std.mem.readInt(u32, src_bytes[x * 4 ..][0..4], .little) | 0xFF000000;
+                    }
                 } else {
-                    for (dst_row, 0..) |*dst_p, i| {
-                        const src_color = std.mem.readInt(u32, src_bytes[i * 4 ..][0..4], .little);
+                    var x: u32 = 0;
+                    while (x + 4 <= span_w) : (x += 4) {
+                        const src_v: @Vector(4, u32) = @bitCast(src_bytes[x * 4 ..][0..16].*);
+                        const alphas = src_v >> @splat(24);
+                        if (@reduce(.And, alphas) == 0xff) {
+                            dst_row[x..][0..4].* = @bitCast(src_v);
+                        } else if (@reduce(.Or, alphas) != 0) {
+                            const src_arr: [4]u32 = @bitCast(src_v);
+                            inline for (0..4) |k| {
+                                const sc = src_arr[k];
+                                const a = sc >> 24;
+                                if (a == 255) {
+                                    dst_row[x + @as(u32, @intCast(k))] = sc;
+                                } else if (a > 0) {
+                                    const idx_x = x + @as(u32, @intCast(k));
+                                    dst_row[idx_x] = blendPixel(dst_row[idx_x], sc, a, premult);
+                                }
+                            }
+                        }
+                    }
+                    while (x < span_w) : (x += 1) {
+                        const src_color = std.mem.readInt(u32, src_bytes[x * 4 ..][0..4], .little);
                         const a = src_color >> 24;
                         if (a == 255) {
-                            dst_p.* = src_color;
+                            dst_row[x] = src_color;
                         } else if (a > 0) {
-                            dst_p.* = blendPixel(dst_p.*, src_color, a, premult);
+                            dst_row[x] = blendPixel(dst_row[x], src_color, a, premult);
                         }
                     }
                 }
@@ -367,80 +396,169 @@ pub const Hvs = struct {
             return;
         }
 
+        // Fast path 1b: Unity 16-bit RGB565 Linear plane
+        if (unity and tiling == 0 and is_565) {
+            var py: u32 = dst_y;
+            while (py < max_dy) : (py += 1) {
+                const sy = py - dst_y;
+                const row_off = ptr0 + sy * linear_pitch;
+                if (row_off + span_w * 2 > ram.len) continue;
+                const dst_row = out_argb[py * out_w + dst_x ..][0..span_w];
+                const src_bytes = ram[row_off..][0 .. span_w * 2];
+                var x: u32 = 0;
+                while (x + 8 <= span_w) : (x += 8) {
+                    const p16_vec: @Vector(8, u16) = @bitCast(src_bytes[x * 2 ..][0..16].*);
+                    dst_row[x..][0..8].* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
+                }
+                while (x < span_w) : (x += 1) {
+                    const p16 = std.mem.readInt(u16, src_bytes[x * 2 ..][0..2], .little);
+                    dst_row[x] = format_mod.fromRgb565(p16);
+                }
+            }
+            return;
+        }
+
         var start_py: u32 = dst_y;
 
-        // Fast path 2: Unity 32-bit T-tiled / LT-tiled plane aligned to (0, 0)
-        if (unity and tiling != 0 and !is_565 and dst_x == 0 and dst_y == 0 and (max_dx & 3) == 0) {
-            const utiles_x = max_dx >> 2;
-            const utiles_y = max_dy >> 2;
+        // Fast path 2: Unity 32-bit T-tiled / LT-tiled plane (4x4 utiles, hoisted group address)
+        if (unity and tiling != 0 and !is_565) {
+            const is_lt = (tiled_w <= 16 or src_h <= 16);
+            const lt_row_stride = ((tiled_w + 3) & ~@as(u32, 3)) << 2;
+            const utile_stride = ((tiled_w + 31) & ~@as(u32, 31)) >> 2;
+            const utiles_x = span_w >> 2;
+            const utiles_y = span_h >> 2;
+            const rem_x = span_w & 3;
+            const opaque_mask: @Vector(4, u32) = @splat(0xFF000000);
+
             var uy: u32 = 0;
             while (uy < utiles_y) : (uy += 1) {
-                const py0 = uy << 2;
+                const dy0 = dst_y + (uy << 2);
                 var ux: u32 = 0;
+                var group_base: u32 = 0;
                 while (ux < utiles_x) : (ux += 1) {
-                    const px0 = ux << 2;
-                    const utile_off = ptr0 + texture.texelOffsetOf(.argb8888, tiled_w, src_h, px0, py0);
+                    if ((ux & 3) == 0) {
+                        group_base = ptr0 + texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, ux, uy);
+                    }
+                    const utile_off = group_base + ((ux & 3) << 6);
                     if (utile_off + 64 > ram.len) continue;
+                    const dx0 = dst_x + (ux << 2);
                     inline for (0..4) |ry| {
-                        const dst_row = out_argb[(py0 + @as(u32, @intCast(ry))) * out_w + px0 ..][0..4];
-                        const src_row_bytes = ram[utile_off + ry * 16 ..][0..16];
+                        const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..4];
+                        const src_v: @Vector(4, u32) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
                         if (alpha_mode == 1) {
-                            @memcpy(std.mem.sliceAsBytes(dst_row), src_row_bytes);
-                            inline for (0..4) |rx| dst_row[rx] |= 0xFF000000;
+                            dst_row.* = @bitCast(src_v | opaque_mask);
                         } else {
-                            inline for (0..4) |rx| {
+                            const alphas = src_v >> @splat(24);
+                            if (@reduce(.And, alphas) == 0xff) {
+                                dst_row.* = @bitCast(src_v);
+                            } else if (@reduce(.Or, alphas) != 0) {
+                                const src_arr: [4]u32 = @bitCast(src_v);
+                                inline for (0..4) |rx| {
+                                    const src_color = src_arr[rx];
+                                    const a = src_color >> 24;
+                                    if (a == 255) {
+                                        dst_row[rx] = src_color;
+                                    } else if (a > 0) {
+                                        dst_row[rx] = blendPixel(dst_row[rx], src_color, a, premult);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (rem_x != 0) {
+                    if ((utiles_x & 3) == 0) {
+                        group_base = ptr0 + texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, utiles_x, uy);
+                    }
+                    const utile_off = group_base + ((utiles_x & 3) << 6);
+                    if (utile_off + 64 <= ram.len) {
+                        const dx0 = dst_x + (utiles_x << 2);
+                        inline for (0..4) |ry| {
+                            const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..rem_x];
+                            const src_row_bytes = ram[utile_off + ry * 16 ..][0..16];
+                            for (0..rem_x) |rx| {
                                 const src_color = std.mem.readInt(u32, src_row_bytes[rx * 4 ..][0..4], .little);
-                                const a = src_color >> 24;
-                                if (a == 255) {
-                                    dst_row[rx] = src_color;
-                                } else if (a > 0) {
-                                    dst_row[rx] = blendPixel(dst_row[rx], src_color, a, premult);
+                                if (alpha_mode == 1) {
+                                    dst_row[rx] = src_color | 0xFF000000;
+                                } else {
+                                    const a = src_color >> 24;
+                                    if (a == 255) {
+                                        dst_row[rx] = src_color;
+                                    } else if (a > 0) {
+                                        dst_row[rx] = blendPixel(dst_row[rx], src_color, a, premult);
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-            if ((max_dy & 3) == 0) return;
-            start_py = utiles_y << 2;
+            if ((span_h & 3) == 0) return;
+            start_py = dst_y + (utiles_y << 2);
         }
 
-        // Fast path 3: Unity 16-bit RGB565 T-tiled / LT-tiled plane aligned to (0, 0) (8x4 utiles)
-        if (unity and tiling != 0 and is_565 and dst_x == 0 and dst_y == 0 and (max_dx & 7) == 0) {
-            const utiles_x = max_dx >> 3;
-            const utiles_y = max_dy >> 2;
+        // Fast path 3: Unity 16-bit RGB565 T-tiled / LT-tiled plane (8x4 utiles, hoisted group address + SIMD)
+        if (unity and tiling != 0 and is_565) {
+            const is_lt = (tiled_w <= 32 or src_h <= 16);
+            const lt_row_stride = ((tiled_w + 7) & ~@as(u32, 7)) << 1;
+            const utile_stride = ((tiled_w + 63) & ~@as(u32, 63)) >> 3;
+            const utiles_x = span_w >> 3;
+            const utiles_y = span_h >> 2;
+            const rem_x = span_w & 7;
+
             var uy: u32 = 0;
             while (uy < utiles_y) : (uy += 1) {
-                const py0 = uy << 2;
+                const dy0 = dst_y + (uy << 2);
                 var ux: u32 = 0;
+                var group_base: u32 = 0;
                 while (ux < utiles_x) : (ux += 1) {
-                    const px0 = ux << 3;
-                    const utile_off = ptr0 + texture.texelOffsetOf(.rgb565, tiled_w, src_h, px0, py0);
+                    if ((ux & 3) == 0) {
+                        group_base = ptr0 + texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, ux, uy);
+                    }
+                    const utile_off = group_base + ((ux & 3) << 6);
                     if (utile_off + 64 > ram.len) continue;
+                    const dx0 = dst_x + (ux << 3);
                     inline for (0..4) |ry| {
-                        const dst_row = out_argb[(py0 + @as(u32, @intCast(ry))) * out_w + px0 ..][0..8];
-                        const src_row_bytes = ram[utile_off + ry * 16 ..][0..16];
-                        inline for (0..8) |rx| {
-                            const p16 = std.mem.readInt(u16, src_row_bytes[rx * 2 ..][0..2], .little);
-                            dst_row[rx] = format_mod.fromRgb565(p16);
+                        const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..8];
+                        const p16_vec: @Vector(8, u16) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
+                        dst_row.* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
+                    }
+                }
+                if (rem_x != 0) {
+                    if ((utiles_x & 3) == 0) {
+                        group_base = ptr0 + texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, utiles_x, uy);
+                    }
+                    const utile_off = group_base + ((utiles_x & 3) << 6);
+                    if (utile_off + 64 <= ram.len) {
+                        const dx0 = dst_x + (utiles_x << 3);
+                        inline for (0..4) |ry| {
+                            const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..rem_x];
+                            const src_row_bytes = ram[utile_off + ry * 16 ..][0..16];
+                            for (0..rem_x) |rx| {
+                                const p16 = std.mem.readInt(u16, src_row_bytes[rx * 2 ..][0..2], .little);
+                                dst_row[rx] = format_mod.fromRgb565(p16);
+                            }
                         }
                     }
                 }
             }
-            if ((max_dy & 3) == 0) return;
-            start_py = utiles_y << 2;
+            if ((span_h & 3) == 0) return;
+            start_py = dst_y + (utiles_y << 2);
         }
 
+        // General / scaled / bottom-remainder fallback with hoisted row invariants
         var py: u32 = start_py;
         while (py < max_dy) : (py += 1) {
             const sy: u32 = if (unity) (py - dst_y) else ((py - dst_y) * src_h) / dst_h;
+            const linear_row_off = ptr0 + sy * linear_pitch;
+            const out_row_base = py * out_w;
             var px: u32 = dst_x;
             while (px < max_dx) : (px += 1) {
                 const sx: u32 = if (unity) (px - dst_x) else ((px - dst_x) * src_w) / dst_w;
-                const off = ptr0 + if (tiling == 0)
-                    (sy * linear_pitch + sx * cpp)
+                const off = if (tiling == 0)
+                    (linear_row_off + sx * cpp)
                 else
-                    texture.texelOffsetOf(fmt, tiled_w, src_h, sx, sy);
+                    (ptr0 + texture.texelOffsetOf(fmt, tiled_w, src_h, sx, sy));
 
                 if (off + cpp > ram.len) continue;
 
@@ -449,7 +567,7 @@ pub const Hvs = struct {
                 else
                     std.mem.readInt(u32, ram[off..][0..4], .little);
 
-                const out_idx = py * out_w + px;
+                const out_idx = out_row_base + px;
                 if (alpha_mode == 1 or is_565) {
                     out_argb[out_idx] = src_color | 0xFF000000;
                 } else {
@@ -667,4 +785,57 @@ test "HVS EOF interrupt and per-channel frame counters for DLIST reclamation" {
     try std.testing.expect(!hvs.irqPending());
 }
 
+test "HVS Linear RGB565 SIMD scanline and offset T-tiled ARGB8888 overlay compositing" {
+    var hvs = Hvs{};
+    const out_w: u32 = 40;
+    const out_h: u32 = 24;
+    var ram: [65536]u8 = [_]u8{0} ** 65536;
 
+    // Plane 0: 40x24 Linear RGB565 background at 0x0000 with pure red (0xffff0000)
+    const red565 = format_mod.toRgb565(0xffff0000);
+    for (0..out_w * out_h) |i| {
+        std.mem.writeInt(u16, ram[i * 2 ..][0..2], red565, .little);
+    }
+
+    // Plane 1: 35x21 T-tiled ARGB8888 overlay at 0x4000 placed at (dst_x=3, dst_y=2) with opaque green (0xff00ff00)
+    const ov_w: u32 = 35;
+    const ov_h: u32 = 21;
+    for (0..ov_h) |y| {
+        for (0..ov_w) |x| {
+            const off = 0x4000 + texture.texelOffsetOf(.argb8888, 64, ov_h, @intCast(x), @intCast(y));
+            std.mem.writeInt(u32, ram[off..][0..4], 0xff00ff00, .little);
+        }
+    }
+
+    // Slot 16: Plane 0 (Linear RGB565, 40x24 at (0, 0))
+    hvs.write32(Hvs.DLIST_OFFSET + 16 * 4, Hvs.SCALER_CTL0_VALID | Hvs.SCALER_CTL0_UNITY | (7 << 24) | 4);
+    hvs.write32(Hvs.DLIST_OFFSET + 17 * 4, 0);
+    hvs.write32(Hvs.DLIST_OFFSET + 18 * 4, (1 << 30) | (out_h << 16) | out_w);
+    hvs.write32(Hvs.DLIST_OFFSET + 19 * 4, 0);
+    hvs.write32(Hvs.DLIST_OFFSET + 20 * 4, 0x80000000);
+    hvs.write32(Hvs.DLIST_OFFSET + 21 * 4, 0);
+    hvs.write32(Hvs.DLIST_OFFSET + 22 * 4, out_w * 2);
+
+    // Slot 23: Plane 1 (T-tiled ARGB8888, 35x21 at (3, 2), tile_width_t = 2 (64px))
+    hvs.write32(Hvs.DLIST_OFFSET + 23 * 4, Hvs.SCALER_CTL0_VALID | Hvs.SCALER_CTL0_UNITY | (7 << 24) | (3 << 20) | 7);
+    hvs.write32(Hvs.DLIST_OFFSET + 24 * 4, (2 << 12) | 3);
+    hvs.write32(Hvs.DLIST_OFFSET + 25 * 4, (ov_h << 16) | ov_w);
+    hvs.write32(Hvs.DLIST_OFFSET + 26 * 4, 0);
+    hvs.write32(Hvs.DLIST_OFFSET + 27 * 4, 0x80004000);
+    hvs.write32(Hvs.DLIST_OFFSET + 28 * 4, 0);
+    hvs.write32(Hvs.DLIST_OFFSET + 29 * 4, 2); // 2 T-tiles wide (64px)
+
+    // Slot 30: End marker
+    hvs.write32(Hvs.DLIST_OFFSET + 30 * 4, Hvs.SCALER_CTL0_END);
+    hvs.write32(0x0024, 16);
+
+    var out: [40 * 24]u32 = [_]u32{0} ** (40 * 24);
+    try std.testing.expect(hvs.compositeFrame(&ram, &out, out_w, out_h));
+    for (0..out_h) |y| {
+        for (0..out_w) |x| {
+            const in_ov = (x >= 3 and x < 3 + ov_w and y >= 2 and y < 2 + ov_h);
+            const expected: u32 = if (in_ov) 0xff00ff00 else 0xffff0000;
+            try std.testing.expectEqual(expected, out[y * out_w + x]);
+        }
+    }
+}

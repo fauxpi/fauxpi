@@ -85,18 +85,29 @@ fn code(comptime s: *const [4]u8) u32 {
     return std.mem.readInt(u32, s, .little);
 }
 
-pub fn toRgb565(argb: u32) u16 {
+pub inline fn toRgb565(argb: u32) u16 {
     const r: u32 = (argb >> 16) & 0xff;
     const g: u32 = (argb >> 8) & 0xff;
     const b: u32 = argb & 0xff;
     return @intCast(((b * 31 + 127) / 255) << 11 | ((g * 63 + 127) / 255) << 5 | (r * 31 + 127) / 255);
 }
 
-pub fn fromRgb565(p: u16) u32 {
+pub inline fn fromRgb565(p: u16) u32 {
     const b: u32 = p >> 11;
     const g: u32 = (p >> 5) & 0x3f;
     const r: u32 = p & 0x1f;
     return 0xff000000 | (r << 3 | r >> 2) << 16 | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2);
+}
+
+pub inline fn fromRgb565Vec8(p16: @Vector(8, u16)) @Vector(8, u32) {
+    const p: @Vector(8, u32) = p16;
+    const b = p >> @splat(11);
+    const g = (p >> @splat(5)) & @as(@Vector(8, u32), @splat(0x3f));
+    const r = p & @as(@Vector(8, u32), @splat(0x1f));
+    const r8 = (r << @splat(3)) | (r >> @splat(2));
+    const g8 = (g << @splat(2)) | (g >> @splat(4));
+    const b8 = (b << @splat(3)) | (b >> @splat(2));
+    return @as(@Vector(8, u32), @splat(0xff000000)) | (r8 << @splat(16)) | (g8 << @splat(8)) | b8;
 }
 
 test "formats' codes and RGB565 conversions" {
