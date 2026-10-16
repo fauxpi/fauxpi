@@ -166,6 +166,29 @@ pub const Vchiq = struct {
     pub const VC_AUDIO_MSG_TYPE_STOP: u32 = 7;
     pub const VC_AUDIO_MSG_TYPE_WRITE: u32 = 8;
 
+    // VC_SM_MSG_TYPE_* constants (from vc_sm_defs.h)
+    pub const VC_SM_MSG_TYPE_ALLOC: u32 = 0;
+    pub const VC_SM_MSG_TYPE_LOCK: u32 = 1;
+    pub const VC_SM_MSG_TYPE_UNLOCK: u32 = 2;
+    pub const VC_SM_MSG_TYPE_UNLOCK_NOANS: u32 = 3;
+    pub const VC_SM_MSG_TYPE_FREE: u32 = 4;
+    pub const VC_SM_MSG_TYPE_RESIZE: u32 = 5;
+    pub const VC_SM_MSG_TYPE_WALK_ALLOC: u32 = 6;
+    pub const VC_SM_MSG_TYPE_ACTION_CLEAN: u32 = 7;
+    pub const VC_SM_MSG_TYPE_IMPORT: u32 = 8;
+    pub const VC_SM_MSG_TYPE_CLIENT_VERSION: u32 = 9;
+    pub const VC_SM_MSG_TYPE_VC_MEM_REQUEST_REPLY: u32 = 10;
+    pub const VC_SM_MSG_TYPE_RELEASED: u32 = 11;
+    pub const VC_SM_MSG_TYPE_VC_MEM_REQUEST: u32 = 12;
+
+    pub const SmemResource = struct {
+        active: bool = false,
+        vc_handle: u32 = 0,
+        addr: u32 = 0,
+        size: u32 = 0,
+        kernel_id: u32 = 0,
+    };
+
     // Layout offsets within vchiq_slot_zero (sizeof(vchiq_shared_state) == 372 with DEBUG_MAX == 11)
     const MASTER_OFFSET: u32 = 32;
     const SLAVE_OFFSET: u32 = 404;
@@ -234,6 +257,13 @@ pub const Vchiq = struct {
     pending_tail: usize = 0,
     pending_count: usize = 0,
 
+    // SMEM service state (vc_port = 3)
+    smem_arm_port: u12 = 0,
+    smem_client_version: u32 = 0,
+    smem_next_handle: u32 = 1,
+    smem_next_alloc_addr: u32 = 0xdf00_0000,
+    smem_resources: [64]SmemResource = [_]SmemResource{.{}} ** 64,
+
     pub fn irqPending(self: *const Vchiq) bool {
         return self.bell0_active;
     }
@@ -295,6 +325,11 @@ pub const Vchiq = struct {
         self.pending_count = 0;
         self.auds_write_remaining = 0;
         self.pcm_carry_len = 0;
+        self.smem_arm_port = 0;
+        self.smem_client_version = 0;
+        self.smem_next_handle = 1;
+        self.smem_next_alloc_addr = 0xdf00_0000;
+        self.smem_resources = [_]SmemResource{.{}} ** 64;
 
         // Mark master as initialised
         std.mem.writeInt(u32, ram[master + STATE_INITIALISED ..][0..4], 1, .little);
@@ -490,6 +525,15 @@ pub const Vchiq = struct {
                         self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_OPENACK, 2, srcport), &ack);
                         return;
                     }
+                    // 'SMEM' (0x534D454D or 0x4D454D53) - VideoCore Shared Memory service (vc_sm_cma / vmcs_sm)
+                    if (fourcc == 0x534D454D or fourcc == 0x4D454D53) {
+                        self.smem_arm_port = srcport;
+                        var ack: [2]u8 = undefined;
+                        const req_ver: i16 = if (payload.len >= 10) std.mem.readInt(i16, payload[8..10], .little) else 1;
+                        std.mem.writeInt(i16, &ack, if (req_ver > 0) req_ver else 1, .little);
+                        self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_OPENACK, 3, srcport), &ack);
+                        return;
+                    }
                 }
                 // Reject unimplemented services immediately with CLOSE so guest doesn't block
                 self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_CLOSE, 0, srcport), &.{});
@@ -505,6 +549,8 @@ pub const Vchiq = struct {
             VCHIQ_MSG_DATA => {
                 if (dstport == 1) {
                     self.handleAudsData(srcport, payload, ram, audio_fifo, audio_connected, hdmi_connected);
+                } else if (dstport == 3) {
+                    self.handleSmemData(srcport, payload, ram);
                 }
             },
             else => {},
@@ -597,6 +643,160 @@ pub const Vchiq = struct {
         std.mem.writeInt(u32, resp[0..4], VC_AUDIO_MSG_TYPE_RESULT, .little);
         std.mem.writeInt(i32, resp[4..8], success, .little);
         self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 1, self.auds_arm_port), &resp);
+    }
+
+    fn allocSmemHandle(self: *Vchiq) u32 {
+        const h = if (self.smem_next_handle == 0) 1 else self.smem_next_handle;
+        self.smem_next_handle = h +% 1;
+        if (self.smem_next_handle == 0) self.smem_next_handle = 1;
+        return h;
+    }
+
+    fn recordSmemResource(self: *Vchiq, vc_handle: u32, addr: u32, size: u32, kernel_id: u32) void {
+        for (&self.smem_resources) |*slot| {
+            if (!slot.active) {
+                slot.* = .{
+                    .active = true,
+                    .vc_handle = vc_handle,
+                    .addr = addr,
+                    .size = size,
+                    .kernel_id = kernel_id,
+                };
+                return;
+            }
+        }
+        // Overwrite slot 0 if full
+        self.smem_resources[0] = .{
+            .active = true,
+            .vc_handle = vc_handle,
+            .addr = addr,
+            .size = size,
+            .kernel_id = kernel_id,
+        };
+    }
+
+    fn lookupSmemResource(self: *const Vchiq, vc_handle: u32) ?SmemResource {
+        for (&self.smem_resources) |*slot| {
+            if (slot.active and slot.vc_handle == vc_handle) {
+                return slot.*;
+            }
+        }
+        return null;
+    }
+
+    fn freeSmemResource(self: *Vchiq, vc_handle: u32) ?SmemResource {
+        for (&self.smem_resources) |*slot| {
+            if (slot.active and slot.vc_handle == vc_handle) {
+                const res = slot.*;
+                slot.* = .{};
+                return res;
+            }
+        }
+        return null;
+    }
+
+    fn handleSmemData(
+        self: *Vchiq,
+        srcport: u12,
+        payload: []const u8,
+        ram: []u8,
+    ) void {
+        self.smem_arm_port = srcport;
+        if (payload.len < 8) return;
+
+        const msg_type = std.mem.readInt(u32, payload[0..4], .little);
+        const trans_id = std.mem.readInt(u32, payload[4..8], .little);
+        const body = payload[8..];
+
+        switch (msg_type) {
+            VC_SM_MSG_TYPE_CLIENT_VERSION => {
+                if (body.len >= 4) {
+                    self.smem_client_version = std.mem.readInt(u32, body[0..4], .little);
+                }
+                // Acknowledge client version support via VPU event callback (top bit of trans_id set)
+                var resp: [8]u8 = [_]u8{0} ** 8;
+                std.mem.writeInt(u32, resp[0..4], VC_SM_MSG_TYPE_CLIENT_VERSION | 0x8000_0000, .little);
+                std.mem.writeInt(i32, resp[4..8], 0, .little);
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
+            },
+            VC_SM_MSG_TYPE_IMPORT => {
+                const addr: u32 = if (body.len >= 8) std.mem.readInt(u32, body[4..8], .little) else 0xc000_0000;
+                const size: u32 = if (body.len >= 12) std.mem.readInt(u32, body[8..12], .little) else 4096;
+                const kernel_id: u32 = if (body.len >= 16) std.mem.readInt(u32, body[12..16], .little) else 0;
+                const res_handle = self.allocSmemHandle();
+                self.recordSmemResource(res_handle, addr, size, kernel_id);
+
+                // struct vc_sm_import_result { u32 trans_id; u32 res_handle; }
+                var resp: [8]u8 = [_]u8{0} ** 8;
+                std.mem.writeInt(u32, resp[0..4], trans_id, .little);
+                std.mem.writeInt(u32, resp[4..8], res_handle, .little);
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
+            },
+            VC_SM_MSG_TYPE_ALLOC => {
+                const base_unit: u32 = if (body.len >= 8) std.mem.readInt(u32, body[4..8], .little) else 4096;
+                const num_unit: u32 = if (body.len >= 12) std.mem.readInt(u32, body[8..12], .little) else 1;
+                const total_size = @max(base_unit *| num_unit, 4096);
+                const res_handle = self.allocSmemHandle();
+                const res_mem = self.smem_next_alloc_addr;
+                self.smem_next_alloc_addr +%= std.mem.alignForward(u32, total_size, 4096);
+                self.recordSmemResource(res_handle, res_mem, total_size, 0);
+
+                // struct vc_sm_alloc_result_t { u32 trans_id; u32 res_handle; u32 res_mem; u32 res_base_size; u32 res_num; }
+                var resp: [20]u8 = [_]u8{0} ** 20;
+                std.mem.writeInt(u32, resp[0..4], trans_id, .little);
+                std.mem.writeInt(u32, resp[4..8], res_handle, .little);
+                std.mem.writeInt(u32, resp[8..12], res_mem, .little);
+                std.mem.writeInt(u32, resp[12..16], base_unit, .little);
+                std.mem.writeInt(u32, resp[16..20], num_unit, .little);
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
+            },
+            VC_SM_MSG_TYPE_LOCK => {
+                const res_handle: u32 = if (body.len >= 4) std.mem.readInt(u32, body[0..4], .little) else 0;
+                const req_mem: u32 = if (body.len >= 8) std.mem.readInt(u32, body[4..8], .little) else 0;
+                const res_mem = if (req_mem != 0)
+                    req_mem
+                else if (self.lookupSmemResource(res_handle)) |r|
+                    r.addr
+                else
+                    0xdf00_0000;
+
+                // struct vc_sm_lock_result_t { u32 trans_id; u32 res_handle; u32 res_mem; u32 res_old_mem; }
+                var resp: [16]u8 = [_]u8{0} ** 16;
+                std.mem.writeInt(u32, resp[0..4], trans_id, .little);
+                std.mem.writeInt(u32, resp[4..8], res_handle, .little);
+                std.mem.writeInt(u32, resp[8..12], res_mem, .little);
+                std.mem.writeInt(u32, resp[12..16], res_mem, .little);
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
+            },
+            VC_SM_MSG_TYPE_FREE => {
+                const res_handle: u32 = if (body.len >= 4) std.mem.readInt(u32, body[0..4], .little) else 0;
+                const freed = self.freeSmemResource(res_handle);
+                if (self.smem_client_version >= 2) {
+                    // Protocol >= 2 uses async VC_SM_MSG_TYPE_RELEASED callback (wait_reply == 0 on FREE)
+                    const r = freed orelse SmemResource{ .vc_handle = res_handle };
+                    var resp: [20]u8 = [_]u8{0} ** 20;
+                    std.mem.writeInt(u32, resp[0..4], VC_SM_MSG_TYPE_RELEASED | 0x8000_0000, .little);
+                    std.mem.writeInt(u32, resp[4..8], r.addr, .little);
+                    std.mem.writeInt(u32, resp[8..12], r.size, .little);
+                    std.mem.writeInt(u32, resp[12..16], r.kernel_id, .little);
+                    std.mem.writeInt(u32, resp[16..20], res_handle, .little);
+                    self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
+                } else {
+                    var resp: [8]u8 = [_]u8{0} ** 8;
+                    std.mem.writeInt(u32, resp[0..4], trans_id, .little);
+                    std.mem.writeInt(i32, resp[4..8], 0, .little);
+                    self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
+                }
+            },
+            VC_SM_MSG_TYPE_UNLOCK_NOANS, VC_SM_MSG_TYPE_VC_MEM_REQUEST_REPLY => {},
+            else => {
+                // Generic struct vc_sm_result_t { u32 trans_id; s32 success; }
+                var resp: [8]u8 = [_]u8{0} ** 8;
+                std.mem.writeInt(u32, resp[0..4], trans_id, .little);
+                std.mem.writeInt(i32, resp[4..8], 0, .little);
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
+            },
+        }
     }
 
     fn enqueueOrSendWriteComplete(self: *Vchiq, ram: []u8) void {
@@ -1130,3 +1330,83 @@ test "Vchiq AUDS service opens, configures, streams PCM, and respects audio_conn
     try std.testing.expectEqual(@as(i16, 0x5678), samples[2]);
     try std.testing.expectEqual(@as(i16, -0x5678), samples[3]);
 }
+
+test "Vchiq SMEM service opens and handles client_version, import, and free" {
+    var ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024);
+    var vchiq = Vchiq{};
+    var fifo = AudioFifo{};
+
+    const base: u32 = 0x1000;
+    const master = base + 32;
+    const slave = base + 404;
+    std.mem.writeInt(u32, ram[master + 4 ..][0..4], 1, .little); // master.slot_first = 1
+    std.mem.writeInt(u32, ram[master + 8 ..][0..4], 4, .little); // master.slot_last = 4
+    std.mem.writeInt(u32, ram[master + 12 ..][0..4], 9, .little); // master.slot_sync = 9
+    std.mem.writeInt(u32, ram[slave + 4 ..][0..4], 5, .little); // slave.slot_first = 5
+    std.mem.writeInt(u32, ram[slave + 8 ..][0..4], 8, .little); // slave.slot_last = 8
+    std.mem.writeInt(u32, ram[slave + 72 ..][0..4], 5, .little); // slave.slot_queue[0] = 5
+    std.mem.writeInt(u32, ram[slave + 0 ..][0..4], 1, .little); // slave.initialised = 1
+
+    try std.testing.expectEqual(@as(u32, 0), vchiq.initSlotZero(0xc0001000, &ram));
+
+    const slot5 = base + 5 * 4096;
+    var tx_off: u32 = 0;
+
+    // 1. VCHIQ_MSG_OPEN 'SMEM' (0x4D454D53) from arm port 9
+    std.mem.writeInt(u32, ram[slot5 + tx_off ..][0..4], (Vchiq.VCHIQ_MSG_OPEN << 24) | (9 << 12), .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 4 ..][0..4], 12, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 8 ..][0..4], 0x4D454D53, .little); // 'SMEM'
+    std.mem.writeInt(i16, ram[slot5 + tx_off + 16 ..][0..2], 1, .little); // version = 1
+    tx_off += 24;
+
+    // 2. VC_SM_MSG_TYPE_CLIENT_VERSION (version = 2)
+    std.mem.writeInt(u32, ram[slot5 + tx_off ..][0..4], (Vchiq.VCHIQ_MSG_DATA << 24) | (9 << 12) | 3, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 4 ..][0..4], 12, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 8 ..][0..4], Vchiq.VC_SM_MSG_TYPE_CLIENT_VERSION, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 12 ..][0..4], 1, .little); // trans_id = 1
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 16 ..][0..4], 2, .little); // version = 2
+    tx_off += 24;
+
+    // 3. VC_SM_MSG_TYPE_IMPORT (addr = 0xc0100000, size = 0x4000, kernel_id = 42)
+    std.mem.writeInt(u32, ram[slot5 + tx_off ..][0..4], (Vchiq.VCHIQ_MSG_DATA << 24) | (9 << 12) | 3, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 4 ..][0..4], 60, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 8 ..][0..4], Vchiq.VC_SM_MSG_TYPE_IMPORT, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 12 ..][0..4], 2, .little); // trans_id = 2
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 16 ..][0..4], 1, .little); // VC_SM_ALLOC_NON_CACHED
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 20 ..][0..4], 0xc010_0000, .little); // addr
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 24 ..][0..4], 0x4000, .little); // size
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 28 ..][0..4], 42, .little); // kernel_id
+    tx_off += 72;
+
+    // 4. VC_SM_MSG_TYPE_FREE (res_handle = 1)
+    std.mem.writeInt(u32, ram[slot5 + tx_off ..][0..4], (Vchiq.VCHIQ_MSG_DATA << 24) | (9 << 12) | 3, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 4 ..][0..4], 16, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 8 ..][0..4], Vchiq.VC_SM_MSG_TYPE_FREE, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 12 ..][0..4], 3, .little); // trans_id = 3
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 16 ..][0..4], 1, .little); // res_handle = 1
+    tx_off += 24;
+
+    std.mem.writeInt(u32, ram[slave + 28 ..][0..4], tx_off, .little); // slave.tx_pos
+    vchiq.write32(0x08, 0, &ram, &fifo, false, false);
+
+    try std.testing.expect(vchiq.irqPending());
+    try std.testing.expectEqual(@as(u12, 9), vchiq.smem_arm_port);
+    try std.testing.expectEqual(@as(u32, 2), vchiq.smem_client_version);
+
+    // Master slot 1 should contain:
+    //   [0..16):  OPENACK (msgid = (3<<24)|(3<<12)|9, size = 2)
+    //   [16..32): DATA CLIENT_VERSION ack (size = 8, cmd = 0x80000009, success = 0)
+    //   [32..48): DATA IMPORT result (size = 8, trans_id = 2, res_handle = 1)
+    //   [48..80): DATA RELEASED callback (size = 20, cmd = 0x8000000b, addr = 0xc0100000, size = 0x4000, kernel_id = 42, vc_handle = 1)
+    const slot1 = base + 1 * 4096;
+    try std.testing.expectEqual((Vchiq.VCHIQ_MSG_OPENACK << 24) | (3 << 12) | 9, std.mem.readInt(u32, ram[slot1 + 0 ..][0..4], .little));
+    try std.testing.expectEqual(Vchiq.VC_SM_MSG_TYPE_CLIENT_VERSION | 0x8000_0000, std.mem.readInt(u32, ram[slot1 + 24 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, ram[slot1 + 40 ..][0..4], .little)); // trans_id = 2
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ram[slot1 + 44 ..][0..4], .little)); // res_handle = 1
+    try std.testing.expectEqual(Vchiq.VC_SM_MSG_TYPE_RELEASED | 0x8000_0000, std.mem.readInt(u32, ram[slot1 + 56 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0xc010_0000), std.mem.readInt(u32, ram[slot1 + 60 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, ram[slot1 + 64 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, ram[slot1 + 68 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ram[slot1 + 72 ..][0..4], .little));
+}
+
