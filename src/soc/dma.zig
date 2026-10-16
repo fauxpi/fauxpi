@@ -51,6 +51,8 @@ pub const DmaController = struct {
         read32Fn: *const fn (ctx: *anyopaque, phys_addr: u32) u32,
         write32Fn: *const fn (ctx: *anyopaque, phys_addr: u32, val: u32) void,
         dreqReadyFn: *const fn (ctx: *anyopaque, permap: u5) bool,
+        readFifoBulkFn: ?*const fn (ctx: *anyopaque, phys_addr: u32, dst: []u8) bool = null,
+        writeFifoBulkFn: ?*const fn (ctx: *anyopaque, phys_addr: u32, src: []const u8) bool = null,
     };
 
     pub inline fn channelIrqPending(self: *const DmaController, ch: usize) bool {
@@ -386,6 +388,31 @@ pub const DmaController = struct {
                         src = @bitCast(@as(i32, @bitCast(src)) +% s_stride);
                         dst = @bitCast(@as(i32, @bitCast(dst)) +% d_stride);
                         continue;
+                    } else if (!s_inc and !s_ign and isPeripAddr(src) and (x_len & 3) == 0) {
+                        if (mmio) |m| {
+                            if (m.readFifoBulkFn) |bulkRead| {
+                                if (bulkRead(m.ctx, src, ram[dp .. dp + x_len])) {
+                                    dst +%= x_len;
+                                    src = @bitCast(@as(i32, @bitCast(src)) +% s_stride);
+                                    dst = @bitCast(@as(i32, @bitCast(dst)) +% d_stride);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (x_len > 0 and !s_ign and s_inc and !isPeripAddr(src) and !isPeripAddr(src +% (x_len - 1)) and !d_ign and !d_inc and isPeripAddr(dst) and (x_len & 3) == 0) {
+                const sp: usize = src & 0x1FFFFFFF;
+                if (sp + x_len <= ram.len) {
+                    if (mmio) |m| {
+                        if (m.writeFifoBulkFn) |bulkWrite| {
+                            if (bulkWrite(m.ctx, dst, ram[sp .. sp + x_len])) {
+                                src +%= x_len;
+                                src = @bitCast(@as(i32, @bitCast(src)) +% s_stride);
+                                dst = @bitCast(@as(i32, @bitCast(dst)) +% d_stride);
+                                continue;
+                            }
+                        }
                     }
                 }
             }

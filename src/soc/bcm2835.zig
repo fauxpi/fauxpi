@@ -117,6 +117,8 @@ pub const Bcm2835 = struct {
             .read32Fn = busRead32Opaque,
             .write32Fn = busWrite32Opaque,
             .dreqReadyFn = dmaDreqReady,
+            .readFifoBulkFn = busReadFifoBulkOpaque,
+            .writeFifoBulkFn = busWriteFifoBulkOpaque,
         };
     }
 
@@ -147,6 +149,24 @@ pub const Bcm2835 = struct {
     fn busWrite32Opaque(ctx: *anyopaque, raw_addr: u32, val: u32) void {
         const self: *Bcm2835 = @ptrCast(@alignCast(ctx));
         self.write32(raw_addr, val);
+    }
+
+    fn busReadFifoBulkOpaque(ctx: *anyopaque, raw_addr: u32, dst: []u8) bool {
+        const self: *Bcm2835 = @ptrCast(@alignCast(ctx));
+        return switch (normalizeAddr(raw_addr)) {
+            sdhost_mod.SdHost.BASE_ADDR + 0x40 => self.sdhost.tryReadDataBulk(dst),
+            sdhost_mod.ArasanSdhci.BASE_ADDR + 0x20 => self.sdhci.tryReadDataBulk(&self.sdhost, dst),
+            else => false,
+        };
+    }
+
+    fn busWriteFifoBulkOpaque(ctx: *anyopaque, raw_addr: u32, src: []const u8) bool {
+        const self: *Bcm2835 = @ptrCast(@alignCast(ctx));
+        return switch (normalizeAddr(raw_addr)) {
+            sdhost_mod.SdHost.BASE_ADDR + 0x40 => self.sdhost.tryWriteDataBulk(src),
+            sdhost_mod.ArasanSdhci.BASE_ADDR + 0x20 => self.sdhci.tryWriteDataBulk(&self.sdhost, src),
+            else => false,
+        };
     }
 
     const MmioPage = enum(u8) {

@@ -400,7 +400,9 @@ pub const Qcow2Disk = struct {
         if (offset >= self.virtual_size) return 0;
         const vcluster = offset >> CLUSTER_BITS;
         const in_cluster: usize = @intCast(offset & CLUSTER_MASK);
-        self.loadClusterIntoCache(vcluster) catch return 0;
+        if (self.cached_vcluster != vcluster) {
+            self.loadClusterIntoCache(vcluster) catch return 0;
+        }
         return self.cluster_cache[in_cluster];
     }
 
@@ -408,10 +410,104 @@ pub const Qcow2Disk = struct {
         if (offset >= self.virtual_size) return;
         const vcluster = offset >> CLUSTER_BITS;
         const in_cluster: usize = @intCast(offset & CLUSTER_MASK);
-        self.loadClusterIntoCache(vcluster) catch return;
+        if (self.cached_vcluster != vcluster) {
+            self.loadClusterIntoCache(vcluster) catch return;
+        }
         if (self.cluster_cache[in_cluster] != b) {
             self.cluster_cache[in_cluster] = b;
             self.cluster_dirty = true;
+        }
+    }
+
+    pub inline fn readWord32(self: *Qcow2Disk, offset: u64) u32 {
+        if (offset + 4 <= self.virtual_size) {
+            const in_cluster: usize = @intCast(offset & CLUSTER_MASK);
+            if (in_cluster <= CLUSTER_SIZE - 4) {
+                const vcluster = offset >> CLUSTER_BITS;
+                if (self.cached_vcluster != vcluster) {
+                    self.loadClusterIntoCache(vcluster) catch return 0;
+                }
+                return std.mem.readInt(u32, self.cluster_cache[in_cluster..][0..4], .little);
+            }
+        }
+        var bytes: [4]u8 = undefined;
+        inline for (0..4) |i| bytes[i] = self.readByte(offset + i);
+        return std.mem.readInt(u32, &bytes, .little);
+    }
+
+    pub inline fn writeWord32(self: *Qcow2Disk, offset: u64, val: u32) void {
+        if (offset + 4 <= self.virtual_size) {
+            const in_cluster: usize = @intCast(offset & CLUSTER_MASK);
+            if (in_cluster <= CLUSTER_SIZE - 4) {
+                const vcluster = offset >> CLUSTER_BITS;
+                if (self.cached_vcluster != vcluster) {
+                    self.loadClusterIntoCache(vcluster) catch return;
+                }
+                const prev = std.mem.readInt(u32, self.cluster_cache[in_cluster..][0..4], .little);
+                if (prev != val) {
+                    std.mem.writeInt(u32, self.cluster_cache[in_cluster..][0..4], val, .little);
+                    self.cluster_dirty = true;
+                }
+                return;
+            }
+        }
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, val, .little);
+        inline for (0..4) |i| self.writeByte(offset + i, bytes[i]);
+    }
+
+    pub fn readSlice(self: *Qcow2Disk, offset: u64, dst: []u8) void {
+        var pos: usize = 0;
+        var cur_off = offset;
+        while (pos < dst.len) {
+            if (cur_off >= self.virtual_size) {
+                @memset(dst[pos..], 0);
+                return;
+            }
+            const vcluster = cur_off >> CLUSTER_BITS;
+            const in_cluster: usize = @intCast(cur_off & CLUSTER_MASK);
+            const avail_in_cluster = CLUSTER_SIZE - in_cluster;
+            const avail_in_disk: usize = @intCast(@min(@as(u64, avail_in_cluster), self.virtual_size - cur_off));
+            const chunk = @min(dst.len - pos, avail_in_disk);
+            if (self.cached_vcluster != vcluster) {
+                self.loadClusterIntoCache(vcluster) catch {
+                    @memset(dst[pos .. pos + chunk], 0);
+                    pos += chunk;
+                    cur_off += chunk;
+                    continue;
+                };
+            }
+            @memcpy(dst[pos .. pos + chunk], self.cluster_cache[in_cluster .. in_cluster + chunk]);
+            pos += chunk;
+            cur_off += chunk;
+        }
+    }
+
+    pub fn writeSlice(self: *Qcow2Disk, offset: u64, src: []const u8) void {
+        var pos: usize = 0;
+        var cur_off = offset;
+        while (pos < src.len and cur_off < self.virtual_size) {
+            const vcluster = cur_off >> CLUSTER_BITS;
+            const in_cluster: usize = @intCast(cur_off & CLUSTER_MASK);
+            const avail_in_cluster = CLUSTER_SIZE - in_cluster;
+            const avail_in_disk: usize = @intCast(@min(@as(u64, avail_in_cluster), self.virtual_size - cur_off));
+            const chunk = @min(src.len - pos, avail_in_disk);
+            if (in_cluster == 0 and chunk == CLUSTER_SIZE) {
+                if (self.cached_vcluster != vcluster) {
+                    self.flush() catch return;
+                    self.cached_vcluster = vcluster;
+                }
+                @memcpy(self.cluster_cache, src[pos .. pos + CLUSTER_SIZE]);
+                self.cluster_dirty = true;
+            } else {
+                if (self.cached_vcluster != vcluster) {
+                    self.loadClusterIntoCache(vcluster) catch return;
+                }
+                @memcpy(self.cluster_cache[in_cluster .. in_cluster + chunk], src[pos .. pos + chunk]);
+                self.cluster_dirty = true;
+            }
+            pos += chunk;
+            cur_off += chunk;
         }
     }
 
@@ -419,8 +515,8 @@ pub const Qcow2Disk = struct {
     /// into a slice so `loader.loadFromSdImage` can parse `config.txt`, `kernel.img`, and `.dtb`.
     pub fn readBootVolumeAlloc(self: *Qcow2Disk, allocator: std.mem.Allocator) ![]u8 {
         try self.flush();
-        var sec0: [512]u8 = @splat(0);
-        for (0..512) |i| sec0[i] = self.readByte(i);
+        var sec0: [512]u8 = undefined;
+        self.readSlice(0, &sec0);
 
         var needed_bytes: u64 = @min(self.virtual_size, 64 * 1024 * 1024);
         // Check MBR partition 1 extent so we read the entire FAT boot partition

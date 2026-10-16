@@ -412,6 +412,146 @@ pub const SdHost = struct {
         }
     }
 
+    pub inline fn readImageWord32(self: *SdHost, offset: u64) u32 {
+        if (self.qcow2_disk) |disk| {
+            return disk.readWord32(offset);
+        }
+        if (self.image_const) |slice| {
+            if (offset + 4 <= slice.len) {
+                const off: usize = @intCast(offset);
+                return std.mem.readInt(u32, slice[off..][0..4], .little);
+            }
+            var bytes: [4]u8 = @splat(0);
+            for (0..4) |i| {
+                if (offset + i < slice.len) bytes[i] = slice[@intCast(offset + i)];
+            }
+            return std.mem.readInt(u32, &bytes, .little);
+        }
+        if (self.image_fd) |fd| {
+            const in_sec: usize = @intCast(offset & 511);
+            if (in_sec <= 508) {
+                const lba = offset >> 9;
+                if (self.sector_cache_lba != lba) {
+                    @memset(&self.sector_cache, 0);
+                    host_posix.preadAll(fd, &self.sector_cache, lba << 9) catch {};
+                    self.sector_cache_lba = lba;
+                }
+                return std.mem.readInt(u32, self.sector_cache[in_sec..][0..4], .little);
+            }
+        }
+        var bytes: [4]u8 = undefined;
+        inline for (0..4) |i| bytes[i] = self.readImageByte(offset + i);
+        return std.mem.readInt(u32, &bytes, .little);
+    }
+
+    pub inline fn writeImageWord32(self: *SdHost, offset: u64, val: u32) void {
+        if (self.qcow2_disk) |disk| {
+            disk.writeWord32(offset, val);
+            return;
+        }
+        if (self.image_data) |slice| {
+            if (offset + 4 <= slice.len) {
+                const off: usize = @intCast(offset);
+                std.mem.writeInt(u32, slice[off..][0..4], val, .little);
+                return;
+            }
+        }
+        if (self.image_fd) |fd| {
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, val, .little);
+            host_posix.pwriteAll(fd, &bytes, offset) catch {};
+            const lba = offset >> 9;
+            const in_sec: usize = @intCast(offset & 511);
+            if (self.sector_cache_lba == lba and in_sec <= 508) {
+                std.mem.writeInt(u32, self.sector_cache[in_sec..][0..4], val, .little);
+            } else if (self.sector_cache_lba == lba or self.sector_cache_lba == (offset + 3) >> 9) {
+                self.sector_cache_lba = std.math.maxInt(u64);
+            }
+            return;
+        }
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, val, .little);
+        inline for (0..4) |i| self.writeImageByte(offset + i, bytes[i]);
+    }
+
+    pub fn readImageSlice(self: *SdHost, offset: u64, dst: []u8) void {
+        if (self.qcow2_disk) |disk| {
+            disk.readSlice(offset, dst);
+            return;
+        }
+        if (self.image_const) |slice| {
+            if (offset >= slice.len) {
+                @memset(dst, 0);
+                return;
+            }
+            const off: usize = @intCast(offset);
+            const copy_len = @min(dst.len, slice.len - off);
+            @memcpy(dst[0..copy_len], slice[off .. off + copy_len]);
+            if (copy_len < dst.len) @memset(dst[copy_len..], 0);
+            return;
+        }
+        if (self.image_fd) |fd| {
+            @memset(dst, 0);
+            host_posix.preadAll(fd, dst, offset) catch {};
+            return;
+        }
+        @memset(dst, 0);
+    }
+
+    pub fn writeImageSlice(self: *SdHost, offset: u64, src: []const u8) void {
+        if (self.qcow2_disk) |disk| {
+            disk.writeSlice(offset, src);
+            return;
+        }
+        if (self.image_data) |slice| {
+            if (offset >= slice.len) return;
+            const off: usize = @intCast(offset);
+            const copy_len = @min(src.len, slice.len - off);
+            @memcpy(slice[off .. off + copy_len], src[0..copy_len]);
+            return;
+        }
+        if (self.image_fd) |fd| {
+            host_posix.pwriteAll(fd, src, offset) catch {};
+            self.sector_cache_lba = std.math.maxInt(u64);
+            return;
+        }
+    }
+
+    pub fn tryReadDataBulk(self: *SdHost, dst: []u8) bool {
+        if (self.transfer_mode != .read_image or dst.len == 0 or dst.len > self.data_remaining) return false;
+        self.readImageSlice(self.transfer_offset, dst);
+        self.transfer_offset += dst.len;
+        self.data_remaining -= @intCast(dst.len);
+        if (self.data_remaining == 0) {
+            self.transfer_mode = .none;
+            self.sdhsts &= ~SDHSTS_DATA_FLAG;
+            if ((self.sdhcfg & SDHCFG_BLOCK_IRPT_EN) != 0) {
+                self.sdhsts |= SDHSTS_BLOCK_IRPT;
+            }
+            if (self.sdhblc > 0) self.sdhblc = 0;
+        }
+        return true;
+    }
+
+    pub fn tryWriteDataBulk(self: *SdHost, src: []const u8) bool {
+        if (self.transfer_mode != .write_image or src.len == 0 or src.len > self.data_remaining) return false;
+        self.writeImageSlice(self.transfer_offset, src);
+        self.transfer_offset += src.len;
+        self.data_remaining -= @intCast(src.len);
+        if (self.sdhbct > 0 and (self.data_remaining % self.sdhbct) == 0) {
+            if ((self.sdhcfg & SDHCFG_BLOCK_IRPT_EN) != 0) {
+                self.sdhsts |= SDHSTS_BLOCK_IRPT;
+            }
+        }
+        if (self.data_remaining == 0) {
+            self.transfer_mode = .none;
+            self.sdhsts &= ~SDHSTS_DATA_FLAG;
+            if (self.sdhblc > 0) self.sdhblc = 0;
+            self.flushBacking();
+        }
+        return true;
+    }
+
     pub fn flushBacking(self: *SdHost) void {
         if (self.qcow2_disk) |disk| {
             disk.flush() catch {};
@@ -421,24 +561,32 @@ pub const SdHost = struct {
     fn readDataWord(self: *SdHost) u32 {
         if (self.data_remaining == 0) return 0;
 
-        var bytes: [4]u8 = [_]u8{0} ** 4;
-        for (0..4) |i| {
-            if (self.data_remaining > 0) {
-                switch (self.transfer_mode) {
-                    .read_aux => {
-                        if (self.aux_pos < self.aux_buf.len) {
-                            bytes[i] = self.aux_buf[self.aux_pos];
-                            self.aux_pos += 1;
-                        }
-                    },
-                    .read_image => {
-                        bytes[i] = self.readImageByte(self.transfer_offset);
-                        self.transfer_offset += 1;
-                    },
-                    else => {},
+        var word: u32 = 0;
+        if (self.transfer_mode == .read_image and self.data_remaining >= 4) {
+            word = self.readImageWord32(self.transfer_offset);
+            self.transfer_offset += 4;
+            self.data_remaining -= 4;
+        } else {
+            var bytes: [4]u8 = [_]u8{0} ** 4;
+            for (0..4) |i| {
+                if (self.data_remaining > 0) {
+                    switch (self.transfer_mode) {
+                        .read_aux => {
+                            if (self.aux_pos < self.aux_buf.len) {
+                                bytes[i] = self.aux_buf[self.aux_pos];
+                                self.aux_pos += 1;
+                            }
+                        },
+                        .read_image => {
+                            bytes[i] = self.readImageByte(self.transfer_offset);
+                            self.transfer_offset += 1;
+                        },
+                        else => {},
+                    }
+                    self.data_remaining -= 1;
                 }
-                self.data_remaining -= 1;
             }
+            word = std.mem.readInt(u32, &bytes, .little);
         }
 
         if (self.data_remaining == 0) {
@@ -449,19 +597,25 @@ pub const SdHost = struct {
             }
             if (self.sdhblc > 0) self.sdhblc = 0;
         }
-        return std.mem.readInt(u32, &bytes, .little);
+        return word;
     }
 
     fn writeDataWord(self: *SdHost, val: u32) void {
         if (self.transfer_mode != .write_image or self.data_remaining == 0) return;
 
-        var bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &bytes, val, .little);
-        for (0..4) |i| {
-            if (self.data_remaining > 0) {
-                self.writeImageByte(self.transfer_offset, bytes[i]);
-                self.transfer_offset += 1;
-                self.data_remaining -= 1;
+        if (self.data_remaining >= 4) {
+            self.writeImageWord32(self.transfer_offset, val);
+            self.transfer_offset += 4;
+            self.data_remaining -= 4;
+        } else {
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, val, .little);
+            for (0..4) |i| {
+                if (self.data_remaining > 0) {
+                    self.writeImageByte(self.transfer_offset, bytes[i]);
+                    self.transfer_offset += 1;
+                    self.data_remaining -= 1;
+                }
             }
         }
 
@@ -957,6 +1111,47 @@ pub const ArasanSdhci = struct {
         }
     }
 
+    pub fn tryReadDataBulk(self: *ArasanSdhci, sd: ?*SdHost, dst: []u8) bool {
+        if (self.pio_mode != .read_sd_image or self.pio_block_pos != 0 or self.pio_blksz == 0 or dst.len == 0) return false;
+        if ((dst.len % self.pio_blksz) != 0) return false;
+        const blocks = dst.len / self.pio_blksz;
+        if (blocks > self.pio_blocks_rem) return false;
+        const s = sd orelse return false;
+        s.readImageSlice(self.sd_transfer_offset, dst);
+        self.sd_transfer_offset += dst.len;
+        self.pio_total_pos += dst.len;
+        self.pio_blocks_rem -= blocks;
+        if (self.pio_blocks_rem == 0) {
+            self.pio_mode = .none;
+            self.int_status &= ~SDHCI_INT_DATA_AVAIL;
+            self.int_status |= SDHCI_INT_DATA_END;
+        } else {
+            self.int_status |= SDHCI_INT_DATA_AVAIL;
+        }
+        return true;
+    }
+
+    pub fn tryWriteDataBulk(self: *ArasanSdhci, sd: ?*SdHost, src: []const u8) bool {
+        if (self.pio_mode != .write_sd_image or self.pio_block_pos != 0 or self.pio_blksz == 0 or src.len == 0) return false;
+        if ((src.len % self.pio_blksz) != 0) return false;
+        const blocks = src.len / self.pio_blksz;
+        if (blocks > self.pio_blocks_rem) return false;
+        const s = sd orelse return false;
+        s.writeImageSlice(self.sd_transfer_offset, src);
+        self.sd_transfer_offset += src.len;
+        self.pio_total_pos += src.len;
+        self.pio_blocks_rem -= blocks;
+        if (self.pio_blocks_rem == 0) {
+            self.pio_mode = .none;
+            s.flushBacking();
+            self.int_status &= ~SDHCI_INT_SPACE_AVAIL;
+            self.int_status |= SDHCI_INT_DATA_END;
+        } else {
+            self.int_status |= SDHCI_INT_SPACE_AVAIL;
+        }
+        return true;
+    }
+
     fn readPioBuffer(self: *ArasanSdhci, sd: ?*SdHost) u32 {
         if (self.pio_blocks_rem == 0) return 0;
         switch (self.pio_mode) {
@@ -966,31 +1161,43 @@ pub const ArasanSdhci = struct {
         }
 
         const chunk = @min(@as(usize, 4), self.pio_blksz - self.pio_block_pos);
-        var bytes: [4]u8 = [_]u8{0} ** 4;
-        for (0..chunk) |i| {
-            switch (self.pio_mode) {
-                .read_wifi => {
-                    if (self.pio_total_pos < self.pio_total_len) {
-                        bytes[i] = self.pio_buf[self.pio_total_pos];
+        var word: u32 = 0;
+        if (chunk == 4 and self.pio_mode == .read_sd_image) {
+            const s = sd.?;
+            word = s.readImageWord32(self.sd_transfer_offset);
+            self.sd_transfer_offset += 4;
+            self.pio_total_pos += 4;
+        } else if (chunk == 4 and self.pio_mode == .read_wifi and self.pio_total_pos + 4 <= self.pio_total_len) {
+            word = std.mem.readInt(u32, self.pio_buf[self.pio_total_pos..][0..4], .little);
+            self.pio_total_pos += 4;
+        } else {
+            var bytes: [4]u8 = [_]u8{0} ** 4;
+            for (0..chunk) |i| {
+                switch (self.pio_mode) {
+                    .read_wifi => {
+                        if (self.pio_total_pos < self.pio_total_len) {
+                            bytes[i] = self.pio_buf[self.pio_total_pos];
+                            self.pio_total_pos += 1;
+                        }
+                    },
+                    .read_sd_aux => {
+                        const s = sd.?;
+                        if (s.aux_pos < s.aux_buf.len) {
+                            bytes[i] = s.aux_buf[s.aux_pos];
+                            s.aux_pos += 1;
+                        }
                         self.pio_total_pos += 1;
-                    }
-                },
-                .read_sd_aux => {
-                    const s = sd.?;
-                    if (s.aux_pos < s.aux_buf.len) {
-                        bytes[i] = s.aux_buf[s.aux_pos];
-                        s.aux_pos += 1;
-                    }
-                    self.pio_total_pos += 1;
-                },
-                .read_sd_image => {
-                    const s = sd.?;
-                    bytes[i] = s.readImageByte(self.sd_transfer_offset);
-                    self.sd_transfer_offset += 1;
-                    self.pio_total_pos += 1;
-                },
-                else => {},
+                    },
+                    .read_sd_image => {
+                        const s = sd.?;
+                        bytes[i] = s.readImageByte(self.sd_transfer_offset);
+                        self.sd_transfer_offset += 1;
+                        self.pio_total_pos += 1;
+                    },
+                    else => {},
+                }
             }
+            word = std.mem.readInt(u32, &bytes, .little);
         }
         self.pio_block_pos += chunk;
 
@@ -1005,7 +1212,7 @@ pub const ArasanSdhci = struct {
                 self.int_status |= SDHCI_INT_DATA_AVAIL;
             }
         }
-        return std.mem.readInt(u32, &bytes, .little);
+        return word;
     }
 
     fn writePioBuffer(self: *ArasanSdhci, val: u32, sd: ?*SdHost) void {
@@ -1017,23 +1224,33 @@ pub const ArasanSdhci = struct {
         }
 
         const chunk = @min(@as(usize, 4), self.pio_blksz - self.pio_block_pos);
-        var bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &bytes, val, .little);
-        for (0..chunk) |i| {
-            switch (self.pio_mode) {
-                .write_wifi => {
-                    if (self.pio_total_pos < self.pio_total_len) {
-                        self.pio_buf[self.pio_total_pos] = bytes[i];
+        if (chunk == 4 and self.pio_mode == .write_sd_image) {
+            const s = sd.?;
+            s.writeImageWord32(self.sd_transfer_offset, val);
+            self.sd_transfer_offset += 4;
+            self.pio_total_pos += 4;
+        } else if (chunk == 4 and self.pio_mode == .write_wifi and self.pio_total_pos + 4 <= self.pio_total_len) {
+            std.mem.writeInt(u32, self.pio_buf[self.pio_total_pos..][0..4], val, .little);
+            self.pio_total_pos += 4;
+        } else {
+            var bytes: [4]u8 = undefined;
+            std.mem.writeInt(u32, &bytes, val, .little);
+            for (0..chunk) |i| {
+                switch (self.pio_mode) {
+                    .write_wifi => {
+                        if (self.pio_total_pos < self.pio_total_len) {
+                            self.pio_buf[self.pio_total_pos] = bytes[i];
+                            self.pio_total_pos += 1;
+                        }
+                    },
+                    .write_sd_image => {
+                        const s = sd.?;
+                        s.writeImageByte(self.sd_transfer_offset, bytes[i]);
+                        self.sd_transfer_offset += 1;
                         self.pio_total_pos += 1;
-                    }
-                },
-                .write_sd_image => {
-                    const s = sd.?;
-                    s.writeImageByte(self.sd_transfer_offset, bytes[i]);
-                    self.sd_transfer_offset += 1;
-                    self.pio_total_pos += 1;
-                },
-                else => {},
+                    },
+                    else => {},
+                }
             }
         }
         self.pio_block_pos += chunk;
