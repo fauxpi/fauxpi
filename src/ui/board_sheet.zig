@@ -464,6 +464,59 @@ pub const BoardUi = struct {
     board_cache_key: BoardCacheKey = .{},
     gpio_cache: []u32 = &.{},
     gpio_cache_key: GpioCacheKey = .{},
+    hover_dirty: bool = false,
+
+    const HoverStateSnapshot = struct {
+        hovered_target: ?InteractiveTarget,
+        board_btn_hovered: bool,
+        max_btn_hovered: bool,
+        close_btn_hovered: bool,
+        settings_btn_hovered: bool,
+        board_menu_btn_hovered: bool,
+        hovered_board_menu_idx: ?usize,
+        serial_field_hovered: bool,
+        mac_field_hovered: bool,
+        wifi_mac_field_hovered: bool,
+        dhcp_toggle_hovered: bool,
+        hovered_sd_menu_idx: ?usize,
+        hovered_sd_size_idx: ?usize,
+        hovered_sd_card_row_idx: ?usize,
+        sd_name_field_hovered: bool,
+        sd_browse_btn_hovered: bool,
+        sd_add_btn_hovered: bool,
+        sd_manage_close_hovered: bool,
+        hovered_gpio_input_idx: ?usize,
+    };
+
+    inline fn snapshotHoverState(self: *const BoardUi) HoverStateSnapshot {
+        return .{
+            .hovered_target = self.hovered_target,
+            .board_btn_hovered = self.board_btn_hovered,
+            .max_btn_hovered = self.max_btn_hovered,
+            .close_btn_hovered = self.close_btn_hovered,
+            .settings_btn_hovered = self.settings_btn_hovered,
+            .board_menu_btn_hovered = self.board_menu_btn_hovered,
+            .hovered_board_menu_idx = self.hovered_board_menu_idx,
+            .serial_field_hovered = self.serial_field_hovered,
+            .mac_field_hovered = self.mac_field_hovered,
+            .wifi_mac_field_hovered = self.wifi_mac_field_hovered,
+            .dhcp_toggle_hovered = self.dhcp_toggle_hovered,
+            .hovered_sd_menu_idx = self.hovered_sd_menu_idx,
+            .hovered_sd_size_idx = self.hovered_sd_size_idx,
+            .hovered_sd_card_row_idx = self.hovered_sd_card_row_idx,
+            .sd_name_field_hovered = self.sd_name_field_hovered,
+            .sd_browse_btn_hovered = self.sd_browse_btn_hovered,
+            .sd_add_btn_hovered = self.sd_add_btn_hovered,
+            .sd_manage_close_hovered = self.sd_manage_close_hovered,
+            .hovered_gpio_input_idx = self.hovered_gpio_input_idx,
+        };
+    }
+
+    pub fn takeHoverDirty(self: *BoardUi) bool {
+        const d = self.hover_dirty;
+        self.hover_dirty = false;
+        return d;
+    }
 
     pub const AsyncSdCreateTask = struct {
         card_name_buf: [64]u8 = @splat(0),
@@ -1893,6 +1946,10 @@ pub const BoardUi = struct {
     /// Handles pointer motion at `(x, y)` in window coordinates.
     /// Returns true if the pointer is over the TitleBar, an open BoardSheet, or the connected GPIO box.
     pub fn pointerMotion(self: *BoardUi, x: f32, y: f32, status: SystemStatus, gpio_hw: *const Gpio) bool {
+        const prev_hover = self.snapshotHoverState();
+        defer if (!std.meta.eql(prev_hover, self.snapshotHoverState())) {
+            self.hover_dirty = true;
+        };
         self.updateLayout(self.last_win_w, self.last_win_h, status, gpio_hw);
         const pt: Point = .{ x, y };
 
@@ -2029,6 +2086,8 @@ pub const BoardUi = struct {
     }
 
     pub fn pointerLeave(self: *BoardUi) void {
+        const prev_hover = self.snapshotHoverState();
+        const had_pressed = self.board_btn_pressed or self.max_btn_pressed or self.close_btn_pressed or self.settings_btn_pressed;
         self.board_btn_hovered = false;
         self.board_btn_pressed = false;
         self.max_btn_hovered = false;
@@ -2052,6 +2111,9 @@ pub const BoardUi = struct {
         self.sd_manage_close_hovered = false;
         self.hovered_gpio_input_idx = null;
         self.hovered_target = null;
+        if (had_pressed or !std.meta.eql(prev_hover, self.snapshotHoverState())) {
+            self.hover_dirty = true;
+        }
     }
 
     /// Handles pointer button press/release at `(x, y)` in window coordinates.
@@ -2530,12 +2592,78 @@ pub const BoardUi = struct {
         c.drawIcon(icon, @round(r.x + (r.w - s) * 0.5), @round(r.y + (r.h - s) * 0.5), s, icon_color);
     }
 
-    inline fn dimSpanSwar(span: []u32) void {
-        for (span) |*dst| {
-            const px = dst.*;
+    /// Blits the 1x `src_hdmi` (`dw * dh`) into the physical window backbuffer `dst_full`,
+    /// using 8-wide SIMD `@shuffle` pixel-doubling when `sc == 2`.
+    pub fn blitHdmiToBackbuffer(
+        dst_full: []u32,
+        buf_w: usize,
+        top_phys_rows: usize,
+        src_hdmi: []const u32,
+        dw: usize,
+        dh: usize,
+        sc: u32,
+    ) void {
+        if (sc == 1) {
+            const dst = dst_full[top_phys_rows * buf_w ..][0 .. dw * dh];
+            @memcpy(dst, src_hdmi[0 .. dw * dh]);
+        } else if (sc == 2) {
+            const dup_mask = [16]i32{ 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7 };
+            for (0..dh) |sy| {
+                const src_row = src_hdmi[sy * dw ..][0..dw];
+                const dst_y0 = top_phys_rows + sy * 2;
+                const row0 = dst_full[dst_y0 * buf_w ..][0 .. dw * 2];
+                const row1 = dst_full[(dst_y0 + 1) * buf_w ..][0 .. dw * 2];
+                var sx: usize = 0;
+                while (sx + 8 <= dw) : (sx += 8) {
+                    const v: @Vector(8, u32) = src_row[sx..][0..8].*;
+                    const v2: @Vector(16, u32) = @shuffle(u32, v, undefined, dup_mask);
+                    row0[sx * 2 ..][0..16].* = v2;
+                    row1[sx * 2 ..][0..16].* = v2;
+                }
+                while (sx < dw) : (sx += 1) {
+                    const px = src_row[sx];
+                    row0[sx * 2] = px;
+                    row0[sx * 2 + 1] = px;
+                    row1[sx * 2] = px;
+                    row1[sx * 2 + 1] = px;
+                }
+            }
+        } else {
+            const s: usize = sc;
+            for (0..dh) |sy| {
+                const src_row = src_hdmi[sy * dw ..][0..dw];
+                const dst_y0 = top_phys_rows + sy * s;
+                const first_dst_row = dst_full[dst_y0 * buf_w ..][0 .. dw * s];
+                for (src_row, 0..) |px, sx| {
+                    @memset(first_dst_row[sx * s ..][0..s], px);
+                }
+                for (1..s) |ry| {
+                    const dup_dst_row = dst_full[(dst_y0 + ry) * buf_w ..][0 .. dw * s];
+                    @memcpy(dup_dst_row, first_dst_row);
+                }
+            }
+        }
+    }
+
+    pub inline fn dimSpanSwar(span: []u32) void {
+        const mask_rb: @Vector(8, u32) = @splat(0x00FF00FF);
+        const mask_g: @Vector(8, u32) = @splat(0x0000FF00);
+        const factor: @Vector(8, u32) = @splat(115);
+        const shift8: @Vector(8, u5) = @splat(8);
+        const alpha: @Vector(8, u32) = @splat(0xFF000000);
+
+        var i: usize = 0;
+        while (i + 8 <= span.len) : (i += 8) {
+            const px: @Vector(8, u32) = span[i..][0..8].*;
+            const rb = (((px & mask_rb) *% factor) >> shift8) & mask_rb;
+            const g = (((px & mask_g) *% factor) >> shift8) & mask_g;
+            span[i..][0..8].* = alpha | rb | g;
+        }
+        while (i < span.len) : (i += 1) {
+            const px = span[i];
             const rb = (((px & 0x00FF00FF) * 115) >> 8) & 0x00FF00FF;
             const g = (((px & 0x0000FF00) * 115) >> 8) & 0x0000FF00;
-            dst.* = 0xFF000000 | rb | g;
+            span[i] = 0xFF000000 | rb | g;
         }
     }
 

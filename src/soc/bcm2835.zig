@@ -70,6 +70,8 @@ pub const Bcm2835 = struct {
     display_height: u16 = 720,
     audio_connected: bool = true,
     act_led_hold_frames: u8 = 0,
+    last_display_hash: u64 = 0,
+    last_display_was_hvs: bool = false,
 
     pub fn init(ram: []u8, display_width: u16, display_height: u16) Bcm2835 {
         var soc = Bcm2835{
@@ -363,29 +365,139 @@ pub const Bcm2835 = struct {
         if (self.hvs.compositeFrame(self.ram, out_argb, width, height)) {
             return true;
         }
+        return self.renderMailboxFb(out_argb, width, height);
+    }
+
+    fn renderMailboxFb(self: *const Bcm2835, out_argb: []u32, width: u32, height: u32) bool {
+        if (!self.mailbox.fb_allocated) return false;
+        const fb_phys = self.mailbox.fb_bus_addr & 0x1FFFFFFF;
+        const fb_w = self.mailbox.fb_width;
+        const fb_h = self.mailbox.fb_height;
+        const bpp = self.mailbox.fb_depth / 8;
+        if (bpp < 2 or fb_w == 0 or fb_h == 0 or out_argb.len < width * height) return false;
+
+        const fmt_mod = @import("../vc4/format.zig");
+
+        // Fast path: 1:1 unscaled Mailbox framebuffer (8-wide SIMD)
+        if (fb_w == width and fb_h == height) {
+            const total_px: usize = @as(usize, width) * @as(usize, height);
+            const total_bytes: usize = total_px * bpp;
+            if (@as(usize, fb_phys) + total_bytes <= self.ram.len) {
+                const src_bytes = self.ram[fb_phys..][0..total_bytes];
+                if (bpp == 2) {
+                    var i: usize = 0;
+                    while (i + 8 <= total_px) : (i += 8) {
+                        const p16_vec: @Vector(8, u16) = @bitCast(src_bytes[i * 2 ..][0..16].*);
+                        out_argb[i..][0..8].* = @bitCast(fmt_mod.fromRgb565Vec8(p16_vec));
+                    }
+                    while (i < total_px) : (i += 1) {
+                        const p16 = std.mem.readInt(u16, src_bytes[i * 2 ..][0..2], .little);
+                        out_argb[i] = fmt_mod.fromRgb565(p16);
+                    }
+                    return true;
+                } else if (bpp == 4) {
+                    const opaque_mask8: @Vector(8, u32) = @splat(0xFF000000);
+                    var i: usize = 0;
+                    while (i + 8 <= total_px) : (i += 8) {
+                        const src_v: @Vector(8, u32) = @bitCast(src_bytes[i * 4 ..][0..32].*);
+                        out_argb[i..][0..8].* = @bitCast(src_v | opaque_mask8);
+                    }
+                    while (i < total_px) : (i += 1) {
+                        out_argb[i] = std.mem.readInt(u32, src_bytes[i * 4 ..][0..4], .little) | 0xFF000000;
+                    }
+                    return true;
+                }
+            }
+        }
+
+        for (0..height) |y| {
+            const sy = (@as(u32, @intCast(y)) * fb_h) / height;
+            for (0..width) |x| {
+                const sx = (@as(u32, @intCast(x)) * fb_w) / width;
+                const off = fb_phys + (sy * fb_w + sx) * bpp;
+                if (off + bpp <= self.ram.len) {
+                    out_argb[y * width + x] = if (bpp == 2)
+                        fmt_mod.fromRgb565(std.mem.readInt(u16, self.ram[off..][0..2], .little))
+                    else
+                        std.mem.readInt(u32, self.ram[off..][0..4], .little) | 0xFF000000;
+                }
+            }
+        }
+        return true;
+    }
+
+    /// Composites the current HDMI frame only if the display list, V3D output, or scanout RAM changed.
+    pub fn renderDisplayFrameIfChanged(
+        self: *Bcm2835,
+        out_argb: []u32,
+        width: u32,
+        height: u32,
+        force: bool,
+        cpu_was_active: bool,
+    ) struct { active: bool, changed: bool } {
+        if (!self.hdmi.connected) {
+            self.last_display_hash = 0;
+            self.last_display_was_hvs = false;
+            return .{ .active = false, .changed = false };
+        }
+
+        const dlist_dirty = self.hvs.dlist_updated;
+        self.hvs.dlist_updated = false;
+        const v3d_dirty = self.v3d.takeFrameDirty();
+
+        if (self.hvs.isActive()) {
+            if (!force and self.last_display_was_hvs and !dlist_dirty and !v3d_dirty) {
+                if (!cpu_was_active) {
+                    return .{ .active = true, .changed = false };
+                }
+                const h = self.hvs.computeActivePlanesHash(self.ram, width, height);
+                if (h != 0 and h == self.last_display_hash) {
+                    return .{ .active = true, .changed = false };
+                }
+                if (self.hvs.compositeFrame(self.ram, out_argb, width, height)) {
+                    self.last_display_hash = h;
+                    self.last_display_was_hvs = true;
+                    return .{ .active = true, .changed = true };
+                }
+            } else if (self.hvs.compositeFrame(self.ram, out_argb, width, height)) {
+                self.last_display_hash = self.hvs.computeActivePlanesHash(self.ram, width, height);
+                self.last_display_was_hvs = true;
+                return .{ .active = true, .changed = true };
+            }
+        }
+
         if (self.mailbox.fb_allocated) {
             const fb_phys = self.mailbox.fb_bus_addr & 0x1FFFFFFF;
             const fb_w = self.mailbox.fb_width;
             const fb_h = self.mailbox.fb_height;
             const bpp = self.mailbox.fb_depth / 8;
             if (bpp >= 2 and fb_w > 0 and fb_h > 0) {
-                for (0..height) |y| {
-                    const sy = (@as(u32, @intCast(y)) * fb_h) / height;
-                    for (0..width) |x| {
-                        const sx = (@as(u32, @intCast(x)) * fb_w) / width;
-                        const off = fb_phys + (sy * fb_w + sx) * bpp;
-                        if (off + bpp <= self.ram.len) {
-                            out_argb[y * width + x] = if (bpp == 2)
-                                @import("../vc4/format.zig").fromRgb565(std.mem.readInt(u16, self.ram[off..][0..2], .little))
-                            else
-                                std.mem.readInt(u32, self.ram[off..][0..4], .little) | 0xFF000000;
+                const fb_bytes: usize = @as(usize, fb_w) * @as(usize, fb_h) * bpp;
+                var h: u64 = 0;
+                if (@as(usize, fb_phys) + fb_bytes <= self.ram.len) {
+                    if (!force and !self.last_display_was_hvs and !v3d_dirty) {
+                        if (!cpu_was_active and self.last_display_hash != 0) {
+                            return .{ .active = true, .changed = false };
                         }
+                        h = std.hash.Wyhash.hash(0x517CC1B727220A95, self.ram[fb_phys..][0..fb_bytes]);
+                        if (h == self.last_display_hash) {
+                            return .{ .active = true, .changed = false };
+                        }
+                    } else {
+                        h = std.hash.Wyhash.hash(0x517CC1B727220A95, self.ram[fb_phys..][0..fb_bytes]);
                     }
                 }
-                return true;
+                if (self.renderMailboxFb(out_argb, width, height)) {
+                    self.last_display_hash = h;
+                    self.last_display_was_hvs = false;
+                    return .{ .active = true, .changed = true };
+                }
             }
         }
-        return false;
+
+        self.last_display_hash = 0;
+        self.last_display_was_hvs = false;
+        return .{ .active = false, .changed = false };
     }
 
     fn normalizeAddr(addr: u32) u32 {
@@ -965,6 +1077,49 @@ test "Bcm2835 AUX SPI1/SPI2 and I2S PCM (PERMAP 2) audio streaming" {
     try std.testing.expectEqual(@as(i16, -0x2468), samples[3]);
     _ = pm_mod;
 }
+
+test "Bcm2835 renderDisplayFrameIfChanged dirty-frame detection and SIMD Mailbox FB scanout" {
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 16 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    const w: u16 = 16;
+    const h: u16 = 8;
+    var soc = Bcm2835.init(ram, w, h);
+    var out: [16 * 8]u32 = [_]u32{0} ** (16 * 8);
+
+    // 1. Before FB allocation or HVS setup: inactive and unchanged
+    const r0 = soc.renderDisplayFrameIfChanged(&out, w, h, true, true);
+    try std.testing.expect(!r0.active);
+    try std.testing.expect(!r0.changed);
+
+    // 2. Allocate 16x8 32bpp Mailbox FB at 0x1000 and write a pixel
+    soc.mailbox.fb_allocated = true;
+    soc.mailbox.fb_bus_addr = 0x40001000;
+    soc.mailbox.fb_width = w;
+    soc.mailbox.fb_height = h;
+    soc.mailbox.fb_depth = 32;
+    std.mem.writeInt(u32, ram[0x1000..0x1004], 0x00112233, .little);
+
+    const r1 = soc.renderDisplayFrameIfChanged(&out, w, h, true, true);
+    try std.testing.expect(r1.active);
+    try std.testing.expect(r1.changed);
+    try std.testing.expectEqual(@as(u32, 0xFF112233), out[0]);
+
+    // 3. Subsequent frame with no RAM changes: skipped (changed == false) even if CPU was active
+    const r2 = soc.renderDisplayFrameIfChanged(&out, w, h, false, true);
+    try std.testing.expect(r2.active);
+    try std.testing.expect(!r2.changed);
+
+    // 4. Modify pixel in-place in RAM: detected and re-rendered
+    std.mem.writeInt(u32, ram[0x1000 + 15 * 4 ..][0..4], 0x00AABBCC, .little);
+    const r3 = soc.renderDisplayFrameIfChanged(&out, w, h, false, true);
+    try std.testing.expect(r3.active);
+    try std.testing.expect(r3.changed);
+    try std.testing.expectEqual(@as(u32, 0xFFAABBCC), out[15]);
+}
+
 
 
 

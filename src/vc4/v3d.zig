@@ -150,6 +150,13 @@ pub const V3d = struct {
 
     gl: GlRenderer = .{},
     gl_initialized: bool = false,
+    frame_dirty: bool = false,
+
+    pub fn takeFrameDirty(self: *V3d) bool {
+        const d = self.frame_dirty;
+        self.frame_dirty = false;
+        return d;
+    }
 
     pub fn irqPending(self: *const V3d) bool {
         return (self.intctl & self.int_mask) != 0;
@@ -236,6 +243,7 @@ pub const V3d = struct {
                     self.ct1ca = self.ct1ea;
                     self.rfc +%= 1;
                     self.intctl |= INT_FRDONE;
+                    self.frame_dirty = true;
                 }
             },
             0x110 => self.ct0ca = val,

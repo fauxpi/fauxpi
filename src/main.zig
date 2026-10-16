@@ -783,21 +783,24 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 const leds = soc.sampleBoardLeds(w.status.power_connected);
                 w.status.act_led_on = leds.act_on;
                 w.status.pwr_led_on = leds.pwr_on;
-                const leds_changed = (leds.act_on != prev_act) or (leds.pwr_on != prev_pwr);
+                const leds_changed = w.ui.sheet_open and ((leds.act_on != prev_act) or (leds.pwr_on != prev_pwr));
 
-                const need_hdmi_render = soc.hvs.dlist_updated or
-                    !w.status.hdmi_active or
-                    (!soc.hvs.isActive() and soc.mailbox.fb_allocated) or
-                    (frame_active_us > 200);
-                var hdmi_changed = false;
-                if (need_hdmi_render) {
-                    soc.hvs.dlist_updated = false;
-                    const disp_pixels = w.displayPixels();
-                    w.status.hdmi_active = soc.renderDisplayFrame(disp_pixels, opts.width, opts.height);
-                    hdmi_changed = true;
+                const prev_hdmi_active = w.status.hdmi_active;
+                const disp_pixels = w.displayPixels();
+                const disp_res = soc.renderDisplayFrameIfChanged(
+                    disp_pixels,
+                    opts.width,
+                    opts.height,
+                    !prev_hdmi_active,
+                    frame_active_us > 0,
+                );
+                w.status.hdmi_active = disp_res.active;
+                const hdmi_changed = disp_res.changed or (disp_res.active != prev_hdmi_active);
+                if (disp_res.changed) {
+                    w.notifyHdmiUpdated();
                 }
 
-                const gpio_ui_dirty = soc.gpio.takeUiDirty();
+                const gpio_ui_dirty = soc.gpio.takeUiDirty() and w.status.gpio_connected;
                 const need_present = hdmi_changed or
                     leds_changed or
                     gpio_ui_dirty or

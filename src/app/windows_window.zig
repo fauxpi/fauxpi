@@ -320,6 +320,9 @@ pub const WindowsWindow = struct {
     hdmi_fb: []u32,
     /// Physical window backbuffer (`(width * scale) * (height * scale)`)
     backbuffer: []u32 = &.{},
+    hdmi_gen: u64 = 1,
+    backbuf_hdmi_gen: u64 = 0,
+    backbuf_had_sheet: bool = false,
 
     closed: bool = false,
     ui_dirty: bool = true,
@@ -544,6 +547,8 @@ pub const WindowsWindow = struct {
         const count = @as(usize, self.width * sc) * @as(usize, self.height * sc);
         self.backbuffer = try self.gpa.alloc(u32, count);
         @memset(self.backbuffer, 0xFF101418);
+        self.backbuf_hdmi_gen = 0;
+        self.backbuf_had_sheet = false;
         self.cursor_mode = .unknown;
         self.ui_dirty = true;
     }
@@ -554,6 +559,11 @@ pub const WindowsWindow = struct {
 
     pub fn displayPixels(self: *WindowsWindow) []u32 {
         return self.hdmi_fb;
+    }
+
+    pub fn notifyHdmiUpdated(self: *WindowsWindow) void {
+        self.hdmi_gen +%= 1;
+        if (self.hdmi_gen == 0) self.hdmi_gen = 1;
     }
 
     pub fn chosenSdPath(self: *const WindowsWindow) []const u8 {
@@ -597,36 +607,17 @@ pub const WindowsWindow = struct {
         const dh: usize = self.display_height;
 
         if (self.status.hdmi_connected and self.status.hdmi_active) {
-            if (sc == 1) {
-                const dst = full[top_phys_rows * buf_w ..][0 .. dw * dh];
-                @memcpy(dst, self.hdmi_fb[0 .. dw * dh]);
-            } else if (sc == 2) {
-                for (0..dh) |sy| {
-                    const src_row = self.hdmi_fb[sy * dw ..][0..dw];
-                    const dst_y0 = top_phys_rows + sy * 2;
-                    const first_dst_row = full[dst_y0 * buf_w ..][0 .. dw * 2];
-                    const dst_u64: [*]align(4) u64 = @ptrCast(first_dst_row.ptr);
-                    for (src_row, 0..) |px, sx| {
-                        dst_u64[sx] = (@as(u64, px) << 32) | px;
-                    }
-                    const dup_dst_row = full[(dst_y0 + 1) * buf_w ..][0 .. dw * 2];
-                    @memcpy(dup_dst_row, first_dst_row);
-                }
-            } else {
-                for (0..dh) |sy| {
-                    const src_row = self.hdmi_fb[sy * dw ..][0..dw];
-                    const dst_y0 = top_phys_rows + sy * sc;
-                    const first_dst_row = full[dst_y0 * buf_w ..][0 .. dw * sc];
-                    for (src_row, 0..) |px, sx| {
-                        @memset(first_dst_row[sx * sc ..][0..sc], px);
-                    }
-                    for (1..sc) |ry| {
-                        const dup_dst_row = full[(dst_y0 + ry) * buf_w ..][0 .. dw * sc];
-                        @memcpy(dup_dst_row, first_dst_row);
-                    }
-                }
+            const need_hdmi_blit = (self.backbuf_hdmi_gen != self.hdmi_gen) or
+                self.ui.sheet_open or
+                self.backbuf_had_sheet;
+            if (need_hdmi_blit) {
+                board_sheet.BoardUi.blitHdmiToBackbuffer(full, buf_w, top_phys_rows, self.hdmi_fb, dw, dh, sc);
+                self.backbuf_hdmi_gen = self.hdmi_gen;
             }
+        } else {
+            self.backbuf_hdmi_gen = 0;
         }
+        self.backbuf_had_sheet = self.ui.sheet_open;
 
         self.ui.paint(full, self.width, self.height, sc, self.status, self.gpio);
     }
@@ -806,7 +797,9 @@ pub const WindowsWindow = struct {
                     }
                     self.last_mouse_x = pt.x;
                     self.last_mouse_y = pt.y;
-                    self.ui_dirty = true;
+                    if (self.ui.takeHoverDirty()) {
+                        self.ui_dirty = true;
+                    }
                 }
                 return 0;
             },

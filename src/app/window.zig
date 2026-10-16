@@ -107,6 +107,10 @@ pub const WaylandWindow = struct {
     cursor_buffers: [2]client.Proxy = undefined,
     has_buffers: bool = false,
     cur_buf: u1 = 0,
+    hdmi_gen: u64 = 1,
+    buf_hdmi_gen: [2]u64 = .{ 0, 0 },
+    buf_had_sheet: [2]bool = .{ false, false },
+    last_composite_damaged_hdmi: bool = true,
 
     configured: bool = false,
     closed: bool = false,
@@ -508,6 +512,9 @@ pub const WaylandWindow = struct {
 
         self.has_buffers = true;
         self.cur_buf = 0;
+        self.buf_hdmi_gen = .{ 0, 0 };
+        self.buf_had_sheet = .{ false, false };
+        self.last_composite_damaged_hdmi = true;
         self.cursor_mode = .unknown;
         self.ui_dirty = true;
 
@@ -531,6 +538,11 @@ pub const WaylandWindow = struct {
         return self.hdmi_fb;
     }
 
+    pub fn notifyHdmiUpdated(self: *WaylandWindow) void {
+        self.hdmi_gen +%= 1;
+        if (self.hdmi_gen == 0) self.hdmi_gen = 1;
+    }
+
     /// Blits the 1x `hdmi_fb` (`display_width * display_height`) into the physical
     /// backbuffer (pixel-doubling `scale x scale` when `scale > 1`) and renders
     /// `BoardUi` at native HiDPI resolution (`scale`).
@@ -551,38 +563,24 @@ pub const WaylandWindow = struct {
         const top_phys_rows: usize = @as(usize, board_sheet.BoardUi.title_bar_height) * @as(usize, sc);
         const dw: usize = self.display_width;
         const dh: usize = self.display_height;
+        const b_idx: usize = self.cur_buf;
 
         if (self.status.hdmi_connected and self.status.hdmi_active) {
-            if (sc == 1) {
-                const dst = full[top_phys_rows * buf_w ..][0 .. dw * dh];
-                @memcpy(dst, self.hdmi_fb[0 .. dw * dh]);
-            } else if (sc == 2) {
-                for (0..dh) |sy| {
-                    const src_row = self.hdmi_fb[sy * dw ..][0..dw];
-                    const dst_y0 = top_phys_rows + sy * 2;
-                    const first_dst_row = full[dst_y0 * buf_w ..][0 .. dw * 2];
-                    const dst_u64: [*]align(4) u64 = @ptrCast(first_dst_row.ptr);
-                    for (src_row, 0..) |px, sx| {
-                        dst_u64[sx] = (@as(u64, px) << 32) | px;
-                    }
-                    const dup_dst_row = full[(dst_y0 + 1) * buf_w ..][0 .. dw * 2];
-                    @memcpy(dup_dst_row, first_dst_row);
-                }
+            const need_hdmi_blit = (self.buf_hdmi_gen[b_idx] != self.hdmi_gen) or
+                self.ui.sheet_open or
+                self.buf_had_sheet[b_idx];
+            if (need_hdmi_blit) {
+                board_sheet.BoardUi.blitHdmiToBackbuffer(full, buf_w, top_phys_rows, self.hdmi_fb, dw, dh, sc);
+                self.buf_hdmi_gen[b_idx] = self.hdmi_gen;
+                self.last_composite_damaged_hdmi = true;
             } else {
-                for (0..dh) |sy| {
-                    const src_row = self.hdmi_fb[sy * dw ..][0..dw];
-                    const dst_y0 = top_phys_rows + sy * sc;
-                    const first_dst_row = full[dst_y0 * buf_w ..][0 .. dw * sc];
-                    for (src_row, 0..) |px, sx| {
-                        @memset(first_dst_row[sx * sc ..][0..sc], px);
-                    }
-                    for (1..sc) |ry| {
-                        const dup_dst_row = full[(dst_y0 + ry) * buf_w ..][0 .. dw * sc];
-                        @memcpy(dup_dst_row, first_dst_row);
-                    }
-                }
+                self.last_composite_damaged_hdmi = false;
             }
+        } else {
+            self.buf_hdmi_gen[b_idx] = 0;
+            self.last_composite_damaged_hdmi = true;
         }
+        self.buf_had_sheet[b_idx] = self.ui.sheet_open;
 
         self.ui.paint(full, self.width, self.height, sc, self.status, self.gpio);
     }
@@ -600,9 +598,19 @@ pub const WaylandWindow = struct {
             var m = try self.surface.request(protocol.wl_surface.request.attach);
             m.uint(buf.id).int(0).int(0).end();
         }
-        {
+        if (self.last_composite_damaged_hdmi) {
             var m = try self.surface.request(protocol.wl_surface.request.damage);
             m.int(0).int(0).int(@intCast(self.width)).int(@intCast(self.height)).end();
+        } else {
+            {
+                var m = try self.surface.request(protocol.wl_surface.request.damage);
+                m.int(0).int(0).int(@intCast(self.width)).int(@intCast(board_sheet.BoardUi.title_bar_height)).end();
+            }
+            if (self.status.gpio_connected and self.height > board_sheet.BoardUi.gpio_panel_height) {
+                const gpio_y = self.height - board_sheet.BoardUi.gpio_panel_height;
+                var m = try self.surface.request(protocol.wl_surface.request.damage);
+                m.int(0).int(@intCast(gpio_y)).int(@intCast(self.width)).int(@intCast(board_sheet.BoardUi.gpio_panel_height)).end();
+            }
         }
         {
             var m = try self.surface.request(protocol.wl_surface.request.commit);
@@ -920,14 +928,18 @@ pub const WaylandWindow = struct {
                 if (!in_ui) {
                     self.updateGuestMouseTarget(sx, sy);
                 }
-                self.ui_dirty = true;
+                if (self.ui.takeHoverDirty()) {
+                    self.ui_dirty = true;
+                }
             },
             protocol.wl_pointer.event.leave => {
                 self.last_mouse_x = null;
                 self.last_mouse_y = null;
                 self.cursor_mode = .unknown;
                 self.ui.pointerLeave();
-                self.ui_dirty = true;
+                if (self.ui.takeHoverDirty()) {
+                    self.ui_dirty = true;
+                }
             },
             protocol.wl_pointer.event.motion => {
                 _ = r.uint() catch return; // time
@@ -940,7 +952,9 @@ pub const WaylandWindow = struct {
                 }
                 self.last_mouse_x = sx;
                 self.last_mouse_y = sy;
-                self.ui_dirty = true;
+                if (self.ui.takeHoverDirty()) {
+                    self.ui_dirty = true;
+                }
             },
             protocol.wl_pointer.event.button => {
                 const serial = r.uint() catch return;

@@ -146,6 +146,7 @@ pub const Hvs = struct {
         }
         switch (offset) {
             0x0000 => {
+                if ((self.dispctrl ^ val) & (1 << 31) != 0) self.dlist_updated = true;
                 self.dispctrl = val;
                 self.updateDispstatSummaryBits();
             },
@@ -158,39 +159,54 @@ pub const Hvs = struct {
             0x0014 => self.dispdither = val,
             0x0018 => self.dispeoln = val,
             0x0020 => {
+                if (self.displist[0] != val or self.displact[0] != val) self.dlist_updated = true;
                 self.displist[0] = val;
                 self.displact[0] = val;
-                self.dlist_updated = true;
             },
             0x0024 => {
+                if (self.displist[1] != val or self.displact[1] != val) self.dlist_updated = true;
                 self.displist[1] = val;
                 self.displact[1] = val;
-                self.dlist_updated = true;
             },
             0x0028 => {
+                if (self.displist[2] != val or self.displact[2] != val) self.dlist_updated = true;
                 self.displist[2] = val;
                 self.displact[2] = val;
-                self.dlist_updated = true;
             },
             0x0040 => {
-                self.chan_ctrl[0] = val & ~SCALER_DISPCTRLX_RESET;
+                const next = val & ~SCALER_DISPCTRLX_RESET;
+                if (self.chan_ctrl[0] != next) self.dlist_updated = true;
+                self.chan_ctrl[0] = next;
                 self.chan_stat[0] = self.computeChanStat(0);
             },
-            0x0044 => self.chan_bkgnd[0] = val,
+            0x0044 => {
+                if (self.chan_bkgnd[0] != val) self.dlist_updated = true;
+                self.chan_bkgnd[0] = val;
+            },
             0x0048 => self.chan_stat[0] = self.computeChanStat(0),
             0x004c => self.chan_base[0] = val,
             0x0050 => {
-                self.chan_ctrl[1] = val & ~SCALER_DISPCTRLX_RESET;
+                const next = val & ~SCALER_DISPCTRLX_RESET;
+                if (self.chan_ctrl[1] != next) self.dlist_updated = true;
+                self.chan_ctrl[1] = next;
                 self.chan_stat[1] = self.computeChanStat(1);
             },
-            0x0054 => self.chan_bkgnd[1] = val,
+            0x0054 => {
+                if (self.chan_bkgnd[1] != val) self.dlist_updated = true;
+                self.chan_bkgnd[1] = val;
+            },
             0x0058 => self.chan_stat[1] = self.computeChanStat(1),
             0x005c => self.chan_base[1] = val,
             0x0060 => {
-                self.chan_ctrl[2] = val & ~SCALER_DISPCTRLX_RESET;
+                const next = val & ~SCALER_DISPCTRLX_RESET;
+                if (self.chan_ctrl[2] != next) self.dlist_updated = true;
+                self.chan_ctrl[2] = next;
                 self.chan_stat[2] = self.computeChanStat(2);
             },
-            0x0064 => self.chan_bkgnd[2] = val,
+            0x0064 => {
+                if (self.chan_bkgnd[2] != val) self.dlist_updated = true;
+                self.chan_bkgnd[2] = val;
+            },
             0x0068 => self.chan_stat[2] = self.computeChanStat(2),
             0x006c => self.chan_base[2] = val,
             else => {},
@@ -207,6 +223,104 @@ pub const Hvs = struct {
             }
         }
         return false;
+    }
+
+    /// Computes a fast 64-bit Wyhash signature over the active HVS display list and plane backing memory.
+    /// Used to skip re-compositing 1280x720 frames when neither DLIST nor scanout pixel data changed.
+    pub fn computeActivePlanesHash(self: *const Hvs, ram: []const u8, width: u32, height: u32) u64 {
+        var active_ch: ?usize = null;
+        for ([_]usize{ 1, 0, 2 }) |ch| {
+            const head = self.displact[ch] & DLIST_MASK;
+            const ctl0 = self.dlist[head];
+            if ((ctl0 & SCALER_CTL0_END) == 0 and (ctl0 & SCALER_CTL0_VALID) != 0) {
+                active_ch = ch;
+                break;
+            }
+        }
+        const ch = active_ch orelse return 0;
+
+        var hasher = std.hash.Wyhash.init(0x9E3779B97F4A7C15);
+        const hdr = [3]u32{ self.dispctrl & (1 << 31), self.chan_bkgnd[ch], self.displact[ch] };
+        hasher.update(std.mem.asBytes(&hdr));
+
+        var idx: usize = self.displact[ch] & DLIST_MASK;
+        var planes_seen: usize = 0;
+
+        while (idx + 7 <= DLIST_WORDS and planes_seen < 32) {
+            const ctl0 = self.dlist[idx];
+            if ((ctl0 & SCALER_CTL0_END) != 0) break;
+            const entry_words: usize = (ctl0 >> 24) & 0x3f;
+            if (entry_words < 7 or idx + entry_words > DLIST_WORDS) break;
+
+            if ((ctl0 & SCALER_CTL0_VALID) != 0) {
+                hasher.update(std.mem.sliceAsBytes(self.dlist[idx .. idx + entry_words]));
+                const pix_fmt: u4 = @truncate(ctl0 & 0x0f);
+                const unity = (ctl0 & SCALER_CTL0_UNITY) != 0;
+                const tiling: u2 = @truncate((ctl0 >> 20) & 3);
+                const pos0 = self.dlist[idx + 1];
+                const dst_x: u32 = pos0 & 0xfff;
+                const dst_y: u32 = (pos0 >> 12) & 0xfff;
+
+                const pos2_idx = if (unity) idx + 2 else idx + 3;
+                const pos2 = self.dlist[pos2_idx];
+                const src_w: u32 = pos2 & 0xfff;
+                const raw_h16: u32 = (pos2 >> 16) & 0xfff;
+                const src_h: u32 = if (raw_h16 != 0) raw_h16 else ((pos2 >> 12) & 0xfff);
+                const dst_w: u32 = if (unity) src_w else (self.dlist[idx + 2] & 0xfff);
+                const dst_h: u32 = if (unity) src_h else ((self.dlist[idx + 2] >> 16) & 0xfff);
+
+                const ptr0_idx = if (unity) idx + 4 else idx + 5;
+                if (src_w > 0 and src_h > 0 and dst_w > 0 and dst_h > 0 and ptr0_idx + 2 < DLIST_WORDS) {
+                    const ptr0 = self.dlist[ptr0_idx] & 0x1FFFFFFF;
+                    const pitch0 = self.dlist[ptr0_idx + 2];
+                    const is_565 = (pix_fmt == 0) or (pix_fmt == 4);
+                    const cpp: u32 = if (is_565) 2 else 4;
+                    const max_dy = @min(dst_y + dst_h, height);
+                    const max_dx = @min(dst_x + dst_w, width);
+
+                    if (dst_x < max_dx and dst_y < max_dy) {
+                        const span_w = max_dx - dst_x;
+                        const span_h = max_dy - dst_y;
+                        if (tiling == 0) {
+                            const raw_pitch: u32 = pitch0 & 0xffff;
+                            const linear_pitch: u32 = if (raw_pitch != 0) raw_pitch else (src_w * cpp);
+                            const row_bytes: usize = @as(usize, span_w) * cpp;
+                            if (linear_pitch == span_w * cpp) {
+                                const total_bytes = row_bytes * @as(usize, span_h);
+                                if (@as(usize, ptr0) + total_bytes <= ram.len) {
+                                    hasher.update(ram[ptr0 .. ptr0 + total_bytes]);
+                                }
+                            } else {
+                                var sy: u32 = 0;
+                                while (sy < span_h) : (sy += 1) {
+                                    const row_off: usize = @as(usize, ptr0) + @as(usize, sy) * linear_pitch;
+                                    if (row_off + row_bytes <= ram.len) {
+                                        hasher.update(ram[row_off .. row_off + row_bytes]);
+                                    }
+                                }
+                            }
+                        } else {
+                            // T-tiled / LT-tiled plane: sample 64-byte utiles across the plane
+                            const tile_w_px: u32 = if (is_565) 64 else 32;
+                            const tiled_w: u32 = if (tiling == 3 and (pitch0 & 0x7f) != 0)
+                                (pitch0 & 0x7f) * tile_w_px
+                            else
+                                src_w;
+                            const aligned_h = (src_h + 31) & ~@as(u32, 31);
+                            const total_bytes: usize = @as(usize, tiled_w) * @as(usize, aligned_h) * cpp;
+                            const step: usize = @max((total_bytes / 64) & ~@as(usize, 63), 64);
+                            var off: usize = 0;
+                            while (off + 64 <= total_bytes and @as(usize, ptr0) + off + 64 <= ram.len) : (off += step) {
+                                hasher.update(ram[@as(usize, ptr0) + off ..][0..64]);
+                            }
+                        }
+                    }
+                }
+                planes_seen += 1;
+            }
+            idx += entry_words;
+        }
+        return hasher.final();
     }
 
     /// Composites the active HVS display list into `out_argb` (`width * height` pixels of `0xFFRRGGBB`).
@@ -342,9 +456,9 @@ pub const Hvs = struct {
         const span_w = max_dx - dst_x;
         const span_h = max_dy - dst_y;
 
-        // Fast path 1a: Unity 32-bit Linear plane
+        // Fast path 1a: Unity 32-bit Linear plane (8-wide SIMD)
         if (unity and tiling == 0 and !is_565) {
-            const opaque_mask: @Vector(4, u32) = @splat(0xFF000000);
+            const opaque_mask8: @Vector(8, u32) = @splat(0xFF000000);
             var py: u32 = dst_y;
             while (py < max_dy) : (py += 1) {
                 const sy = py - dst_y;
@@ -354,23 +468,23 @@ pub const Hvs = struct {
                 const src_bytes = ram[row_off..][0 .. span_w * 4];
                 if (alpha_mode == 1) {
                     var x: u32 = 0;
-                    while (x + 4 <= span_w) : (x += 4) {
-                        const src_v: @Vector(4, u32) = @bitCast(src_bytes[x * 4 ..][0..16].*);
-                        dst_row[x..][0..4].* = @bitCast(src_v | opaque_mask);
+                    while (x + 8 <= span_w) : (x += 8) {
+                        const src_v: @Vector(8, u32) = @bitCast(src_bytes[x * 4 ..][0..32].*);
+                        dst_row[x..][0..8].* = @bitCast(src_v | opaque_mask8);
                     }
                     while (x < span_w) : (x += 1) {
                         dst_row[x] = std.mem.readInt(u32, src_bytes[x * 4 ..][0..4], .little) | 0xFF000000;
                     }
                 } else {
                     var x: u32 = 0;
-                    while (x + 4 <= span_w) : (x += 4) {
-                        const src_v: @Vector(4, u32) = @bitCast(src_bytes[x * 4 ..][0..16].*);
+                    while (x + 8 <= span_w) : (x += 8) {
+                        const src_v: @Vector(8, u32) = @bitCast(src_bytes[x * 4 ..][0..32].*);
                         const alphas = src_v >> @splat(24);
                         if (@reduce(.And, alphas) == 0xff) {
-                            dst_row[x..][0..4].* = @bitCast(src_v);
+                            dst_row[x..][0..8].* = @bitCast(src_v);
                         } else if (@reduce(.Or, alphas) != 0) {
-                            const src_arr: [4]u32 = @bitCast(src_v);
-                            inline for (0..4) |k| {
+                            const src_arr: [8]u32 = @bitCast(src_v);
+                            inline for (0..8) |k| {
                                 const sc = src_arr[k];
                                 const a = sc >> 24;
                                 if (a == 255) {
