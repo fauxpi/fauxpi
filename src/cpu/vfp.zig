@@ -91,7 +91,7 @@ pub const Vfp = struct {
         }
     }
 
-    fn updateCmpFlags(self: *Vfp, comptime T: type, a: T, b: T) void {
+    pub inline fn updateCmpFlags(self: *Vfp, comptime T: type, a: T, b: T) void {
         var nzcv: u32 = 0;
         if (std.math.isNan(a) or std.math.isNan(b)) {
             // Unordered: N=0, Z=0, C=1, V=1

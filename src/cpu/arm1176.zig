@@ -130,6 +130,33 @@ pub const ArmOp = enum(u8) {
     rev_al,
     rev16_al,
     ubfx_al,
+    vldr_f64_al,
+    vstr_f64_al,
+    vldr_f32_al,
+    vstr_f32_al,
+    vmov_r_f64_al,
+    vmov_f64_r_al,
+    vmov_r_f32_al,
+    vmov_f32_r_al,
+    vmrs_apsr_al,
+    vadd_f64_al,
+    vsub_f64_al,
+    vmul_f64_al,
+    vdiv_f64_al,
+    vmla_f64_al,
+    vmls_f64_al,
+    vmov_f64_al,
+    vcmp_f64_al,
+    vcmpz_f64_al,
+    vadd_f32_al,
+    vsub_f32_al,
+    vmul_f32_al,
+    vdiv_f32_al,
+    vmla_f32_al,
+    vmls_f32_al,
+    vmov_f32_al,
+    vfp_dp_al,
+    vfp_ls_multi_al,
     // Pre-classified group fallbacks
     dp_imm_general,
     dp_reg_general,
@@ -552,6 +579,131 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
             };
         },
         0b110, 0b111 => {
+            if ((inst & 0x0f00_0000) != 0x0f00_0000) {
+                const cp_num: u4 = @truncate((inst >> 8) & 0xf);
+                if (cp_num == 10 or cp_num == 11) {
+                    const is_double = cp_num == 11;
+                    if (top3 == 0b110) {
+                        if ((inst & 0x0fe0_0000) == 0x0c40_0000) {
+                            if (is_double) {
+                                const l = (inst & (1 << 20)) != 0;
+                                const rt2: u8 = @truncate((inst >> 16) & 0xf);
+                                const rt: u8 = @truncate((inst >> 12) & 0xf);
+                                const dm: u8 = @truncate((((inst >> 5) & 1) << 4) | (inst & 0xf));
+                                if (rt != 15 and rt2 != 15 and (!l or rt != rt2)) {
+                                    return .{
+                                        .raw = inst,
+                                        .op = @intFromEnum(if (l) ArmOp.vmov_r_f64_al else ArmOp.vmov_f64_r_al),
+                                        .rd = rt,
+                                        .rn = rt2,
+                                        .rm = dm * 2,
+                                    };
+                                }
+                            }
+                        } else {
+                            const p = (inst & (1 << 24)) != 0;
+                            const u = (inst & (1 << 23)) != 0;
+                            const d_bit: u8 = @truncate((inst >> 22) & 1);
+                            const w = (inst & (1 << 21)) != 0;
+                            const l = (inst & (1 << 20)) != 0;
+                            const rn: u8 = @truncate((inst >> 16) & 0xf);
+                            const vd: u8 = @truncate((inst >> 12) & 0xf);
+                            const imm8: u32 = inst & 0xff;
+                            const offset_bytes: u32 = imm8 * 4;
+                            const signed_off: u32 = if (u) offset_bytes else (0 -% offset_bytes);
+                            if (p and !w) {
+                                if (is_double) {
+                                    const dd: u8 = (d_bit << 4) | vd;
+                                    return .{
+                                        .raw = inst,
+                                        .op = @intFromEnum(if (l) ArmOp.vldr_f64_al else ArmOp.vstr_f64_al),
+                                        .rd = dd * 2,
+                                        .rn = rn,
+                                        .imm = signed_off,
+                                    };
+                                } else {
+                                    const sd: u8 = (vd << 1) | d_bit;
+                                    return .{
+                                        .raw = inst,
+                                        .op = @intFromEnum(if (l) ArmOp.vldr_f32_al else ArmOp.vstr_f32_al),
+                                        .rd = sd,
+                                        .rn = rn,
+                                        .imm = signed_off,
+                                    };
+                                }
+                            }
+                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.vfp_ls_multi_al), .rm = @intFromBool(is_double) };
+                        }
+                    } else {
+                        if ((inst & 0x0f00_0010) == 0x0e00_0010) {
+                            if ((inst & 0x0fff_ffff) == 0x0ef1_fa10) {
+                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.vmrs_apsr_al) };
+                            }
+                            if (!is_double and ((inst >> 21) & 7) == 0) {
+                                const l = (inst & (1 << 20)) != 0;
+                                const sn: u8 = @truncate((((inst >> 16) & 0xf) << 1) | ((inst >> 7) & 1));
+                                const rt: u8 = @truncate((inst >> 12) & 0xf);
+                                if (rt != 15) {
+                                    return .{
+                                        .raw = inst,
+                                        .op = @intFromEnum(if (l) ArmOp.vmov_r_f32_al else ArmOp.vmov_f32_r_al),
+                                        .rd = rt,
+                                        .rn = sn,
+                                    };
+                                }
+                            }
+                        } else if ((inst & 0x0f00_0010) == 0x0e00_0000) {
+                            const p_b: u4 = @truncate((inst >> 23) & 1);
+                            const q_b: u4 = @truncate((inst >> 21) & 1);
+                            const r_b: u4 = @truncate((inst >> 20) & 1);
+                            const s_b: u4 = @truncate((inst >> 6) & 1);
+                            const op4: u4 = (p_b << 3) | (q_b << 2) | (r_b << 1) | s_b;
+                            const ext_op: u5 = @truncate((((inst >> 16) & 0xf) << 1) | ((inst >> 7) & 1));
+                            if (is_double) {
+                                const dd: u8 = @truncate((((inst >> 22) & 1) << 4) | ((inst >> 12) & 0xf));
+                                const dn: u8 = @truncate((((inst >> 7) & 1) << 4) | ((inst >> 16) & 0xf));
+                                const dm: u8 = @truncate((((inst >> 5) & 1) << 4) | (inst & 0xf));
+                                const f64_op: ?ArmOp = switch (op4) {
+                                    0b0000 => .vmla_f64_al,
+                                    0b0001 => .vmls_f64_al,
+                                    0b0100 => .vmul_f64_al,
+                                    0b0110 => .vadd_f64_al,
+                                    0b0111 => .vsub_f64_al,
+                                    0b1000 => .vdiv_f64_al,
+                                    0b1111 => switch (ext_op) {
+                                        0b00000 => .vmov_f64_al,
+                                        0b01000, 0b01001 => .vcmp_f64_al,
+                                        0b01010, 0b01011 => .vcmpz_f64_al,
+                                        else => null,
+                                    },
+                                    else => null,
+                                };
+                                if (f64_op) |fop| {
+                                    return .{ .raw = inst, .op = @intFromEnum(fop), .rd = dd, .rn = dn, .rm = dm };
+                                }
+                            } else {
+                                const sd: u8 = @truncate((((inst >> 12) & 0xf) << 1) | ((inst >> 22) & 1));
+                                const sn: u8 = @truncate((((inst >> 16) & 0xf) << 1) | ((inst >> 7) & 1));
+                                const sm: u8 = @truncate(((inst & 0xf) << 1) | ((inst >> 5) & 1));
+                                const f32_op: ?ArmOp = switch (op4) {
+                                    0b0000 => .vmla_f32_al,
+                                    0b0001 => .vmls_f32_al,
+                                    0b0100 => .vmul_f32_al,
+                                    0b0110 => .vadd_f32_al,
+                                    0b0111 => .vsub_f32_al,
+                                    0b1000 => .vdiv_f32_al,
+                                    0b1111 => if (sn == 0b00000) .vmov_f32_al else null,
+                                    else => null,
+                                };
+                                if (f32_op) |fop| {
+                                    return .{ .raw = inst, .op = @intFromEnum(fop), .rd = sd, .rn = sn, .rm = sm };
+                                }
+                            }
+                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.vfp_dp_al) };
+                        }
+                    }
+                }
+            }
             return .{ .raw = inst, .op = @intFromEnum(ArmOp.coproc_svc) };
         },
     }
@@ -1716,6 +1868,286 @@ pub fn Arm1176(comptime Bus: type) type {
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
+                    },
+                    .vldr_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
+                            const vaddr = base +% imm32;
+                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == slot.r_vbase) {
+                                const paddr = slot.pbase | (vaddr & 0xfff);
+                                self.vfp.s[d.rd] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                                self.vfp.s[d.rd + 1] = std.mem.readInt(u32, bus.ram[paddr + 4 ..][0..4], .little);
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                            }
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vstr_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
+                            const vaddr = base +% imm32;
+                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == slot.w_vbase) {
+                                const paddr = slot.pbase | (vaddr & 0xfff);
+                                std.mem.writeInt(u32, bus.ram[paddr..][0..4], self.vfp.s[d.rd], .little);
+                                std.mem.writeInt(u32, bus.ram[paddr + 4 ..][0..4], self.vfp.s[d.rd + 1], .little);
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                _ = self.checkInterrupts(bus);
+                                priv = @intFromBool(self.isPrivileged());
+                            }
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vldr_f32_al => {
+                        if (self.vfpReady(priv)) {
+                            const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
+                            const vaddr = base +% imm32;
+                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                            if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == slot.r_vbase) {
+                                const paddr = slot.pbase | (vaddr & 0xfff);
+                                self.vfp.s[d.rd] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                            }
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vstr_f32_al => {
+                        if (self.vfpReady(priv)) {
+                            const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
+                            const vaddr = base +% imm32;
+                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                            if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == slot.w_vbase) {
+                                const paddr = slot.pbase | (vaddr & 0xfff);
+                                std.mem.writeInt(u32, bus.ram[paddr..][0..4], self.vfp.s[d.rd], .little);
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                _ = self.checkInterrupts(bus);
+                                priv = @intFromBool(self.isPrivileged());
+                            }
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmov_r_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            self.r[d.rd] = self.vfp.s[d.rm];
+                            self.r[d.rn] = self.vfp.s[d.rm + 1];
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmov_f64_r_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.s[d.rm] = self.r[d.rd];
+                            self.vfp.s[d.rm + 1] = self.r[d.rn];
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmov_r_f32_al => {
+                        if (self.vfpReady(priv)) {
+                            self.r[d.rd] = self.vfp.s[d.rn];
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmov_f32_r_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.s[d.rn] = self.r[d.rd];
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmrs_apsr_al => {
+                        if (self.vfpReady(priv)) {
+                            self.cpsr = (self.cpsr & 0x0fff_ffff) | (self.vfp.fpscr & 0xf000_0000);
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vadd_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) + self.vfp.getD(@truncate(d.rm)));
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vsub_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) - self.vfp.getD(@truncate(d.rm)));
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmul_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) * self.vfp.getD(@truncate(d.rm)));
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vdiv_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) / self.vfp.getD(@truncate(d.rm)));
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmla_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rd)) + (self.vfp.getD(@truncate(d.rn)) * self.vfp.getD(@truncate(d.rm))));
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmls_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rd)) - (self.vfp.getD(@truncate(d.rn)) * self.vfp.getD(@truncate(d.rm))));
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmov_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setDU64(@truncate(d.rd), self.vfp.getDU64(@truncate(d.rm)));
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vcmp_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.updateCmpFlags(f64, self.vfp.getD(@truncate(d.rd)), self.vfp.getD(@truncate(d.rm)));
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vcmpz_f64_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.updateCmpFlags(f64, self.vfp.getD(@truncate(d.rd)), 0.0);
+                        } else {
+                            self.executeVfp(bus, pc, inst, true);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vadd_f32_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) + self.vfp.getS(@truncate(d.rm)));
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vsub_f32_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) - self.vfp.getS(@truncate(d.rm)));
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmul_f32_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) * self.vfp.getS(@truncate(d.rm)));
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vdiv_f32_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) / self.vfp.getS(@truncate(d.rm)));
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmla_f32_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rd)) + (self.vfp.getS(@truncate(d.rn)) * self.vfp.getS(@truncate(d.rm))));
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmls_f32_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rd)) - (self.vfp.getS(@truncate(d.rn)) * self.vfp.getS(@truncate(d.rm))));
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vmov_f32_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.s[d.rd] = self.vfp.s[d.rm];
+                        } else {
+                            self.executeVfp(bus, pc, inst, false);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vfp_dp_al => {
+                        if (self.vfpReady(priv)) {
+                            self.vfp.executeDataProc(inst);
+                        } else {
+                            self.executeVfp(bus, pc, inst, ((inst >> 8) & 0xf) == 11);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vfp_ls_multi_al => {
+                        self.executeVfp(bus, pc, inst, d.rm != 0);
+                        priv = @intFromBool(self.isPrivileged());
                     },
                     .unconditional => {
                         self.executeUnconditional(bus, pc, inst);
@@ -2971,6 +3403,11 @@ pub fn Arm1176(comptime Bus: type) type {
             self.enterException(.und, 0x04, inst_pc +% 4, false);
         }
 
+        inline fn vfpReady(self: *const Self, priv: u1) bool {
+            const cp10_acc: u2 = @truncate((self.mmu.cpacr >> 20) & 3);
+            return self.vfp.isEnabled() and (cp10_acc >= 2 or (cp10_acc == 1 and priv != 0));
+        }
+
         fn executeVfp(self: *Self, bus: *Bus, inst_pc: u32, inst: u32, is_double: bool) void {
             // Check CPACR bits [21:20] for CP10 access permission
             const cp10_acc: u2 = @truncate((self.mmu.cpacr >> 20) & 3);
@@ -3817,4 +4254,84 @@ test "ARM1176 pre-decoded atomics, 64-bit multiplies, CLZ, and media fast-path" 
     try std.testing.expectEqual(@as(u32, 0x18), cpu.r[9]);
     try std.testing.expectEqual(@as(u32, 0x18), cpu.r[10]);
 }
+
+test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+    @memset(ram, 0);
+
+    var bus: TestBus = .{ .ram = ram };
+    const Cpu = Arm1176(TestBus);
+    var cpu: Cpu = .{};
+    cpu.initReset(0x1000, 0x2000, 0, 0);
+    cpu.mmu.cpacr = 0x00f0_0000;
+    cpu.vfp.fpexc = 1 << 30;
+
+    std.mem.writeInt(u64, ram[0x2000..][0..8], @bitCast(@as(f64, 12.5)), .little);
+    std.mem.writeInt(u64, ram[0x2008..][0..8], @bitCast(@as(f64, 3.5)), .little);
+
+    // 0x1000: vldr d0, [r0, #0]     (0xed900b00) -> d0 = 12.5
+    // 0x1004: vldr d1, [r0, #8]     (0xed901b02) -> d1 = 3.5
+    // 0x1008: vadd.f64 d2, d0, d1   (0xee302b01) -> d2 = 16.0
+    // 0x100c: vmul.f64 d3, d2, d1   (0xee223b01) -> d3 = 56.0
+    // 0x1010: vstr d3, [r0, #16]    (0xed803b04) -> [0x2010] = 56.0
+    // 0x1014: vcmp.f64 d3, d2       (0xeeb43b42) -> d3 > d2
+    // 0x1018: vmrs APSR_nzcv, fpscr (0xeef1fa10) -> C=1, Z=0
+    const prog = [_]u32{
+        0xed900b00,
+        0xed901b02,
+        0xee302b01,
+        0xee223b01,
+        0xed803b04,
+        0xeeb43b42,
+        0xeef1fa10,
+    };
+    for (prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+    }
+
+    try std.testing.expectEqual(ArmOp.vldr_f64_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[0]).op)));
+    try std.testing.expectEqual(ArmOp.vadd_f64_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[2]).op)));
+    try std.testing.expectEqual(ArmOp.vmul_f64_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[3]).op)));
+    try std.testing.expectEqual(ArmOp.vstr_f64_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[4]).op)));
+    try std.testing.expectEqual(ArmOp.vcmp_f64_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[5]).op)));
+    try std.testing.expectEqual(ArmOp.vmrs_apsr_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[6]).op)));
+
+    _ = cpu.runSteps(&bus, prog.len);
+    try std.testing.expectEqual(@as(f64, 16.0), cpu.vfp.getD(2));
+    try std.testing.expectEqual(@as(f64, 56.0), cpu.vfp.getD(3));
+    try std.testing.expectEqual(@as(f64, 56.0), @as(f64, @bitCast(std.mem.readInt(u64, ram[0x2010..][0..8], .little))));
+    try std.testing.expect((cpu.cpsr & PsrFlags.C) != 0);
+    try std.testing.expect((cpu.cpsr & PsrFlags.Z) == 0);
+}
+
 
