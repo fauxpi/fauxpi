@@ -764,6 +764,9 @@ const PrecomputedTex = struct {
     uw_mask: u32,
     uh_mask: u32,
     cpp_shift: u5,
+    utile_row_stride: u32,
+    alpha_or_mask32: u32,
+    alpha_or_mask64: u64,
     is_small_microtile: bool,
     utiles_per_row: u32,
     tile_w_shift: u5,
@@ -800,6 +803,9 @@ const PrecomputedTex = struct {
             .uw_mask = uw - 1,
             .uh_mask = uh - 1,
             .cpp_shift = cpp_shift,
+            .utile_row_stride = if (p.type == .rgba32r) (p.width << 2) else (@as(u32, 1) << (uw_shift + cpp_shift)),
+            .alpha_or_mask32 = if (p.type == .rgbx8888) 0xff000000 else 0,
+            .alpha_or_mask64 = if (p.type == .rgbx8888) 0xff000000_ff000000 else 0,
             .is_small_microtile = (p.width <= (uw << 2) or p.height <= (uh << 2)),
             .utiles_per_row = (p.width + uw - 1) >> uw_shift,
             .tile_w_shift = tile_w_shift,
@@ -830,58 +836,135 @@ const PrecomputedTex = struct {
         return tile_base + (sub_index << 10) + (utile_in_sub << 6) + in_utile;
     }
 
-    inline fn fetchAt(pt: *const PrecomputedTex, memory: []const u8, x: u32, y: u32) Error!u32 {
-        const offset = pt.base_off + pt.texelOffset(x, y);
+    inline fn fetchFromOffset(pt: *const PrecomputedTex, memory: []const u8, offset: u32) Error!u32 {
         if (offset + pt.cpp > memory.len) return error.Unsupported;
         if (pt.cpp == 4) {
-            const raw = std.mem.readInt(u32, memory[offset..][0..4], .little);
-            return if (pt.cfg.type == .rgbx8888) (raw | 0xff000000) else raw;
+            return std.mem.readInt(u32, memory[offset..][0..4], .little) | pt.alpha_or_mask32;
         }
         if (pt.cpp == 1) {
             if (pt.cfg.type == .luminance) {
                 const l: u32 = memory[offset];
-                return 0xff000000 | (l << 16) | (l << 8) | l;
+                return 0xff000000 | (l * 0x010101);
             }
             return @as(u32, memory[offset]) << 24;
         }
         return pixel.fromRgb565(std.mem.readInt(u16, memory[offset..][0..2], .little));
     }
 
+    inline fn fetchPairFromOffset(pt: *const PrecomputedTex, memory: []const u8, offset: u32) Error![2]u32 {
+        if (offset + (pt.cpp << 1) > memory.len) return error.Unsupported;
+        if (pt.cpp == 4) {
+            const pair = std.mem.readInt(u64, memory[offset..][0..8], .little) | pt.alpha_or_mask64;
+            return .{ @truncate(pair), @truncate(pair >> 32) };
+        }
+        if (pt.cpp == 1) {
+            const b0: u32 = memory[offset];
+            const b1: u32 = memory[offset + 1];
+            if (pt.cfg.type == .luminance) {
+                return .{ 0xff000000 | (b0 * 0x010101), 0xff000000 | (b1 * 0x010101) };
+            }
+            return .{ b0 << 24, b1 << 24 };
+        }
+        const raw = std.mem.readInt(u32, memory[offset..][0..4], .little);
+        return .{ pixel.fromRgb565(@truncate(raw)), pixel.fromRgb565(@truncate(raw >> 16)) };
+    }
+
+    inline fn fetchAt(pt: *const PrecomputedTex, memory: []const u8, x: u32, y: u32) Error!u32 {
+        return pt.fetchFromOffset(memory, pt.base_off + pt.texelOffset(x, y));
+    }
+
     inline fn sample(pt: *const PrecomputedTex, memory: []const u8, s: f32, t: f32) Error!u32 {
         const p = pt.cfg;
         if (p.mag_filter == .nearest) {
-            return pt.fetchAt(memory, try wrap(@floor(s * pt.fw), p.width, p.wrap_s), try wrap(@floor(t * pt.fh), p.height, p.wrap_t));
+            return pt.fetchAt(memory, wrap(@floor(s * pt.fw), p.width, p.wrap_s), wrap(@floor(t * pt.fh), p.height, p.wrap_t));
         }
         const fx = s * pt.fw - 0.5;
         const fy = t * pt.fh - 0.5;
         const x0 = @floor(fx);
         const y0 = @floor(fy);
-        const wx0 = try wrap(x0, p.width, p.wrap_s);
-        const wx1 = try wrap(x0 + 1.0, p.width, p.wrap_s);
-        const wy0 = try wrap(y0, p.height, p.wrap_t);
-        const wy1 = try wrap(y0 + 1.0, p.height, p.wrap_t);
-        const c00 = try pt.fetchAt(memory, wx0, wy0);
-        if (wx0 == wx1 and wy0 == wy1) return c00;
-        const c10 = if (wx1 == wx0) c00 else try pt.fetchAt(memory, wx1, wy0);
-        const c01 = if (wy1 == wy0) c00 else try pt.fetchAt(memory, wx0, wy1);
-        const c11 = if (wx1 == wx0) c01 else if (wy1 == wy0) c10 else try pt.fetchAt(memory, wx1, wy1);
+        var wx0: u32 = undefined;
+        var wx1: u32 = undefined;
+        if (x0 >= 0.0 and x0 + 1.0 < pt.fw) {
+            wx0 = @intFromFloat(x0);
+            wx1 = wx0 + 1;
+        } else {
+            wx0 = wrap(x0, p.width, p.wrap_s);
+            wx1 = wrap(x0 + 1.0, p.width, p.wrap_s);
+        }
+        var wy0: u32 = undefined;
+        var wy1: u32 = undefined;
+        if (y0 >= 0.0 and y0 + 1.0 < pt.fh) {
+            wy0 = @intFromFloat(y0);
+            wy1 = wy0 + 1;
+        } else {
+            wy0 = wrap(y0, p.height, p.wrap_t);
+            wy1 = wrap(y0 + 1.0, p.height, p.wrap_t);
+        }
+
+        const same_utile_x = (wx1 == wx0 + 1) and (p.type == .rgba32r or (wx0 & pt.uw_mask) != pt.uw_mask);
+        const same_utile_y = (wy1 == wy0 + 1) and (p.type == .rgba32r or (wy0 & pt.uh_mask) != pt.uh_mask);
+
+        var c00: u32 = undefined;
+        var c10: u32 = undefined;
+        var c01: u32 = undefined;
+        var c11: u32 = undefined;
+
+        if (same_utile_x and same_utile_y) {
+            const off00 = pt.base_off + pt.texelOffset(wx0, wy0);
+            const row0 = try pt.fetchPairFromOffset(memory, off00);
+            const row1 = try pt.fetchPairFromOffset(memory, off00 + pt.utile_row_stride);
+            c00 = row0[0];
+            c10 = row0[1];
+            c01 = row1[0];
+            c11 = row1[1];
+        } else if (same_utile_x) {
+            const row0 = try pt.fetchPairFromOffset(memory, pt.base_off + pt.texelOffset(wx0, wy0));
+            const row1 = if (wy1 == wy0) row0 else try pt.fetchPairFromOffset(memory, pt.base_off + pt.texelOffset(wx0, wy1));
+            c00 = row0[0];
+            c10 = row0[1];
+            c01 = row1[0];
+            c11 = row1[1];
+        } else if (same_utile_y) {
+            const off00 = pt.base_off + pt.texelOffset(wx0, wy0);
+            c00 = try pt.fetchFromOffset(memory, off00);
+            c01 = try pt.fetchFromOffset(memory, off00 + pt.utile_row_stride);
+            if (wx1 == wx0) {
+                c10 = c00;
+                c11 = c01;
+            } else {
+                const off10 = pt.base_off + pt.texelOffset(wx1, wy0);
+                c10 = try pt.fetchFromOffset(memory, off10);
+                c11 = try pt.fetchFromOffset(memory, off10 + pt.utile_row_stride);
+            }
+        } else {
+            c00 = try pt.fetchAt(memory, wx0, wy0);
+            if (wx0 == wx1 and wy0 == wy1) return c00;
+            c10 = if (wx1 == wx0) c00 else try pt.fetchAt(memory, wx1, wy0);
+            c01 = if (wy1 == wy0) c00 else try pt.fetchAt(memory, wx0, wy1);
+            c11 = if (wx1 == wx0) c01 else if (wy1 == wy0) c10 else try pt.fetchAt(memory, wx1, wy1);
+        }
+
         if (c00 == c10 and c00 == c01 and c00 == c11) return c00;
         const ax = fx - x0;
         const ay = fy - y0;
-        const w00 = (1 - ax) * (1 - ay);
-        const w10 = ax * (1 - ay);
-        const w01 = (1 - ax) * ay;
+        const w00 = (1.0 - ax) * (1.0 - ay);
+        const w10 = ax * (1.0 - ay);
+        const w01 = (1.0 - ax) * ay;
         const w11 = ax * ay;
-        var out: u32 = 0;
-        inline for (0..4) |byte| {
-            const sh: u5 = @intCast(byte * 8);
-            const v = @as(f32, @floatFromInt((c00 >> sh) & 0xff)) * w00 +
-                @as(f32, @floatFromInt((c10 >> sh) & 0xff)) * w10 +
-                @as(f32, @floatFromInt((c01 >> sh) & 0xff)) * w01 +
-                @as(f32, @floatFromInt((c11 >> sh) & 0xff)) * w11;
-            out |= @as(u32, @intFromFloat(@round(v))) << sh;
-        }
-        return out;
+        const V4U8 = @Vector(4, u8);
+        const V4F = @Vector(4, f32);
+        const v00: V4F = @floatFromInt(@as(V4U8, @bitCast(c00)));
+        const v10: V4F = @floatFromInt(@as(V4U8, @bitCast(c10)));
+        const v01: V4F = @floatFromInt(@as(V4U8, @bitCast(c01)));
+        const v11: V4F = @floatFromInt(@as(V4U8, @bitCast(c11)));
+        const blended = @round(
+            v00 * @as(V4F, @splat(w00)) +
+                v10 * @as(V4F, @splat(w10)) +
+                v01 * @as(V4F, @splat(w01)) +
+                v11 * @as(V4F, @splat(w11)),
+        );
+        const out_bytes: V4U8 = @intFromFloat(blended);
+        return @bitCast(out_bytes);
     }
 };
 
@@ -894,7 +977,7 @@ fn sampleConfig(memory: []const u8, p: texture.Config, s: f32, t: f32) Error!u32
     return pt.sample(memory, s, t);
 }
 
-fn wrap(coord: f32, size: u32, mode: texture.Wrap) Error!u32 {
+fn wrap(coord: f32, size: u32, mode: texture.Wrap) u32 {
     const n: i64 = @max(size, 1);
     const i: i64 = if (std.math.isNan(coord)) 0 else @intFromFloat(std.math.clamp(coord, -1e9, 1e9));
     return switch (mode) {
@@ -962,4 +1045,39 @@ test "QPU simulator runs fragment shader" {
     const varyings = [_]Vec{ splatF(1.0), splatF(0.5), splatF(0.25) };
     const res = try run(p.code(), .{ .varyings = &varyings, .frag_w = splatF(2.0) });
     try std.testing.expectEqual(packColor(1.0, 0.5, 0.25, 1.0), res.tlb_color.?[0]);
+}
+
+test "QPU TMU bilinear same-utile and cross-utile sampling" {
+    var mem: [4096]u8 = @splat(0);
+    const cfg: texture.Config = .{
+        .offset = 0,
+        .width = 8,
+        .height = 8,
+        .type = .rgba8888,
+        .mag_filter = .linear,
+        .min_filter = .linear,
+        .wrap_s = .clamp,
+        .wrap_t = .clamp,
+    };
+    const pt = try PrecomputedTex.init(cfg);
+    for (0..8) |y| {
+        for (0..8) |x| {
+            const off = pt.texelOffset(@intCast(x), @intCast(y));
+            const color: u32 = 0xff000000 |
+                (@as(u32, @intCast(x * 30)) << 16) |
+                (@as(u32, @intCast(y * 30)) << 8) |
+                @as(u32, @intCast((x + y) * 15));
+            std.mem.writeInt(u32, mem[off..][0..4], color, .little);
+        }
+    }
+
+    // Same-utile sample: between (1, 1) and (2, 2) at midpoint -> s = 2.0/8.0, t = 2.0/8.0
+    const s_same = try pt.sample(&mem, 2.0 / 8.0, 2.0 / 8.0);
+    // Expected average of (1,1), (2,1), (1,2), (2,2): R = 45, G = 45, B = 45, A = 255
+    try std.testing.expectEqual(@as(u32, 0xff2d2d2d), s_same);
+
+    // Cross-utile X & Y sample: between (3, 3) and (4, 4) at midpoint -> s = 4.0/8.0, t = 4.0/8.0
+    const s_cross = try pt.sample(&mem, 4.0 / 8.0, 4.0 / 8.0);
+    // Expected average of (3,3), (4,3), (3,4), (4,4): R = 105, G = 105, B = 105, A = 255
+    try std.testing.expectEqual(@as(u32, 0xff696969), s_cross);
 }
