@@ -103,12 +103,33 @@ pub const ArmOp = enum(u8) {
     ldm_al,
     ldm_pc_al,
     stm_al,
-    // Branches & Multiply
+    // Branches, Multiply, Atomics & Media
     b_al,
     bl_al,
     bx_lr_al,
+    bx_reg_al,
+    blx_reg_al,
+    clz_al,
     mul_al,
     mla_al,
+    mls_al,
+    umull_al,
+    umlal_al,
+    smull_al,
+    smlal_al,
+    ldrex_al,
+    strex_al,
+    ldrexb_al,
+    strexb_al,
+    uxtb_al,
+    uxth_al,
+    sxtb_al,
+    sxth_al,
+    uxtab_al,
+    uxtah_al,
+    rev_al,
+    rev16_al,
+    ubfx_al,
     // Pre-classified group fallbacks
     dp_imm_general,
     dp_reg_general,
@@ -134,34 +155,61 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
             const bit7 = (inst & (1 << 7)) != 0;
             if (bit4 and bit7) {
                 const sh: u2 = @truncate((inst >> 5) & 3);
-                if (sh == 0b00 and (inst & (1 << 24)) == 0) {
-                    const mul_op: u3 = @truncate((inst >> 21) & 7);
-                    const s = (inst & (1 << 20)) != 0;
-                    const rd_hi: u4 = @truncate((inst >> 16) & 0xf);
-                    const rn_lo: u4 = @truncate((inst >> 12) & 0xf);
-                    const rs: u4 = @truncate((inst >> 8) & 0xf);
-                    const rm: u4 = @truncate(inst & 0xf);
-                    if (!s and rd_hi != 15 and rs != 15 and rm != 15) {
-                        if (mul_op == 0b000) {
-                            return .{
-                                .raw = inst,
-                                .op = @intFromEnum(ArmOp.mul_al),
-                                .rd = rd_hi,
-                                .rn = rs,
-                                .rm = rm,
-                            };
-                        } else if (mul_op == 0b001 and rn_lo != 15) {
-                            return .{
-                                .raw = inst,
-                                .op = @intFromEnum(ArmOp.mla_al),
-                                .rd = rd_hi,
-                                .rn = rs,
-                                .rm = rm,
-                                .imm = rn_lo,
-                            };
+                if (sh == 0b00) {
+                    if ((inst & (1 << 24)) == 0) {
+                        const mul_op: u3 = @truncate((inst >> 21) & 7);
+                        const s = (inst & (1 << 20)) != 0;
+                        const rd_hi: u4 = @truncate((inst >> 16) & 0xf);
+                        const rn_lo: u4 = @truncate((inst >> 12) & 0xf);
+                        const rs: u4 = @truncate((inst >> 8) & 0xf);
+                        const rm: u4 = @truncate(inst & 0xf);
+                        if (!s and rd_hi != 15 and rs != 15 and rm != 15) {
+                            if (mul_op == 0b000) {
+                                return .{
+                                    .raw = inst,
+                                    .op = @intFromEnum(ArmOp.mul_al),
+                                    .rd = rd_hi,
+                                    .rn = rs,
+                                    .rm = rm,
+                                };
+                            } else if (rn_lo != 15) {
+                                const m_op: ?ArmOp = switch (mul_op) {
+                                    0b001 => .mla_al,
+                                    0b011 => .mls_al,
+                                    0b100 => .umull_al,
+                                    0b101 => .umlal_al,
+                                    0b110 => .smull_al,
+                                    0b111 => .smlal_al,
+                                    else => null,
+                                };
+                                if (m_op) |mop| {
+                                    return .{
+                                        .raw = inst,
+                                        .op = @intFromEnum(mop),
+                                        .rd = rd_hi,
+                                        .rn = rs,
+                                        .rm = rm,
+                                        .imm = rn_lo,
+                                    };
+                                }
+                            }
+                        }
+                    } else {
+                        const sync_op: u4 = @truncate((inst >> 20) & 0xf);
+                        const rn: u4 = @truncate((inst >> 16) & 0xf);
+                        const rd: u4 = @truncate((inst >> 12) & 0xf);
+                        const rm: u4 = @truncate(inst & 0xf);
+                        if (rd != 15 and rn != 15) {
+                            switch (sync_op) {
+                                0b1001 => return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldrex_al), .rd = rd, .rn = rn },
+                                0b1000 => if (rm != 15) return .{ .raw = inst, .op = @intFromEnum(ArmOp.strex_al), .rd = rd, .rn = rn, .rm = rm },
+                                0b1101 => return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldrexb_al), .rd = rd, .rn = rn },
+                                0b1100 => if (rm != 15) return .{ .raw = inst, .op = @intFromEnum(ArmOp.strexb_al), .rd = rd, .rn = rn, .rm = rm },
+                                else => {},
+                            }
                         }
                     }
-                } else if (sh != 0b00 and (inst & (1 << 24)) != 0 and (inst & (1 << 22)) != 0 and (inst & (1 << 21)) == 0) {
+                } else if ((inst & (1 << 24)) != 0 and (inst & (1 << 22)) != 0 and (inst & (1 << 21)) == 0) {
                     const rn: u4 = @truncate((inst >> 16) & 0xf);
                     const rd: u4 = @truncate((inst >> 12) & 0xf);
                     if (rd != 15 and rn != 15) {
@@ -196,6 +244,21 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
             if ((op & 0b1100) == 0b1000 and !s) {
                 if ((inst & 0x0fff_ffff) == 0x012f_ff1e) {
                     return .{ .raw = inst, .op = @intFromEnum(ArmOp.bx_lr_al) };
+                }
+                const rm: u4 = @truncate(inst & 0xf);
+                if (rm != 15) {
+                    if ((inst & 0x0fff_fff0) == 0x012f_ff10) {
+                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.bx_reg_al), .rm = rm };
+                    }
+                    if ((inst & 0x0fff_fff0) == 0x012f_ff30) {
+                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.blx_reg_al), .rm = rm };
+                    }
+                    if ((inst & 0x0fff_0ff0) == 0x016f_0f10) {
+                        const rd: u4 = @truncate((inst >> 12) & 0xf);
+                        if (rd != 15) {
+                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.clz_al), .rd = rd, .rm = rm };
+                        }
+                    }
                 }
                 return .{ .raw = inst, .op = @intFromEnum(ArmOp.misc_000) };
             }
@@ -368,6 +431,61 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
         },
         0b011 => {
             if ((inst & (1 << 4)) != 0) {
+                const op1: u5 = @truncate((inst >> 20) & 0x1f);
+                const op2: u3 = @truncate((inst >> 5) & 7);
+                const rn: u4 = @truncate((inst >> 16) & 0xf);
+                const rd: u4 = @truncate((inst >> 12) & 0xf);
+                const rm: u4 = @truncate(inst & 0xf);
+                if (rd != 15 and rm != 15) {
+                    if (op2 == 0b011) {
+                        const rot: u5 = @as(u5, @truncate((inst >> 10) & 3)) * 8;
+                        switch (op1) {
+                            0b01110 => return .{
+                                .raw = inst,
+                                .op = @intFromEnum(if (rn == 15) ArmOp.uxtb_al else ArmOp.uxtab_al),
+                                .rd = rd,
+                                .rn = rn,
+                                .rm = rm,
+                                .imm = rot,
+                            },
+                            0b01111 => return .{
+                                .raw = inst,
+                                .op = @intFromEnum(if (rn == 15) ArmOp.uxth_al else ArmOp.uxtah_al),
+                                .rd = rd,
+                                .rn = rn,
+                                .rm = rm,
+                                .imm = rot,
+                            },
+                            0b01010 => if (rn == 15) return .{
+                                .raw = inst,
+                                .op = @intFromEnum(ArmOp.sxtb_al),
+                                .rd = rd,
+                                .rm = rm,
+                                .imm = rot,
+                            },
+                            0b01011 => if (rn == 15) return .{
+                                .raw = inst,
+                                .op = @intFromEnum(ArmOp.sxth_al),
+                                .rd = rd,
+                                .rm = rm,
+                                .imm = rot,
+                            },
+                            else => {},
+                        }
+                    } else if (op1 == 0b01011) {
+                        if (op2 == 0b001 and rn == 15) {
+                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.rev_al), .rd = rd, .rm = rm };
+                        } else if (op2 == 0b101) {
+                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.rev16_al), .rd = rd, .rm = rm };
+                        }
+                    } else if ((op1 == 0b11110 or op1 == 0b11111) and (op2 & 0b011) == 0b010) {
+                        const lsb: u5 = @truncate((inst >> 7) & 0x1f);
+                        const widthm1: u5 = @truncate((inst >> 16) & 0x1f);
+                        const width: u6 = @as(u6, widthm1) + 1;
+                        const mask: u32 = if (width >= 32) 0xffff_ffff else (@as(u32, 1) << @truncate(width)) -% 1;
+                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.ubfx_al), .rd = rd, .rn = lsb, .rm = rm, .imm = mask };
+                    }
+                }
                 return .{ .raw = inst, .op = @intFromEnum(ArmOp.media) };
             }
             // Scaled register offset LDR/STR/LDRB/STRB (P == 1, U == 1, W == 0, shift_type == LSL)
@@ -1005,6 +1123,145 @@ pub fn Arm1176(comptime Bus: type) type {
                     .bic_lsl_reg_al => self.r[d.rd] = self.r[d.rn] & ~(self.r[d.rm] << @as(u5, @truncate(imm32))),
                     .mul_al => self.r[d.rd] = self.r[d.rm] *% self.r[d.rn],
                     .mla_al => self.r[d.rd] = self.r[d.rm] *% self.r[d.rn] +% self.r[@as(u4, @truncate(imm32))],
+                    .mls_al => self.r[d.rd] = self.r[@as(u4, @truncate(imm32))] -% (self.r[d.rm] *% self.r[d.rn]),
+                    .umull_al => {
+                        const prod: u64 = @as(u64, self.r[d.rm]) * @as(u64, self.r[d.rn]);
+                        self.r[@as(u4, @truncate(imm32))] = @truncate(prod);
+                        self.r[d.rd] = @truncate(prod >> 32);
+                    },
+                    .umlal_al => {
+                        const rd_lo: u4 = @truncate(imm32);
+                        const acc: u64 = (@as(u64, self.r[d.rd]) << 32) | self.r[rd_lo];
+                        const prod: u64 = (@as(u64, self.r[d.rm]) * @as(u64, self.r[d.rn])) +% acc;
+                        self.r[rd_lo] = @truncate(prod);
+                        self.r[d.rd] = @truncate(prod >> 32);
+                    },
+                    .smull_al => {
+                        const a: i64 = @as(i32, @bitCast(self.r[d.rm]));
+                        const b: i64 = @as(i32, @bitCast(self.r[d.rn]));
+                        const prod: u64 = @bitCast(a * b);
+                        self.r[@as(u4, @truncate(imm32))] = @truncate(prod);
+                        self.r[d.rd] = @truncate(prod >> 32);
+                    },
+                    .smlal_al => {
+                        const rd_lo: u4 = @truncate(imm32);
+                        const a: i64 = @as(i32, @bitCast(self.r[d.rm]));
+                        const b: i64 = @as(i32, @bitCast(self.r[d.rn]));
+                        const acc: i64 = @bitCast((@as(u64, self.r[d.rd]) << 32) | self.r[rd_lo]);
+                        const prod: u64 = @bitCast((a * b) +% acc);
+                        self.r[rd_lo] = @truncate(prod);
+                        self.r[d.rd] = @truncate(prod >> 32);
+                    },
+                    .ldrex_al => {
+                        const vaddr = self.r[d.rn];
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                            const paddr = slot.pbase | (vaddr & 0xfff);
+                            self.r[d.rd] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                            self.excl_valid = true;
+                            self.excl_paddr = paddr;
+                        } else {
+                            self.r[d.rd] = self.read32(bus, vaddr) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                            self.excl_valid = true;
+                            self.excl_paddr = self.mmu.translate(bus.ram, vaddr, .read, priv != 0) catch 0;
+                        }
+                    },
+                    .strex_al => {
+                        const vaddr = self.r[d.rn];
+                        const val = self.r[d.rm];
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                            if (self.excl_valid) {
+                                std.mem.writeInt(u32, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..4], val, .little);
+                                self.r[d.rd] = 0;
+                                self.excl_valid = false;
+                            } else {
+                                self.r[d.rd] = 1;
+                            }
+                        } else {
+                            _ = self.mmu.translate(bus.ram, vaddr, .write, priv != 0) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                            if (self.excl_valid) {
+                                self.write32(bus, vaddr, val) catch {
+                                    self.enterException(.abt, 0x10, pc +% 8, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    continue;
+                                };
+                                self.r[d.rd] = 0;
+                                self.excl_valid = false;
+                            } else {
+                                self.r[d.rd] = 1;
+                            }
+                        }
+                    },
+                    .ldrexb_al => {
+                        const vaddr = self.r[d.rn];
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & 0xffff_f000) == slot.r_vbase) {
+                            self.r[d.rd] = bus.ram[slot.pbase | (vaddr & 0xfff)];
+                            self.excl_valid = true;
+                        } else {
+                            self.r[d.rd] = self.read8(bus, vaddr) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                            self.excl_valid = true;
+                        }
+                    },
+                    .strexb_al => {
+                        const vaddr = self.r[d.rn];
+                        const val: u8 = @truncate(self.r[d.rm]);
+                        if (self.excl_valid) {
+                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                            if ((vaddr & 0xffff_f000) == slot.w_vbase) {
+                                bus.ram[slot.pbase | (vaddr & 0xfff)] = val;
+                            } else {
+                                self.write8(bus, vaddr, val) catch {
+                                    self.enterException(.abt, 0x10, pc +% 8, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    continue;
+                                };
+                            }
+                            self.r[d.rd] = 0;
+                            self.excl_valid = false;
+                        } else {
+                            self.r[d.rd] = 1;
+                        }
+                    },
+                    .clz_al => self.r[d.rd] = @clz(self.r[d.rm]),
+                    .uxtb_al => self.r[d.rd] = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xff,
+                    .uxth_al => self.r[d.rd] = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xffff,
+                    .sxtb_al => {
+                        const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
+                        self.r[d.rd] = @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(rot_rm))))));
+                    },
+                    .sxth_al => {
+                        const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
+                        self.r[d.rd] = @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(rot_rm))))));
+                    },
+                    .uxtab_al => self.r[d.rd] = self.r[d.rn] +% (std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xff),
+                    .uxtah_al => self.r[d.rd] = self.r[d.rn] +% (std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xffff),
+                    .rev_al => self.r[d.rd] = @byteSwap(self.r[d.rm]),
+                    .rev16_al => {
+                        const v = self.r[d.rm];
+                        const lo: u16 = @byteSwap(@as(u16, @truncate(v)));
+                        const hi: u16 = @byteSwap(@as(u16, @truncate(v >> 16)));
+                        self.r[d.rd] = (@as(u32, hi) << 16) | lo;
+                    },
+                    .ubfx_al => self.r[d.rd] = (self.r[d.rm] >> @as(u5, @truncate(d.rn))) & imm32,
                     .ldr_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
                         const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
@@ -1397,6 +1654,14 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .bx_lr_al => {
                         self.setPcWithInterworking(self.r[14]);
+                    },
+                    .bx_reg_al => {
+                        self.setPcWithInterworking(self.r[d.rm]);
+                    },
+                    .blx_reg_al => {
+                        const target = self.r[d.rm];
+                        self.r[14] = pc +% 4;
+                        self.setPcWithInterworking(target);
                     },
                     .dp_imm_general => {
                         self.executeGroup001(pc, inst);
@@ -3466,3 +3731,90 @@ test "ARM1176 data processing, load/store, banked modes, and exceptions" {
     try std.testing.expectEqual(@as(u32, 100), cpu.r[5]);
     _ = aarch64_mod;
 }
+
+test "ARM1176 pre-decoded atomics, 64-bit multiplies, CLZ, and media fast-path" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+    @memset(ram, 0);
+
+    var bus: TestBus = .{ .ram = ram };
+    const Cpu = Arm1176(TestBus);
+    var cpu: Cpu = .{};
+    cpu.initReset(0x1000, 0, 0xffffffff, 0x2000);
+    std.mem.writeInt(u32, ram[0x2000..][0..4], 10, .little);
+
+    // 0x1000: ldrex r0, [r2]        (0xe1920f9f) -> r0 = 10, excl_valid = true
+    // 0x1004: add r1, r0, #5        (0xe2801005) -> r1 = 15
+    // 0x1008: strex r3, r1, [r2]    (0xe1823f91) -> [0x2000] = 15, r3 = 0, excl_valid = false
+    // 0x100c: strex r4, r0, [r2]    (0xe1824f90) -> fails (r4 = 1), [0x2000] remains 15
+    // 0x1010: movw r5, #0x8000      (0xe3085000)
+    // 0x1014: movt r5, #0x0001      (0xe3405001) -> r5 = 0x00018000
+    // 0x1018: clz r6, r5            (0xe16f6f15) -> r6 = 15
+    // 0x101c: umull r7, r8, r5, r5  (0xe0887595) -> 0x18000 * 0x18000 = 0x00000002_40000000 (r7=0x40000000, r8=2)
+    // 0x1020: ubfx r9, r5, #12, #8  (0xe7e79655) -> (0x18000 >> 12) & 0xff = 0x18
+    // 0x1024: sxtb r10, r9, ror #0  (0xe6afaa79) -> Wait: sxtb r10, r9 is 0xe6afa079
+    const prog = [_]u32{
+        0xe1920f9f,
+        0xe2801005,
+        0xe1823f91,
+        0xe1824f90,
+        0xe3085000,
+        0xe3405001,
+        0xe16f6f15,
+        0xe0887595,
+        0xe7e79655,
+        0xe6afa079,
+    };
+    for (prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+    }
+
+    try std.testing.expectEqual(ArmOp.ldrex_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[0]).op)));
+    try std.testing.expectEqual(ArmOp.strex_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[2]).op)));
+    try std.testing.expectEqual(ArmOp.clz_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[6]).op)));
+    try std.testing.expectEqual(ArmOp.umull_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[7]).op)));
+    try std.testing.expectEqual(ArmOp.ubfx_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[8]).op)));
+    try std.testing.expectEqual(ArmOp.sxtb_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[9]).op)));
+
+    _ = cpu.runSteps(&bus, prog.len);
+    try std.testing.expectEqual(@as(u32, 10), cpu.r[0]);
+    try std.testing.expectEqual(@as(u32, 15), cpu.r[1]);
+    try std.testing.expectEqual(@as(u32, 0), cpu.r[3]);
+    try std.testing.expectEqual(@as(u32, 1), cpu.r[4]);
+    try std.testing.expectEqual(@as(u32, 15), std.mem.readInt(u32, ram[0x2000..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 15), cpu.r[6]);
+    try std.testing.expectEqual(@as(u32, 0x4000_0000), cpu.r[7]);
+    try std.testing.expectEqual(@as(u32, 2), cpu.r[8]);
+    try std.testing.expectEqual(@as(u32, 0x18), cpu.r[9]);
+    try std.testing.expectEqual(@as(u32, 0x18), cpu.r[10]);
+}
+
