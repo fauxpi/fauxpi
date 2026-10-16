@@ -83,6 +83,7 @@ pub fn Arm1176(comptime Bus: type) type {
         /// Total executed instructions
         cycles: u64 = 0,
         last_inst: u32 = 0,
+        last_dmb_pc: u32 = 0xffff_ffff,
 
         /// Inline I-TLB & D-TLB cache for single-comparison RAM accesses within the current 4 KB page.
         /// Stores `(vaddr & 0xffff_f000)` when valid, or `0xffff_ffff` when invalid.
@@ -473,10 +474,13 @@ pub fn Arm1176(comptime Bus: type) type {
                 if (self.mmu.halted_wfi) return 0;
 
                 self.yield_slice = false;
+                self.last_dmb_pc = 0xffff_ffff;
                 defer self.excl_valid = false;
 
+                const limit = if (max_steps == 4096) max_steps + 256 else max_steps;
                 var executed: usize = 0;
-                while (executed < max_steps) {
+                while (executed < limit) {
+                    if (executed >= max_steps and (self.pstate & PstateFlags.I) == 0) break;
                     A64.step64(self, bus);
                     executed += 1;
                     if (self.mmu.halted_wfi or self.yield_slice) break;
@@ -487,10 +491,13 @@ pub fn Arm1176(comptime Bus: type) type {
             if (self.mmu.halted_wfi) return 0;
 
             self.yield_slice = false;
+            self.last_dmb_pc = 0xffff_ffff;
             defer self.excl_valid = false;
 
+            const limit = if (max_steps == 4096) max_steps + 256 else max_steps;
             var executed: usize = 0;
-            while (executed < max_steps) {
+            while (executed < limit) {
+                if (executed >= max_steps and (self.cpsr & PsrFlags.I) == 0) break;
                 self.stepOne(bus);
                 self.cycles +%= 1;
                 executed += 1;
@@ -575,9 +582,32 @@ pub fn Arm1176(comptime Bus: type) type {
                     // B / BL
                     const link = (inst & (1 << 24)) != 0;
                     const imm24: i24 = @bitCast(@as(u24, @truncate(inst)));
-                    const offset: u32 = @bitCast(@as(i32, imm24) << 2);
-                    if (link) self.r[14] = inst_pc +% 4;
-                    self.r[15] = (inst_pc +% 8) +% offset;
+                    const shift_imm: i32 = @as(i32, imm24) << 2;
+                    const offset: u32 = @bitCast(shift_imm);
+                    const target_pc = (inst_pc +% 8) +% offset;
+                    if (link) {
+                        self.r[14] = inst_pc +% 4;
+                        if (self.last_dmb_pc == inst_pc) {
+                            self.yield_slice = true;
+                        } else if ((target_pc & 0xffff_f000) == self.itlb_vbase) {
+                            const target_paddr = self.itlb_pbase | (target_pc & 0xfff);
+                            const target_inst = std.mem.readInt(u32, bus.ram[target_paddr..][0..4], .little);
+                            if (target_inst == 0xe12fff1e) {
+                                self.last_dmb_pc = inst_pc;
+                            }
+                        }
+                    } else if (shift_imm >= -28 and shift_imm < 0) {
+                        if (self.last_dmb_pc == inst_pc) {
+                            self.yield_slice = true;
+                        } else if ((inst_pc & 0xfff) < 0xffc and self.itlb_vbase == (inst_pc & 0xffff_f000)) {
+                            const next_paddr = self.itlb_pbase | ((inst_pc +% 4) & 0xfff);
+                            const next_inst = std.mem.readInt(u32, bus.ram[next_paddr..][0..4], .little);
+                            if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) {
+                                self.last_dmb_pc = inst_pc;
+                            }
+                        }
+                    }
+                    self.r[15] = target_pc;
                 },
                 0b110, 0b111 => self.executeCoprocOrSvc(bus, inst_pc, inst),
             }
@@ -626,6 +656,13 @@ pub fn Arm1176(comptime Bus: type) type {
                 if ((inst & 0x0fff_fff0) == 0x057f_f010) {
                     // CLREX
                     self.excl_valid = false;
+                } else if ((inst & 0x0fff_ffe0) == 0x057f_f040) {
+                    // DSB / DMB: yield slice if repeated at the same PC within the current slice
+                    if (self.last_dmb_pc == inst_pc) {
+                        self.yield_slice = true;
+                    } else {
+                        self.last_dmb_pc = inst_pc;
+                    }
                 }
                 // PLD / PLI / DMB / DSB / ISB are memory/cache hints
                 return;
@@ -2307,6 +2344,16 @@ pub fn Arm1176(comptime Bus: type) type {
                         if ((rlist & (@as(u8, 1) << @intCast(i))) != 0) self.r[i] = loaded[i];
                     }
                     if (pop_pc) self.setPcWithInterworking(new_pc);
+                },
+                0b1111 => { // 16-bit Thumb NOP / YIELD / WFE / WFI / SEV hints (0xbf00..0xbf40)
+                    const hint: u4 = @truncate((inst >> 4) & 0xf);
+                    if ((inst & 0xf) == 0) {
+                        if (hint == 3) {
+                            self.mmu.halted_wfi = true;
+                        } else if (hint == 1 or hint == 2) {
+                            self.yield_slice = true;
+                        }
+                    }
                 },
                 else => {},
             }

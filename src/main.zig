@@ -558,26 +558,33 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             }
         }
 
-        const max_slice: u64 = if (num_cores > 1) 4096 else 65536;
+        var runnable_cores: usize = 0;
+        for (0..num_cores) |i| {
+            if (cpus[i].halted_spin) continue;
+            soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+            const cid: u2 = @intCast(i);
+            if (!cpus[i].mmu.halted_wfi or soc.hasPendingIrqForCore(cid) or soc.hasPendingFiqForCore(cid)) {
+                runnable_cores += 1;
+            }
+        }
+
+        const max_slice: u64 = if (runnable_cores > 1) 4096 else 65536;
         const batch: usize = if (opts.max_steps != 0)
             @intCast(@min(max_slice, opts.max_steps - cpus[0].cycles))
         else
             @intCast(max_slice);
 
-        var total_ran: usize = 0;
-        var active_cores: usize = 0;
+        var max_ran: usize = 0;
         for (0..num_cores) |i| {
             if (cpus[i].halted_spin) continue;
-            active_cores += 1;
             soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
             const ran = cpus[i].runSteps(&soc, batch);
-            total_ran += ran;
+            if (ran > max_ran) max_ran = ran;
             soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
         }
 
         // Advance 1 MHz system timer and ARM timer proportionally to instructions executed (~256 instructions per us)
-        const ran_per_core = if (active_cores > 0) total_ran / active_cores else 0;
-        const timer_ticks: u64 = if (ran_per_core > 0) @max(ran_per_core / 256, 1) else 1;
+        const timer_ticks: u64 = if (max_ran > 0) @max(max_ran / 256, 1) else 1;
         active_us_accum += timer_ticks;
         soc.timer.advance(timer_ticks, &soc.intc);
         soc.arm_timer.advance(timer_ticks, &soc.intc);
@@ -687,37 +694,57 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 for (0..num_cores) |i| {
                     if (!cpus[i].halted_spin) {
                         soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
-                        cpus[i].mmu.halted_wfi = false;
                     }
                 }
                 soc.updateIrqs();
             } else {
                 // Fast-forward timer to next compare match, ARM timer, watchdog, or core generic timer during boot / headless mode
-                var jump = @min(
-                    soc.timer.usUntilNextMatch(2000),
+                var timer_wait_us = @min(
+                    soc.timer.usUntilNextMatch(1_000_000),
                     @min(
-                        soc.arm_timer.usUntilNextMatch(2000),
-                        soc.pm.usUntilWatchdogExpire(2000),
+                        soc.arm_timer.usUntilNextMatch(1_000_000),
+                        soc.pm.usUntilWatchdogExpire(1_000_000),
                     ),
                 );
                 for (0..num_cores) |i| {
                     if (!cpus[i].halted_spin) {
-                        jump = @min(jump, cpus[i].mmu.usUntilNextGenericTimer(2000));
+                        timer_wait_us = @min(timer_wait_us, cpus[i].mmu.usUntilNextGenericTimer(1_000_000));
                     }
                 }
+                const usb_active = soc.usb.pending_csplit_sof or
+                    (soc.usb.sof_wakeup_frames > 0) or
+                    soc.usb.hid.hasPendingInterruptIn();
+                const until_vblank_us: u64 = 16_667 -| (soc.timer.counter -| last_guest_vblank_us);
+                var jump = @min(timer_wait_us, @max(until_vblank_us, 1));
+                if (usb_active) jump = @min(jump, 1000);
                 jump = @max(jump, 1);
                 idle_us_accum += jump;
                 soc.timer.advance(jump, &soc.intc);
                 soc.arm_timer.advance(jump, &soc.intc);
                 soc.pm.advance(jump);
                 soc.advanceAudio(jump);
+                if (soc.timer.counter -| last_guest_vblank_us >= 16_667) {
+                    last_guest_vblank_us = soc.timer.counter;
+                    soc.triggerVblank();
+                }
                 for (0..num_cores) |i| {
                     if (!cpus[i].halted_spin) {
                         soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
-                        cpus[i].mmu.halted_wfi = false;
                     }
                 }
                 soc.updateIrqs();
+                var any_woke = false;
+                for (0..num_cores) |i| {
+                    if (cpus[i].halted_spin) continue;
+                    const cid: u2 = @intCast(i);
+                    if (soc.hasPendingIrqForCore(cid) or soc.hasPendingFiqForCore(cid)) {
+                        cpus[i].mmu.halted_wfi = false;
+                        any_woke = true;
+                    }
+                }
+                if (!any_woke and timer_wait_us >= 1_000_000) {
+                    cpus[0].mmu.halted_wfi = false;
+                }
             }
         }
 

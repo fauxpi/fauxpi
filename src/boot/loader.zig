@@ -242,6 +242,234 @@ pub fn loadFromSdImageForModel(
     return loadDirect(allocator, ram, kernel_bytes, dtb_bytes, initrd_bytes, full_cmdline, cfg.vc4_kms_v3d or true);
 }
 
+const SliceLzma2Buffer = struct {
+    dest: []u8,
+    pos: usize = 0,
+    len: usize = 0,
+
+    pub fn resetDict(self: *SliceLzma2Buffer) void {
+        self.len = 0;
+    }
+
+    pub fn lastOr(self: *const SliceLzma2Buffer, lit: u8) u8 {
+        if (self.len == 0) return lit;
+        return self.dest[self.pos - 1];
+    }
+
+    pub fn lastN(self: *const SliceLzma2Buffer, dist: usize) !u8 {
+        if (dist == 0 or dist > self.len) return error.CorruptInput;
+        return self.dest[self.pos - dist];
+    }
+
+    pub fn appendByteDirect(self: *SliceLzma2Buffer, b: u8) !void {
+        if (self.pos >= self.dest.len) return error.NoSpaceLeft;
+        self.dest[self.pos] = b;
+        self.pos += 1;
+        self.len += 1;
+    }
+
+    pub fn appendLiteral(
+        self: *SliceLzma2Buffer,
+        _: std.mem.Allocator,
+        lit: u8,
+        _: *std.Io.Writer,
+    ) !void {
+        try self.appendByteDirect(lit);
+    }
+
+    pub fn appendLz(
+        self: *SliceLzma2Buffer,
+        _: std.mem.Allocator,
+        match_len: usize,
+        dist: usize,
+        _: *std.Io.Writer,
+    ) !void {
+        if (dist == 0 or dist > self.len) return error.CorruptInput;
+        if (self.pos + match_len > self.dest.len) return error.NoSpaceLeft;
+        var src_pos = self.pos - dist;
+        for (0..match_len) |_| {
+            self.dest[self.pos] = self.dest[src_pos];
+            self.pos += 1;
+            src_pos += 1;
+        }
+        self.len += match_len;
+    }
+};
+
+fn decodeXzVliSlice(buf: []const u8, pos: *usize) !u64 {
+    var result: u64 = 0;
+    var i: usize = 0;
+    while (i < 9) : (i += 1) {
+        if (pos.* >= buf.len) return error.CorruptInput;
+        const b = buf[pos.*];
+        pos.* += 1;
+        if (b == 0 and i > 0) return error.CorruptInput;
+        result |= @as(u64, b & 0x7F) << @intCast(i * 7);
+        if ((b & 0x80) == 0) return result;
+    }
+    return error.CorruptInput;
+}
+
+fn decompressXzSingleBlock(allocator: std.mem.Allocator, xz_bytes: []const u8, dest: []u8) !usize {
+    var input: std.Io.Reader = .fixed(xz_bytes);
+    const magic = try input.takeArray(6);
+    if (!std.mem.eql(u8, magic, &.{ 0xFD, '7', 'z', 'X', 'Z', 0x00 })) return error.NotXzStream;
+
+    const stream_flags: [2]u8 = (try input.takeArray(2)).*;
+    const header_crc = try input.takeInt(u32, .little);
+    if (header_crc != std.hash.Crc32.hash(&stream_flags)) return error.WrongChecksum;
+    if (stream_flags[0] != 0 or (stream_flags[1] & 0xF0) != 0) return error.CorruptInput;
+
+    const first_byte: usize = try input.peekByte();
+    if (first_byte == 0) return error.CorruptInput;
+
+    const declared_header_size = first_byte * 4;
+    const header_bytes = try input.take(declared_header_size);
+    const declared_hdr_crc = try input.takeInt(u32, .little);
+    if (declared_hdr_crc != std.hash.Crc32.hash(header_bytes)) return error.WrongChecksum;
+
+    var hdr_pos: usize = 1;
+    const blk_flags = header_bytes[hdr_pos];
+    hdr_pos += 1;
+    const filter_count = @as(usize, blk_flags & 0x03) + 1;
+    if ((blk_flags & 0x3C) != 0 or filter_count > 2) return error.Unsupported;
+
+    if ((blk_flags & 0x40) != 0) _ = try decodeXzVliSlice(header_bytes, &hdr_pos);
+    if ((blk_flags & 0x80) != 0) _ = try decodeXzVliSlice(header_bytes, &hdr_pos);
+
+    var use_arm_bcj = false;
+    var arm_bcj_start_offset: u32 = 0;
+    if (filter_count == 2) {
+        const f0_id = try decodeXzVliSlice(header_bytes, &hdr_pos);
+        if (f0_id != 0x07) return error.Unsupported; // 0x07 = ARM BCJ
+        use_arm_bcj = true;
+        const f0_props_size = try decodeXzVliSlice(header_bytes, &hdr_pos);
+        if (f0_props_size == 4) {
+            if (hdr_pos + 4 > header_bytes.len) return error.CorruptInput;
+            arm_bcj_start_offset = std.mem.readInt(u32, header_bytes[hdr_pos..][0..4], .little);
+            hdr_pos += 4;
+        } else if (f0_props_size != 0) {
+            return error.CorruptInput;
+        }
+    }
+
+    const filter_id = try decodeXzVliSlice(header_bytes, &hdr_pos);
+    if (filter_id != 0x21) return error.Unsupported; // 0x21 = LZMA2
+    const props_size = try decodeXzVliSlice(header_bytes, &hdr_pos);
+    if (props_size != 1 or hdr_pos >= header_bytes.len) return error.CorruptInput;
+    hdr_pos += 1; // dict_size prop
+
+    var lzma_decode = try std.compress.lzma.Decode.init(allocator, .{ .lc = 0, .lp = 0, .pb = 0 });
+    defer lzma_decode.deinit(allocator);
+
+    var dummy_allocating = std.Io.Writer.Allocating.init(allocator);
+    defer dummy_allocating.deinit();
+
+    var lzma2_buf: SliceLzma2Buffer = .{ .dest = dest };
+    var packed_bytes_read: u64 = 0;
+
+    while (true) {
+        const status = try input.takeByte();
+        packed_bytes_read += 1;
+        if (status == 0) break;
+
+        if (status == 1 or status == 2) {
+            const chunk_unpacked = @as(usize, try input.takeInt(u16, .big)) + 1;
+            packed_bytes_read += 2 + chunk_unpacked;
+            if (status == 1) lzma2_buf.resetDict();
+            for (0..chunk_unpacked) |_| {
+                try lzma2_buf.appendByteDirect(try input.takeByte());
+            }
+        } else {
+            if ((status & 0x80) == 0) return error.CorruptInput;
+            const reset_mode: u2 = @truncate((status >> 5) & 0x03);
+            const reset_dict = (reset_mode == 3);
+            const reset_state = (reset_mode >= 1);
+            const reset_props = (reset_mode >= 2);
+
+            const chunk_unpacked: usize = (@as(usize, status & 0x1F) << 16) +
+                @as(usize, try input.takeInt(u16, .big)) + 1;
+            const chunk_packed: u64 = @as(u64, try input.takeInt(u16, .big)) + 1;
+            packed_bytes_read += 4;
+
+            if (reset_dict) lzma2_buf.resetDict();
+            if (reset_state) {
+                var new_props = lzma_decode.properties;
+                if (reset_props) {
+                    var props = try input.takeByte();
+                    packed_bytes_read += 1;
+                    if (props >= 225) return error.CorruptInput;
+                    const lc: u4 = @intCast(props % 9);
+                    props /= 9;
+                    const lp: u3 = @intCast(props % 5);
+                    props /= 5;
+                    const pb: u3 = @intCast(props);
+                    if (lc + lp > 4) return error.CorruptInput;
+                    new_props = .{ .lc = lc, .lp = lp, .pb = pb };
+                }
+                try lzma_decode.resetState(allocator, new_props);
+            }
+
+            const target_pos = lzma2_buf.pos + chunk_unpacked;
+            const start_packed = packed_bytes_read;
+            var range_decoder = try std.compress.lzma.RangeDecoder.initCounting(&input, &packed_bytes_read);
+            while (lzma2_buf.pos < target_pos) {
+                switch (try lzma_decode.process(&input, &dummy_allocating, &lzma2_buf, &range_decoder, &packed_bytes_read)) {
+                    .more => continue,
+                    .finished => break,
+                }
+            }
+            if (lzma2_buf.pos != target_pos) return error.DecompressedSizeMismatch;
+            if (packed_bytes_read - start_packed != chunk_packed) return error.CompressedSizeMismatch;
+        }
+    }
+
+    if (use_arm_bcj) {
+        const out = dest[0..lzma2_buf.pos];
+        const aligned_len = out.len & ~@as(usize, 3);
+        var i: usize = 0;
+        while (i < aligned_len) : (i += 4) {
+            if (out[i + 3] == 0xeb) {
+                var addr: u32 = @as(u32, out[i]) |
+                    (@as(u32, out[i + 1]) << 8) |
+                    (@as(u32, out[i + 2]) << 16);
+                addr <<= 2;
+                addr -%= arm_bcj_start_offset +% @as(u32, @intCast(i)) +% 8;
+                addr >>= 2;
+                out[i] = @truncate(addr);
+                out[i + 1] = @truncate(addr >> 8);
+                out[i + 2] = @truncate(addr >> 16);
+            }
+        }
+    }
+
+    return lzma2_buf.pos;
+}
+
+fn tryDecompressArmZImage(allocator: std.mem.Allocator, kernel_bytes: []const u8, dest: []u8) ?usize {
+    if (kernel_bytes.len < 0x40) return null;
+    // 32-bit ARM zImage magic at 0x24
+    if (std.mem.readInt(u32, kernel_bytes[0x24..0x28], .little) != 0x016f2818) return null;
+
+    const xz_magic = [_]u8{ 0xFD, '7', 'z', 'X', 'Z', 0x00 };
+    var search_pos: usize = 0;
+    while (std.mem.indexOfPos(u8, kernel_bytes, search_pos, &xz_magic)) |off| {
+        search_pos = off + 1;
+        if (off + 12 > kernel_bytes.len) break;
+        const flags = kernel_bytes[off + 6 .. off + 8];
+        if (flags[0] != 0 or (flags[1] & 0xF0) != 0) continue;
+        const crc = std.mem.readInt(u32, kernel_bytes[off + 8 ..][0..4], .little);
+        if (crc != std.hash.Crc32.hash(flags)) continue;
+
+        if (decompressXzSingleBlock(allocator, kernel_bytes[off..], dest)) |unpacked_len| {
+            if (unpacked_len > kernel_bytes.len) {
+                return unpacked_len;
+            }
+        } else |_| {}
+    }
+    return null;
+}
+
 /// Loads `kernel_bytes`, `dtb_bytes`, and optional `initrd_bytes` directly into `ram`.
 pub fn loadDirect(
     allocator: std.mem.Allocator,
@@ -260,7 +488,19 @@ pub fn loadDirect(
     const load_addr: u32 = if (is_aarch64) arm64KernelLoadOffset(kernel_bytes) else kernel_load_addr;
 
     if (load_addr + kernel_bytes.len > ram.len) return error.KernelTooLarge;
-    @memcpy(ram[load_addr .. load_addr + kernel_bytes.len], kernel_bytes);
+    const max_kernel_dest = if (!is_aarch64 and dtb_load_addr <= ram.len and dtb_load_addr > load_addr)
+        dtb_load_addr
+    else
+        ram.len;
+    const loaded_kernel_size: usize = if (!is_aarch64)
+        tryDecompressArmZImage(alloc, kernel_bytes, ram[load_addr..max_kernel_dest]) orelse blk: {
+            @memcpy(ram[load_addr .. load_addr + kernel_bytes.len], kernel_bytes);
+            break :blk kernel_bytes.len;
+        }
+    else blk: {
+        @memcpy(ram[load_addr .. load_addr + kernel_bytes.len], kernel_bytes);
+        break :blk kernel_bytes.len;
+    };
 
     var initrd_range: ?fdt.Tree.InitrdRange = null;
     var initrd_len: usize = 0;
@@ -290,7 +530,7 @@ pub fn loadDirect(
         .r0 = if (is_aarch64) dtb_load_addr else 0,
         .r1 = if (is_aarch64) 0 else 0xffffffff,
         .r2 = if (is_aarch64) 0 else dtb_load_addr,
-        .kernel_size = kernel_bytes.len,
+        .kernel_size = loaded_kernel_size,
         .dtb_size = patched_dtb.len,
         .initrd_size = initrd_len,
     };

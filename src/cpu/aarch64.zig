@@ -669,7 +669,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
 
             // 6. System instructions, hints, barriers, MSR/MRS (`0xd500_0000`)
             if ((inst & 0xffc0_0000) == 0xd500_0000) {
-                try executeSystem(cpu, bus, inst);
+                try executeSystem(cpu, bus, inst, cur_pc);
                 return;
             }
 
@@ -702,7 +702,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             _ = op1;
         }
 
-        fn executeSystem(cpu: *CpuType, bus: *Bus, inst: u32) error{Abort}!void {
+        fn executeSystem(cpu: *CpuType, bus: *Bus, inst: u32, cur_pc: u64) error{Abort}!void {
             const l = ((inst >> 21) & 1) != 0;
             const op0: u2 = @truncate(inst >> 19);
             const op1: u3 = @truncate(inst >> 16);
@@ -722,7 +722,16 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         cpu.mmu.halted_wfi = true;
                     }
                 } else if (crn == 3) {
-                    if (op2 == 2) cpu.excl_valid = false; // CLREX
+                    if (op2 == 2) {
+                        cpu.excl_valid = false; // CLREX
+                    } else if (op2 == 4 or op2 == 5) {
+                        const pc32: u32 = @truncate(cur_pc);
+                        if (cpu.last_dmb_pc == pc32) {
+                            cpu.yield_slice = true;
+                        } else {
+                            cpu.last_dmb_pc = pc32;
+                        }
+                    }
                 } else if (crn == 4) {
                     // MSR (immediate): SPSel (op1=0, op2=5), DAIFSet (op1=3, op2=6), DAIFClr (op1=3, op2=7)
                     if (op1 == 0 and op2 == 5) {

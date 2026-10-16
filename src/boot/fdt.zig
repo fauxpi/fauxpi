@@ -420,6 +420,14 @@ pub const Tree = struct {
         try sys_node.setU32Prop(self.allocator, "linux,revision", 0x00900093);
         try self.setBoardSerial(0x00000000fa000001);
 
+        // 2c. Ensure PL011 UART0 (/soc/serial@7e201000) is enabled and mapped to serial0
+        if (self.findNode("/soc/serial@7e201000") orelse self.findNode("uart0")) |uart0| {
+            try uart0.setStringProp(self.allocator, "status", "okay");
+            if (self.findNode("/aliases")) |aliases| {
+                try aliases.setStringProp(self.allocator, "serial0", "/soc/serial@7e201000");
+            }
+        }
+
         // 3. Ensure USB controller uses mainline dwc2 compatible string
         if (self.findNode("usb") orelse self.findNode("/soc/usb@7e980000")) |usb| {
             try usb.setStringProp(self.allocator, "compatible", "brcm,bcm2835-usb");
