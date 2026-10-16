@@ -80,6 +80,13 @@ pub const ArmOp = enum(u8) {
     ldr_lit_al,
     ldrh_imm_al,
     strh_imm_al,
+    ldr_wb_al,
+    str_wb_al,
+    ldrb_wb_al,
+    strb_wb_al,
+    ldm_al,
+    ldm_pc_al,
+    stm_al,
     // Unconditional / Conditional Branches & Return
     b_al,
     bl_al,
@@ -275,9 +282,9 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                 const l = (inst & (1 << 20)) != 0;
                 const rn: u4 = @truncate((inst >> 16) & 0xf);
                 const rd: u4 = @truncate((inst >> 12) & 0xf);
+                const imm12: u32 = inst & 0xfff;
+                const signed_off: u32 = if (u) imm12 else (0 -% imm12);
                 if (p and !w and rd != 15) {
-                    const imm12: u32 = inst & 0xfff;
-                    const signed_off: u32 = if (u) imm12 else (0 -% imm12);
                     if (rn != 15) {
                         const ls_op: ArmOp = if (l)
                             (if (b) .ldrb_imm_al else .ldr_imm_al)
@@ -286,6 +293,17 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                         return .{ .raw = inst, .op = @intFromEnum(ls_op), .rd = rd, .rn = rn, .imm = signed_off };
                     } else if (l and !b) {
                         return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldr_lit_al), .rd = rd, .imm = signed_off };
+                    }
+                } else if ((p and w) or (!p and !w)) {
+                    // Pre-index with writeback (`p and w`) or post-index (`!p and !w`, not LDRT/STRT)
+                    if (rn != 15 and rd != rn and (l or rd != 15) and (!b or rd != 15)) {
+                        const addr_off: u32 = if (p) signed_off else 0;
+                        const packed_imm: u64 = @as(u64, addr_off) | (@as(u64, signed_off) << 32);
+                        const wb_op: ArmOp = if (l)
+                            (if (b) .ldrb_wb_al else .ldr_wb_al)
+                        else
+                            (if (b) .strb_wb_al else .str_wb_al);
+                        return .{ .raw = inst, .op = @intFromEnum(wb_op), .rd = rd, .rn = rn, .imm = packed_imm };
                     }
                 }
             }
@@ -298,6 +316,35 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
             return .{ .raw = inst, .op = @intFromEnum(ArmOp.ls_wb_reg) };
         },
         0b100 => {
+            const p = (inst & (1 << 24)) != 0;
+            const u = (inst & (1 << 23)) != 0;
+            const s = (inst & (1 << 22)) != 0;
+            const w = (inst & (1 << 21)) != 0;
+            const l = (inst & (1 << 20)) != 0;
+            const rn: u4 = @truncate((inst >> 16) & 0xf);
+            const reg_list: u16 = @truncate(inst & 0xffff);
+            if (cond == 0xe and !s and reg_list != 0 and rn != 15) {
+                const count: i32 = @intCast(@popCount(reg_list));
+                const total_bytes: i32 = count * 4;
+                const start_off: i16 = @intCast(switch (@as(u2, (@as(u2, @intFromBool(p)) << 1) | @intFromBool(u))) {
+                    0b00 => -total_bytes + 4, // DA
+                    0b01 => 0, // IA
+                    0b10 => -total_bytes, // DB
+                    0b11 => 4, // IB
+                });
+                const has_wb = w and (!l or (reg_list & (@as(u16, 1) << rn)) == 0);
+                const wb_off: i16 = if (has_wb) @intCast(if (u) total_bytes else -total_bytes) else 0;
+                const last_off: u16 = @intCast((count - 1) * 4);
+                const packed_imm: u64 = @as(u64, reg_list) |
+                    (@as(u64, last_off) << 16) |
+                    (@as(u64, @as(u16, @bitCast(start_off))) << 32) |
+                    (@as(u64, @as(u16, @bitCast(wb_off))) << 48);
+                const op: ArmOp = if (l)
+                    (if ((reg_list & (1 << 15)) != 0) .ldm_pc_al else .ldm_al)
+                else
+                    .stm_al;
+                return .{ .raw = inst, .op = @intFromEnum(op), .rn = rn, .imm = packed_imm };
+            }
             return .{ .raw = inst, .op = @intFromEnum(ArmOp.ls_multiple) };
         },
         0b101 => {
@@ -392,28 +439,11 @@ pub fn Arm1176(comptime Bus: type) type {
         last_inst: u32 = 0,
         last_dmb_pc: u32 = 0xffff_ffff,
 
-        /// Inline I-TLB & D-TLB cache for single-comparison RAM accesses within the current 4 KB page.
-        /// Stores `(vaddr & 0xffff_f000)` when valid, or `0xffff_ffff` when invalid.
-        itlb_vbase: u32 = 0xffff_ffff,
-        itlb_pbase: u32 = 0,
-        dtlb_r_vbase: u32 = 0xffff_ffff,
-        dtlb_r_pbase: u32 = 0,
-        dtlb_w_vbase: u32 = 0xffff_ffff,
-        dtlb_w_pbase: u32 = 0,
-        /// 64-bit virtual page bases for AArch64 inline TLBs (`0xffff_ffff_ffff_ffff` when invalid)
-        itlb64_vbase: u64 = 0xffff_ffff_ffff_ffff,
-        dtlb64_r_vbase: u64 = 0xffff_ffff_ffff_ffff,
-        dtlb64_w_vbase: u64 = 0xffff_ffff_ffff_ffff,
         /// Direct-mapped decoded instruction cache (`icache_size` entries)
         icache: [icache_size]DecodedSlot = @splat(.{}),
 
         pub inline fn invalidateInlineTlb(self: *Self) void {
-            self.itlb_vbase = 0xffff_ffff;
-            self.dtlb_r_vbase = 0xffff_ffff;
-            self.dtlb_w_vbase = 0xffff_ffff;
-            self.itlb64_vbase = 0xffff_ffff_ffff_ffff;
-            self.dtlb64_r_vbase = 0xffff_ffff_ffff_ffff;
-            self.dtlb64_w_vbase = 0xffff_ffff_ffff_ffff;
+            self.mmu.flushTlb();
         }
 
         pub fn initReset(self: *Self, entry_pc: u32, r0: u32, r1: u32, r2: u32) void {
@@ -522,14 +552,12 @@ pub fn Arm1176(comptime Bus: type) type {
             }
 
             self.cpsr = (self.cpsr & ~@as(u32, 0x1f)) | new_mode_bits;
-            self.invalidateInlineTlb();
         }
 
         pub fn setCpsr(self: *Self, new_cpsr: u32) void {
             const new_mode: u5 = @truncate(new_cpsr & 0x1f);
             self.switchMode(new_mode);
             self.cpsr = new_cpsr;
-            self.invalidateInlineTlb();
         }
 
         fn readUserReg(self: *const Self, reg: u4) u32 {
@@ -579,7 +607,6 @@ pub fn Arm1176(comptime Bus: type) type {
             const base: u32 = if (self.mmu.highVectors()) 0xffff_0000 else self.mmu.vbar;
             self.r[15] = base + vector_offset;
             self.excl_valid = false;
-            self.invalidateInlineTlb();
         }
 
         pub inline fn checkInterrupts(self: *Self, bus: *const Bus) bool {
@@ -608,19 +635,17 @@ pub fn Arm1176(comptime Bus: type) type {
             return false;
         }
 
-        // --- Memory Access via MMU & Bus ---
+        // --- Memory Access via SoftMMU & Bus ---
 
         inline fn read32(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u32 {
-            if ((vaddr & ~@as(u32, 0xffc)) == self.dtlb_r_vbase) {
-                const paddr = self.dtlb_r_pbase | (vaddr & 0xfff);
+            const priv: u1 = @intFromBool(self.isPrivileged());
+            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+            if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                const paddr = slot.pbase | (vaddr & 0xfff);
                 return std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
             }
-            const paddr = try self.mmu.translate(bus.ram, vaddr, .read, self.isPrivileged());
+            const paddr = try self.mmu.translate(bus.ram, vaddr, .read, priv != 0);
             if (paddr < bus.ram.len and (vaddr & 3) == 0) {
-                if (@as(usize, paddr & 0xffff_f000) + 4096 <= bus.ram.len) {
-                    self.dtlb_r_vbase = vaddr & 0xffff_f000;
-                    self.dtlb_r_pbase = paddr & 0xffff_f000;
-                }
                 return std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
             }
             // Handle unaligned RAM access or MMIO access
@@ -641,8 +666,10 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         inline fn write32(self: *Self, bus: *Bus, vaddr: u32, val: u32) error{Abort}!void {
-            if ((vaddr & ~@as(u32, 0xffc)) == self.dtlb_w_vbase) {
-                const paddr = self.dtlb_w_pbase | (vaddr & 0xfff);
+            const priv: u1 = @intFromBool(self.isPrivileged());
+            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+            if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                const paddr = slot.pbase | (vaddr & 0xfff);
                 std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
                 return;
             }
@@ -653,12 +680,8 @@ pub fn Arm1176(comptime Bus: type) type {
                 try self.write8(bus, vaddr +% 3, @truncate(val >> 24));
                 return;
             }
-            const paddr = try self.mmu.translate(bus.ram, vaddr, .write, self.isPrivileged());
+            const paddr = try self.mmu.translate(bus.ram, vaddr, .write, priv != 0);
             if (paddr < bus.ram.len and (paddr & 3) == 0) {
-                if (@as(usize, paddr & 0xffff_f000) + 4096 <= bus.ram.len) {
-                    self.dtlb_w_vbase = vaddr & 0xffff_f000;
-                    self.dtlb_w_pbase = paddr & 0xffff_f000;
-                }
                 std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
                 return;
             }
@@ -666,8 +689,10 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         inline fn read16(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u16 {
-            if ((vaddr & ~@as(u32, 0xffe)) == self.dtlb_r_vbase) {
-                const paddr = self.dtlb_r_pbase | (vaddr & 0xfff);
+            const priv: u1 = @intFromBool(self.isPrivileged());
+            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+            if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                const paddr = slot.pbase | (vaddr & 0xfff);
                 return std.mem.readInt(u16, bus.ram[paddr..][0..2], .little);
             }
             if ((vaddr & 1) != 0 and (self.mmu.sctlr & (1 << 22)) != 0) {
@@ -675,7 +700,7 @@ pub fn Arm1176(comptime Bus: type) type {
                 const b1: u16 = try self.read8(bus, vaddr +% 1);
                 return b0 | (b1 << 8);
             }
-            const paddr = try self.mmu.translate(bus.ram, vaddr, .read, self.isPrivileged());
+            const paddr = try self.mmu.translate(bus.ram, vaddr, .read, priv != 0);
             if (@as(usize, paddr) + 2 <= bus.ram.len) {
                 return std.mem.readInt(u16, bus.ram[paddr..][0..2], .little);
             }
@@ -683,8 +708,10 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         inline fn write16(self: *Self, bus: *Bus, vaddr: u32, val: u16) error{Abort}!void {
-            if ((vaddr & ~@as(u32, 0xffe)) == self.dtlb_w_vbase) {
-                const paddr = self.dtlb_w_pbase | (vaddr & 0xfff);
+            const priv: u1 = @intFromBool(self.isPrivileged());
+            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+            if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
+                const paddr = slot.pbase | (vaddr & 0xfff);
                 std.mem.writeInt(u16, bus.ram[paddr..][0..2], val, .little);
                 return;
             }
@@ -693,7 +720,7 @@ pub fn Arm1176(comptime Bus: type) type {
                 try self.write8(bus, vaddr +% 1, @truncate(val >> 8));
                 return;
             }
-            const paddr = try self.mmu.translate(bus.ram, vaddr, .write, self.isPrivileged());
+            const paddr = try self.mmu.translate(bus.ram, vaddr, .write, priv != 0);
             if (@as(usize, paddr) + 2 <= bus.ram.len) {
                 std.mem.writeInt(u16, bus.ram[paddr..][0..2], val, .little);
                 return;
@@ -702,33 +729,27 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         inline fn read8(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u8 {
-            const vbase = vaddr & 0xffff_f000;
-            if (vbase == self.dtlb_r_vbase) {
-                return bus.ram[self.dtlb_r_pbase | (vaddr & 0xfff)];
+            const priv: u1 = @intFromBool(self.isPrivileged());
+            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+            if ((vaddr & 0xffff_f000) == slot.r_vbase) {
+                return bus.ram[slot.pbase | (vaddr & 0xfff)];
             }
-            const paddr = try self.mmu.translate(bus.ram, vaddr, .read, self.isPrivileged());
+            const paddr = try self.mmu.translate(bus.ram, vaddr, .read, priv != 0);
             if (paddr < bus.ram.len) {
-                if (@as(usize, paddr & 0xffff_f000) + 4096 <= bus.ram.len) {
-                    self.dtlb_r_vbase = vbase;
-                    self.dtlb_r_pbase = paddr & 0xffff_f000;
-                }
                 return bus.ram[paddr];
             }
             return bus.read8(paddr);
         }
 
         inline fn write8(self: *Self, bus: *Bus, vaddr: u32, val: u8) error{Abort}!void {
-            const vbase = vaddr & 0xffff_f000;
-            if (vbase == self.dtlb_w_vbase) {
-                bus.ram[self.dtlb_w_pbase | (vaddr & 0xfff)] = val;
+            const priv: u1 = @intFromBool(self.isPrivileged());
+            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+            if ((vaddr & 0xffff_f000) == slot.w_vbase) {
+                bus.ram[slot.pbase | (vaddr & 0xfff)] = val;
                 return;
             }
-            const paddr = try self.mmu.translate(bus.ram, vaddr, .write, self.isPrivileged());
+            const paddr = try self.mmu.translate(bus.ram, vaddr, .write, priv != 0);
             if (paddr < bus.ram.len) {
-                if (@as(usize, paddr & 0xffff_f000) + 4096 <= bus.ram.len) {
-                    self.dtlb_w_vbase = vbase;
-                    self.dtlb_w_pbase = paddr & 0xffff_f000;
-                }
                 bus.ram[paddr] = val;
                 return;
             }
@@ -736,17 +757,13 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         inline fn fetch32(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u32 {
-            const vbase = vaddr & 0xffff_f000;
-            if (vbase == self.itlb_vbase) {
-                const paddr = self.itlb_pbase | (vaddr & 0xfff);
+            const priv: u1 = @intFromBool(self.isPrivileged());
+            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+            if ((vaddr & 0xffff_f000) == slot.x_vbase) {
+                const paddr = slot.pbase | (vaddr & 0xfff);
                 return std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
             }
-            const paddr = try self.mmu.translate(bus.ram, vaddr, .fetch, self.isPrivileged());
-            if (@as(usize, paddr & 0xffff_f000) + 4096 <= bus.ram.len) {
-                self.itlb_vbase = vbase;
-                self.itlb_pbase = paddr & 0xffff_f000;
-                return std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
-            }
+            const paddr = try self.mmu.translate(bus.ram, vaddr, .fetch, priv != 0);
             if (@as(usize, paddr) + 4 <= bus.ram.len) {
                 return std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
             }
@@ -754,17 +771,13 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         inline fn fetch16(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u16 {
-            const vbase = vaddr & 0xffff_f000;
-            if (vbase == self.itlb_vbase) {
-                const paddr = self.itlb_pbase | (vaddr & 0xfff);
+            const priv: u1 = @intFromBool(self.isPrivileged());
+            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+            if ((vaddr & 0xffff_f000) == slot.x_vbase) {
+                const paddr = slot.pbase | (vaddr & 0xfff);
                 return std.mem.readInt(u16, bus.ram[paddr..][0..2], .little);
             }
-            const paddr = try self.mmu.translate(bus.ram, vaddr, .fetch, self.isPrivileged());
-            if (@as(usize, paddr & 0xffff_f000) + 4096 <= bus.ram.len) {
-                self.itlb_vbase = vbase;
-                self.itlb_pbase = paddr & 0xffff_f000;
-                return std.mem.readInt(u16, bus.ram[paddr..][0..2], .little);
-            }
+            const paddr = try self.mmu.translate(bus.ram, vaddr, .fetch, priv != 0);
             if (@as(usize, paddr) + 2 <= bus.ram.len) {
                 return std.mem.readInt(u16, bus.ram[paddr..][0..2], .little);
             }
@@ -809,9 +822,11 @@ pub fn Arm1176(comptime Bus: type) type {
                     continue;
                 }
 
+                const priv: u1 = @intFromBool(self.isPrivileged());
                 const pc = self.r[15] & ~@as(u32, 3);
-                const inst: u32 = if ((pc & 0xffff_f000) == self.itlb_vbase)
-                    std.mem.readInt(u32, bus.ram[(self.itlb_pbase | (pc & 0xfff))..][0..4], .little)
+                const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
+                const inst: u32 = if ((pc & 0xffff_f000) == islot.x_vbase)
+                    std.mem.readInt(u32, bus.ram[(islot.pbase | (pc & 0xfff))..][0..4], .little)
                 else
                     self.fetch32(bus, pc) catch {
                         self.enterException(.abt, 0x0c, pc +% 4, false);
@@ -879,8 +894,9 @@ pub fn Arm1176(comptime Bus: type) type {
                     .mul_al => self.r[d.rd] = self.r[d.rm] *% self.r[d.rn],
                     .ldr_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffc)) == self.dtlb_r_vbase) {
-                            self.r[d.rd] = std.mem.readInt(u32, bus.ram[(self.dtlb_r_pbase | (vaddr & 0xfff))..][0..4], .little);
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                            self.r[d.rd] = std.mem.readInt(u32, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..4], .little);
                         } else {
                             self.r[d.rd] = self.read32(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -890,8 +906,9 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .str_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffc)) == self.dtlb_w_vbase) {
-                            std.mem.writeInt(u32, bus.ram[(self.dtlb_w_pbase | (vaddr & 0xfff))..][0..4], self.r[d.rd], .little);
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                            std.mem.writeInt(u32, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..4], self.r[d.rd], .little);
                         } else {
                             self.write32(bus, vaddr, self.r[d.rd]) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -902,8 +919,9 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldrb_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & 0xffff_f000) == self.dtlb_r_vbase) {
-                            self.r[d.rd] = bus.ram[self.dtlb_r_pbase | (vaddr & 0xfff)];
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & 0xffff_f000) == slot.r_vbase) {
+                            self.r[d.rd] = bus.ram[slot.pbase | (vaddr & 0xfff)];
                         } else {
                             self.r[d.rd] = self.read8(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -913,8 +931,9 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .strb_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & 0xffff_f000) == self.dtlb_w_vbase) {
-                            bus.ram[self.dtlb_w_pbase | (vaddr & 0xfff)] = @truncate(self.r[d.rd]);
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & 0xffff_f000) == slot.w_vbase) {
+                            bus.ram[slot.pbase | (vaddr & 0xfff)] = @truncate(self.r[d.rd]);
                         } else {
                             self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -925,8 +944,9 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldr_lit_al => {
                         const vaddr = (pc +% 8) +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffc)) == self.dtlb_r_vbase) {
-                            self.r[d.rd] = std.mem.readInt(u32, bus.ram[(self.dtlb_r_pbase | (vaddr & 0xfff))..][0..4], .little);
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                            self.r[d.rd] = std.mem.readInt(u32, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..4], .little);
                         } else {
                             self.r[d.rd] = self.read32(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -936,8 +956,9 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldrh_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffe)) == self.dtlb_r_vbase) {
-                            self.r[d.rd] = std.mem.readInt(u16, bus.ram[(self.dtlb_r_pbase | (vaddr & 0xfff))..][0..2], .little);
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                            self.r[d.rd] = std.mem.readInt(u16, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..2], .little);
                         } else {
                             self.r[d.rd] = self.read16(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -947,8 +968,9 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .strh_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffe)) == self.dtlb_w_vbase) {
-                            std.mem.writeInt(u16, bus.ram[(self.dtlb_w_pbase | (vaddr & 0xfff))..][0..2], @truncate(self.r[d.rd]), .little);
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
+                            std.mem.writeInt(u16, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..2], @truncate(self.r[d.rd]), .little);
                         } else {
                             self.write16(bus, vaddr, @truncate(self.r[d.rd])) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -957,13 +979,133 @@ pub fn Arm1176(comptime Bus: type) type {
                             _ = self.checkInterrupts(bus);
                         }
                     },
+                    .ldr_wb_al => {
+                        const base_val = self.r[d.rn];
+                        const vaddr = base_val +% imm32;
+                        const wb_off: u32 = @truncate(d.imm >> 32);
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        const val: u32 = if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase)
+                            std.mem.readInt(u32, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..4], .little)
+                        else
+                            self.read32(bus, vaddr) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                continue;
+                            };
+                        self.r[d.rn] = base_val +% wb_off;
+                        if (d.rd == 15) {
+                            self.setPcWithInterworking(val);
+                        } else {
+                            self.r[d.rd] = val;
+                        }
+                    },
+                    .str_wb_al => {
+                        const base_val = self.r[d.rn];
+                        const vaddr = base_val +% imm32;
+                        const wb_off: u32 = @truncate(d.imm >> 32);
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                            std.mem.writeInt(u32, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..4], self.r[d.rd], .little);
+                            self.r[d.rn] = base_val +% wb_off;
+                        } else {
+                            self.write32(bus, vaddr, self.r[d.rd]) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                continue;
+                            };
+                            self.r[d.rn] = base_val +% wb_off;
+                            _ = self.checkInterrupts(bus);
+                        }
+                    },
+                    .ldrb_wb_al => {
+                        const base_val = self.r[d.rn];
+                        const vaddr = base_val +% imm32;
+                        const wb_off: u32 = @truncate(d.imm >> 32);
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & 0xffff_f000) == slot.r_vbase) {
+                            self.r[d.rd] = bus.ram[slot.pbase | (vaddr & 0xfff)];
+                        } else {
+                            self.r[d.rd] = self.read8(bus, vaddr) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                continue;
+                            };
+                        }
+                        self.r[d.rn] = base_val +% wb_off;
+                    },
+                    .strb_wb_al => {
+                        const base_val = self.r[d.rn];
+                        const vaddr = base_val +% imm32;
+                        const wb_off: u32 = @truncate(d.imm >> 32);
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & 0xffff_f000) == slot.w_vbase) {
+                            bus.ram[slot.pbase | (vaddr & 0xfff)] = @truncate(self.r[d.rd]);
+                            self.r[d.rn] = base_val +% wb_off;
+                        } else {
+                            self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                continue;
+                            };
+                            self.r[d.rn] = base_val +% wb_off;
+                            _ = self.checkInterrupts(bus);
+                        }
+                    },
+                    .ldm_al, .ldm_pc_al => {
+                        const base_val = self.r[d.rn];
+                        const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
+                        const start_addr = base_val +% @as(u32, @bitCast(start_off));
+                        const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
+                        const last_addr = start_addr +% last_off;
+                        const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
+                        if ((start_addr & ~@as(u32, 0xffc)) == slot.r_vbase and
+                            (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
+                        {
+                            var paddr = slot.pbase | (start_addr & 0xfff);
+                            var rem: u16 = @truncate(d.imm & 0x7fff);
+                            while (rem != 0) : (rem &= rem - 1) {
+                                const i: u4 = @intCast(@ctz(rem));
+                                self.r[i] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                                paddr += 4;
+                            }
+                            const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
+                            self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
+                            if (op == .ldm_pc_al) {
+                                const pc_val = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                                self.setPcWithInterworking(pc_val);
+                            }
+                        } else {
+                            self.executeLoadStoreMultiple(bus, pc, inst);
+                        }
+                    },
+                    .stm_al => {
+                        const base_val = self.r[d.rn];
+                        const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
+                        const start_addr = base_val +% @as(u32, @bitCast(start_off));
+                        const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
+                        const last_addr = start_addr +% last_off;
+                        const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
+                        if ((start_addr & ~@as(u32, 0xffc)) == slot.w_vbase and
+                            (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
+                        {
+                            var paddr = slot.pbase | (start_addr & 0xfff);
+                            var rem: u16 = @truncate(d.imm);
+                            while (rem != 0) : (rem &= rem - 1) {
+                                const i: u4 = @intCast(@ctz(rem));
+                                const val = if (i == 15) (pc +% 8) else self.r[i];
+                                std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
+                                paddr += 4;
+                            }
+                            const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
+                            self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
+                        } else {
+                            self.executeLoadStoreMultiple(bus, pc, inst);
+                            _ = self.checkInterrupts(bus);
+                        }
+                    },
                     .b_al => {
                         const shift_imm: i32 = @bitCast(imm32);
                         if (shift_imm >= -28 and shift_imm < 0) {
                             if (self.last_dmb_pc == pc) {
                                 self.yield_slice = true;
-                            } else if ((pc & 0xfff) < 0xffc and self.itlb_vbase == (pc & 0xffff_f000)) {
-                                const next_paddr = self.itlb_pbase | ((pc +% 4) & 0xfff);
+                            } else if ((pc & 0xfff) < 0xffc and (pc & 0xffff_f000) == islot.x_vbase) {
+                                const next_paddr = islot.pbase | ((pc +% 4) & 0xfff);
                                 const next_inst = std.mem.readInt(u32, bus.ram[next_paddr..][0..4], .little);
                                 if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) {
                                     self.last_dmb_pc = pc;
@@ -978,11 +1120,14 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.r[14] = pc +% 4;
                         if (self.last_dmb_pc == pc) {
                             self.yield_slice = true;
-                        } else if ((target_pc & 0xffff_f000) == self.itlb_vbase) {
-                            const target_paddr = self.itlb_pbase | (target_pc & 0xfff);
-                            const target_inst = std.mem.readInt(u32, bus.ram[target_paddr..][0..4], .little);
-                            if (target_inst == 0xe12fff1e) {
-                                self.last_dmb_pc = pc;
+                        } else {
+                            const tslot = self.mmu.soft_tlb32[priv][(target_pc >> 12) & Mmu.soft_tlb_mask];
+                            if ((target_pc & 0xffff_f000) == tslot.x_vbase) {
+                                const target_paddr = tslot.pbase | (target_pc & 0xfff);
+                                const target_inst = std.mem.readInt(u32, bus.ram[target_paddr..][0..4], .little);
+                                if (target_inst == 0xe12fff1e) {
+                                    self.last_dmb_pc = pc;
+                                }
                             }
                         }
                         self.r[15] = target_pc;
@@ -998,8 +1143,8 @@ pub fn Arm1176(comptime Bus: type) type {
                                 if (shift_imm >= -28 and shift_imm < 0) {
                                     if (self.last_dmb_pc == pc) {
                                         self.yield_slice = true;
-                                    } else if ((pc & 0xfff) < 0xffc and self.itlb_vbase == (pc & 0xffff_f000)) {
-                                        const next_paddr = self.itlb_pbase | ((pc +% 4) & 0xfff);
+                                    } else if ((pc & 0xfff) < 0xffc and (pc & 0xffff_f000) == islot.x_vbase) {
+                                        const next_paddr = islot.pbase | ((pc +% 4) & 0xfff);
                                         const next_inst = std.mem.readInt(u32, bus.ram[next_paddr..][0..4], .little);
                                         if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) {
                                             self.last_dmb_pc = pc;
@@ -1167,25 +1312,32 @@ pub fn Arm1176(comptime Bus: type) type {
                     const shift_imm: i32 = @as(i32, imm24) << 2;
                     const offset: u32 = @bitCast(shift_imm);
                     const target_pc = (inst_pc +% 8) +% offset;
+                    const priv: u1 = @intFromBool(self.isPrivileged());
                     if (link) {
                         self.r[14] = inst_pc +% 4;
                         if (self.last_dmb_pc == inst_pc) {
                             self.yield_slice = true;
-                        } else if ((target_pc & 0xffff_f000) == self.itlb_vbase) {
-                            const target_paddr = self.itlb_pbase | (target_pc & 0xfff);
-                            const target_inst = std.mem.readInt(u32, bus.ram[target_paddr..][0..4], .little);
-                            if (target_inst == 0xe12fff1e) {
-                                self.last_dmb_pc = inst_pc;
+                        } else {
+                            const tslot = self.mmu.soft_tlb32[priv][(target_pc >> 12) & Mmu.soft_tlb_mask];
+                            if ((target_pc & 0xffff_f000) == tslot.x_vbase) {
+                                const target_paddr = tslot.pbase | (target_pc & 0xfff);
+                                const target_inst = std.mem.readInt(u32, bus.ram[target_paddr..][0..4], .little);
+                                if (target_inst == 0xe12fff1e) {
+                                    self.last_dmb_pc = inst_pc;
+                                }
                             }
                         }
                     } else if (shift_imm >= -28 and shift_imm < 0) {
                         if (self.last_dmb_pc == inst_pc) {
                             self.yield_slice = true;
-                        } else if ((inst_pc & 0xfff) < 0xffc and self.itlb_vbase == (inst_pc & 0xffff_f000)) {
-                            const next_paddr = self.itlb_pbase | ((inst_pc +% 4) & 0xfff);
-                            const next_inst = std.mem.readInt(u32, bus.ram[next_paddr..][0..4], .little);
-                            if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) {
-                                self.last_dmb_pc = inst_pc;
+                        } else {
+                            const islot = self.mmu.soft_tlb32[priv][(inst_pc >> 12) & Mmu.soft_tlb_mask];
+                            if ((inst_pc & 0xfff) < 0xffc and (inst_pc & 0xffff_f000) == islot.x_vbase) {
+                                const next_paddr = islot.pbase | ((inst_pc +% 4) & 0xfff);
+                                const next_inst = std.mem.readInt(u32, bus.ram[next_paddr..][0..4], .little);
+                                if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) {
+                                    self.last_dmb_pc = inst_pc;
+                                }
                             }
                         }
                     }
@@ -2012,11 +2164,9 @@ pub fn Arm1176(comptime Bus: type) type {
             const saved_cpsr = self.cpsr;
             if (unpriv_access) {
                 self.cpsr = (self.cpsr & ~@as(u32, 0x1f)) | @intFromEnum(Mode.usr);
-                self.invalidateInlineTlb();
             }
             defer if (unpriv_access) {
                 self.cpsr = saved_cpsr;
-                self.invalidateInlineTlb();
             };
 
             if (l) {
@@ -2082,14 +2232,16 @@ pub fn Arm1176(comptime Bus: type) type {
             const final_base = if (u) (base_val +% total_bytes) else (base_val -% total_bytes);
 
             const user_bank = s and (!l or (reg_list & (1 << 15)) == 0);
+            const priv: u1 = @intFromBool(self.isPrivileged());
 
             if (l) {
                 if (!user_bank and count > 0) {
                     const last_addr = start_addr +% total_bytes -% 4;
-                    if ((start_addr & ~@as(u32, 0xffc)) == self.dtlb_r_vbase and
-                        (last_addr & ~@as(u32, 0xffc)) == self.dtlb_r_vbase)
+                    const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((start_addr & ~@as(u32, 0xffc)) == slot.r_vbase and
+                        (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
                     {
-                        var paddr = self.dtlb_r_pbase | (start_addr & 0xfff);
+                        var paddr = slot.pbase | (start_addr & 0xfff);
                         var rem_fast = reg_list & 0x7fff;
                         while (rem_fast != 0) : (rem_fast &= rem_fast - 1) {
                             const i: u4 = @intCast(@ctz(rem_fast));
@@ -2147,10 +2299,11 @@ pub fn Arm1176(comptime Bus: type) type {
             } else {
                 if (!user_bank and count > 0) {
                     const last_addr = start_addr +% total_bytes -% 4;
-                    if ((start_addr & ~@as(u32, 0xffc)) == self.dtlb_w_vbase and
-                        (last_addr & ~@as(u32, 0xffc)) == self.dtlb_w_vbase)
+                    const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((start_addr & ~@as(u32, 0xffc)) == slot.w_vbase and
+                        (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
                     {
-                        var paddr = self.dtlb_w_pbase | (start_addr & 0xfff);
+                        var paddr = slot.pbase | (start_addr & 0xfff);
                         var rem_fast = reg_list;
                         while (rem_fast != 0) : (rem_fast &= rem_fast - 1) {
                             const i: u4 = @intCast(@ctz(rem_fast));
@@ -2167,15 +2320,16 @@ pub fn Arm1176(comptime Bus: type) type {
                 // STM: Pre-validate write translation on first and last address before committing writes
                 if (count > 0) {
                     const last_addr = start_addr +% total_bytes -% 4;
-                    if ((start_addr & ~@as(u32, 0xffc)) != self.dtlb_w_vbase or
-                        (last_addr & ~@as(u32, 0xffc)) != self.dtlb_w_vbase)
+                    const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((start_addr & ~@as(u32, 0xffc)) != slot.w_vbase or
+                        (last_addr & ~@as(u32, 0xffc)) != slot.w_vbase)
                     {
-                        _ = self.mmu.translate(bus.ram, start_addr, .write, self.isPrivileged()) catch {
+                        _ = self.mmu.translate(bus.ram, start_addr, .write, priv != 0) catch {
                             self.enterException(.abt, 0x10, inst_pc +% 8, false);
                             return;
                         };
                         if (total_bytes > 4) {
-                            _ = self.mmu.translate(bus.ram, last_addr, .write, self.isPrivileged()) catch {
+                            _ = self.mmu.translate(bus.ram, last_addr, .write, priv != 0) catch {
                                 self.enterException(.abt, 0x10, inst_pc +% 8, false);
                                 return;
                             };
@@ -2284,7 +2438,6 @@ pub fn Arm1176(comptime Bus: type) type {
                         }
                     } else {
                         self.mmu.writeCp15(opc1, crn, crm, opc2, self.r[rt]);
-                        self.invalidateInlineTlb();
                     }
                     return;
                 }
@@ -2306,7 +2459,6 @@ pub fn Arm1176(comptime Bus: type) type {
                     } else {
                         const val64: u64 = (@as(u64, self.r[rt2]) << 32) | self.r[rt];
                         self.mmu.writeCp15_64(opc1_64, crm, val64);
-                        self.invalidateInlineTlb();
                     }
                     return;
                 }

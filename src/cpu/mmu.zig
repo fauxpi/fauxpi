@@ -136,9 +136,35 @@ pub const Mmu = struct {
     /// Current TLB generation counter (incremented on full TLB flush to avoid 48 KB memset)
     tlb_gen: u32 = 1,
 
+    /// Direct-indexed SoftMMU RAM fast-path tables banked by privilege (`[0]` = User/EL0, `[1]` = Priv/EL1..3).
+    /// Entries are populated only for 4 KB pages backed by main RAM (`pbase + 4096 <= ram.len`).
+    soft_tlb32: [2][soft_tlb_size]SoftTlbSlot32 = @splat(@splat(.{})),
+    soft_tlb64: [2][soft_tlb_size]SoftTlbSlot64 = @splat(@splat(.{})),
+    soft_tlb32_dirty: bool = false,
+    soft_tlb64_dirty: bool = false,
+
     pub const tlb_bits = 12;
     pub const tlb_size = 1 << tlb_bits;
     pub const tlb_mask = tlb_size - 1;
+
+    pub const soft_tlb_bits = 10;
+    pub const soft_tlb_size = 1 << soft_tlb_bits;
+    pub const soft_tlb_mask = soft_tlb_size - 1;
+
+    pub const SoftTlbSlot32 = struct {
+        r_vbase: u32 = 0xffff_ffff,
+        w_vbase: u32 = 0xffff_ffff,
+        x_vbase: u32 = 0xffff_ffff,
+        pbase: u32 = 0,
+    };
+
+    pub const SoftTlbSlot64 = struct {
+        r_vbase: u64 = 0xffff_ffff_ffff_ffff,
+        w_vbase: u64 = 0xffff_ffff_ffff_ffff,
+        x_vbase: u64 = 0xffff_ffff_ffff_ffff,
+        pbase: u32 = 0,
+        _pad: u32 = 0,
+    };
 
     pub const perm_priv_r: u8 = 1 << 0;
     pub const perm_priv_w: u8 = 1 << 1;
@@ -179,6 +205,16 @@ pub const Mmu = struct {
             @memset(&self.tlb, .{});
             self.tlb_gen = 1;
         }
+        if (self.soft_tlb32_dirty) {
+            @memset(&self.soft_tlb32[0], .{});
+            @memset(&self.soft_tlb32[1], .{});
+            self.soft_tlb32_dirty = false;
+        }
+        if (self.soft_tlb64_dirty) {
+            @memset(&self.soft_tlb64[0], .{});
+            @memset(&self.soft_tlb64[1], .{});
+            self.soft_tlb64_dirty = false;
+        }
     }
 
     pub fn flushTlbMva(self: *Mmu, mva: u32) void {
@@ -187,6 +223,9 @@ pub const Mmu = struct {
         if (self.tlb[idx].gen == self.tlb_gen and self.tlb[idx].vpn == vpn) {
             self.tlb[idx].gen = 0;
         }
+        const s_idx: usize = @as(usize, @truncate(vpn)) & soft_tlb_mask;
+        self.soft_tlb32[0][s_idx] = .{};
+        self.soft_tlb32[1][s_idx] = .{};
     }
 
     pub fn flushTlbVa64(self: *Mmu, va_page_shifted: u64) void {
@@ -194,6 +233,51 @@ pub const Mmu = struct {
         const idx: usize = @as(usize, @truncate(vpn)) & tlb_mask;
         if (self.tlb[idx].gen == self.tlb_gen and self.tlb[idx].vpn == vpn) {
             self.tlb[idx].gen = 0;
+        }
+        const s_idx: usize = @as(usize, @truncate(vpn)) & soft_tlb_mask;
+        self.soft_tlb64[0][s_idx] = .{};
+        self.soft_tlb64[1][s_idx] = .{};
+    }
+
+    pub inline fn populateSoftTlb32(self: *Mmu, ram_len: usize, vaddr: u32, pbase: u32, perms: u8) void {
+        if (@as(usize, pbase) + 4096 <= ram_len) {
+            const vbase = vaddr & 0xffff_f000;
+            const s_idx: usize = @as(usize, vaddr >> 12) & soft_tlb_mask;
+            self.soft_tlb32[1][s_idx] = .{
+                .r_vbase = if ((perms & perm_priv_r) != 0) vbase else 0xffff_ffff,
+                .w_vbase = if ((perms & perm_priv_w) != 0) vbase else 0xffff_ffff,
+                .x_vbase = if ((perms & perm_priv_x) != 0) vbase else 0xffff_ffff,
+                .pbase = pbase,
+            };
+            self.soft_tlb32[0][s_idx] = .{
+                .r_vbase = if ((perms & perm_user_r) != 0) vbase else 0xffff_ffff,
+                .w_vbase = if ((perms & perm_user_w) != 0) vbase else 0xffff_ffff,
+                .x_vbase = if ((perms & perm_user_x) != 0) vbase else 0xffff_ffff,
+                .pbase = pbase,
+            };
+            self.soft_tlb32_dirty = true;
+        }
+    }
+
+    pub inline fn populateSoftTlb64(self: *Mmu, ram_len: usize, vaddr: u64, pbase: u32, perms: u8, is_el2: bool) void {
+        if (@as(usize, pbase) + 4096 <= ram_len) {
+            const vbase = vaddr & ~@as(u64, 0xfff);
+            const s_idx: usize = @as(usize, @truncate(vaddr >> 12)) & soft_tlb_mask;
+            self.soft_tlb64[1][s_idx] = .{
+                .r_vbase = if ((perms & perm_priv_r) != 0) vbase else 0xffff_ffff_ffff_ffff,
+                .w_vbase = if ((perms & perm_priv_w) != 0) vbase else 0xffff_ffff_ffff_ffff,
+                .x_vbase = if ((perms & perm_priv_x) != 0) vbase else 0xffff_ffff_ffff_ffff,
+                .pbase = pbase,
+            };
+            if (!is_el2) {
+                self.soft_tlb64[0][s_idx] = .{
+                    .r_vbase = if ((perms & perm_user_r) != 0) vbase else 0xffff_ffff_ffff_ffff,
+                    .w_vbase = if ((perms & perm_user_w) != 0) vbase else 0xffff_ffff_ffff_ffff,
+                    .x_vbase = if ((perms & perm_user_x) != 0) vbase else 0xffff_ffff_ffff_ffff,
+                    .pbase = pbase,
+                };
+            }
+            self.soft_tlb64_dirty = true;
         }
     }
 
@@ -262,6 +346,7 @@ pub const Mmu = struct {
         is_priv: bool,
     ) error{Abort}!u32 {
         if (!self.isMmuEnabled()) {
+            self.populateSoftTlb32(ram.len, vaddr, vaddr & 0xffff_f000, 0x3f);
             return vaddr;
         }
 
@@ -277,6 +362,7 @@ pub const Mmu = struct {
 
         if (entry.gen == self.tlb_gen and entry.vpn == vpn) {
             if ((entry.perms & req_perm) != 0) {
+                self.populateSoftTlb32(ram.len, vaddr, entry.ppn_base, entry.perms);
                 return entry.ppn_base | (vaddr & 0xfff);
             }
             // Permission fault on cached TLB entry
@@ -321,7 +407,9 @@ pub const Mmu = struct {
             3 => (self.sctlr_el3 & 1) != 0,
         };
         if (!mmu_enabled) {
-            return @truncate(vaddr);
+            const paddr: u32 = @truncate(vaddr);
+            self.populateSoftTlb64(ram.len, vaddr, paddr & 0xffff_f000, 0x3f, is_el2);
+            return paddr;
         }
 
         const is_priv = el != 0;
@@ -337,6 +425,7 @@ pub const Mmu = struct {
 
         if (entry.gen == self.tlb_gen and entry.vpn == vpn) {
             if ((entry.perms & req_perm) != 0) {
+                self.populateSoftTlb64(ram.len, vaddr, entry.ppn_base, entry.perms, is_el2);
                 return entry.ppn_base | @as(u32, @truncate(vaddr & 0xfff));
             }
             self.recordFault64AtEl(vaddr, access, el, 0b001100 | @as(u6, entry.level));
@@ -491,6 +580,7 @@ pub const Mmu = struct {
             return error.Abort;
         }
 
+        self.populateSoftTlb32(ram.len, vaddr, phys_page_base, perms);
         return phys_page_base | (vaddr & 0xfff);
     }
 
@@ -676,6 +766,7 @@ pub const Mmu = struct {
             return error.Abort;
         }
 
+        self.populateSoftTlb32(ram.len, vaddr, phys_page_base, perms);
         return phys_page_base | (vaddr & 0xfff);
     }
 
@@ -824,6 +915,7 @@ pub const Mmu = struct {
             return error.Abort;
         }
 
+        self.populateSoftTlb64(ram.len, vaddr, phys_page_base, perms, is_el2);
         return phys_page_base | @as(u32, @truncate(vaddr & 0xfff));
     }
 
