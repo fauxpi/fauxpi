@@ -645,14 +645,17 @@ pub const WaylandWindow = struct {
 
     pub fn waitEventsUs(self: *WaylandWindow, timeout_us: ?u64) !void {
         const was_dirty = self.ui_dirty;
+        const had_pending_in = if (self.hid) |h| h.hasPendingInterruptIn() else false;
         try self.display.pollAndDispatch();
         self.pollSdImagePicker();
         self.pollAsyncSdCreation();
         const now_ns = monotonicNs();
         self.serviceRepeat(now_ns);
         if (self.closed or (!was_dirty and self.ui_dirty)) return;
-        if (self.hid) |h| {
-            if (h.hasPendingInterruptIn()) return;
+        if (timeout_us != null) {
+            if (self.hid) |h| {
+                if (!had_pending_in and h.hasPendingInterruptIn()) return;
+            }
         }
 
         var fds: [2 + 32]linux.pollfd = undefined;

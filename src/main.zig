@@ -606,7 +606,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
         if (all_wfi) {
             soc.usb.pollNetwork(soc.ram);
-            soc.usb.wakeIfPending();
             soc.updateIrqs();
             for (0..num_cores) |i| {
                 if (cpus[i].halted_spin) continue;
@@ -661,6 +660,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     break :blk @min(timer_wait_us, until_vblank_us);
                 } else timer_wait_us;
 
+                const had_ui_dirty = w.ui_dirty;
+                const had_pending_in = soc.usb.hid.hasPendingInterruptIn();
                 if (sleep_us > 0) {
                     try w.waitEventsUs(sleep_us);
                 } else {
@@ -668,7 +669,10 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 }
                 const sleep_end_ns = monotonicNs();
                 const elapsed_sleep_us = @max((sleep_end_ns -| sleep_start_ns) / 1000, 1);
-                const jump = if (w.ui_dirty or soc.usb.hid.hasPendingInterruptIn() or soc.usb.hid.hasEthBulkIn())
+                const woke_for_event = (!had_ui_dirty and w.ui_dirty) or
+                    (!had_pending_in and soc.usb.hid.hasPendingInterruptIn()) or
+                    soc.usb.hid.hasEthBulkIn();
+                const jump = if (woke_for_event)
                     @min(elapsed_sleep_us, timer_wait_us)
                 else
                     @max(elapsed_sleep_us, sleep_us);

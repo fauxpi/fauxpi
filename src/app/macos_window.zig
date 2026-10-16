@@ -709,14 +709,17 @@ pub const MacosWindow = struct {
 
     pub fn waitEventsUs(self: *MacosWindow, timeout_us: ?u64) !void {
         const was_dirty = self.ui_dirty;
+        const had_pending_in = if (self.hid) |h| h.hasPendingInterruptIn() else false;
         self.pumpCocoaEvents(0.0);
         self.pollSdImagePicker();
         self.pollAsyncSdCreation();
         const now_ns = host_posix.monotonicNs();
         self.serviceRepeat(now_ns);
         if (self.closed or (!was_dirty and self.ui_dirty)) return;
-        if (self.hid) |h| {
-            if (h.hasPendingInterruptIn()) return;
+        if (timeout_us != null) {
+            if (self.hid) |h| {
+                if (!had_pending_in and h.hasPendingInterruptIn()) return;
+            }
         }
 
         var eff_timeout_us: u64 = timeout_us orelse 16_000;

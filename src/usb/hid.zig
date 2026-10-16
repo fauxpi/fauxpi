@@ -197,12 +197,14 @@ pub const UsbHidComposite = struct {
     ethernet_connected: bool = true,
 
     // CDC-ECM Interrupt IN notification queue (EP1 IN on Ethernet device)
+    eth_notif_polled: bool = false,
     reported_link_up: ?bool = null,
     cdc_notif_queue: [8][16]u8 = undefined,
     cdc_notif_lens: [8]u8 = [_]u8{0} ** 8,
     cdc_notif_head: u3 = 0,
     cdc_notif_tail: u3 = 0,
     cdc_notif_count: u4 = 0,
+    mouse_polled: bool = false,
 
     // User-mode NAT / SLIRP network stack
     net: net_mod.VirtualNetwork = .{},
@@ -240,6 +242,7 @@ pub const UsbHidComposite = struct {
         self.eth_configured = false;
         self.cdc_alt_setting = 0;
         self.cdc_packet_filter = 0;
+        self.eth_notif_polled = false;
         self.reported_link_up = null;
         self.cdc_notif_head = 0;
         self.cdc_notif_tail = 0;
@@ -258,6 +261,8 @@ pub const UsbHidComposite = struct {
     pub fn resetMouseDevice(self: *UsbHidComposite) void {
         self.mouse_addr = 0;
         self.mouse_configured = false;
+        self.mouse_polled = false;
+        self.has_target = false;
         self.mouse_idle_rate = 0;
         self.mouse_protocol = 1;
         self.ctrl[@intFromEnum(TargetDevice.mouse)] = .{};
@@ -362,18 +367,20 @@ pub const UsbHidComposite = struct {
     }
 
     pub fn hasPendingInterruptIn(self: *UsbHidComposite) bool {
-        if (!self.isHubPresent()) return false;
+        if (!self.isHubPresent() or !self.hub_configured) return false;
         self.syncHubPortConnections();
         const num_ports = self.hub_kind.numPorts();
         for (0..num_ports) |p| {
             if (self.port_change[p] != 0) return true;
         }
-        const link_up = self.isEthernetLinkUp();
-        if (self.reported_link_up == null or self.reported_link_up.? != link_up or self.cdc_notif_count > 0) {
-            return true;
+        if (self.eth_configured and self.eth_notif_polled) {
+            const link_up = self.isEthernetLinkUp();
+            if (self.reported_link_up == null or self.reported_link_up.? != link_up or self.cdc_notif_count > 0) {
+                return true;
+            }
         }
-        if (self.keyboard_connected and self.kbd_count > 0) return true;
-        if (self.mouse_connected) {
+        if (self.keyboard_connected and self.kbd_configured and self.kbd_count > 0) return true;
+        if (self.mouse_connected and self.mouse_configured and self.mouse_polled) {
             if (self.mouse_count > 0) return true;
             if (self.has_target and (self.target_x != self.guest_x or self.target_y != self.guest_y)) return true;
         }
@@ -397,6 +404,7 @@ pub const UsbHidComposite = struct {
 
     pub fn popCdcNotification(self: *UsbHidComposite, dest: []u8) ?usize {
         if (!self.isHubPresent()) return null;
+        self.eth_notif_polled = true;
         const link_up = self.isEthernetLinkUp();
         if (self.reported_link_up == null or self.reported_link_up.? != link_up) {
             self.reported_link_up = link_up;
@@ -561,6 +569,7 @@ pub const UsbHidComposite = struct {
 
     pub fn popMouseReport(self: *UsbHidComposite) ?[4]u8 {
         if (!self.isHubPresent() or !self.mouse_connected) return null;
+        self.mouse_polled = true;
         if (self.has_target) {
             const dx_i32 = std.math.clamp(self.target_x - self.guest_x, -127, 127);
             const dy_i32 = std.math.clamp(self.target_y - self.guest_y, -127, 127);
