@@ -10,6 +10,8 @@ pub const Vec = [lanes]u32;
 const VecU = @Vector(lanes, u32);
 const VecI = @Vector(lanes, i32);
 const VecF = @Vector(lanes, f32);
+const VecB = @Vector(lanes * 4, u8);
+const VecU16 = @Vector(lanes * 4, u16);
 
 pub fn splat(v: u32) Vec {
     return @splat(v);
@@ -71,7 +73,8 @@ const State = struct {
     rb: [32]Vec = undefined,
     ra_init: u32 = 0,
     rb_init: u32 = 0,
-    acc: [6]Vec = std.mem.zeroes([6]Vec),
+    /// Indices 0..5 are accumulators r0..r5; index 6 is mux .a; index 7 is mux .b.
+    acc: [8]Vec = std.mem.zeroes([8]Vec),
     zero: [lanes]bool = @splat(false),
     neg: [lanes]bool = @splat(false),
     vpm_read_left: u32 = 16,
@@ -138,30 +141,13 @@ fn ftoi(x: f32) u32 {
     return @bitCast(@as(i32, @intFromFloat(@trunc(clamped))));
 }
 
-fn addOpScalar(op: qpu.AddOp, a: u32, b: u32) u32 {
-    return switch (op) {
-        .v8adds => blk: {
-            var res: u32 = 0;
-            inline for (0..4) |i| {
-                const shift: u5 = @intCast(i * 8);
-                const ba: u16 = @truncate((a >> shift) & 0xff);
-                const bb: u16 = @truncate((b >> shift) & 0xff);
-                res |= @as(u32, @min(ba + bb, 255)) << shift;
-            }
-            break :blk res;
-        },
-        .v8subs => blk: {
-            var res: u32 = 0;
-            inline for (0..4) |i| {
-                const shift: u5 = @intCast(i * 8);
-                const ba: i16 = @intCast((a >> shift) & 0xff);
-                const bb: i16 = @intCast((b >> shift) & 0xff);
-                res |= @as(u32, @intCast(@max(ba - bb, 0))) << shift;
-            }
-            break :blk res;
-        },
-        else => 0,
-    };
+inline fn v8muldVec(au: VecU, bu: VecU) Vec {
+    const ab: VecB = @bitCast(au);
+    const bb: VecB = @bitCast(bu);
+    const prod: VecU16 = @as(VecU16, ab) * @as(VecU16, bb) + @as(VecU16, @splat(127));
+    const div255: VecU16 = (prod + @as(VecU16, @splat(1)) + (prod >> @as(@Vector(lanes * 4, u4), @splat(8)))) >> @as(@Vector(lanes * 4, u4), @splat(8));
+    const res_b: VecB = @truncate(div255);
+    return @bitCast(res_b);
 }
 
 fn addOpVec(op: qpu.AddOp, a: Vec, b: Vec) Vec {
@@ -190,26 +176,14 @@ fn addOpVec(op: qpu.AddOp, a: Vec, b: Vec) Vec {
         },
         .add => au +% bu,
         .sub => au -% bu,
-        .shr => blk: {
-            var res: Vec = undefined;
-            for (0..lanes) |l| res[l] = a[l] >> @truncate(b[l]);
-            break :blk res;
-        },
-        .asr => blk: {
-            var res: Vec = undefined;
-            for (0..lanes) |l| res[l] = @bitCast(@as(i32, @bitCast(a[l])) >> @truncate(b[l]));
-            break :blk res;
-        },
+        .shr => au >> @as(@Vector(lanes, u5), @truncate(bu)),
+        .asr => @bitCast(ai >> @as(@Vector(lanes, u5), @truncate(bu))),
         .ror => blk: {
-            var res: Vec = undefined;
-            for (0..lanes) |l| res[l] = std.math.rotr(u32, a[l], @as(u5, @truncate(b[l])));
-            break :blk res;
+            const sh: @Vector(lanes, u5) = @truncate(bu);
+            const neg_sh: @Vector(lanes, u5) = @as(@Vector(lanes, u5), @splat(0)) -% sh;
+            break :blk (au >> sh) | (au << neg_sh);
         },
-        .shl => blk: {
-            var res: Vec = undefined;
-            for (0..lanes) |l| res[l] = a[l] << @truncate(b[l]);
-            break :blk res;
-        },
+        .shl => au << @as(@Vector(lanes, u5), @truncate(bu)),
         .min => @bitCast(@min(ai, bi)),
         .max => @bitCast(@max(ai, bi)),
         .@"and" => au & bu,
@@ -217,46 +191,9 @@ fn addOpVec(op: qpu.AddOp, a: Vec, b: Vec) Vec {
         .xor => au ^ bu,
         .not => ~au,
         .clz => @clz(au),
-        .v8adds, .v8subs => blk: {
-            var res: Vec = undefined;
-            for (0..lanes) |l| res[l] = addOpScalar(op, a[l], b[l]);
-            break :blk res;
-        },
+        .v8adds => @bitCast(@as(VecB, @bitCast(au)) +| @as(VecB, @bitCast(bu))),
+        .v8subs => @bitCast(@as(VecB, @bitCast(au)) -| @as(VecB, @bitCast(bu))),
         else => splat(0),
-    };
-}
-
-fn mulOpScalar(op: qpu.MulOp, a: u32, b: u32) u32 {
-    return switch (op) {
-        .v8muld => blk: {
-            var res: u32 = 0;
-            inline for (0..4) |i| {
-                const shift: u5 = @intCast(i * 8);
-                const ba: u32 = (a >> shift) & 0xff;
-                const bb: u32 = (b >> shift) & 0xff;
-                res |= ((ba * bb + 127) / 255) << shift;
-            }
-            break :blk res;
-        },
-        .v8min => blk: {
-            var res: u32 = 0;
-            inline for (0..4) |i| {
-                const shift: u5 = @intCast(i * 8);
-                res |= @min((a >> shift) & 0xff, (b >> shift) & 0xff) << shift;
-            }
-            break :blk res;
-        },
-        .v8max => blk: {
-            var res: u32 = 0;
-            inline for (0..4) |i| {
-                const shift: u5 = @intCast(i * 8);
-                res |= @max((a >> shift) & 0xff, (b >> shift) & 0xff) << shift;
-            }
-            break :blk res;
-        },
-        .v8adds => addOpScalar(.v8adds, a, b),
-        .v8subs => addOpScalar(.v8subs, a, b),
-        else => 0,
     };
 }
 
@@ -269,11 +206,11 @@ fn mulOpVec(op: qpu.MulOp, a: Vec, b: Vec) Vec {
         .nop => splat(0),
         .fmul => @bitCast(af * bf),
         .mul24 => (au & @as(VecU, @splat(0xffffff))) *% (bu & @as(VecU, @splat(0xffffff))),
-        .v8muld, .v8min, .v8max, .v8adds, .v8subs => blk: {
-            var res: Vec = undefined;
-            for (0..lanes) |l| res[l] = mulOpScalar(op, a[l], b[l]);
-            break :blk res;
-        },
+        .v8muld => v8muldVec(au, bu),
+        .v8min => @bitCast(@min(@as(VecB, @bitCast(au)), @as(VecB, @bitCast(bu)))),
+        .v8max => @bitCast(@max(@as(VecB, @bitCast(au)), @as(VecB, @bitCast(bu)))),
+        .v8adds => @bitCast(@as(VecB, @bitCast(au)) +| @as(VecB, @bitCast(bu))),
+        .v8subs => @bitCast(@as(VecB, @bitCast(au)) -| @as(VecB, @bitCast(bu))),
     };
 }
 
@@ -343,6 +280,7 @@ pub const DecodedInst = struct {
     pub const FLAG_FETCH_B: u8 = 1 << 3;
     pub const FLAG_FLT_ADD: u8 = 1 << 4;
     pub const FLAG_FLT_MUL: u8 = 1 << 5;
+    pub const FLAG_HAS_UNPACK: u8 = 1 << 6;
 };
 
 pub fn decodeInst(inst: qpu.Inst) DecodedInst {
@@ -375,16 +313,19 @@ pub fn decodeInst(inst: qpu.Inst) DecodedInst {
     const waddr_mul_raw = qpu.getWaddrMul(inst);
     const a_pack: u4 = if (!pm) pack else 0;
     const mul_pack: u4 = if (pm) pack else 0;
+    const unpack_r4: u3 = if (pm) unpack_mode else 0;
+    const unpack_a: u3 = if (!pm and raddr_a < 32) unpack_mode else 0;
 
     var flags: u8 = 0;
     if ((inst & (1 << 45)) != 0) flags |= DecodedInst.FLAG_SF;
     if ((uses_a and raddr_a == qpu.R.vary) or (sig != .small_imm and uses_b and raddr_b == qpu.R.vary)) {
         flags |= DecodedInst.FLAG_READS_VARY;
     }
-    if (uses_a or raddr_a < 32) flags |= DecodedInst.FLAG_FETCH_A;
-    if (sig != .small_imm and (uses_b or raddr_b < 32)) flags |= DecodedInst.FLAG_FETCH_B;
+    if (uses_a) flags |= DecodedInst.FLAG_FETCH_A;
+    if (sig != .small_imm and uses_b) flags |= DecodedInst.FLAG_FETCH_B;
     if (isFloatInputAdd(add_op)) flags |= DecodedInst.FLAG_FLT_ADD;
     if (isFloatInputMul(mul_op)) flags |= DecodedInst.FLAG_FLT_MUL;
+    if (unpack_r4 != 0 or unpack_a != 0) flags |= DecodedInst.FLAG_HAS_UNPACK;
 
     return .{
         .imm_or_small = if (sig == .load_imm)
@@ -408,8 +349,8 @@ pub fn decodeInst(inst: qpu.Inst) DecodedInst {
         .mux1 = mux1,
         .mux2 = mux2,
         .mux3 = mux3,
-        .unpack_r4 = if (pm) unpack_mode else 0,
-        .unpack_a = if (!pm and raddr_a < 32) unpack_mode else 0,
+        .unpack_r4 = unpack_r4,
+        .unpack_a = unpack_a,
         .add_pack_a = if (!ws) a_pack else 0,
         .mul_pack_a = if (ws) a_pack else 0,
         .mul_pack_m = mul_pack,
@@ -425,21 +366,17 @@ pub fn decodeProgram(code: []const qpu.Inst, out_buf: []DecodedInst) []const Dec
     return out_buf[0..len];
 }
 
-inline fn resolveMuxVec(
+inline fn resolveMuxSlow(
     m: qpu.Mux,
     s: *const State,
-    old_r4: Vec,
-    va: Vec,
-    vb: Vec,
     unpack_r4: u3,
     unpack_a: u3,
     float_input: bool,
 ) Vec {
     return switch (m) {
-        .r0, .r1, .r2, .r3, .r5 => s.acc[@intFromEnum(m)],
-        .r4 => if (unpack_r4 != 0) unpackVec(old_r4, unpack_r4, float_input) else old_r4,
-        .a => if (unpack_a != 0) unpackVec(va, unpack_a, float_input) else va,
-        .b => vb,
+        .r4 => if (unpack_r4 != 0) unpackVec(s.acc[4], unpack_r4, float_input) else s.acc[4],
+        .a => if (unpack_a != 0) unpackVec(s.acc[6], unpack_a, float_input) else s.acc[6],
+        else => s.acc[@intFromEnum(m)],
     };
 }
 
@@ -472,43 +409,50 @@ pub fn runDecoded(decoded: []const DecodedInst, env: Env) Error!Result {
             add_result = splat(d.imm_or_small);
             mul_result = add_result;
         } else {
-            const va: Vec = if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0)
-                try readPort(&s, &r, env, d.raddr_a, .a)
-            else
-                splat(0);
-            const vb: Vec = if (d.sig == .small_imm)
-                splat(d.imm_or_small)
-            else if ((d.flags & DecodedInst.FLAG_FETCH_B) != 0)
-                try readPort(&s, &r, env, d.raddr_b, .b)
-            else
-                splat(0);
-
-            const old_r4 = s.acc[4];
-
-            if (d.add_op != .nop) {
-                const flt_add = (d.flags & DecodedInst.FLAG_FLT_ADD) != 0;
-                const in0 = resolveMuxVec(d.mux0, &s, old_r4, va, vb, d.unpack_r4, d.unpack_a, flt_add);
-                const in1 = resolveMuxVec(d.mux1, &s, old_r4, va, vb, d.unpack_r4, d.unpack_a, flt_add);
-                add_result = addOpVec(d.add_op, in0, in1);
-            } else {
-                add_result = splat(0);
+            if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0) {
+                s.acc[6] = try readPort(&s, &r, env, d.raddr_a, .a);
+            }
+            if (d.sig == .small_imm) {
+                s.acc[7] = splat(d.imm_or_small);
+            } else if ((d.flags & DecodedInst.FLAG_FETCH_B) != 0) {
+                s.acc[7] = try readPort(&s, &r, env, d.raddr_b, .b);
             }
 
-            if (d.mul_op != .nop) {
-                const flt_mul = (d.flags & DecodedInst.FLAG_FLT_MUL) != 0;
-                const in2 = resolveMuxVec(d.mux2, &s, old_r4, va, vb, d.unpack_r4, d.unpack_a, flt_mul);
-                const in3 = resolveMuxVec(d.mux3, &s, old_r4, va, vb, d.unpack_r4, d.unpack_a, flt_mul);
-                mul_result = mulOpVec(d.mul_op, in2, in3);
+            if ((d.flags & DecodedInst.FLAG_HAS_UNPACK) == 0) {
+                if (d.add_op != .nop) {
+                    add_result = addOpVec(d.add_op, s.acc[@intFromEnum(d.mux0)], s.acc[@intFromEnum(d.mux1)]);
+                } else {
+                    add_result = splat(0);
+                }
+                if (d.mul_op != .nop) {
+                    mul_result = mulOpVec(d.mul_op, s.acc[@intFromEnum(d.mux2)], s.acc[@intFromEnum(d.mux3)]);
+                } else {
+                    mul_result = splat(0);
+                }
             } else {
-                mul_result = splat(0);
+                if (d.add_op != .nop) {
+                    const flt_add = (d.flags & DecodedInst.FLAG_FLT_ADD) != 0;
+                    const in0 = resolveMuxSlow(d.mux0, &s, d.unpack_r4, d.unpack_a, flt_add);
+                    const in1 = if (d.mux1 == d.mux0) in0 else resolveMuxSlow(d.mux1, &s, d.unpack_r4, d.unpack_a, flt_add);
+                    add_result = addOpVec(d.add_op, in0, in1);
+                } else {
+                    add_result = splat(0);
+                }
+
+                if (d.mul_op != .nop) {
+                    const flt_mul = (d.flags & DecodedInst.FLAG_FLT_MUL) != 0;
+                    const in2 = resolveMuxSlow(d.mux2, &s, d.unpack_r4, d.unpack_a, flt_mul);
+                    const in3 = if (d.mux3 == d.mux2) in2 else resolveMuxSlow(d.mux3, &s, d.unpack_r4, d.unpack_a, flt_mul);
+                    mul_result = mulOpVec(d.mul_op, in2, in3);
+                } else {
+                    mul_result = splat(0);
+                }
             }
 
             if ((d.flags & DecodedInst.FLAG_SF) != 0) {
-                const flags_from = if (d.add_op != .nop) add_result else mul_result;
-                for (0..lanes) |lane| {
-                    s.zero[lane] = flags_from[lane] == 0;
-                    s.neg[lane] = @as(i32, @bitCast(flags_from[lane])) < 0;
-                }
+                const flags_from: VecI = @bitCast(if (d.add_op != .nop) add_result else mul_result);
+                s.zero = flags_from == @as(VecI, @splat(0));
+                s.neg = flags_from < @as(VecI, @splat(0));
             }
             if ((d.flags & DecodedInst.FLAG_READS_VARY) != 0) s.acc[5] = splatF(varying_c);
         }
@@ -612,24 +556,56 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
         else => null,
     };
     if (dst) |d| {
-        if (cond == .always and a_pack == 0 and mul_pack == 0) {
-            d.* = value;
-            return;
-        }
-        if (cond == .always and a_pack == 0 and mul_pack >= 4 and mul_pack <= 7) {
-            const shift: u5 = @as(u5, @intCast(mul_pack - 4)) * 8;
-            const mask: VecU = @splat(@as(u32, 0xff) << shift);
-            const dv: VecU = d.*;
-            d.* = (dv & ~mask) | (unorm8Vec(value) << @as(@Vector(lanes, u5), @splat(shift)));
-            return;
-        }
-        if (cond == .always and (a_pack & 7) >= 4) {
-            const shift: u5 = @as(u5, @intCast((a_pack & 7) - 4)) * 8;
-            const mask: VecU = @splat(@as(u32, 0xff) << shift);
+        if (cond == .always) {
+            if (a_pack == 0) {
+                switch (mul_pack) {
+                    0 => {
+                        d.* = value;
+                        return;
+                    },
+                    3 => {
+                        d.* = unorm8Vec(value) *% @as(VecU, @splat(0x01010101));
+                        return;
+                    },
+                    4, 5, 6, 7 => {
+                        const shift: u5 = @as(u5, @intCast(mul_pack - 4)) * 8;
+                        const mask: VecU = @splat(@as(u32, 0xff) << shift);
+                        const dv: VecU = d.*;
+                        d.* = (dv & ~mask) | (unorm8Vec(value) << @as(@Vector(lanes, u5), @splat(shift)));
+                        return;
+                    },
+                    else => {
+                        d.* = value;
+                        return;
+                    },
+                }
+            }
             const dv: VecU = d.*;
             const vv: VecU = value;
-            d.* = (dv & ~mask) | ((vv & @as(VecU, @splat(0xff))) << @as(@Vector(lanes, u5), @splat(shift)));
-            return;
+            switch (a_pack) {
+                1, 9 => {
+                    d.* = (dv & @as(VecU, @splat(0xffff0000))) | (vv & @as(VecU, @splat(0x0000ffff)));
+                    return;
+                },
+                2, 10 => {
+                    d.* = (dv & @as(VecU, @splat(0x0000ffff))) | (vv << @as(@Vector(lanes, u5), @splat(16)));
+                    return;
+                },
+                3, 11 => {
+                    d.* = (vv & @as(VecU, @splat(0xff))) *% @as(VecU, @splat(0x01010101));
+                    return;
+                },
+                4, 5, 6, 7, 12, 13, 14, 15 => {
+                    const shift: u5 = @as(u5, @intCast((a_pack & 7) - 4)) * 8;
+                    const mask: VecU = @splat(@as(u32, 0xff) << shift);
+                    d.* = (dv & ~mask) | ((vv & @as(VecU, @splat(0xff))) << @as(@Vector(lanes, u5), @splat(shift)));
+                    return;
+                },
+                else => {
+                    d.* = value;
+                    return;
+                },
+            }
         }
         for (0..lanes) |lane| {
             if (!condPasses(cond, s, lane)) continue;
@@ -1080,4 +1056,45 @@ test "QPU TMU bilinear same-utile and cross-utile sampling" {
     const s_cross = try pt.sample(&mem, 4.0 / 8.0, 4.0 / 8.0);
     // Expected average of (3,3), (4,3), (3,4), (4,4): R = 105, G = 105, B = 105, A = 255
     try std.testing.expectEqual(@as(u32, 0xff696969), s_cross);
+}
+
+test "QPU vectorized v8muld, v8min, v8max, v8adds, v8subs, and shifts" {
+    // Exhaustively verify v8muldVec matches (a * b + 127) / 255 for all 65,536 byte pairs
+    var a_vec: Vec = undefined;
+    var b_vec: Vec = undefined;
+    var pair: u32 = 0;
+    while (pair < 65536) : (pair += 64) {
+        for (0..lanes) |l| {
+            var aw: u32 = 0;
+            var bw: u32 = 0;
+            inline for (0..4) |bi| {
+                const idx = pair + @as(u32, @intCast(l * 4 + bi));
+                const a8: u32 = idx & 0xff;
+                const b8: u32 = (idx >> 8) & 0xff;
+                aw |= a8 << @intCast(bi * 8);
+                bw |= b8 << @intCast(bi * 8);
+            }
+            a_vec[l] = aw;
+            b_vec[l] = bw;
+        }
+        const got = mulOpVec(.v8muld, a_vec, b_vec);
+        for (0..lanes) |l| {
+            var exp: u32 = 0;
+            inline for (0..4) |bi| {
+                const idx = pair + @as(u32, @intCast(l * 4 + bi));
+                const a8: u32 = idx & 0xff;
+                const b8: u32 = (idx >> 8) & 0xff;
+                exp |= ((a8 * b8 + 127) / 255) << @intCast(bi * 8);
+            }
+            try std.testing.expectEqual(exp, got[l]);
+        }
+    }
+
+    const va = splat(0xf080_1005);
+    const vb = splat(0x2090_0810);
+    try std.testing.expectEqual(@as(u32, 0xffff_1815), addOpVec(.v8adds, va, vb)[0]);
+    try std.testing.expectEqual(@as(u32, 0xd000_0800), addOpVec(.v8subs, va, vb)[0]);
+    try std.testing.expectEqual(@as(u32, 0x2080_0805), mulOpVec(.v8min, va, vb)[0]);
+    try std.testing.expectEqual(@as(u32, 0xf090_1010), mulOpVec(.v8max, va, vb)[0]);
+    try std.testing.expectEqual(@as(u32, 0x05f0_8010), addOpVec(.ror, va, splat(8))[0]);
 }
