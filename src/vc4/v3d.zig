@@ -1495,21 +1495,146 @@ pub const V3d = struct {
             }
         }.f;
 
+        const lane_f_offsets = @Vector(16, f32){ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        const lane_u_offsets = @Vector(16, u32){ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+        const fx_min_tile = @as(f32, @floatFromInt(x_start)) + 0.5;
+        const fx_max_tile = @as(f32, @floatFromInt(x_end - 1)) + 0.5;
+        const step_x0 = -edge0.dy * edge0.sign;
+        const step_x1 = -edge1.dy * edge1.sign;
+        const step_x2 = -edge2.dy * edge2.sign;
+
         var py = y_start;
         while (py < y_end) : (py += 1) {
             const fy = @as(f32, @floatFromInt(py)) + 0.5;
             const row_term0 = edge0.dx * (fy - edge0.p0y);
-            if (edge0.dy == 0 and !edge0.passes(row_term0 * edge0.sign)) continue;
             const row_term1 = edge1.dx * (fy - edge1.p0y);
-            if (edge1.dy == 0 and !edge1.passes(row_term1 * edge1.sign)) continue;
             const row_term2 = edge2.dx * (fy - edge2.p0y);
-            if (edge2.dy == 0 and !edge2.passes(row_term2 * edge2.sign)) continue;
+
+            // Evaluate edges at tile scanline endpoints to reject empty scanlines and tighten [px_start, px_end)
+            const e0_min = edge0.eval(row_term0, fx_min_tile);
+            const e0_max = edge0.eval(row_term0, fx_max_tile);
+            const p0_min = edge0.passes(e0_min);
+            const p0_max = edge0.passes(e0_max);
+            if (!p0_min and !p0_max) continue;
+
+            const e1_min = edge1.eval(row_term1, fx_min_tile);
+            const e1_max = edge1.eval(row_term1, fx_max_tile);
+            const p1_min = edge1.passes(e1_min);
+            const p1_max = edge1.passes(e1_max);
+            if (!p1_min and !p1_max) continue;
+
+            const e2_min = edge2.eval(row_term2, fx_min_tile);
+            const e2_max = edge2.eval(row_term2, fx_max_tile);
+            const p2_min = edge2.passes(e2_min);
+            const p2_max = edge2.passes(e2_max);
+            if (!p2_min and !p2_max) continue;
+
+            var px_start = x_start;
+            var px_end = x_end;
+            inline for (
+                .{ p0_min, p1_min, p2_min },
+                .{ p0_max, p1_max, p2_max },
+                .{ e0_min, e1_min, e2_min },
+                .{ step_x0, step_x1, step_x2 },
+            ) |p_min, p_max, e_min, sx| {
+                if (!p_min and p_max and sx > 1e-12) {
+                    const skip = @floor((-e_min) / sx - 0.5);
+                    if (skip > 0.0) {
+                        const cand = x_start + @as(u32, @intFromFloat(@min(skip, @as(f32, @floatFromInt(x_end - x_start)))));
+                        if (cand > px_start) px_start = cand;
+                    }
+                } else if (p_min and !p_max and sx < -1e-12) {
+                    const keep = @ceil(e_min / (-sx) + 1.5);
+                    if (keep > 0.0) {
+                        const cand = x_start + @as(u32, @intFromFloat(@min(keep, @as(f32, @floatFromInt(x_end - x_start)))));
+                        if (cand < px_end) px_end = cand;
+                    }
+                }
+            }
+            if (px_start >= px_end) continue;
 
             const row_base = (py - tile_px_y) * tile_size;
 
-            var px = x_start;
-            while (px < x_end) : (px += 1) {
+            var px = px_start;
+            while (px < px_end) {
+                // 16-lane SIMD interior span fast-path when batch buffer is empty
+                if (batch_len == 0 and px + 16 <= px_end) {
+                    const fx0 = @as(f32, @floatFromInt(px)) + 0.5;
+                    const fx15 = fx0 + 15.0;
+                    if (edge0.passes(edge0.eval(row_term0, fx0)) and
+                        edge0.passes(edge0.eval(row_term0, fx15)) and
+                        edge1.passes(edge1.eval(row_term1, fx0)) and
+                        edge1.passes(edge1.eval(row_term1, fx15)) and
+                        edge2.passes(edge2.eval(row_term2, fx0)) and
+                        edge2.passes(edge2.eval(row_term2, fx15)))
+                    {
+                        const tile_idx = row_base + (px - tile_px_x);
+                        const fx_vec = @as(@Vector(16, f32), @splat(fx0)) + lane_f_offsets;
+                        const e0_vec = (@as(@Vector(16, f32), @splat(row_term0)) - @as(@Vector(16, f32), @splat(edge0.dy)) * (fx_vec - @as(@Vector(16, f32), @splat(edge0.p0x)))) * @as(@Vector(16, f32), @splat(edge0.sign));
+                        const e1_vec = (@as(@Vector(16, f32), @splat(row_term1)) - @as(@Vector(16, f32), @splat(edge1.dy)) * (fx_vec - @as(@Vector(16, f32), @splat(edge1.p0x)))) * @as(@Vector(16, f32), @splat(edge1.sign));
+                        const w0_vec = e0_vec * @as(@Vector(16, f32), @splat(inv_area));
+                        const w1_vec = e1_vec * @as(@Vector(16, f32), @splat(inv_area));
+                        const z_vec = @as(@Vector(16, f32), @splat(z2)) + w0_vec * @as(@Vector(16, f32), @splat(dz0)) + w1_vec * @as(@Vector(16, f32), @splat(dz1));
+
+                        const depth_all_pass: bool = if (depth_func == 7) true else blk: {
+                            const cur_z_vec: @Vector(16, f32) = self.tile_depth[tile_idx..][0..16].*;
+                            break :blk switch (depth_func) {
+                                0 => false,
+                                1 => @reduce(.And, z_vec < cur_z_vec),
+                                2 => @reduce(.And, z_vec == cur_z_vec),
+                                3 => @reduce(.And, z_vec <= cur_z_vec),
+                                4 => @reduce(.And, z_vec > cur_z_vec),
+                                5 => @reduce(.And, z_vec != cur_z_vec),
+                                6 => @reduce(.And, z_vec >= cur_z_vec),
+                                7 => true,
+                            };
+                        };
+
+                        if (depth_all_pass) {
+                            const w_vec: @Vector(16, f32) = if (all_unit_w)
+                                @splat(1.0)
+                            else blk: {
+                                const interp_inv_w = @as(@Vector(16, f32), @splat(invw2)) +
+                                    w0_vec * @as(@Vector(16, f32), @splat(dinvw0)) +
+                                    w1_vec * @as(@Vector(16, f32), @splat(dinvw1));
+                                const valid_mask = @abs(interp_inv_w) > @as(@Vector(16, f32), @splat(1e-12));
+                                break :blk @select(f32, valid_mask, @as(@Vector(16, f32), @splat(1.0)) / interp_inv_w, @as(@Vector(16, f32), @splat(1.0)));
+                            };
+
+                            for (0..n_var) |vi| {
+                                const p_vec = (@as(@Vector(16, f32), @splat(var2[vi])) +
+                                    w0_vec * @as(@Vector(16, f32), @splat(dvar0[vi])) +
+                                    w1_vec * @as(@Vector(16, f32), @splat(dvar1[vi]))) * w_vec;
+                                vary_vecs[vi] = @bitCast(p_vec);
+                            }
+
+                            const span_res = qpu_sim.runDecoded(fs_decoded, .{
+                                .uniforms = fs_unifs,
+                                .varyings = vary_vecs[0..n_var],
+                                .frag_w = @bitCast(w_vec),
+                                .frag_z = @bitCast(z_vec),
+                                .frag_x = @as(qpu_sim.Vec, @splat(px)) + lane_u_offsets,
+                                .frag_y = @splat(py),
+                                .texture_memory = ram,
+                                .tlb_color_in = self.tile_color[tile_idx..][0..16].*,
+                            }) catch null;
+
+                            if (span_res) |res| {
+                                if (res.tlb_color) |colors| {
+                                    self.tile_color[tile_idx..][0..16].* = colors;
+                                    if (z_updates) {
+                                        self.tile_depth[tile_idx..][0..16].* = z_vec;
+                                    }
+                                }
+                            }
+                            px += 16;
+                            continue;
+                        }
+                    }
+                }
+
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                px += 1;
                 const e0 = edge0.eval(row_term0, fx);
                 if (!edge0.passes(e0)) continue;
                 const e1 = edge1.eval(row_term1, fx);
@@ -1521,7 +1646,7 @@ pub const V3d = struct {
                 const w1 = e1 * inv_area;
 
                 const z = z2 + w0 * dz0 + w1 * dz1;
-                const tile_idx = row_base + (px - tile_px_x);
+                const tile_idx = row_base + (px - 1 - tile_px_x);
 
                 if (depth_func != 7) {
                     const cur_z = self.tile_depth[tile_idx];
@@ -1548,7 +1673,7 @@ pub const V3d = struct {
                 batch_z[lane] = z;
                 frag_w[lane] = @bitCast(w_val);
                 frag_z[lane] = @bitCast(z);
-                frag_x_vec[lane] = px;
+                frag_x_vec[lane] = px - 1;
                 frag_y_vec[lane] = py;
                 tlb_in[lane] = self.tile_color[tile_idx];
 
