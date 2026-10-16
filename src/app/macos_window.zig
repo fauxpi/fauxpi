@@ -681,7 +681,25 @@ pub const MacosWindow = struct {
     pub fn pollEvents(self: *MacosWindow) !void {
         self.pumpCocoaEvents(0.0);
         self.pollSdImagePicker();
+        self.pollAsyncSdCreation();
         self.serviceRepeat(host_posix.monotonicNs());
+    }
+
+    fn pollAsyncSdCreation(self: *MacosWindow) void {
+        switch (self.ui.pollAsyncSdCreation(host_posix.monotonicNs())) {
+            .idle => {},
+            .in_progress => {
+                self.ui_dirty = true;
+            },
+            .completed_ok => {
+                self.sd_image_chosen = true;
+                self.ui_dirty = true;
+                self.ui.saveSettings(self.status) catch {};
+            },
+            .completed_err => {
+                self.ui_dirty = true;
+            },
+        }
     }
 
     pub fn waitEvents(self: *MacosWindow, timeout_ms: i32) !void {
@@ -693,6 +711,7 @@ pub const MacosWindow = struct {
         const was_dirty = self.ui_dirty;
         self.pumpCocoaEvents(0.0);
         self.pollSdImagePicker();
+        self.pollAsyncSdCreation();
         const now_ns = host_posix.monotonicNs();
         self.serviceRepeat(now_ns);
         if (self.closed or (!was_dirty and self.ui_dirty)) return;
@@ -722,6 +741,7 @@ pub const MacosWindow = struct {
             self.pumpCocoaEvents(wait_secs);
         }
         self.pollSdImagePicker();
+        self.pollAsyncSdCreation();
         self.serviceRepeat(host_posix.monotonicNs());
     }
 

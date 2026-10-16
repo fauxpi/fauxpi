@@ -610,13 +610,32 @@ pub const WaylandWindow = struct {
         }
         try self.display.pollAndDispatch();
         self.pollSdImagePicker();
+        self.pollAsyncSdCreation();
         self.serviceRepeat(monotonicNs());
     }
 
     pub fn pollEvents(self: *WaylandWindow) !void {
         try self.display.pollAndDispatch();
         self.pollSdImagePicker();
+        self.pollAsyncSdCreation();
         self.serviceRepeat(monotonicNs());
+    }
+
+    fn pollAsyncSdCreation(self: *WaylandWindow) void {
+        switch (self.ui.pollAsyncSdCreation(monotonicNs())) {
+            .idle => {},
+            .in_progress => {
+                self.ui_dirty = true;
+            },
+            .completed_ok => {
+                self.sd_image_chosen = true;
+                self.ui_dirty = true;
+                self.ui.saveSettings(self.status) catch {};
+            },
+            .completed_err => {
+                self.ui_dirty = true;
+            },
+        }
     }
 
     pub fn waitEvents(self: *WaylandWindow, timeout_ms: i32) !void {
@@ -628,6 +647,7 @@ pub const WaylandWindow = struct {
         const was_dirty = self.ui_dirty;
         try self.display.pollAndDispatch();
         self.pollSdImagePicker();
+        self.pollAsyncSdCreation();
         const now_ns = monotonicNs();
         self.serviceRepeat(now_ns);
         if (self.closed or (!was_dirty and self.ui_dirty)) return;
@@ -652,6 +672,11 @@ pub const WaylandWindow = struct {
             @intCast(@min((us + 999) / 1000, @as(u64, std.math.maxInt(i32))))
         else
             -1;
+        if (self.ui.isCreatingSdCard()) {
+            if (eff_timeout_ms < 0 or eff_timeout_ms > 16) {
+                eff_timeout_ms = 16;
+            }
+        }
         if (self.repeatTimeoutMs(now_ns)) |rep_ms| {
             if (eff_timeout_ms < 0 or rep_ms < eff_timeout_ms) {
                 eff_timeout_ms = rep_ms;
@@ -662,6 +687,7 @@ pub const WaylandWindow = struct {
             try self.display.pollAndDispatch();
             self.pollSdImagePicker();
         }
+        self.pollAsyncSdCreation();
         self.serviceRepeat(monotonicNs());
     }
 

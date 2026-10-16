@@ -425,6 +425,8 @@ pub const BoardUi = struct {
     pending_sd_image_slice: ?[]const u8 = null,
     sd_error_buf: [160]u8 = @splat(0),
     sd_error_len: usize = 0,
+    sd_create_task: ?*AsyncSdCreateTask = null,
+    spinner_phase_rad: f32 = 0.0,
 
     /// Last computed geometry for hit-testing.
     last_win_w: u32 = 1280,
@@ -463,6 +465,48 @@ pub const BoardUi = struct {
     gpio_cache: []u32 = &.{},
     gpio_cache_key: GpioCacheKey = .{},
 
+    pub const AsyncSdCreateTask = struct {
+        card_name_buf: [64]u8 = @splat(0),
+        card_name_len: usize = 0,
+        src_path_buf: [std.fs.max_path_bytes]u8 = @splat(0),
+        src_path_len: usize = 0,
+        qcow2_path_buf: [std.fs.max_path_bytes]u8 = @splat(0),
+        qcow2_path_len: usize = 0,
+        has_qcow2_path: bool = false,
+        size: SdCardSize = .gb_4,
+        image_size_bytes: u64 = 0,
+        start_ns: u64 = 0,
+
+        progress_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        result_disk: ?Qcow2Disk = null,
+        err_msg_buf: [160]u8 = @splat(0),
+        err_msg_len: usize = 0,
+        thread: ?std.Thread = null,
+
+        fn workerMain(self: *AsyncSdCreateTask) void {
+            const src_path = self.src_path_buf[0..self.src_path_len];
+            const qcow2_path: ?[]const u8 = if (self.has_qcow2_path)
+                self.qcow2_path_buf[0..self.qcow2_path_len]
+            else
+                null;
+
+            if (Qcow2Disk.createFromImageFileAtPathWithProgress(
+                std.heap.page_allocator,
+                self.size.bytes(),
+                src_path,
+                qcow2_path,
+                &self.progress_bytes,
+            )) |disk| {
+                self.result_disk = disk;
+            } else |err| {
+                const msg = std.fmt.bufPrint(&self.err_msg_buf, "Error: {s}", .{@errorName(err)}) catch "Error creating SD card image";
+                self.err_msg_len = msg.len;
+            }
+            self.done.store(true, .release);
+        }
+    };
+
     pub fn init(gpa: std.mem.Allocator) !BoardUi {
         const font = try Font.init(canvas_mod.fira_ttf);
         const icon_font = try Font.init(canvas_mod.icons_ttf);
@@ -478,6 +522,12 @@ pub const BoardUi = struct {
     }
 
     pub fn deinit(self: *BoardUi) void {
+        if (self.sd_create_task) |task| {
+            if (task.thread) |t| t.join();
+            if (task.result_disk) |*d| d.deinit();
+            self.gpa.destroy(task);
+            self.sd_create_task = null;
+        }
         for (self.sd_cards.items) |*card| {
             card.deinit();
         }
@@ -961,7 +1011,12 @@ pub const BoardUi = struct {
         return idx;
     }
 
+    pub fn isCreatingSdCard(self: *const BoardUi) bool {
+        return self.sd_create_task != null;
+    }
+
     pub fn addPendingSdCard(self: *BoardUi) bool {
+        if (self.sd_create_task != null) return false;
         if (self.pending_sd_image_path_len == 0) {
             self.setSdError("Error: Choose an image file to put on the SD card");
             return false;
@@ -979,16 +1034,135 @@ pub const BoardUi = struct {
                 self.setSdError(@errorName(err));
                 return false;
             };
+            self.pending_sd_image_path_len = 0;
+            self.pending_sd_image_size = 0;
+            self.pending_sd_image_slice = null;
+            return true;
         } else {
-            _ = self.addSdCardFromFile(path, self.new_card_size) catch |err| {
+            return self.startPendingSdCardAsync(path, self.new_card_size);
+        }
+    }
+
+    fn startPendingSdCardAsync(self: *BoardUi, path: []const u8, size: SdCardSize) bool {
+        const file_size = Qcow2Disk.getFileSizeLinux(path) catch |err| {
+            self.setSdError(@errorName(err));
+            return false;
+        };
+        if (file_size > size.bytes()) {
+            self.new_card_size = size;
+            self.setPendingSdImageFile(path, file_size);
+            return false;
+        }
+
+        var name_buf: [64]u8 = undefined;
+        const card_name = self.resolveNewCardName(null, &name_buf);
+
+        var qcow2_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const qcow2_path = self.buildPersistentQcow2Path(card_name, &qcow2_path_buf);
+
+        const task = self.gpa.create(AsyncSdCreateTask) catch {
+            // Fallback to synchronous if task struct allocation fails
+            _ = self.addSdCardFromFile(path, size) catch |err| {
                 self.setSdError(@errorName(err));
                 return false;
             };
+            self.pending_sd_image_path_len = 0;
+            self.pending_sd_image_size = 0;
+            self.pending_sd_image_slice = null;
+            return true;
+        };
+        task.* = .{
+            .size = size,
+            .image_size_bytes = file_size,
+            .start_ns = host_posix.monotonicNs(),
+        };
+        @memcpy(task.card_name_buf[0..card_name.len], card_name);
+        task.card_name_len = card_name.len;
+        const plen = @min(path.len, task.src_path_buf.len);
+        @memcpy(task.src_path_buf[0..plen], path[0..plen]);
+        task.src_path_len = plen;
+        if (qcow2_path) |qp| {
+            const qlen = @min(qp.len, task.qcow2_path_buf.len);
+            @memcpy(task.qcow2_path_buf[0..qlen], qp[0..qlen]);
+            task.qcow2_path_len = qlen;
+            task.has_qcow2_path = true;
         }
-        self.pending_sd_image_path_len = 0;
-        self.pending_sd_image_size = 0;
-        self.pending_sd_image_slice = null;
-        return true;
+
+        task.thread = std.Thread.spawn(.{}, AsyncSdCreateTask.workerMain, .{task}) catch {
+            self.gpa.destroy(task);
+            _ = self.addSdCardFromFile(path, size) catch |err| {
+                self.setSdError(@errorName(err));
+                return false;
+            };
+            self.pending_sd_image_path_len = 0;
+            self.pending_sd_image_size = 0;
+            self.pending_sd_image_slice = null;
+            return true;
+        };
+
+        self.sd_create_task = task;
+        self.focused_field = .none;
+        self.sd_error_len = 0;
+        return false;
+    }
+
+    pub const AsyncSdPollResult = enum {
+        idle,
+        in_progress,
+        completed_ok,
+        completed_err,
+    };
+
+    /// Polls any active background SD card image creation thread, advancing the spinner animation
+    /// while running and finalizing the new `SdCardEntry` once complete.
+    pub fn pollAsyncSdCreation(self: *BoardUi, now_ns: u64) AsyncSdPollResult {
+        const task = self.sd_create_task orelse return .idle;
+
+        const elapsed_ns = now_ns -| task.start_ns;
+        const rev_ns: f32 = 900_000_000.0; // 1 full revolution per 0.9s
+        const phase = @as(f32, @floatFromInt(elapsed_ns % 900_000_000)) / rev_ns;
+        self.spinner_phase_rad = phase * (2.0 * std.math.pi);
+
+        if (!task.done.load(.acquire)) {
+            return .in_progress;
+        }
+
+        if (task.thread) |t| {
+            t.join();
+            task.thread = null;
+        }
+        self.sd_create_task = null;
+        defer self.gpa.destroy(task);
+
+        if (task.result_disk) |disk| {
+            var owned_disk = disk;
+            const card_name = task.card_name_buf[0..task.card_name_len];
+            const entry_path = if (task.has_qcow2_path)
+                task.qcow2_path_buf[0..task.qcow2_path_len]
+            else
+                task.src_path_buf[0..task.src_path_len];
+            const entry = makeNamedSdCardEntry(card_name, entry_path, task.image_size_bytes, task.size, owned_disk);
+            self.sd_cards.append(self.gpa, entry) catch |err| {
+                owned_disk.deinit();
+                self.setSdError(@errorName(err));
+                return .completed_err;
+            };
+            self.selected_sd_card_idx = self.sd_cards.items.len - 1;
+            self.sd_error_len = 0;
+            self.pending_sd_image_path_len = 0;
+            self.pending_sd_image_size = 0;
+            self.pending_sd_image_slice = null;
+            self.resetDefaultNewCardName();
+            self.sd_manage_open = false;
+            return .completed_ok;
+        } else {
+            const err_msg = if (task.err_msg_len > 0)
+                task.err_msg_buf[0..task.err_msg_len]
+            else
+                "Error creating SD card image";
+            self.setSdError(err_msg);
+            return .completed_err;
+        }
     }
 
     fn makeNamedSdCardEntry(card_name: []const u8, path: []const u8, img_size: u64, size: SdCardSize, disk: Qcow2Disk) SdCardEntry {
@@ -1332,7 +1506,7 @@ pub const BoardUi = struct {
     /// Handles an evdev key press when a text field (`serial`, `mac`, `wifi_mac`, or `sd_card_name`) is focused.
     /// Returns true if the key was consumed by the editor.
     pub fn handleKey(self: *BoardUi, evdev_key: u32) bool {
-        if (!self.sheet_open or self.focused_field == .none) return false;
+        if (!self.sheet_open or self.focused_field == .none or self.isCreatingSdCard()) return false;
         if (self.focused_field == .sd_card_name) {
             if (!self.sd_manage_open) return false;
         } else {
@@ -1758,6 +1932,15 @@ pub const BoardUi = struct {
 
         if (self.sd_manage_open) {
             self.hovered_target = null;
+            if (self.isCreatingSdCard()) {
+                self.sd_manage_close_hovered = false;
+                self.sd_name_field_hovered = false;
+                self.sd_browse_btn_hovered = false;
+                self.sd_add_btn_hovered = false;
+                self.hovered_sd_size_idx = null;
+                self.hovered_sd_card_row_idx = null;
+                return true;
+            }
             self.sd_manage_close_hovered = self.sd_manage_close_rect.contains(pt);
             self.sd_name_field_hovered = self.sd_name_field_rect.contains(pt);
             self.sd_browse_btn_hovered = self.sd_browse_btn_rect.contains(pt);
@@ -1906,6 +2089,7 @@ pub const BoardUi = struct {
                     self.close_btn_pressed = false;
                 }
                 if (self.board_btn_pressed and self.boardBtnRect(self.last_win_w).contains(pt)) {
+                    if (self.isCreatingSdCard()) return .consumed;
                     self.sheet_open = !self.sheet_open;
                     if (!self.sheet_open) {
                         self.focused_field = .none;
@@ -1955,6 +2139,9 @@ pub const BoardUi = struct {
 
             // 1. Modal Manage SD Cards popup handling
             if (self.sd_manage_open) {
+                if (self.isCreatingSdCard()) {
+                    return .consumed;
+                }
                 if (self.sd_name_field_rect.contains(pt)) {
                     self.focused_field = .sd_card_name;
                     return .consumed;
@@ -2945,12 +3132,35 @@ pub const BoardUi = struct {
                 _ = c.drawText(12.0, err_r.x + 10.0, err_r.y + 16.5, self.sdErrorMessage(), t.@"error");
             }
 
+            // Progress spinner & status text when building an image in the background
+            if (self.sd_create_task) |task| {
+                const spin_cx = mr.x + 28.0;
+                const spin_cy = self.sd_add_btn_rect.y + self.sd_add_btn_rect.h * 0.5;
+                paintSpinner(c, .{ spin_cx, spin_cy }, 9.0, self.spinner_phase_rad, t.primary, t.outline_variant);
+
+                const done_bytes = task.progress_bytes.load(.monotonic);
+                const total_bytes = task.image_size_bytes;
+                var prog_buf: [96]u8 = undefined;
+                const prog_txt = if (total_bytes > 0) blk: {
+                    const pct = @min(@as(u64, 99), (done_bytes * 100) / total_bytes);
+                    break :blk std.fmt.bufPrint(&prog_buf, "Creating SD card image... {d}%", .{pct}) catch "Creating SD card image...";
+                } else "Creating SD card image...";
+                _ = c.drawText(
+                    12.5,
+                    spin_cx + 16.0,
+                    @round(self.sd_add_btn_rect.y + (self.sd_add_btn_rect.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
+                    prog_txt,
+                    t.on_surface_variant,
+                );
+            }
+
             // Add Card button
             const ar = self.sd_add_btn_rect;
-            const can_add = self.pending_sd_image_path_len > 0 and !self.hasImageTooLargeError();
+            const creating = self.isCreatingSdCard();
+            const can_add = !creating and self.pending_sd_image_path_len > 0 and !self.hasImageTooLargeError();
             c.fillRoundedRect(ar, .all(6.0), if (can_add) t.primary else t.surface.withAlpha(0.5));
             c.strokeRoundedRect(ar, .all(6.0), 1.0, if (can_add) t.primary else t.outline_variant);
-            const add_lbl = "Add Card";
+            const add_lbl = if (creating) "Creating..." else "Add Card";
             const add_tw = c.measureText(13.0, add_lbl);
             _ = c.drawText(
                 13.0,
@@ -2959,6 +3169,21 @@ pub const BoardUi = struct {
                 add_lbl,
                 if (can_add) t.on_primary else t.on_surface_variant.withAlpha(0.5),
             );
+        }
+    }
+
+    fn paintSpinner(c: *Canvas, center: Point, radius: f32, phase_rad: f32, fg: Color, track: Color) void {
+        c.strokeCircle(center, radius, 1.5, track.withAlpha(0.28));
+        const num_dots: usize = 12;
+        const step_angle: f32 = (2.0 * std.math.pi) / @as(f32, @floatFromInt(num_dots));
+        for (0..num_dots) |i| {
+            const idx_f: f32 = @floatFromInt(i);
+            const angle = phase_rad - idx_f * step_angle;
+            const alpha = 1.0 - (idx_f / @as(f32, @floatFromInt(num_dots))) * 0.85;
+            const dot_r: f32 = if (i == 0) 2.2 else if (i < 4) 1.9 else 1.6;
+            const dx = center[0] + @cos(angle) * radius;
+            const dy = center[1] + @sin(angle) * radius;
+            c.fillCircle(.{ dx, dy }, dot_r, fg.withAlpha(alpha));
         }
     }
 
@@ -5334,5 +5559,65 @@ test "XkbKeymap parsing, modifiers, Caps Lock, AltGr, and non-US layout input" {
     ui.updateModifiersFromXkb(1 << 7, 0, 0); // AltGr depressed
     try testing.expectEqual(@as(?u8, '#'), ui.lookupKeyChar(4)); // AltGr+AE03 -> '#'
     try testing.expectEqual(@as(?u8, '@'), ui.lookupKeyChar(30)); // AltGr+AC01 -> '@'
+}
+
+test "BoardUi threaded SD card image creation with progress spinner" {
+    var rnd: [8]u8 = undefined;
+    host_posix.getRandomBytes(&rnd);
+    var src_path_buf: [128]u8 = undefined;
+    const src_path = try std.fmt.bufPrint(&src_path_buf, "/tmp/fauxpi-async-test-{x}.img", .{std.mem.readInt(u64, &rnd, .little)});
+    defer host_posix.unlinkFile(src_path);
+
+    {
+        const fd = try host_posix.openCreateTruncWrite(src_path, false);
+        defer host_posix.close(fd);
+        var sector: [512]u8 = @splat(0);
+        sector[510] = 0x55;
+        sector[511] = 0xAA;
+        try host_posix.writeAll(fd, &sector);
+    }
+
+    var ui = try BoardUi.init(testing.allocator);
+    defer ui.deinit();
+
+    var hw: Gpio = .{};
+    const status: SystemStatus = .{};
+    const win_w: u32 = 1280;
+    const win_h: u32 = 764;
+    const pixels = try testing.allocator.alloc(u32, win_w * win_h);
+    defer testing.allocator.free(pixels);
+    @memset(pixels, 0xff000000);
+
+    ui.sheet_open = true;
+    ui.sd_manage_open = true;
+    ui.setPendingSdImageFile(src_path, 512);
+    ui.updateLayout(win_w, win_h, status, &hw);
+
+    // Clicking "Add Card" for a file on disk launches the background worker thread and keeps the dialog open
+    _ = ui.pointerButton(ui.sd_add_btn_rect.x + 10, ui.sd_add_btn_rect.y + 10, true, status, &hw);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(ui.sd_add_btn_rect.x + 10, ui.sd_add_btn_rect.y + 10, false, status, &hw));
+    try testing.expect(ui.isCreatingSdCard());
+    try testing.expect(ui.sd_manage_open);
+
+    // Paint while task is active to exercise progress spinner rendering
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+
+    // Poll until background creation finishes
+    var spins: usize = 0;
+    while (true) : (spins += 1) {
+        const res = ui.pollAsyncSdCreation(host_posix.monotonicNs());
+        if (res == .completed_ok) break;
+        try testing.expect(res == .in_progress);
+        try testing.expect(spins < 100_000);
+        var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
+        _ = std.os.linux.nanosleep(&ts, null);
+    }
+
+    try testing.expect(!ui.isCreatingSdCard());
+    try testing.expect(!ui.sd_manage_open);
+    try testing.expectEqual(@as(usize, 1), ui.sd_cards.items.len);
+    try testing.expectEqual(@as(?usize, 0), ui.selected_sd_card_idx);
+    try testing.expectEqual(@as(u8, 0x55), ui.sd_cards.items[0].disk.readByte(510));
+    try testing.expectEqual(@as(u8, 0xAA), ui.sd_cards.items[0].disk.readByte(511));
 }
 

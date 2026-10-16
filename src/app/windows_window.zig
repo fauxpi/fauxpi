@@ -672,7 +672,25 @@ pub const WindowsWindow = struct {
 
     pub fn pollEvents(self: *WindowsWindow) !void {
         self.pumpWin32Messages();
+        self.pollAsyncSdCreation();
         self.serviceRepeat(host_posix.monotonicNs());
+    }
+
+    fn pollAsyncSdCreation(self: *WindowsWindow) void {
+        switch (self.ui.pollAsyncSdCreation(host_posix.monotonicNs())) {
+            .idle => {},
+            .in_progress => {
+                self.ui_dirty = true;
+            },
+            .completed_ok => {
+                self.sd_image_chosen = true;
+                self.ui_dirty = true;
+                self.ui.saveSettings(self.status) catch {};
+            },
+            .completed_err => {
+                self.ui_dirty = true;
+            },
+        }
     }
 
     pub fn waitEvents(self: *WindowsWindow, timeout_ms: i32) !void {
@@ -683,6 +701,7 @@ pub const WindowsWindow = struct {
     pub fn waitEventsUs(self: *WindowsWindow, timeout_us: ?u64) !void {
         const was_dirty = self.ui_dirty;
         self.pumpWin32Messages();
+        self.pollAsyncSdCreation();
         const now_ns = host_posix.monotonicNs();
         self.serviceRepeat(now_ns);
         if (self.closed or (!was_dirty and self.ui_dirty)) return;
@@ -713,6 +732,7 @@ pub const WindowsWindow = struct {
             }
         }
         self.pumpWin32Messages();
+        self.pollAsyncSdCreation();
         self.serviceRepeat(host_posix.monotonicNs());
     }
 

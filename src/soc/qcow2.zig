@@ -199,6 +199,19 @@ pub const Qcow2Disk = struct {
         image_path: []const u8,
         backing_path: ?[]const u8,
     ) !Qcow2Disk {
+        return createFromImageFileAtPathWithProgress(allocator, virtual_size, image_path, backing_path, null);
+    }
+
+    /// Creates a new QCOW2 v3 disk of `virtual_size` bytes backed by `backing_path` by streaming
+    /// `image_path` (raw `.img` or `.img.xz`) in 64 KiB clusters while updating `progress_bytes_opt`
+    /// with the number of uncompressed image bytes processed so far.
+    pub fn createFromImageFileAtPathWithProgress(
+        allocator: std.mem.Allocator,
+        virtual_size: u64,
+        image_path: []const u8,
+        backing_path: ?[]const u8,
+        progress_bytes_opt: ?*std.atomic.Value(u64),
+    ) !Qcow2Disk {
         const src_fd = try host_posix.openRead(image_path);
         defer host_posix.close(src_fd);
 
@@ -229,7 +242,7 @@ pub const Qcow2Disk = struct {
 
         if (is_xz) {
             var fd_reader = PosixFdReader.init(src_fd, io_buf);
-            try streamXzToQcow2(allocator, &fd_reader.reader, &disk);
+            try streamXzToQcow2WithProgress(allocator, &fd_reader.reader, &disk, progress_bytes_opt);
         } else {
             var off: u64 = 0;
             while (off < raw_file_size) {
@@ -245,6 +258,7 @@ pub const Qcow2Disk = struct {
                     try disk.writeClusterSlice(off / CLUSTER_SIZE, io_buf[0..got]);
                 }
                 off += got;
+                if (progress_bytes_opt) |p| p.store(off, .monotonic);
             }
         }
 
@@ -840,6 +854,7 @@ const ClusterSink = struct {
     cluster_pos: usize = 0,
     vcluster: u64 = 0,
     total_written: u64 = 0,
+    progress_bytes: ?*std.atomic.Value(u64) = null,
 
     pub fn writeByte(self: *ClusterSink, b: u8) !void {
         self.cluster_buf[self.cluster_pos] = b;
@@ -857,6 +872,7 @@ const ClusterSink = struct {
         }
         self.vcluster += 1;
         self.cluster_pos = 0;
+        if (self.progress_bytes) |p| p.store(self.total_written, .monotonic);
     }
 
     pub fn finish(self: *ClusterSink) !void {
@@ -868,6 +884,7 @@ const ClusterSink = struct {
             }
             self.cluster_pos = 0;
         }
+        if (self.progress_bytes) |p| p.store(self.total_written, .monotonic);
     }
 };
 
@@ -970,6 +987,15 @@ pub fn streamXzToQcow2(
     input: *std.Io.Reader,
     disk: *Qcow2Disk,
 ) !void {
+    return streamXzToQcow2WithProgress(allocator, input, disk, null);
+}
+
+pub fn streamXzToQcow2WithProgress(
+    allocator: std.mem.Allocator,
+    input: *std.Io.Reader,
+    disk: *Qcow2Disk,
+    progress_bytes_opt: ?*std.atomic.Value(u64),
+) !void {
     const cluster_buf = try allocator.create([CLUSTER_SIZE]u8);
     defer allocator.destroy(cluster_buf);
     @memset(cluster_buf, 0);
@@ -977,6 +1003,7 @@ pub fn streamXzToQcow2(
     var sink: ClusterSink = .{
         .disk = disk,
         .cluster_buf = cluster_buf,
+        .progress_bytes = progress_bytes_opt,
     };
 
     var dict_buf: []u8 = &.{};
