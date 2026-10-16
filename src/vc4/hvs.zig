@@ -269,7 +269,7 @@ pub const Hvs = struct {
         const alpha_mode: u2 = @truncate((pos2 >> 30) & 3);
         const dst_w: u32 = if (unity) src_w else (self.dlist[idx + 2] & 0xfff);
         const dst_h: u32 = if (unity) src_h else ((self.dlist[idx + 2] >> 16) & 0xfff);
-        return dst_w >= out_w and dst_h >= out_h and (alpha_mode == 1 or pix_fmt == 0);
+        return dst_w >= out_w and dst_h >= out_h and (alpha_mode == 1 or pix_fmt == 0 or pix_fmt == 4);
     }
 
     inline fn blendPixel(dst_c: u32, src_color: u32, a: u32, premult: bool) u32 {
@@ -322,12 +322,16 @@ pub const Hvs = struct {
         const pitch0 = self.dlist[ptr0_idx + 2];
 
         const raw_pitch: u32 = pitch0 & 0xffff;
-        const is_565 = (pix_fmt == 0) or (pix_fmt == 4 and raw_pitch == src_w * 2);
+        // HVS_PIXEL_FORMAT_RGB565 is 4 (some legacy bare-metal tests also used 0 for 565)
+        const is_565 = (pix_fmt == 0) or (pix_fmt == 4);
         const fmt: format_mod.Format = if (is_565) .rgb565 else .argb8888;
         const cpp: u32 = if (is_565) 2 else 4;
         const linear_pitch: u32 = if (raw_pitch != 0) raw_pitch else (src_w * cpp);
-        const tiled_w: u32 = if (tiling == 3 and (pitch0 >> 16) != 0)
-            ((pitch0 >> 16) & 0xffff) * 32
+        // For T-tiled planes (SCALER_CTL0_TILING_256B_OR_T = 3), pitch0[6:0] is SCALER_TILE_WIDTH_T
+        // in 4KB T-tiles (64 pixels wide for 16bpp RGB565, 32 pixels wide for 32bpp).
+        const tile_w_px: u32 = if (is_565) 64 else 32;
+        const tiled_w: u32 = if (tiling == 3 and (pitch0 & 0x7f) != 0)
+            (pitch0 & 0x7f) * tile_w_px
         else
             src_w;
 
@@ -525,8 +529,8 @@ test "HVS DLIST plane compositing" {
     }
 
     // Write DLIST entry at slot 16
-    // ctl0: VALID | UNITY | format=4 (RGBA8888) | size=7 words
-    hvs.write32(Hvs.DLIST_OFFSET + 16 * 4, Hvs.SCALER_CTL0_VALID | Hvs.SCALER_CTL0_UNITY | (7 << 24) | 4);
+    // ctl0: VALID | UNITY | format=7 (HVS_PIXEL_FORMAT_RGBA8888) | size=7 words
+    hvs.write32(Hvs.DLIST_OFFSET + 16 * 4, Hvs.SCALER_CTL0_VALID | Hvs.SCALER_CTL0_UNITY | (7 << 24) | 7);
     // pos0: x=0, y=0
     hvs.write32(Hvs.DLIST_OFFSET + 17 * 4, 0);
     // pos2: w=2, h=2, alpha_mode=0
@@ -549,6 +553,40 @@ test "HVS DLIST plane compositing" {
     try std.testing.expect(hvs.compositeFrame(&ram, &out, 2, 2));
     try std.testing.expectEqual(@as(u32, 0xff00ff00), out[0]);
     try std.testing.expectEqual(@as(u32, 0xff00ff00), out[3]);
+}
+
+test "HVS T-tiled RGB565 plane compositing (direct scanout of maximized window)" {
+    var hvs = Hvs{};
+    const w: u32 = 128;
+    const h: u32 = 64;
+    var ram: [128 * 64 * 2]u8 = [_]u8{0} ** (128 * 64 * 2);
+
+    // Populate T-tiled RGB565 buffer with pure blue (0xff0000ff)
+    const blue565 = format_mod.toRgb565(0xff0000ff);
+    for (0..h) |y| {
+        for (0..w) |x| {
+            const off = texture.texelOffsetOf(.rgb565, w, h, @intCast(x), @intCast(y));
+            std.mem.writeInt(u16, ram[off..][0..2], blue565, .little);
+        }
+    }
+
+    // ctl0: VALID | UNITY | tiling=3 (T-tiled) | format=4 (HVS_PIXEL_FORMAT_RGB565) | size=7 words
+    hvs.write32(Hvs.DLIST_OFFSET + 16 * 4, Hvs.SCALER_CTL0_VALID | Hvs.SCALER_CTL0_UNITY | (7 << 24) | (3 << 20) | 4);
+    hvs.write32(Hvs.DLIST_OFFSET + 17 * 4, 0xff000000);
+    hvs.write32(Hvs.DLIST_OFFSET + 18 * 4, (1 << 30) | (h << 16) | w);
+    hvs.write32(Hvs.DLIST_OFFSET + 19 * 4, 0xc0c0c0c0);
+    hvs.write32(Hvs.DLIST_OFFSET + 20 * 4, 0x80000000);
+    hvs.write32(Hvs.DLIST_OFFSET + 21 * 4, 0xc0c0c0c0);
+    // pitch0: SCALER_TILE_WIDTH_T = w / 64 = 2 T-tiles (NOT w * 2 bytes!)
+    hvs.write32(Hvs.DLIST_OFFSET + 22 * 4, w / 64);
+    hvs.write32(Hvs.DLIST_OFFSET + 23 * 4, Hvs.SCALER_CTL0_END);
+    hvs.write32(0x0024, 16);
+
+    var out: [128 * 64]u32 = [_]u32{0} ** (128 * 64);
+    try std.testing.expect(hvs.compositeFrame(&ram, &out, w, h));
+    for (out) |px| {
+        try std.testing.expectEqual(@as(u32, 0xff0000ff), px);
+    }
 }
 
 test "HVS cursor hotspot detection" {
