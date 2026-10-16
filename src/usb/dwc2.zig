@@ -89,6 +89,7 @@ pub const Dwc2Controller = struct {
     sof_base: u16 = 0,
     pending_csplit_sof: bool = false,
     sof_wakeup_frames: u8 = 16,
+    wake_attempts: u8 = 0,
     haintmsk: u32 = 0,
     hprt0: u32 = HPRT0_PRTCONNSTS | HPRT0_PRTSPD_HIGH,
     pcgcctl: u32 = 0,
@@ -147,7 +148,11 @@ pub const Dwc2Controller = struct {
         self.syncRootPortConnection();
         if (self.hid.hasPendingInterruptIn() or !self.hid.allConnectedDevicesConfigured() or self.pending_csplit_sof) {
             self.sof_wakeup_frames = 8;
-            if ((self.gintmsk & GINTSTS_SOF) != 0) {
+            if ((self.gintmsk & GINTSTS_SOF) != 0 and (self.gintsts & GINTSTS_SOF) == 0 and self.wake_attempts < 8) {
+                self.wake_attempts += 1;
+                const step: u16 = if (self.pending_csplit_sof) 2 else 64;
+                self.pending_csplit_sof = false;
+                self.hfnum = (self.hfnum + step) & 0x3fff;
                 self.gintsts |= GINTSTS_SOF;
             }
         }
@@ -158,6 +163,7 @@ pub const Dwc2Controller = struct {
         // 1 vblank at 60 Hz (~16.67 ms) corresponds to ~128 USB High-Speed microframes (16.0 ms)
         self.sof_base = (self.sof_base + 128) & 0x3fff;
         self.hfnum = self.sof_base;
+        self.wake_attempts = 0;
         self.pollNetwork(ram);
 
         const has_pending = self.hid.hasPendingInterruptIn() or !self.hid.allConnectedDevicesConfigured();
@@ -321,7 +327,13 @@ pub const Dwc2Controller = struct {
             0x014 => { // GINTSTS W1C
                 self.gintsts &= ~val;
             },
-            0x018 => self.gintmsk = val,
+            0x018 => {
+                if ((self.gintmsk & GINTSTS_SOF) == 0 and (val & GINTSTS_SOF) != 0) {
+                    self.sof_wakeup_frames = 8;
+                    self.wake_attempts = 0;
+                }
+                self.gintmsk = val;
+            },
             0x024 => self.grxfsiz = val,
             0x028 => self.gnptxfsiz = val,
             0x100 => self.hptxfsiz = val,
@@ -374,6 +386,7 @@ pub const Dwc2Controller = struct {
     }
 
     fn executeChannel(self: *Dwc2Controller, ch_idx: usize, ram: []u8) void {
+        self.wake_attempts = 0;
         var ch = &self.channels[ch_idx];
 
         if ((ch.hcchar & HCCHAR_CHDIS) != 0) {

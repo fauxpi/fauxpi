@@ -606,6 +606,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
         if (all_wfi) {
             soc.usb.pollNetwork(soc.ram);
+            soc.usb.wakeIfPending();
             soc.updateIrqs();
             for (0..num_cores) |i| {
                 if (cpus[i].halted_spin) continue;

@@ -204,7 +204,6 @@ pub const UsbHidComposite = struct {
     cdc_notif_head: u3 = 0,
     cdc_notif_tail: u3 = 0,
     cdc_notif_count: u4 = 0,
-    mouse_polled: bool = false,
 
     // User-mode NAT / SLIRP network stack
     net: net_mod.VirtualNetwork = .{},
@@ -261,7 +260,6 @@ pub const UsbHidComposite = struct {
     pub fn resetMouseDevice(self: *UsbHidComposite) void {
         self.mouse_addr = 0;
         self.mouse_configured = false;
-        self.mouse_polled = false;
         self.has_target = false;
         self.mouse_idle_rate = 0;
         self.mouse_protocol = 1;
@@ -380,7 +378,7 @@ pub const UsbHidComposite = struct {
             }
         }
         if (self.keyboard_connected and self.kbd_configured and self.kbd_count > 0) return true;
-        if (self.mouse_connected and self.mouse_configured and self.mouse_polled) {
+        if (self.mouse_connected and self.mouse_configured) {
             if (self.mouse_count > 0) return true;
             if (self.has_target and (self.target_x != self.guest_x or self.target_y != self.guest_y)) return true;
         }
@@ -525,10 +523,14 @@ pub const UsbHidComposite = struct {
             self.idle_vblanks += 1;
         }
         if (actual) |pos| {
-            if (!self.cursor_seen or self.idle_vblanks >= 4) {
+            if (!self.cursor_seen) {
                 self.cursor_seen = true;
                 self.guest_x = pos[0];
                 self.guest_y = pos[1];
+            } else if (self.idle_vblanks >= 4) {
+                self.guest_x = pos[0];
+                self.guest_y = pos[1];
+                self.has_target = false;
             }
         }
     }
@@ -569,7 +571,6 @@ pub const UsbHidComposite = struct {
 
     pub fn popMouseReport(self: *UsbHidComposite) ?[4]u8 {
         if (!self.isHubPresent() or !self.mouse_connected) return null;
-        self.mouse_polled = true;
         if (self.has_target) {
             const dx_i32 = std.math.clamp(self.target_x - self.guest_x, -127, 127);
             const dy_i32 = std.math.clamp(self.target_y - self.guest_y, -127, 127);
