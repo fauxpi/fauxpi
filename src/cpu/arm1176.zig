@@ -92,6 +92,8 @@ pub const ArmOp = enum(u8) {
     strh_imm_al,
     ldrsb_imm_al,
     ldrsh_imm_al,
+    ldrd_imm_al,
+    strd_imm_al,
     ldr_wb_al,
     str_wb_al,
     ldrb_wb_al,
@@ -134,6 +136,8 @@ pub const ArmOp = enum(u8) {
     vstr_f64_al,
     vldr_f32_al,
     vstr_f32_al,
+    vldm_al,
+    vstm_al,
     vmov_r_f64_al,
     vmov_f64_r_al,
     vmov_r_f32_al,
@@ -256,6 +260,14 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                             return .{
                                 .raw = inst,
                                 .op = @intFromEnum(if (sh == 0b10) ArmOp.ldrsb_imm_al else ArmOp.ldrsh_imm_al),
+                                .rd = rd,
+                                .rn = rn,
+                                .imm = signed_off,
+                            };
+                        } else if ((rd & 1) == 0 and rd != 14) {
+                            return .{
+                                .raw = inst,
+                                .op = @intFromEnum(if (sh == 0b10) ArmOp.ldrd_imm_al else ArmOp.strd_imm_al),
                                 .rd = rd,
                                 .rn = rn,
                                 .imm = signed_off,
@@ -563,7 +575,25 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                     (if ((reg_list & (1 << 15)) != 0) .ldm_pc_al else .ldm_al)
                 else
                     .stm_al;
-                return .{ .raw = inst, .op = @intFromEnum(op), .rn = rn, .imm = packed_imm };
+                // Pre-detect contiguous register range in r0..r13 (+ optional r14/lr) for single-@memcpy burst
+                const low14: u32 = reg_list & 0x3fff;
+                const low14_contig = (low14 == 0) or ((low14 & (low14 + (@as(u32, 1) << @intCast(@ctz(low14))))) == 0);
+                var first_byte: u8 = 0;
+                var contig_meta: u8 = 0;
+                if (low14_contig and (l or (reg_list & (1 << 15)) == 0)) {
+                    first_byte = if (low14 != 0) @intCast(@ctz(low14) * 4) else 0;
+                    const nbytes: u8 = @intCast(@popCount(low14) * 4);
+                    const has_lr: u8 = if ((reg_list & (1 << 14)) != 0) 0x40 else 0;
+                    contig_meta = 0x80 | has_lr | nbytes;
+                }
+                return .{
+                    .raw = inst,
+                    .op = @intFromEnum(op),
+                    .rd = first_byte,
+                    .rn = rn,
+                    .rm = contig_meta,
+                    .imm = packed_imm,
+                };
             }
             return .{ .raw = inst, .op = @intFromEnum(ArmOp.ls_multiple) };
         },
@@ -631,6 +661,27 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                                         .imm = signed_off,
                                     };
                                 }
+                            }
+                            const word_count: u32 = if (is_double) (imm8 & ~@as(u32, 1)) else imm8;
+                            const first_s: u32 = if (is_double) (@as(u32, (d_bit << 4) | vd) * 2) else ((@as(u32, vd) << 1) | d_bit);
+                            if (rn != 15 and word_count > 0 and first_s + word_count <= 64) {
+                                const off_i16: i16 = @intCast(offset_bytes);
+                                const start_off: i16 = if (u) 0 else -off_i16;
+                                const wb_off: i16 = if (w) (if (u) off_i16 else -off_i16) else 0;
+                                const last_off: u16 = @intCast((word_count - 1) * 4);
+                                const nbytes: u16 = @intCast(word_count * 4);
+                                const packed_imm: u64 = @as(u64, nbytes) |
+                                    (@as(u64, last_off) << 16) |
+                                    (@as(u64, @as(u16, @bitCast(start_off))) << 32) |
+                                    (@as(u64, @as(u16, @bitCast(wb_off))) << 48);
+                                return .{
+                                    .raw = inst,
+                                    .op = @intFromEnum(if (l) ArmOp.vldm_al else ArmOp.vstm_al),
+                                    .rd = @intCast(first_s),
+                                    .rn = rn,
+                                    .rm = @intFromBool(is_double),
+                                    .imm = packed_imm,
+                                };
                             }
                             return .{ .raw = inst, .op = @intFromEnum(ArmOp.vfp_ls_multi_al), .rm = @intFromBool(is_double) };
                         }
@@ -1558,6 +1609,33 @@ pub fn Arm1176(comptime Bus: type) type {
                             };
                         self.r[d.rd] = @bitCast(@as(i32, @as(i16, @bitCast(half_val))));
                     },
+                    .ldrd_imm_al => {
+                        const vaddr = self.r[d.rn] +% imm32;
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                            const paddr = slot.pbase | (vaddr & 0xfff);
+                            self.r[d.rd] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                            self.r[d.rd + 1] = std.mem.readInt(u32, bus.ram[paddr + 4 ..][0..4], .little);
+                        } else {
+                            self.executeMultipliesAndExtraLoadStore(bus, pc, inst);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .strd_imm_al => {
+                        const vaddr = self.r[d.rn] +% imm32;
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                            const paddr = slot.pbase | (vaddr & 0xfff);
+                            std.mem.writeInt(u32, bus.ram[paddr..][0..4], self.r[d.rd], .little);
+                            std.mem.writeInt(u32, bus.ram[paddr + 4 ..][0..4], self.r[d.rd + 1], .little);
+                        } else {
+                            self.executeMultipliesAndExtraLoadStore(bus, pc, inst);
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
                     .ldr_wb_al => {
                         const base_val = self.r[d.rn];
                         const vaddr = base_val +% imm32;
@@ -1723,11 +1801,33 @@ pub fn Arm1176(comptime Bus: type) type {
                             (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
                         {
                             var paddr = slot.pbase | (start_addr & 0xfff);
-                            var rem: u16 = @truncate(d.imm & 0x7fff);
-                            while (rem != 0) : (rem &= rem - 1) {
-                                const i: u4 = @intCast(@ctz(rem));
-                                self.r[i] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
-                                paddr += 4;
+                            if (comptime @import("builtin").cpu.arch.endian() == .little) {
+                                if ((d.rm & 0x80) != 0) {
+                                    const nbytes: usize = d.rm & 0x3f;
+                                    if (nbytes != 0) {
+                                        const r_bytes: *[64]u8 = @ptrCast(&self.r);
+                                        @memcpy(r_bytes[d.rd..][0..nbytes], bus.ram[paddr..][0..nbytes]);
+                                        paddr += @intCast(nbytes);
+                                    }
+                                    if ((d.rm & 0x40) != 0) {
+                                        self.r[14] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                                        paddr += 4;
+                                    }
+                                } else {
+                                    var rem: u16 = @truncate(d.imm & 0x7fff);
+                                    while (rem != 0) : (rem &= rem - 1) {
+                                        const i: u4 = @intCast(@ctz(rem));
+                                        self.r[i] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                                        paddr += 4;
+                                    }
+                                }
+                            } else {
+                                var rem: u16 = @truncate(d.imm & 0x7fff);
+                                while (rem != 0) : (rem &= rem - 1) {
+                                    const i: u4 = @intCast(@ctz(rem));
+                                    self.r[i] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                                    paddr += 4;
+                                }
                             }
                             const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
                             if (wb_off != 0) self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
@@ -1752,18 +1852,42 @@ pub fn Arm1176(comptime Bus: type) type {
                             (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
                         {
                             var paddr = slot.pbase | (start_addr & 0xfff);
-                            var rem: u16 = @truncate(d.imm);
-                            while (rem != 0) : (rem &= rem - 1) {
-                                const i: u4 = @intCast(@ctz(rem));
-                                const val = if (i == 15) (pc +% 8) else self.r[i];
-                                std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
-                                paddr += 4;
+                            if (comptime @import("builtin").cpu.arch.endian() == .little) {
+                                if ((d.rm & 0x80) != 0) {
+                                    const nbytes: usize = d.rm & 0x3f;
+                                    if (nbytes != 0) {
+                                        const r_bytes: *const [64]u8 = @ptrCast(&self.r);
+                                        @memcpy(bus.ram[paddr..][0..nbytes], r_bytes[d.rd..][0..nbytes]);
+                                        paddr += @intCast(nbytes);
+                                    }
+                                    if ((d.rm & 0x40) != 0) {
+                                        std.mem.writeInt(u32, bus.ram[paddr..][0..4], self.r[14], .little);
+                                    }
+                                } else {
+                                    var rem: u16 = @truncate(d.imm);
+                                    while (rem != 0) : (rem &= rem - 1) {
+                                        const i: u4 = @intCast(@ctz(rem));
+                                        const val = if (i == 15) (pc +% 8) else self.r[i];
+                                        std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
+                                        paddr += 4;
+                                    }
+                                }
+                            } else {
+                                var rem: u16 = @truncate(d.imm);
+                                while (rem != 0) : (rem &= rem - 1) {
+                                    const i: u4 = @intCast(@ctz(rem));
+                                    const val = if (i == 15) (pc +% 8) else self.r[i];
+                                    std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
+                                    paddr += 4;
+                                }
                             }
                             const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
                             if (wb_off != 0) self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
                         } else {
                             self.executeLoadStoreMultiple(bus, pc, inst);
-                            _ = self.checkInterrupts(bus);
+                            if ((last_addr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(last_addr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                _ = self.checkInterrupts(bus);
+                            }
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
                         }
@@ -2141,6 +2265,76 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.vfp.executeDataProc(inst);
                         } else {
                             self.executeVfp(bus, pc, inst, ((inst >> 8) & 0xf) == 11);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vldm_al => {
+                        if (self.vfpReady(priv)) {
+                            const base_val = self.r[d.rn];
+                            const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
+                            const start_addr = base_val +% @as(u32, @bitCast(start_off));
+                            const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
+                            const last_addr = start_addr +% last_off;
+                            const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
+                            if ((start_addr & ~@as(u32, 0xffc)) == slot.r_vbase and
+                                (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
+                            {
+                                const paddr = slot.pbase | (start_addr & 0xfff);
+                                const nbytes: usize = @as(u16, @truncate(d.imm));
+                                if (comptime @import("builtin").cpu.arch.endian() == .little) {
+                                    const s_bytes: *[256]u8 = @ptrCast(&self.vfp.s);
+                                    @memcpy(s_bytes[@as(usize, d.rd) * 4 ..][0..nbytes], bus.ram[paddr..][0..nbytes]);
+                                } else {
+                                    var p = paddr;
+                                    for (self.vfp.s[d.rd..][0 .. nbytes / 4]) |*s_reg| {
+                                        s_reg.* = std.mem.readInt(u32, bus.ram[p..][0..4], .little);
+                                        p += 4;
+                                    }
+                                }
+                                const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
+                                if (wb_off != 0) self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
+                            } else {
+                                self.executeVfp(bus, pc, inst, d.rm != 0);
+                                priv = @intFromBool(self.isPrivileged());
+                            }
+                        } else {
+                            self.executeVfp(bus, pc, inst, d.rm != 0);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .vstm_al => {
+                        if (self.vfpReady(priv)) {
+                            const base_val = self.r[d.rn];
+                            const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
+                            const start_addr = base_val +% @as(u32, @bitCast(start_off));
+                            const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
+                            const last_addr = start_addr +% last_off;
+                            const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
+                            if ((start_addr & ~@as(u32, 0xffc)) == slot.w_vbase and
+                                (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
+                            {
+                                const paddr = slot.pbase | (start_addr & 0xfff);
+                                const nbytes: usize = @as(u16, @truncate(d.imm));
+                                if (comptime @import("builtin").cpu.arch.endian() == .little) {
+                                    const s_bytes: *const [256]u8 = @ptrCast(&self.vfp.s);
+                                    @memcpy(bus.ram[paddr..][0..nbytes], s_bytes[@as(usize, d.rd) * 4 ..][0..nbytes]);
+                                } else {
+                                    var p = paddr;
+                                    for (self.vfp.s[d.rd..][0 .. nbytes / 4]) |s_reg| {
+                                        std.mem.writeInt(u32, bus.ram[p..][0..4], s_reg, .little);
+                                        p += 4;
+                                    }
+                                }
+                                const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
+                                if (wb_off != 0) self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
+                            } else {
+                                self.executeVfp(bus, pc, inst, d.rm != 0);
+                                priv = @intFromBool(self.isPrivileged());
+                            }
+                        } else {
+                            self.executeVfp(bus, pc, inst, d.rm != 0);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
                         }
@@ -3901,31 +4095,70 @@ pub fn Arm1176(comptime Bus: type) type {
                         const l = (inst & (1 << 11)) != 0;
                         const rn: u4 = @truncate((inst >> 8) & 7);
                         const rlist: u8 = @truncate(inst & 0xff);
-                        var addr = self.r[rn];
+                        const base_val = self.r[rn];
+                        if (rlist != 0) {
+                            const count: u32 = @popCount(rlist);
+                            const total_bytes = count * 4;
+                            const last_addr = base_val +% total_bytes -% 4;
+                            const priv: u1 = @intFromBool(self.isPrivileged());
+                            const slot = self.mmu.soft_tlb32[priv][(base_val >> 12) & Mmu.soft_tlb_mask];
+                            if (l) {
+                                if ((base_val & ~@as(u32, 0xffc)) == slot.r_vbase and
+                                    (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
+                                {
+                                    var paddr = slot.pbase | (base_val & 0xfff);
+                                    self.r[rn] = base_val +% total_bytes;
+                                    var rem = rlist;
+                                    while (rem != 0) : (rem &= rem - 1) {
+                                        const i: u4 = @intCast(@ctz(rem));
+                                        self.r[i] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                                        paddr += 4;
+                                    }
+                                    return;
+                                }
+                            } else {
+                                if ((base_val & ~@as(u32, 0xffc)) == slot.w_vbase and
+                                    (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
+                                {
+                                    var paddr = slot.pbase | (base_val & 0xfff);
+                                    var rem = rlist;
+                                    while (rem != 0) : (rem &= rem - 1) {
+                                        const i: u4 = @intCast(@ctz(rem));
+                                        std.mem.writeInt(u32, bus.ram[paddr..][0..4], self.r[i], .little);
+                                        paddr += 4;
+                                    }
+                                    self.r[rn] = base_val +% total_bytes;
+                                    return;
+                                }
+                            }
+                        }
+                        var addr = base_val;
                         if (l) {
                             var loaded: [8]u32 = undefined;
-                            for (0..8) |i| {
-                                if ((rlist & (@as(u8, 1) << @intCast(i))) != 0) {
-                                    loaded[i] = self.read32(bus, addr) catch {
-                                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
-                                        return;
-                                    };
-                                    addr +%= 4;
-                                }
+                            var rem = rlist;
+                            while (rem != 0) : (rem &= rem - 1) {
+                                const i: u4 = @intCast(@ctz(rem));
+                                loaded[i] = self.read32(bus, addr) catch {
+                                    self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                                    return;
+                                };
+                                addr +%= 4;
                             }
                             self.r[rn] = addr;
-                            for (0..8) |i| {
-                                if ((rlist & (@as(u8, 1) << @intCast(i))) != 0) self.r[i] = loaded[i];
+                            var rem_c = rlist;
+                            while (rem_c != 0) : (rem_c &= rem_c - 1) {
+                                const i: u4 = @intCast(@ctz(rem_c));
+                                self.r[i] = loaded[i];
                             }
                         } else {
-                            for (0..8) |i| {
-                                if ((rlist & (@as(u8, 1) << @intCast(i))) != 0) {
-                                    self.write32(bus, addr, self.r[i]) catch {
-                                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
-                                        return;
-                                    };
-                                    addr +%= 4;
-                                }
+                            var rem = rlist;
+                            while (rem != 0) : (rem &= rem - 1) {
+                                const i: u4 = @intCast(@ctz(rem));
+                                self.write32(bus, addr, self.r[i]) catch {
+                                    self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                                    return;
+                                };
+                                addr +%= 4;
                             }
                             self.r[rn] = addr;
                         }
@@ -3996,23 +4229,36 @@ pub fn Arm1176(comptime Bus: type) type {
                 0b0100, 0b0101 => { // PUSH
                     const push_lr = (sub & 1) != 0;
                     const rlist: u8 = @truncate(inst & 0xff);
-                    const count: u32 = @as(u32, @popCount(rlist)) + @intFromBool(push_lr);
+                    const reg_list: u16 = @as(u16, rlist) | (if (push_lr) @as(u16, 1 << 14) else 0);
+                    const count: u32 = @popCount(reg_list);
                     const start_sp = self.r[13] -% (count * 4);
-                    var addr = start_sp;
-                    for (0..8) |i| {
-                        if ((rlist & (@as(u8, 1) << @intCast(i))) != 0) {
-                            self.write32(bus, addr, self.r[i]) catch {
-                                self.enterException(.abt, 0x10, inst_pc +% 8, false);
-                                return;
-                            };
-                            addr +%= 4;
+                    if (count > 0) {
+                        const last_addr = self.r[13] -% 4;
+                        const priv: u1 = @intFromBool(self.isPrivileged());
+                        const slot = self.mmu.soft_tlb32[priv][(start_sp >> 12) & Mmu.soft_tlb_mask];
+                        if ((start_sp & ~@as(u32, 0xffc)) == slot.w_vbase and
+                            (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
+                        {
+                            var paddr = slot.pbase | (start_sp & 0xfff);
+                            var rem = reg_list;
+                            while (rem != 0) : (rem &= rem - 1) {
+                                const i: u4 = @intCast(@ctz(rem));
+                                std.mem.writeInt(u32, bus.ram[paddr..][0..4], self.r[i], .little);
+                                paddr += 4;
+                            }
+                            self.r[13] = start_sp;
+                            return;
                         }
                     }
-                    if (push_lr) {
-                        self.write32(bus, addr, self.r[14]) catch {
+                    var addr = start_sp;
+                    var rem = reg_list;
+                    while (rem != 0) : (rem &= rem - 1) {
+                        const i: u4 = @intCast(@ctz(rem));
+                        self.write32(bus, addr, self.r[i]) catch {
                             self.enterException(.abt, 0x10, inst_pc +% 8, false);
                             return;
                         };
+                        addr +%= 4;
                     }
                     self.r[13] = start_sp;
                 },
@@ -4031,16 +4277,40 @@ pub fn Arm1176(comptime Bus: type) type {
                 0b1100, 0b1101 => { // POP
                     const pop_pc = (sub & 1) != 0;
                     const rlist: u8 = @truncate(inst & 0xff);
-                    var addr = self.r[13];
-                    var loaded: [8]u32 = undefined;
-                    for (0..8) |i| {
-                        if ((rlist & (@as(u8, 1) << @intCast(i))) != 0) {
-                            loaded[i] = self.read32(bus, addr) catch {
-                                self.enterException(.abt, 0x10, inst_pc +% 8, false);
-                                return;
-                            };
-                            addr +%= 4;
+                    const count: u32 = @as(u32, @popCount(rlist)) + @intFromBool(pop_pc);
+                    const start_sp = self.r[13];
+                    if (count > 0) {
+                        const last_addr = start_sp +% (count * 4) -% 4;
+                        const priv: u1 = @intFromBool(self.isPrivileged());
+                        const slot = self.mmu.soft_tlb32[priv][(start_sp >> 12) & Mmu.soft_tlb_mask];
+                        if ((start_sp & ~@as(u32, 0xffc)) == slot.r_vbase and
+                            (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
+                        {
+                            var paddr = slot.pbase | (start_sp & 0xfff);
+                            var rem = rlist;
+                            while (rem != 0) : (rem &= rem - 1) {
+                                const i: u4 = @intCast(@ctz(rem));
+                                self.r[i] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                                paddr += 4;
+                            }
+                            self.r[13] = start_sp +% (count * 4);
+                            if (pop_pc) {
+                                const new_pc = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                                self.setPcWithInterworking(new_pc);
+                            }
+                            return;
                         }
+                    }
+                    var addr = start_sp;
+                    var loaded: [8]u32 = undefined;
+                    var rem = rlist;
+                    while (rem != 0) : (rem &= rem - 1) {
+                        const i: u4 = @intCast(@ctz(rem));
+                        loaded[i] = self.read32(bus, addr) catch {
+                            self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                            return;
+                        };
+                        addr +%= 4;
                     }
                     var new_pc: u32 = 0;
                     if (pop_pc) {
@@ -4051,8 +4321,10 @@ pub fn Arm1176(comptime Bus: type) type {
                         addr +%= 4;
                     }
                     self.r[13] = addr;
-                    for (0..8) |i| {
-                        if ((rlist & (@as(u8, 1) << @intCast(i))) != 0) self.r[i] = loaded[i];
+                    var rem_c = rlist;
+                    while (rem_c != 0) : (rem_c &= rem_c - 1) {
+                        const i: u4 = @intCast(@ctz(rem_c));
+                        self.r[i] = loaded[i];
                     }
                     if (pop_pc) self.setPcWithInterworking(new_pc);
                 },
@@ -4332,6 +4604,58 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     try std.testing.expectEqual(@as(f64, 56.0), @as(f64, @bitCast(std.mem.readInt(u64, ram[0x2010..][0..8], .little))));
     try std.testing.expect((cpu.cpsr & PsrFlags.C) != 0);
     try std.testing.expect((cpu.cpsr & PsrFlags.Z) == 0);
+
+    // Verify contiguous PUSH/POP (STMDB/LDMIA), VPUSH/VPOP (VSTMDB/VLDMIA), and LDRD/STRD fast-paths
+    cpu.r[13] = 0x3000;
+    cpu.r[4] = 0x1111_2222;
+    cpu.r[5] = 0x3333_4444;
+    cpu.r[6] = 0x5555_6666;
+    cpu.r[7] = 0x7777_8888;
+    cpu.r[14] = 0x1040;
+    // 0x101c: push {r4-r7, lr}      (0xe92d40f0) -> contiguous r4..r7 + lr
+    // 0x1020: vpush {d2-d3}         (0xed2d2b04) -> vstm_al
+    // 0x1024: mov r4, #0            (0xe3a04000)
+    // 0x1028: mov r5, #0            (0xe3a05000)
+    // 0x102c: vmov.f64 d2, d0       (0xeeb02b40) -> overwrite d2 with 12.5
+    // 0x1030: vpop {d2-d3}          (0xecbd2b04) -> vldm_al restores d2=16.0, d3=56.0
+    // 0x1034: strd r4, r5, [r0, #24](0xe1c041f8) -> strd_imm_al writes 0, 0
+    // 0x1038: pop {r4-r7, pc}       (0xe8bd80f0) -> contiguous r4..r7 + pc (jumps to 0x1040)
+    // 0x1040: ldrd r8, r9, [r0, #0] (0xe1c080d0) -> ldrd_imm_al reads d0 raw words into r8, r9
+    const block_prog = [_]u32{
+        0xe92d40f0,
+        0xed2d2b04,
+        0xe3a04000,
+        0xe3a05000,
+        0xeeb02b40,
+        0xecbd2b04,
+        0xe1c041f8,
+        0xe8bd80f0,
+        0xe1a00000, // 0x103c: nop (skipped by pop pc)
+        0xe1c080d0, // 0x1040: ldrd r8, r9, [r0, #0]
+    };
+    for (block_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x101c + i * 4 ..][0..4], inst, .little);
+    }
+
+    const push_dec = decodeArm32(block_prog[0]);
+    try std.testing.expectEqual(ArmOp.stm_al, @as(ArmOp, @enumFromInt(push_dec.op)));
+    try std.testing.expect((push_dec.rm & 0x80) != 0); // contiguous fast-path active
+    try std.testing.expectEqual(ArmOp.vstm_al, @as(ArmOp, @enumFromInt(decodeArm32(block_prog[1]).op)));
+    try std.testing.expectEqual(ArmOp.vldm_al, @as(ArmOp, @enumFromInt(decodeArm32(block_prog[5]).op)));
+    try std.testing.expectEqual(ArmOp.strd_imm_al, @as(ArmOp, @enumFromInt(decodeArm32(block_prog[6]).op)));
+    try std.testing.expectEqual(ArmOp.ldm_pc_al, @as(ArmOp, @enumFromInt(decodeArm32(block_prog[7]).op)));
+    try std.testing.expectEqual(ArmOp.ldrd_imm_al, @as(ArmOp, @enumFromInt(decodeArm32(block_prog[9]).op)));
+
+    _ = cpu.runSteps(&bus, 9);
+    try std.testing.expectEqual(@as(u32, 0x3000), cpu.r[13]);
+    try std.testing.expectEqual(@as(u32, 0x1111_2222), cpu.r[4]);
+    try std.testing.expectEqual(@as(u32, 0x3333_4444), cpu.r[5]);
+    try std.testing.expectEqual(@as(u32, 0x5555_6666), cpu.r[6]);
+    try std.testing.expectEqual(@as(u32, 0x7777_8888), cpu.r[7]);
+    try std.testing.expectEqual(@as(f64, 16.0), cpu.vfp.getD(2));
+    try std.testing.expectEqual(@as(f64, 56.0), cpu.vfp.getD(3));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, 12.5))), (@as(u64, cpu.r[9]) << 32) | cpu.r[8]);
 }
+
 
 
