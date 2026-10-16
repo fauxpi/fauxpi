@@ -311,26 +311,145 @@ fn condPasses(cond: qpu.Cond, s: *const State, lane: usize) bool {
     };
 }
 
+pub const File = enum(u1) { a = 0, b = 1 };
+
+pub const DecodedInst = struct {
+    imm_or_small: u32 = 0,
+    sig: qpu.Sig = .none,
+    add_op: qpu.AddOp = .nop,
+    mul_op: qpu.MulOp = .nop,
+    raddr_a: u6 = qpu.R.nop,
+    raddr_b: u6 = qpu.R.nop,
+    waddr_add: u6 = qpu.W.nop,
+    waddr_mul: u6 = qpu.W.nop,
+    cond_add: qpu.Cond = .never,
+    cond_mul: qpu.Cond = .never,
+    add_file: File = .a,
+    mul_file: File = .b,
+    mux0: qpu.Mux = .r0,
+    mux1: qpu.Mux = .r0,
+    mux2: qpu.Mux = .r0,
+    mux3: qpu.Mux = .r0,
+    unpack_r4: u3 = 0,
+    unpack_a: u3 = 0,
+    add_pack_a: u4 = 0,
+    mul_pack_a: u4 = 0,
+    mul_pack_m: u4 = 0,
+    flags: u8 = 0,
+
+    pub const FLAG_SF: u8 = 1 << 0;
+    pub const FLAG_READS_VARY: u8 = 1 << 1;
+    pub const FLAG_FETCH_A: u8 = 1 << 2;
+    pub const FLAG_FETCH_B: u8 = 1 << 3;
+    pub const FLAG_FLT_ADD: u8 = 1 << 4;
+    pub const FLAG_FLT_MUL: u8 = 1 << 5;
+};
+
+pub fn decodeInst(inst: qpu.Inst) DecodedInst {
+    const sig = qpu.getSig(inst);
+    if (sig == .branch) {
+        return .{ .sig = .branch };
+    }
+
+    const ws = qpu.getWs(inst);
+    const cond_add: qpu.Cond = @enumFromInt(@as(u3, @truncate(inst >> 49)));
+    const cond_mul: qpu.Cond = @enumFromInt(@as(u3, @truncate(inst >> 46)));
+    const pm = (inst >> 56) & 1 != 0;
+    const pack: u4 = @truncate(inst >> 52);
+    const unpack_mode: u3 = @truncate(inst >> 57);
+    const add_op: qpu.AddOp = if (sig == .load_imm) .nop else qpu.getAddOp(inst);
+    const mul_op: qpu.MulOp = if (sig == .load_imm) .nop else qpu.getMulOp(inst);
+    const raddr_a = qpu.getRaddrA(inst);
+    const raddr_b = qpu.getRaddrB(inst);
+    const mux0: qpu.Mux = @enumFromInt(@as(u3, @truncate(inst >> 9)));
+    const mux1: qpu.Mux = @enumFromInt(@as(u3, @truncate(inst >> 6)));
+    const mux2: qpu.Mux = @enumFromInt(@as(u3, @truncate(inst >> 3)));
+    const mux3: qpu.Mux = @enumFromInt(@as(u3, @truncate(inst)));
+
+    const uses_a = (add_op != .nop and (mux0 == .a or mux1 == .a)) or
+        (mul_op != .nop and (mux2 == .a or mux3 == .a));
+    const uses_b = (add_op != .nop and (mux0 == .b or mux1 == .b)) or
+        (mul_op != .nop and (mux2 == .b or mux3 == .b));
+
+    const waddr_add_raw = qpu.getWaddrAdd(inst);
+    const waddr_mul_raw = qpu.getWaddrMul(inst);
+    const a_pack: u4 = if (!pm) pack else 0;
+    const mul_pack: u4 = if (pm) pack else 0;
+
+    var flags: u8 = 0;
+    if ((inst & (1 << 45)) != 0) flags |= DecodedInst.FLAG_SF;
+    if ((uses_a and raddr_a == qpu.R.vary) or (sig != .small_imm and uses_b and raddr_b == qpu.R.vary)) {
+        flags |= DecodedInst.FLAG_READS_VARY;
+    }
+    if (uses_a or raddr_a < 32) flags |= DecodedInst.FLAG_FETCH_A;
+    if (sig != .small_imm and (uses_b or raddr_b < 32)) flags |= DecodedInst.FLAG_FETCH_B;
+    if (isFloatInputAdd(add_op)) flags |= DecodedInst.FLAG_FLT_ADD;
+    if (isFloatInputMul(mul_op)) flags |= DecodedInst.FLAG_FLT_MUL;
+
+    return .{
+        .imm_or_small = if (sig == .load_imm)
+            @truncate(inst)
+        else if (sig == .small_imm)
+            smallImm(raddr_b)
+        else
+            0,
+        .sig = sig,
+        .add_op = add_op,
+        .mul_op = mul_op,
+        .raddr_a = raddr_a,
+        .raddr_b = raddr_b,
+        .waddr_add = if (cond_add != .never) waddr_add_raw else qpu.W.nop,
+        .waddr_mul = if (cond_mul != .never) waddr_mul_raw else qpu.W.nop,
+        .cond_add = cond_add,
+        .cond_mul = cond_mul,
+        .add_file = if (ws) .b else .a,
+        .mul_file = if (ws) .a else .b,
+        .mux0 = mux0,
+        .mux1 = mux1,
+        .mux2 = mux2,
+        .mux3 = mux3,
+        .unpack_r4 = if (pm) unpack_mode else 0,
+        .unpack_a = if (!pm and raddr_a < 32) unpack_mode else 0,
+        .add_pack_a = if (!ws) a_pack else 0,
+        .mul_pack_a = if (ws) a_pack else 0,
+        .mul_pack_m = mul_pack,
+        .flags = flags,
+    };
+}
+
+pub fn decodeProgram(code: []const qpu.Inst, out_buf: []DecodedInst) []const DecodedInst {
+    const len = @min(code.len, out_buf.len);
+    for (0..len) |i| {
+        out_buf[i] = decodeInst(code[i]);
+    }
+    return out_buf[0..len];
+}
+
 inline fn resolveMuxVec(
     m: qpu.Mux,
     s: *const State,
     old_r4: Vec,
     va: Vec,
     vb: Vec,
-    pm: bool,
-    raddr_a: u6,
-    unpack_mode: u3,
+    unpack_r4: u3,
+    unpack_a: u3,
     float_input: bool,
 ) Vec {
     return switch (m) {
         .r0, .r1, .r2, .r3, .r5 => s.acc[@intFromEnum(m)],
-        .r4 => if (pm and unpack_mode != 0) unpackVec(old_r4, unpack_mode, float_input) else old_r4,
-        .a => if (!pm and raddr_a < 32 and unpack_mode != 0) unpackVec(va, unpack_mode, float_input) else va,
+        .r4 => if (unpack_r4 != 0) unpackVec(old_r4, unpack_r4, float_input) else old_r4,
+        .a => if (unpack_a != 0) unpackVec(va, unpack_a, float_input) else va,
         .b => vb,
     };
 }
 
 pub fn run(code: []const qpu.Inst, env: Env) Error!Result {
+    var decoded_buf: [512]DecodedInst = undefined;
+    const decoded = decodeProgram(code, &decoded_buf);
+    return runDecoded(decoded, env);
+}
+
+pub fn runDecoded(decoded: []const DecodedInst, env: Env) Error!Result {
     var s: State = .{};
     var r: Result = .{};
     s.ra[qpu.R.frag_payload_zw] = env.frag_w;
@@ -340,96 +459,70 @@ pub fn run(code: []const qpu.Inst, env: Env) Error!Result {
 
     var end_at: ?usize = null;
     var ip: usize = 0;
-    while (ip < code.len) : (ip += 1) {
+    while (ip < decoded.len) : (ip += 1) {
         if (end_at) |e| if (ip > e) break;
-        const inst = code[ip];
+        const d = decoded[ip];
         r.instructions += 1;
-        const sig = qpu.getSig(inst);
-        if (sig == .branch) continue;
-
-        const ws = qpu.getWs(inst);
-        const cond_add: qpu.Cond = @enumFromInt(@as(u3, @truncate(inst >> 49)));
-        const cond_mul: qpu.Cond = @enumFromInt(@as(u3, @truncate(inst >> 46)));
-        const pm = (inst >> 56) & 1 != 0;
-        const pack: u4 = @truncate(inst >> 52);
-        const unpack_mode: u3 = @truncate(inst >> 57);
+        if (d.sig == .branch) continue;
 
         var add_result: Vec = undefined;
         var mul_result: Vec = undefined;
-        const add_op: qpu.AddOp = if (sig == .load_imm) .nop else qpu.getAddOp(inst);
-        const mul_op: qpu.MulOp = if (sig == .load_imm) .nop else qpu.getMulOp(inst);
 
-        if (sig == .load_imm) {
-            add_result = splat(@truncate(inst));
+        if (d.sig == .load_imm) {
+            add_result = splat(d.imm_or_small);
             mul_result = add_result;
         } else {
-            const raddr_a = qpu.getRaddrA(inst);
-            const raddr_b = qpu.getRaddrB(inst);
-            const muxes = [4]qpu.Mux{
-                @enumFromInt(@as(u3, @truncate(inst >> 9))),
-                @enumFromInt(@as(u3, @truncate(inst >> 6))),
-                @enumFromInt(@as(u3, @truncate(inst >> 3))),
-                @enumFromInt(@as(u3, @truncate(inst))),
-            };
-
-            const uses_a = (add_op != .nop and (muxes[0] == .a or muxes[1] == .a)) or
-                (mul_op != .nop and (muxes[2] == .a or muxes[3] == .a));
-            const uses_b = (add_op != .nop and (muxes[0] == .b or muxes[1] == .b)) or
-                (mul_op != .nop and (muxes[2] == .b or muxes[3] == .b));
-
-            const va: Vec = if (uses_a or raddr_a < 32) try readPort(&s, &r, env, raddr_a, .a) else splat(0);
-            const vb: Vec = if (sig == .small_imm)
-                splat(smallImm(raddr_b))
-            else if (uses_b or raddr_b < 32)
-                try readPort(&s, &r, env, raddr_b, .b)
+            const va: Vec = if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0)
+                try readPort(&s, &r, env, d.raddr_a, .a)
+            else
+                splat(0);
+            const vb: Vec = if (d.sig == .small_imm)
+                splat(d.imm_or_small)
+            else if ((d.flags & DecodedInst.FLAG_FETCH_B) != 0)
+                try readPort(&s, &r, env, d.raddr_b, .b)
             else
                 splat(0);
 
             const old_r4 = s.acc[4];
-            const reads_vary = (uses_a and raddr_a == qpu.R.vary) or (sig != .small_imm and uses_b and raddr_b == qpu.R.vary);
 
-            if (add_op != .nop) {
-                const flt_add = isFloatInputAdd(add_op);
-                const in0 = resolveMuxVec(muxes[0], &s, old_r4, va, vb, pm, raddr_a, unpack_mode, flt_add);
-                const in1 = resolveMuxVec(muxes[1], &s, old_r4, va, vb, pm, raddr_a, unpack_mode, flt_add);
-                add_result = addOpVec(add_op, in0, in1);
+            if (d.add_op != .nop) {
+                const flt_add = (d.flags & DecodedInst.FLAG_FLT_ADD) != 0;
+                const in0 = resolveMuxVec(d.mux0, &s, old_r4, va, vb, d.unpack_r4, d.unpack_a, flt_add);
+                const in1 = resolveMuxVec(d.mux1, &s, old_r4, va, vb, d.unpack_r4, d.unpack_a, flt_add);
+                add_result = addOpVec(d.add_op, in0, in1);
             } else {
                 add_result = splat(0);
             }
 
-            if (mul_op != .nop) {
-                const flt_mul = isFloatInputMul(mul_op);
-                const in2 = resolveMuxVec(muxes[2], &s, old_r4, va, vb, pm, raddr_a, unpack_mode, flt_mul);
-                const in3 = resolveMuxVec(muxes[3], &s, old_r4, va, vb, pm, raddr_a, unpack_mode, flt_mul);
-                mul_result = mulOpVec(mul_op, in2, in3);
+            if (d.mul_op != .nop) {
+                const flt_mul = (d.flags & DecodedInst.FLAG_FLT_MUL) != 0;
+                const in2 = resolveMuxVec(d.mux2, &s, old_r4, va, vb, d.unpack_r4, d.unpack_a, flt_mul);
+                const in3 = resolveMuxVec(d.mux3, &s, old_r4, va, vb, d.unpack_r4, d.unpack_a, flt_mul);
+                mul_result = mulOpVec(d.mul_op, in2, in3);
             } else {
                 mul_result = splat(0);
             }
 
-            if (inst & (1 << 45) != 0) {
-                const flags_from = if (add_op != .nop) add_result else mul_result;
+            if ((d.flags & DecodedInst.FLAG_SF) != 0) {
+                const flags_from = if (d.add_op != .nop) add_result else mul_result;
                 for (0..lanes) |lane| {
                     s.zero[lane] = flags_from[lane] == 0;
                     s.neg[lane] = @as(i32, @bitCast(flags_from[lane])) < 0;
                 }
             }
-            if (reads_vary) s.acc[5] = splatF(varying_c);
+            if ((d.flags & DecodedInst.FLAG_READS_VARY) != 0) s.acc[5] = splatF(varying_c);
         }
 
-        const waddr_add = qpu.getWaddrAdd(inst);
-        const waddr_mul = qpu.getWaddrMul(inst);
-        const a_pack: u4 = if (!pm) pack else 0;
-        const mul_pack: u4 = if (pm) pack else 0;
-        if (waddr_add != qpu.W.nop and cond_add != .never) {
-            try write(&s, &r, env, waddr_add, if (ws) .b else .a, add_result, cond_add, if (!ws) a_pack else 0, 0);
+        if (d.waddr_add != qpu.W.nop) {
+            try write(&s, &r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0);
         }
-        if (waddr_mul != qpu.W.nop and cond_mul != .never) {
-            try write(&s, &r, env, waddr_mul, if (ws) .a else .b, mul_result, cond_mul, if (ws) a_pack else 0, mul_pack);
+        if (d.waddr_mul != qpu.W.nop) {
+            try write(&s, &r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m);
         }
 
-        switch (sig) {
+        switch (d.sig) {
             .load_tmu0, .load_tmu1 => {
-                const t = &s.tmu[if (sig == .load_tmu0) 0 else 1];
+                const t = &s.tmu[if (d.sig == .load_tmu0) 0 else 1];
                 if (t.fifo_len > 0) {
                     s.acc[4] = t.fifo[0];
                     std.mem.copyForwards(Vec, t.fifo[0 .. t.fifo_len - 1], t.fifo[1..t.fifo_len]);
@@ -441,7 +534,7 @@ pub fn run(code: []const qpu.Inst, env: Env) Error!Result {
             .color_load, .color_load_end => {
                 s.acc[4] = env.tlb_color_in;
                 r.color_loads += 1;
-                if (sig == .color_load_end) end_at = ip + 2;
+                if (d.sig == .color_load_end) end_at = ip + 2;
             },
             .prog_end => end_at = ip + 2,
             else => {},
@@ -450,8 +543,6 @@ pub fn run(code: []const qpu.Inst, env: Env) Error!Result {
     if (end_at == null) return error.MissingProgramEnd;
     return r;
 }
-
-const File = enum { a, b };
 
 fn readPort(s: *State, r: *Result, env: Env, raddr: u6, file: File) Error!Vec {
     if (raddr < 32) {

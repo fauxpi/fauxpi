@@ -37,12 +37,17 @@ pub const V3d = struct {
     };
 
     pub const MAX_PREBINNED_TRIS = 2048;
+    pub const MAX_PREP_FS_INSTS = 8192;
+    pub const MAX_PREP_FS_UNIFS = 8192;
 
     pub const PreparedDraw = struct {
         fs_code_phys: u32 = 0,
         fs_code_len: u16 = 0,
         fs_unif_phys: u32 = 0,
         fs_unif_len: u16 = 0,
+        fs_inst_start: u16 = 0,
+        fs_unif_start: u16 = 0,
+        fs_cached: bool = false,
         fs_num_varyings: u8 = 0,
         valid: bool = false,
     };
@@ -119,6 +124,10 @@ pub const V3d = struct {
 
     // Pre-shaded & pre-binned state for the current RCL frame
     prep_draws: [256]PreparedDraw = undefined,
+    prep_fs_insts: [MAX_PREP_FS_INSTS]qpu_sim.DecodedInst = undefined,
+    prep_fs_insts_len: usize = 0,
+    prep_fs_unifs: [MAX_PREP_FS_UNIFS]u32 = undefined,
+    prep_fs_unifs_len: usize = 0,
     shaded_tris: [MAX_PREBINNED_TRIS]ShadedTriangle = undefined,
     shaded_tris_len: usize = 0,
     overflow_draw_start: usize = 0,
@@ -404,10 +413,13 @@ pub const V3d = struct {
     /// Pre-shades and bins triangles across all draw calls once per frame before tile loop.
     fn prepareDrawsForFrame(self: *V3d, ram: []const u8) void {
         self.shaded_tris_len = 0;
+        self.prep_fs_insts_len = 0;
+        self.prep_fs_unifs_len = 0;
         self.overflow_draw_start = self.draws_len;
 
         var vs_buf: [512]qpu.Inst = undefined;
         var fs_buf: [512]qpu.Inst = undefined;
+        var vs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
         var vs_unif_buf: [128]u32 = undefined;
 
         for (self.draws[0..self.draws_len], 0..) |draw, draw_idx| {
@@ -427,14 +439,36 @@ pub const V3d = struct {
             const fs_code = extractQpuProgram(ram, fs_code_phys, &fs_buf);
             if (vs_code.len == 0 or fs_code.len == 0) continue;
 
+            const vs_decoded = qpu_sim.decodeProgram(vs_code, &vs_decoded_buf);
             const vs_unifs = extractUniforms(ram, vs_unif_phys, &vs_unif_buf);
             const max_unif_words: u16 = if (fs_unif_phys < ram.len) @intCast(@min((ram.len - fs_unif_phys) / 4, 128)) else 0;
+
+            var fs_inst_start: u16 = 0;
+            var fs_unif_start: u16 = 0;
+            var fs_cached = false;
+            if (self.prep_fs_insts_len + fs_code.len <= MAX_PREP_FS_INSTS and
+                self.prep_fs_unifs_len + max_unif_words <= MAX_PREP_FS_UNIFS)
+            {
+                fs_inst_start = @intCast(self.prep_fs_insts_len);
+                _ = qpu_sim.decodeProgram(fs_code, self.prep_fs_insts[self.prep_fs_insts_len..][0..fs_code.len]);
+                self.prep_fs_insts_len += fs_code.len;
+
+                fs_unif_start = @intCast(self.prep_fs_unifs_len);
+                for (0..max_unif_words) |i| {
+                    self.prep_fs_unifs[self.prep_fs_unifs_len + i] = std.mem.readInt(u32, ram[fs_unif_phys + i * 4 ..][0..4], .little);
+                }
+                self.prep_fs_unifs_len += max_unif_words;
+                fs_cached = true;
+            }
 
             self.prep_draws[draw_idx] = .{
                 .fs_code_phys = fs_code_phys,
                 .fs_code_len = @intCast(fs_code.len),
                 .fs_unif_phys = fs_unif_phys,
                 .fs_unif_len = max_unif_words,
+                .fs_inst_start = fs_inst_start,
+                .fs_unif_start = fs_unif_start,
+                .fs_cached = fs_cached,
                 .fs_num_varyings = fs_num_varyings,
                 .valid = true,
             };
@@ -514,7 +548,7 @@ pub const V3d = struct {
                     }
                 }
 
-                const vs_res = qpu_sim.run(vs_code, .{
+                const vs_res = qpu_sim.runDecoded(vs_decoded, .{
                     .uniforms = vs_unifs,
                     .vpm_in = vpm_in[0..vpm_words],
                 }) catch continue;
@@ -992,10 +1026,10 @@ pub const V3d = struct {
         const tile_end_x = tile_px_x + tile_size;
         const tile_end_y = tile_px_y + tile_size;
 
-        var fs_buf: [512]qpu.Inst = undefined;
+        var fs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
         var fs_unif_buf: [128]u32 = undefined;
         var cur_draw_idx: ?u16 = null;
-        var cur_fs_code: []const qpu.Inst = &.{};
+        var cur_fs_decoded: []const qpu_sim.DecodedInst = &.{};
         var cur_fs_unifs: []const u32 = &.{};
 
         for (self.shaded_tris[0..self.shaded_tris_len]) |*tri| {
@@ -1010,22 +1044,28 @@ pub const V3d = struct {
 
             if (cur_draw_idx == null or cur_draw_idx.? != tri.draw_idx) {
                 cur_draw_idx = tri.draw_idx;
-                for (0..prep.fs_code_len) |i| {
-                    fs_buf[i] = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
+                if (prep.fs_cached) {
+                    cur_fs_decoded = self.prep_fs_insts[prep.fs_inst_start..][0..prep.fs_code_len];
+                    cur_fs_unifs = self.prep_fs_unifs[prep.fs_unif_start..][0..prep.fs_unif_len];
+                } else {
+                    for (0..prep.fs_code_len) |i| {
+                        const raw_inst = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
+                        fs_decoded_buf[i] = qpu_sim.decodeInst(raw_inst);
+                    }
+                    cur_fs_decoded = fs_decoded_buf[0..prep.fs_code_len];
+                    for (0..prep.fs_unif_len) |i| {
+                        fs_unif_buf[i] = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
+                    }
+                    cur_fs_unifs = fs_unif_buf[0..prep.fs_unif_len];
                 }
-                cur_fs_code = fs_buf[0..prep.fs_code_len];
-                for (0..prep.fs_unif_len) |i| {
-                    fs_unif_buf[i] = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
-                }
-                cur_fs_unifs = fs_unif_buf[0..prep.fs_unif_len];
             }
 
             const draw = self.draws[tri.draw_idx];
-            self.rasterizeShadedTriangleInTile(
+            self.rasterizeShadedTriangleDecodedInTile(
                 ram,
                 draw,
                 tri,
-                cur_fs_code,
+                cur_fs_decoded,
                 cur_fs_unifs,
                 prep.fs_num_varyings,
                 tile_px_x,
@@ -1058,6 +1098,11 @@ pub const V3d = struct {
         const vs_code = extractQpuProgram(ram, vs_code_phys, &vs_buf);
         const fs_code = extractQpuProgram(ram, fs_code_phys, &fs_buf);
         if (vs_code.len == 0 or fs_code.len == 0) return;
+
+        var vs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
+        var fs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
+        const vs_decoded = qpu_sim.decodeProgram(vs_code, &vs_decoded_buf);
+        const fs_decoded = qpu_sim.decodeProgram(fs_code, &fs_decoded_buf);
 
         var vs_unif_buf: [128]u32 = undefined;
         var fs_unif_buf: [128]u32 = undefined;
@@ -1134,7 +1179,7 @@ pub const V3d = struct {
                 }
             }
 
-            const vs_res = qpu_sim.run(vs_code, .{
+            const vs_res = qpu_sim.runDecoded(vs_decoded, .{
                 .uniforms = vs_unifs,
                 .vpm_in = vpm_in[0..vpm_words],
             }) catch continue;
@@ -1179,7 +1224,7 @@ pub const V3d = struct {
                 .area = area,
                 .v = verts,
             };
-            self.rasterizeShadedTriangleInTile(ram, draw, &tri, fs_code, fs_unifs, fs_num_varyings, tile_px_x, tile_px_y, tile_size);
+            self.rasterizeShadedTriangleDecodedInTile(ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, tile_px_x, tile_px_y, tile_size);
         }
     }
 
@@ -1206,6 +1251,23 @@ pub const V3d = struct {
         draw: DrawCall,
         tri: *const ShadedTriangle,
         fs_code: []const qpu.Inst,
+        fs_unifs: []const u32,
+        num_varyings: u8,
+        tile_px_x: u32,
+        tile_px_y: u32,
+        tile_size: u32,
+    ) void {
+        var fs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
+        const fs_decoded = qpu_sim.decodeProgram(fs_code, &fs_decoded_buf);
+        self.rasterizeShadedTriangleDecodedInTile(ram, draw, tri, fs_decoded, fs_unifs, num_varyings, tile_px_x, tile_px_y, tile_size);
+    }
+
+    fn rasterizeShadedTriangleDecodedInTile(
+        self: *V3d,
+        ram: []const u8,
+        draw: DrawCall,
+        tri: *const ShadedTriangle,
+        fs_decoded: []const qpu_sim.DecodedInst,
         fs_unifs: []const u32,
         num_varyings: u8,
         tile_px_x: u32,
@@ -1250,7 +1312,7 @@ pub const V3d = struct {
                 fy: *qpu_sim.Vec,
                 tin: *qpu_sim.Vec,
                 vvecs: []qpu_sim.Vec,
-                fcode: []const qpu.Inst,
+                fcode: []const qpu_sim.DecodedInst,
                 funifs: []const u32,
                 mem: []const u8,
                 z_upd: bool,
@@ -1268,7 +1330,7 @@ pub const V3d = struct {
                         }
                     }
                 }
-                const res = qpu_sim.run(fcode, .{
+                const res = qpu_sim.runDecoded(fcode, .{
                     .uniforms = funifs,
                     .varyings = vvecs,
                     .frag_w = fw.*,
@@ -1363,7 +1425,7 @@ pub const V3d = struct {
                         &frag_y_vec,
                         &tlb_in,
                         vary_vecs[0..n_var],
-                        fs_code,
+                        fs_decoded,
                         fs_unifs,
                         ram,
                         z_updates,
@@ -1385,7 +1447,7 @@ pub const V3d = struct {
                 &frag_y_vec,
                 &tlb_in,
                 vary_vecs[0..n_var],
-                fs_code,
+                fs_decoded,
                 fs_unifs,
                 ram,
                 z_updates,
