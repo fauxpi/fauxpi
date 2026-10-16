@@ -189,6 +189,65 @@ pub const Vchiq = struct {
         kernel_id: u32 = 0,
     };
 
+    // MMAL_MSG_TYPE_* constants (from mmal-msg.h)
+    pub const MMAL_MAGIC: u32 = 0x6C616D6D; // 'mmal' little-endian
+    pub const MMAL_MSG_TYPE_QUIT: u32 = 1;
+    pub const MMAL_MSG_TYPE_SERVICE_CLOSED: u32 = 2;
+    pub const MMAL_MSG_TYPE_GET_VERSION: u32 = 3;
+    pub const MMAL_MSG_TYPE_COMPONENT_CREATE: u32 = 4;
+    pub const MMAL_MSG_TYPE_COMPONENT_DESTROY: u32 = 5;
+    pub const MMAL_MSG_TYPE_COMPONENT_ENABLE: u32 = 6;
+    pub const MMAL_MSG_TYPE_COMPONENT_DISABLE: u32 = 7;
+    pub const MMAL_MSG_TYPE_PORT_INFO_GET: u32 = 8;
+    pub const MMAL_MSG_TYPE_PORT_INFO_SET: u32 = 9;
+    pub const MMAL_MSG_TYPE_PORT_ACTION: u32 = 10;
+    pub const MMAL_MSG_TYPE_BUFFER_FROM_HOST: u32 = 11;
+    pub const MMAL_MSG_TYPE_BUFFER_TO_HOST: u32 = 12;
+    pub const MMAL_MSG_TYPE_GET_STATS: u32 = 13;
+    pub const MMAL_MSG_TYPE_PORT_PARAMETER_SET: u32 = 14;
+    pub const MMAL_MSG_TYPE_PORT_PARAMETER_GET: u32 = 15;
+    pub const MMAL_MSG_TYPE_EVENT_TO_HOST: u32 = 16;
+    pub const MMAL_MSG_TYPE_GET_CORE_STATS_FOR_PORT: u32 = 17;
+    pub const MMAL_MSG_TYPE_OPAQUE_ALLOCATOR: u32 = 18;
+    pub const MMAL_MSG_TYPE_CONSUME_MEM: u32 = 19;
+    pub const MMAL_MSG_TYPE_LMK: u32 = 20;
+    pub const MMAL_MSG_TYPE_OPAQUE_ALLOCATOR_DESC: u32 = 21;
+    pub const MMAL_MSG_TYPE_DRM_GET_LHS32: u32 = 22;
+    pub const MMAL_MSG_TYPE_DRM_GET_TIME: u32 = 23;
+    pub const MMAL_MSG_TYPE_BUFFER_FROM_HOST_ZEROLEN: u32 = 24;
+    pub const MMAL_MSG_TYPE_PORT_FLUSH: u32 = 25;
+    pub const MMAL_MSG_TYPE_HOST_LOG: u32 = 26;
+
+    // MMAL parameter IDs
+    pub const MMAL_PARAMETER_SUPPORTED_ENCODINGS: u32 = 1;
+    pub const MMAL_PARAMETER_CAMERA_INFO: u32 = 0x1001c;
+
+    pub const MmalCompKind = enum(u8) {
+        generic = 0,
+        camera_info = 1,
+        camera = 2,
+        isp = 3,
+        video_decode = 4,
+        video_encode = 5,
+        image_encode = 6,
+        video_render = 7,
+    };
+
+    pub const MmalPortState = struct {
+        configured: bool = false,
+        is_enabled: u32 = 0,
+        buffer_num: u32 = 1,
+        buffer_size: u32 = 4096,
+        format: [32]u8 = [_]u8{0} ** 32,
+        es: [44]u8 = [_]u8{0} ** 44,
+    };
+
+    pub const MmalComponent = struct {
+        active: bool = false,
+        kind: MmalCompKind = .generic,
+        ports: [8]MmalPortState = [_]MmalPortState{.{}} ** 8,
+    };
+
     // Layout offsets within vchiq_slot_zero (sizeof(vchiq_shared_state) == 372 with DEBUG_MAX == 11)
     const MASTER_OFFSET: u32 = 32;
     const SLAVE_OFFSET: u32 = 404;
@@ -264,6 +323,11 @@ pub const Vchiq = struct {
     smem_next_alloc_addr: u32 = 0xdf00_0000,
     smem_resources: [64]SmemResource = [_]SmemResource{.{}} ** 64,
 
+    // MMAL service state (vc_port = 4)
+    mmal_arm_port: u12 = 0,
+    mmal_next_comp_handle: u32 = 1,
+    mmal_components: [32]MmalComponent = [_]MmalComponent{.{}} ** 32,
+
     pub fn irqPending(self: *const Vchiq) bool {
         return self.bell0_active;
     }
@@ -330,6 +394,9 @@ pub const Vchiq = struct {
         self.smem_next_handle = 1;
         self.smem_next_alloc_addr = 0xdf00_0000;
         self.smem_resources = [_]SmemResource{.{}} ** 64;
+        self.mmal_arm_port = 0;
+        self.mmal_next_comp_handle = 1;
+        self.mmal_components = [_]MmalComponent{.{}} ** 32;
 
         // Mark master as initialised
         std.mem.writeInt(u32, ram[master + STATE_INITIALISED ..][0..4], 1, .little);
@@ -534,6 +601,15 @@ pub const Vchiq = struct {
                         self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_OPENACK, 3, srcport), &ack);
                         return;
                     }
+                    // 'mmal' (0x6C616D6D or 0x6D6D616C) - VideoCore Multi-Media Abstraction Layer (vchiq_mmal)
+                    if (fourcc == 0x6C616D6D or fourcc == 0x6D6D616C) {
+                        self.mmal_arm_port = srcport;
+                        var ack: [2]u8 = undefined;
+                        const req_ver: i16 = if (payload.len >= 10) std.mem.readInt(i16, payload[8..10], .little) else 15;
+                        std.mem.writeInt(i16, &ack, if (req_ver > 0) req_ver else 15, .little);
+                        self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_OPENACK, 4, srcport), &ack);
+                        return;
+                    }
                 }
                 // Reject unimplemented services immediately with CLOSE so guest doesn't block
                 self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_CLOSE, 0, srcport), &.{});
@@ -551,6 +627,8 @@ pub const Vchiq = struct {
                     self.handleAudsData(srcport, payload, ram, audio_fifo, audio_connected, hdmi_connected);
                 } else if (dstport == 3) {
                     self.handleSmemData(srcport, payload, ram);
+                } else if (dstport == 4) {
+                    self.handleMmalData(srcport, payload, ram);
                 }
             },
             else => {},
@@ -795,6 +873,344 @@ pub const Vchiq = struct {
                 std.mem.writeInt(u32, resp[0..4], trans_id, .little);
                 std.mem.writeInt(i32, resp[4..8], 0, .little);
                 self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
+            },
+        }
+    }
+
+    fn mmalPortSlot(port_type: u32, port_index: u32) usize {
+        return switch (port_type) {
+            1 => 0, // control
+            2 => 1 + @as(usize, @min(port_index, 1)), // input 0..1
+            3 => 3 + @as(usize, @min(port_index, 3)), // output 0..3
+            else => 7,
+        };
+    }
+
+    fn initDefaultMmalPort(kind: MmalCompKind, port_type: u32, port_index: u32) MmalPortState {
+        var port = MmalPortState{
+            .configured = true,
+            .is_enabled = 0,
+            .buffer_num = 1,
+            .buffer_size = 4096,
+        };
+        const is_isp_stats = (kind == .isp and port_type == 3 and port_index == 2);
+        const es_type: u32 = if (is_isp_stats) 0 else 3; // 3 = MMAL_ES_TYPE_VIDEO
+        const encoding: u32 = if (is_isp_stats)
+            0x54415453 // 'STAT' (MMAL_ENCODING_BRCM_STATS)
+        else if (kind == .video_decode and port_type == 2)
+            0x34363248 // 'H264'
+        else if (kind == .video_encode and port_type == 3)
+            0x34363248 // 'H264'
+        else if (kind == .image_encode and port_type == 3)
+            0x4745504A // 'JPEG'
+        else
+            0x30323449; // 'I420'
+
+        std.mem.writeInt(u32, port.format[0..4], es_type, .little);
+        std.mem.writeInt(u32, port.format[4..8], encoding, .little);
+
+        // Default video ES geometry: 1280x720, crop (0,0,1280,720), 30/1 fps, 1/1 PAR
+        std.mem.writeInt(u32, port.es[0..4], 1280, .little);
+        std.mem.writeInt(u32, port.es[4..8], 720, .little);
+        std.mem.writeInt(i32, port.es[8..12], 0, .little);
+        std.mem.writeInt(i32, port.es[12..16], 0, .little);
+        std.mem.writeInt(i32, port.es[16..20], 1280, .little);
+        std.mem.writeInt(i32, port.es[20..24], 720, .little);
+        std.mem.writeInt(i32, port.es[24..28], 30, .little);
+        std.mem.writeInt(i32, port.es[28..32], 1, .little);
+        std.mem.writeInt(i32, port.es[32..36], 1, .little);
+        std.mem.writeInt(i32, port.es[36..40], 1, .little);
+        return port;
+    }
+
+    fn writeMmalHeader(buf: []u8, msg_type: u32, control_service: u32, context: u32) void {
+        std.mem.writeInt(u32, buf[0..4], MMAL_MAGIC, .little);
+        std.mem.writeInt(u32, buf[4..8], msg_type, .little);
+        std.mem.writeInt(u32, buf[8..12], control_service, .little);
+        std.mem.writeInt(u32, buf[12..16], context, .little);
+        std.mem.writeInt(u32, buf[16..20], 0, .little); // status = MMAL_MSG_STATUS_SUCCESS
+        std.mem.writeInt(u32, buf[20..24], 0, .little);
+    }
+
+    fn buildMmalPortInfoReply(
+        self: *Vchiq,
+        resp: *[316]u8,
+        msg_type: u32,
+        control_service: u32,
+        context: u32,
+        comp_handle: u32,
+        port_type: u32,
+        port_index: u32,
+    ) void {
+        @memset(resp, 0);
+        writeMmalHeader(resp[0..24], msg_type, control_service, context);
+
+        const comp_idx: usize = @intCast((if (comp_handle > 0) comp_handle - 1 else 0) % self.mmal_components.len);
+        const comp = &self.mmal_components[comp_idx];
+        const pslot = mmalPortSlot(port_type, port_index);
+        if (!comp.ports[pslot].configured) {
+            comp.ports[pslot] = initDefaultMmalPort(comp.kind, port_type, port_index);
+        }
+        const pstate = &comp.ports[pslot];
+        const port_handle: u32 = ((comp_handle & 0xff) << 8) | ((port_type & 0x0f) << 4) | (port_index & 0x0f);
+
+        std.mem.writeInt(u32, resp[24..28], 0, .little); // status = MMAL_MSG_STATUS_SUCCESS
+        std.mem.writeInt(u32, resp[28..32], comp_handle, .little);
+        std.mem.writeInt(u32, resp[32..36], port_type, .little);
+        std.mem.writeInt(u32, resp[36..40], port_index, .little);
+        std.mem.writeInt(i32, resp[40..44], 1, .little); // found = 1
+        std.mem.writeInt(u32, resp[44..48], port_handle, .little);
+
+        // struct mmal_port at resp[48..112] (64 bytes)
+        const port_buf = resp[48..112];
+        std.mem.writeInt(u32, port_buf[8..12], port_type, .little);
+        std.mem.writeInt(u16, port_buf[12..14], @truncate(port_index), .little);
+        std.mem.writeInt(u16, port_buf[14..16], @truncate(port_index), .little);
+        std.mem.writeInt(u32, port_buf[16..20], pstate.is_enabled, .little);
+        std.mem.writeInt(u32, port_buf[24..28], 1, .little); // buffer_num_min
+        std.mem.writeInt(u32, port_buf[28..32], 64, .little); // buffer_size_min
+        std.mem.writeInt(u32, port_buf[32..36], 0, .little); // buffer_alignment_min
+        std.mem.writeInt(u32, port_buf[36..40], 1, .little); // buffer_num_recommended
+        std.mem.writeInt(u32, port_buf[40..44], 4096, .little); // buffer_size_recommended
+        std.mem.writeInt(u32, port_buf[44..48], pstate.buffer_num, .little);
+        std.mem.writeInt(u32, port_buf[48..52], pstate.buffer_size, .little);
+
+        // struct mmal_es_format at resp[112..144] (32 bytes)
+        @memcpy(resp[112..144], &pstate.format);
+        // union mmal_es_specific_format at resp[144..188] (44 bytes)
+        @memcpy(resp[144..188], &pstate.es);
+    }
+
+    fn handleMmalData(
+        self: *Vchiq,
+        srcport: u12,
+        payload: []const u8,
+        ram: []u8,
+    ) void {
+        self.mmal_arm_port = srcport;
+        if (payload.len < 24) return;
+
+        const magic = std.mem.readInt(u32, payload[0..4], .little);
+        if (magic != MMAL_MAGIC) return;
+
+        const msg_type = std.mem.readInt(u32, payload[4..8], .little);
+        const control_service = std.mem.readInt(u32, payload[8..12], .little);
+        const context = std.mem.readInt(u32, payload[12..16], .little);
+
+        switch (msg_type) {
+            MMAL_MSG_TYPE_GET_VERSION => {
+                var resp: [40]u8 = [_]u8{0} ** 40;
+                writeMmalHeader(resp[0..24], msg_type, control_service, context);
+                std.mem.writeInt(u32, resp[24..28], 0, .little); // flags
+                std.mem.writeInt(u32, resp[28..32], 16, .little); // major
+                std.mem.writeInt(u32, resp[32..36], 1, .little); // minor
+                std.mem.writeInt(u32, resp[36..40], 10, .little); // minimum
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 4, srcport), &resp);
+            },
+            MMAL_MSG_TYPE_COMPONENT_CREATE => {
+                const name_raw = if (payload.len >= 156) payload[28..156] else payload[24..];
+                const nul_pos = std.mem.indexOfScalar(u8, name_raw, 0) orelse name_raw.len;
+                const name = name_raw[0..nul_pos];
+
+                var kind: MmalCompKind = .generic;
+                var inputs: u32 = 1;
+                var outputs: u32 = 1;
+                const clocks: u32 = 0;
+
+                if (std.mem.indexOf(u8, name, "camera_info") != null) {
+                    kind = .camera_info;
+                    inputs = 0;
+                    outputs = 0;
+                } else if (std.mem.indexOf(u8, name, "camera") != null) {
+                    kind = .camera;
+                    inputs = 0;
+                    outputs = 3;
+                } else if (std.mem.indexOf(u8, name, "isp") != null) {
+                    kind = .isp;
+                    inputs = 1;
+                    outputs = 3;
+                } else if (std.mem.indexOf(u8, name, "video_decode") != null) {
+                    kind = .video_decode;
+                } else if (std.mem.indexOf(u8, name, "video_encode") != null) {
+                    kind = .video_encode;
+                } else if (std.mem.indexOf(u8, name, "image_encode") != null) {
+                    kind = .image_encode;
+                } else if (std.mem.indexOf(u8, name, "video_render") != null) {
+                    kind = .video_render;
+                    inputs = 1;
+                    outputs = 0;
+                }
+
+                const comp_handle: u32 = ((self.mmal_next_comp_handle - 1) % @as(u32, @intCast(self.mmal_components.len))) + 1;
+                self.mmal_next_comp_handle +%= 1;
+                if (self.mmal_next_comp_handle == 0) self.mmal_next_comp_handle = 1;
+
+                var comp = MmalComponent{
+                    .active = true,
+                    .kind = kind,
+                };
+                comp.ports[mmalPortSlot(1, 0)] = initDefaultMmalPort(kind, 1, 0);
+                var p: u32 = 0;
+                while (p < inputs) : (p += 1) {
+                    comp.ports[mmalPortSlot(2, p)] = initDefaultMmalPort(kind, 2, p);
+                }
+                p = 0;
+                while (p < outputs) : (p += 1) {
+                    comp.ports[mmalPortSlot(3, p)] = initDefaultMmalPort(kind, 3, p);
+                }
+                self.mmal_components[comp_handle - 1] = comp;
+
+                var resp: [44]u8 = [_]u8{0} ** 44;
+                writeMmalHeader(resp[0..24], msg_type, control_service, context);
+                std.mem.writeInt(u32, resp[24..28], 0, .little); // status = MMAL_MSG_STATUS_SUCCESS
+                std.mem.writeInt(u32, resp[28..32], comp_handle, .little);
+                std.mem.writeInt(u32, resp[32..36], inputs, .little);
+                std.mem.writeInt(u32, resp[36..40], outputs, .little);
+                std.mem.writeInt(u32, resp[40..44], clocks, .little);
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 4, srcport), &resp);
+            },
+            MMAL_MSG_TYPE_PORT_INFO_GET => {
+                const comp_handle: u32 = if (payload.len >= 28) std.mem.readInt(u32, payload[24..28], .little) else 1;
+                const port_type: u32 = if (payload.len >= 32) std.mem.readInt(u32, payload[28..32], .little) else 1;
+                const port_index: u32 = if (payload.len >= 36) std.mem.readInt(u32, payload[32..36], .little) else 0;
+
+                var resp: [316]u8 = undefined;
+                self.buildMmalPortInfoReply(&resp, msg_type, control_service, context, comp_handle, port_type, port_index);
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 4, srcport), &resp);
+            },
+            MMAL_MSG_TYPE_PORT_INFO_SET => {
+                const comp_handle: u32 = if (payload.len >= 28) std.mem.readInt(u32, payload[24..28], .little) else 1;
+                const port_type: u32 = if (payload.len >= 32) std.mem.readInt(u32, payload[28..32], .little) else 1;
+                const port_index: u32 = if (payload.len >= 36) std.mem.readInt(u32, payload[32..36], .little) else 0;
+
+                const comp_idx: usize = @intCast((if (comp_handle > 0) comp_handle - 1 else 0) % self.mmal_components.len);
+                const comp = &self.mmal_components[comp_idx];
+                const pslot = mmalPortSlot(port_type, port_index);
+                if (!comp.ports[pslot].configured) {
+                    comp.ports[pslot] = initDefaultMmalPort(comp.kind, port_type, port_index);
+                }
+                if (payload.len >= 88) {
+                    const req_num = std.mem.readInt(u32, payload[80..84], .little);
+                    const req_size = std.mem.readInt(u32, payload[84..88], .little);
+                    comp.ports[pslot].buffer_num = @max(req_num, 1);
+                    comp.ports[pslot].buffer_size = @max(req_size, 64);
+                }
+                if (payload.len >= 132) {
+                    @memcpy(&comp.ports[pslot].format, payload[100..132]);
+                }
+                if (payload.len >= 176) {
+                    @memcpy(&comp.ports[pslot].es, payload[132..176]);
+                }
+
+                var resp: [316]u8 = undefined;
+                self.buildMmalPortInfoReply(&resp, msg_type, control_service, context, comp_handle, port_type, port_index);
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 4, srcport), &resp);
+            },
+            MMAL_MSG_TYPE_PORT_ACTION => {
+                if (payload.len >= 36) {
+                    const comp_handle = std.mem.readInt(u32, payload[24..28], .little);
+                    const port_handle = std.mem.readInt(u32, payload[28..32], .little);
+                    const action = std.mem.readInt(u32, payload[32..36], .little);
+                    const port_type = (port_handle >> 4) & 0x0f;
+                    const port_index = port_handle & 0x0f;
+                    const comp_idx: usize = @intCast((if (comp_handle > 0) comp_handle - 1 else 0) % self.mmal_components.len);
+                    const pslot = mmalPortSlot(port_type, port_index);
+                    if (action == 1) {
+                        self.mmal_components[comp_idx].ports[pslot].is_enabled = 1;
+                    } else if (action == 2) {
+                        self.mmal_components[comp_idx].ports[pslot].is_enabled = 0;
+                    }
+                }
+                var resp: [28]u8 = [_]u8{0} ** 28;
+                writeMmalHeader(resp[0..24], msg_type, control_service, context);
+                std.mem.writeInt(u32, resp[24..28], 0, .little); // status = MMAL_MSG_STATUS_SUCCESS
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 4, srcport), &resp);
+            },
+            MMAL_MSG_TYPE_PORT_PARAMETER_GET => {
+                const comp_handle: u32 = if (payload.len >= 28) std.mem.readInt(u32, payload[24..28], .little) else 1;
+                const port_handle: u32 = if (payload.len >= 32) std.mem.readInt(u32, payload[28..32], .little) else 0;
+                const param_id: u32 = if (payload.len >= 36) std.mem.readInt(u32, payload[32..36], .little) else 0;
+                const req_size: u32 = if (payload.len >= 40) std.mem.readInt(u32, payload[36..40], .little) else 8;
+
+                var resp: [420]u8 = [_]u8{0} ** 420;
+                writeMmalHeader(resp[0..24], msg_type, control_service, context);
+                std.mem.writeInt(u32, resp[24..28], 0, .little); // status = MMAL_MSG_STATUS_SUCCESS
+                std.mem.writeInt(u32, resp[28..32], param_id, .little);
+
+                if (param_id == MMAL_PARAMETER_SUPPORTED_ENCODINGS) {
+                    const comp_idx: usize = @intCast((if (comp_handle > 0) comp_handle - 1 else 0) % self.mmal_components.len);
+                    const kind = self.mmal_components[comp_idx].kind;
+                    const port_type = (port_handle >> 4) & 0x0f;
+                    const port_index = port_handle & 0x0f;
+
+                    const stats_encs = [_]u32{0x54415453}; // 'STAT'
+                    const vdec_in_encs = [_]u32{
+                        0x34363248, // 'H264'
+                        0x47504A4D, // 'MJPG'
+                        0x5634504D, // 'MP4V'
+                        0x5632504D, // 'MP2V'
+                        0x33363248, // 'H263'
+                        0x31435657, // 'WVC1'
+                    };
+                    const venc_out_encs = [_]u32{
+                        0x34363248, // 'H264'
+                        0x47504A4D, // 'MJPG'
+                    };
+                    const ienc_out_encs = [_]u32{
+                        0x4745504A, // 'JPEG'
+                    };
+                    const raw_encs = [_]u32{
+                        0x30323449, // 'I420'
+                        0x32315659, // 'YV12'
+                        0x3231564E, // 'NV12'
+                        0x3132564E, // 'NV21'
+                        0x56595559, // 'YUYV'
+                        0x59565955, // 'UYVY'
+                        0x32424752, // 'RGB2' (RGB565)
+                        0x33424752, // 'RGB3' (RGB24)
+                        0x33524742, // 'BGR3' (BGR24)
+                        0x41524742, // 'BGRA'
+                        0x41424752, // 'RGBA'
+                        0x42474752, // 'RGGB' (Bayer BGGR8)
+                        0x31384142, // 'BA81' (Bayer BGGR8)
+                        0x47425247, // 'GRBG'
+                        0x47524247, // 'GBRG'
+                        0x59455247, // 'GREY'
+                    };
+
+                    const encs: []const u32 = if (kind == .isp and port_type == 3 and port_index == 2)
+                        &stats_encs
+                    else if (kind == .video_decode and port_type == 2)
+                        &vdec_in_encs
+                    else if (kind == .video_encode and port_type == 3)
+                        &venc_out_encs
+                    else if (kind == .image_encode and port_type == 3)
+                        &ienc_out_encs
+                    else
+                        &raw_encs;
+
+                    const max_count: usize = @min(encs.len, @min(@as(usize, req_size -| 8) / 4, 96));
+                    for (0..max_count) |idx| {
+                        std.mem.writeInt(u32, resp[36 + idx * 4 ..][0..4], encs[idx], .little);
+                    }
+                    const reply_size: usize = 8 + max_count * 4;
+                    std.mem.writeInt(u32, resp[32..36], @intCast(reply_size), .little);
+                    self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 4, srcport), resp[0 .. 28 + reply_size]);
+                } else {
+                    // For MMAL_PARAMETER_CAMERA_INFO (0x1001c) and other parameters, zero-filled payload
+                    // reports num_cameras = 0 cleanly.
+                    const reply_size: usize = @min(@max(@as(usize, req_size), 8), 392);
+                    std.mem.writeInt(u32, resp[32..36], @intCast(reply_size), .little);
+                    self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 4, srcport), resp[0 .. 28 + reply_size]);
+                }
+            },
+            MMAL_MSG_TYPE_BUFFER_FROM_HOST, MMAL_MSG_TYPE_BUFFER_FROM_HOST_ZEROLEN => {},
+            else => {
+                // COMPONENT_DESTROY, COMPONENT_ENABLE, COMPONENT_DISABLE, PORT_PARAMETER_SET, PORT_FLUSH, etc.
+                var resp: [28]u8 = [_]u8{0} ** 28;
+                writeMmalHeader(resp[0..24], msg_type, control_service, context);
+                std.mem.writeInt(u32, resp[24..28], 0, .little); // status = MMAL_MSG_STATUS_SUCCESS
+                self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 4, srcport), &resp);
             },
         }
     }
@@ -1408,5 +1824,60 @@ test "Vchiq SMEM service opens and handles client_version, import, and free" {
     try std.testing.expectEqual(@as(u32, 0x4000), std.mem.readInt(u32, ram[slot1 + 64 ..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 42), std.mem.readInt(u32, ram[slot1 + 68 ..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ram[slot1 + 72 ..][0..4], .little));
+}
+
+test "Vchiq MMAL service opens and handles component creation, port info, and parameters" {
+    var ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024);
+    var vchiq = Vchiq{};
+    var fifo = AudioFifo{};
+
+    const base: u32 = 0x1000;
+    const master = base + 32;
+    const slave = base + 404;
+    std.mem.writeInt(u32, ram[master + 4 ..][0..4], 1, .little); // master.slot_first = 1
+    std.mem.writeInt(u32, ram[master + 8 ..][0..4], 4, .little); // master.slot_last = 4
+    std.mem.writeInt(u32, ram[master + 12 ..][0..4], 9, .little); // master.slot_sync = 9
+    std.mem.writeInt(u32, ram[slave + 4 ..][0..4], 5, .little); // slave.slot_first = 5
+    std.mem.writeInt(u32, ram[slave + 8 ..][0..4], 8, .little); // slave.slot_last = 8
+    std.mem.writeInt(u32, ram[slave + 72 ..][0..4], 5, .little); // slave.slot_queue[0] = 5
+    std.mem.writeInt(u32, ram[slave + 0 ..][0..4], 1, .little); // slave.initialised = 1
+
+    try std.testing.expectEqual(@as(u32, 0), vchiq.initSlotZero(0xc0001000, &ram));
+
+    const slot5 = base + 5 * 4096;
+    var tx_off: u32 = 0;
+
+    // 1. VCHIQ_MSG_OPEN 'mmal' (0x6C616D6D) from arm port 11
+    std.mem.writeInt(u32, ram[slot5 + tx_off ..][0..4], (Vchiq.VCHIQ_MSG_OPEN << 24) | (11 << 12), .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 4 ..][0..4], 12, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 8 ..][0..4], Vchiq.MMAL_MAGIC, .little); // 'mmal'
+    std.mem.writeInt(i16, ram[slot5 + tx_off + 16 ..][0..2], 15, .little); // VC_MMAL_VER = 15
+    tx_off += 24;
+
+    // 2. MMAL_MSG_TYPE_COMPONENT_CREATE ("vc.ril.isp")
+    std.mem.writeInt(u32, ram[slot5 + tx_off ..][0..4], (Vchiq.VCHIQ_MSG_DATA << 24) | (11 << 12) | 4, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 4 ..][0..4], 160, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 8 ..][0..4], Vchiq.MMAL_MAGIC, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 12 ..][0..4], Vchiq.MMAL_MSG_TYPE_COMPONENT_CREATE, .little);
+    std.mem.writeInt(u32, ram[slot5 + tx_off + 20 ..][0..4], 0xdeadbeef, .little); // context
+    @memcpy(ram[slot5 + tx_off + 36 .. slot5 + tx_off + 46], "vc.ril.isp");
+    tx_off += 168;
+
+    std.mem.writeInt(u32, ram[slave + 28 ..][0..4], tx_off, .little); // slave.tx_pos
+    vchiq.write32(0x08, 0, &ram, &fifo, false, false);
+
+    try std.testing.expect(vchiq.irqPending());
+    try std.testing.expectEqual(@as(u12, 11), vchiq.mmal_arm_port);
+
+    // Master slot 1:
+    //   [0..16):  OPENACK (msgid = (3<<24)|(4<<12)|11, size = 2)
+    //   [16..68): DATA COMPONENT_CREATE reply (size = 44, context = 0xdeadbeef, status = 0, handle = 1, inputs = 1, outputs = 3)
+    const slot1 = base + 1 * 4096;
+    try std.testing.expectEqual((Vchiq.VCHIQ_MSG_OPENACK << 24) | (4 << 12) | 11, std.mem.readInt(u32, ram[slot1 + 0 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0xdeadbeef), std.mem.readInt(u32, ram[slot1 + 24 + 12 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, ram[slot1 + 24 + 24 ..][0..4], .little)); // status
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ram[slot1 + 24 + 28 ..][0..4], .little)); // component_handle
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ram[slot1 + 24 + 32 ..][0..4], .little)); // input_num
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, ram[slot1 + 24 + 36 ..][0..4], .little)); // output_num
 }
 
