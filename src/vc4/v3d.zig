@@ -484,69 +484,77 @@ pub const V3d = struct {
                 break;
             }
 
-            var tri_idx: u32 = 0;
-            while (tri_idx < num_tris) : (tri_idx += 1) {
-                var v_indices: [3]u32 = undefined;
-                switch (draw.mode) {
-                    4 => {
-                        v_indices[0] = tri_idx * 3 + 0;
-                        v_indices[1] = tri_idx * 3 + 1;
-                        v_indices[2] = tri_idx * 3 + 2;
-                    },
-                    5 => {
-                        if ((tri_idx & 1) == 0) {
-                            v_indices[0] = tri_idx + 0;
-                            v_indices[1] = tri_idx + 1;
-                            v_indices[2] = tri_idx + 2;
-                        } else {
-                            v_indices[0] = tri_idx + 1;
-                            v_indices[1] = tri_idx + 0;
-                            v_indices[2] = tri_idx + 2;
-                        }
-                    },
-                    6 => {
-                        v_indices[0] = 0;
-                        v_indices[1] = tri_idx + 1;
-                        v_indices[2] = tri_idx + 2;
-                    },
-                    else => continue,
-                }
+            var attr_streams: [8]AttrStream = undefined;
+            const attr_info = decodeAttrStreams(ram, rec_phys, draw.num_attrs, vs_attr_mask, &attr_streams);
+            const active_attrs = attr_streams[0..attr_info.count];
+            const vpm_words = attr_info.vpm_words;
+            const n_var = @min(@as(usize, fs_num_varyings), 16);
+            const clip_min_x: f32 = @floatFromInt(draw.clip_x);
+            const clip_min_y: f32 = @floatFromInt(draw.clip_y);
+            const clip_max_x: f32 = @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w);
+            const clip_max_y: f32 = @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h);
 
-                for (&v_indices) |*vi| {
-                    if (draw.indexed) {
-                        const idx_base = draw.index_buffer_addr & 0x1FFFFFFF;
-                        if (draw.u16_indices) {
+            var tri_idx: u32 = 0;
+            while (tri_idx < num_tris) {
+                const batch_tris: usize = @min(@as(usize, num_tris - tri_idx), 5);
+                const batch_verts: usize = batch_tris * 3;
+                var v_indices: [15]u32 = undefined;
+
+                for (0..batch_tris) |t_i| {
+                    const cur_tri = tri_idx + @as(u32, @intCast(t_i));
+                    const base_l = t_i * 3;
+                    switch (draw.mode) {
+                        4 => {
+                            v_indices[base_l + 0] = cur_tri * 3 + 0;
+                            v_indices[base_l + 1] = cur_tri * 3 + 1;
+                            v_indices[base_l + 2] = cur_tri * 3 + 2;
+                        },
+                        5 => {
+                            if ((cur_tri & 1) == 0) {
+                                v_indices[base_l + 0] = cur_tri + 0;
+                                v_indices[base_l + 1] = cur_tri + 1;
+                                v_indices[base_l + 2] = cur_tri + 2;
+                            } else {
+                                v_indices[base_l + 0] = cur_tri + 1;
+                                v_indices[base_l + 1] = cur_tri + 0;
+                                v_indices[base_l + 2] = cur_tri + 2;
+                            }
+                        },
+                        6 => {
+                            v_indices[base_l + 0] = 0;
+                            v_indices[base_l + 1] = cur_tri + 1;
+                            v_indices[base_l + 2] = cur_tri + 2;
+                        },
+                        else => {
+                            v_indices[base_l + 0] = 0;
+                            v_indices[base_l + 1] = 0;
+                            v_indices[base_l + 2] = 0;
+                        },
+                    }
+                }
+                tri_idx += @intCast(batch_tris);
+
+                if (draw.indexed) {
+                    const idx_base = draw.index_buffer_addr & 0x1FFFFFFF;
+                    if (draw.u16_indices) {
+                        for (v_indices[0..batch_verts]) |*vi| {
                             const off = idx_base + vi.* * 2;
                             vi.* = if (off + 2 <= ram.len) std.mem.readInt(u16, ram[off..][0..2], .little) else 0;
-                        } else {
+                        }
+                    } else {
+                        for (v_indices[0..batch_verts]) |*vi| {
                             const off = idx_base + vi.*;
                             vi.* = if (off < ram.len) ram[off] else 0;
                         }
-                    } else {
+                    }
+                } else if (draw.first_or_offset != 0) {
+                    for (v_indices[0..batch_verts]) |*vi| {
                         vi.* += draw.first_or_offset;
                     }
                 }
 
-                var vpm_in: [32]qpu_sim.Vec = [_]qpu_sim.Vec{qpu_sim.splat(0)} ** 32;
-                var vpm_words: usize = 0;
-                for (0..draw.num_attrs) |ai| {
-                    if (vs_attr_mask != 0 and (vs_attr_mask & (@as(u8, 1) << @intCast(ai))) == 0) continue;
-                    const a_off = rec_phys + 36 + ai * 8;
-                    const attr_base = std.mem.readInt(u32, ram[a_off..][0..4], .little) & 0x1FFFFFFF;
-                    const attr_bytes: u32 = @as(u32, ram[a_off + 4]) + 1;
-                    const attr_stride: u32 = ram[a_off + 5];
-                    const words = (attr_bytes + 3) / 4;
-                    for (0..words) |w_i| {
-                        if (vpm_words >= vpm_in.len) break;
-                        for (0..3) |lane| {
-                            const v_addr = attr_base + v_indices[lane] * attr_stride + @as(u32, @intCast(w_i * 4));
-                            if (v_addr + 4 <= ram.len) {
-                                vpm_in[vpm_words][lane] = std.mem.readInt(u32, ram[v_addr..][0..4], .little);
-                            }
-                        }
-                        vpm_words += 1;
-                    }
-                }
+                var vpm_in: [32]qpu_sim.Vec = undefined;
+                populateBatchVpmIn(ram, active_attrs, v_indices[0..batch_verts], &vpm_in);
 
                 const vs_res = qpu_sim.runDecoded(vs_decoded, .{
                     .uniforms = vs_unifs,
@@ -554,51 +562,111 @@ pub const V3d = struct {
                 }) catch continue;
                 if (vs_res.vpm_out_len < 3) continue;
 
-                var verts: [3]ShadedVertex = .{ .{}, .{}, .{} };
-                const n_var = @min(@as(usize, fs_num_varyings), 16);
-                for (0..3) |lane| {
-                    const xy_packed = vs_res.vpm_out[0][lane];
-                    const xs: i16 = @bitCast(@as(u16, @truncate(xy_packed)));
-                    const ys: i16 = @bitCast(@as(u16, @truncate(xy_packed >> 16)));
-                    verts[lane].x = @as(f32, @floatFromInt(xs)) / 16.0 + draw.vp_x;
-                    verts[lane].y = @as(f32, @floatFromInt(ys)) / 16.0 + draw.vp_y;
-                    verts[lane].z = @bitCast(vs_res.vpm_out[1][lane]);
-                    const raw_inv_w: f32 = @bitCast(vs_res.vpm_out[2][lane]);
-                    const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
-                    verts[lane].inv_w = inv_w;
-                    for (0..n_var) |vi| {
-                        if (3 + vi < vs_res.vpm_out_len) {
-                            const raw_v: f32 = @bitCast(vs_res.vpm_out[3 + vi][lane]);
-                            verts[lane].persp_varyings[vi] = raw_v * inv_w;
+                for (0..batch_tris) |t_i| {
+                    const base_l = t_i * 3;
+                    var verts: [3]ShadedVertex = .{ .{}, .{}, .{} };
+                    for (0..3) |corner| {
+                        const lane = base_l + corner;
+                        const xy_packed = vs_res.vpm_out[0][lane];
+                        const xs: i16 = @bitCast(@as(u16, @truncate(xy_packed)));
+                        const ys: i16 = @bitCast(@as(u16, @truncate(xy_packed >> 16)));
+                        verts[corner].x = @as(f32, @floatFromInt(xs)) * (1.0 / 16.0) + draw.vp_x;
+                        verts[corner].y = @as(f32, @floatFromInt(ys)) * (1.0 / 16.0) + draw.vp_y;
+                        verts[corner].z = @bitCast(vs_res.vpm_out[1][lane]);
+                        const raw_inv_w: f32 = @bitCast(vs_res.vpm_out[2][lane]);
+                        const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
+                        verts[corner].inv_w = inv_w;
+                        for (0..n_var) |vi| {
+                            if (3 + vi < vs_res.vpm_out_len) {
+                                const raw_v: f32 = @bitCast(vs_res.vpm_out[3 + vi][lane]);
+                                verts[corner].persp_varyings[vi] = raw_v * inv_w;
+                            }
                         }
                     }
+
+                    const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
+                        (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
+                    if (@abs(area) < 1e-6) continue;
+
+                    const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
+                    const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
+                    const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
+                    const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
+                    if (min_fx >= max_fx or min_fy >= max_fy) continue;
+
+                    self.shaded_tris[self.shaded_tris_len] = .{
+                        .draw_idx = @intCast(draw_idx),
+                        .min_x = @intFromFloat(min_fx),
+                        .min_y = @intFromFloat(min_fy),
+                        .max_x = @intFromFloat(max_fx),
+                        .max_y = @intFromFloat(max_fy),
+                        .area = area,
+                        .v = verts,
+                    };
+                    self.shaded_tris_len += 1;
                 }
+            }
+        }
+    }
 
-                const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
-                    (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
-                if (@abs(area) < 1e-6) continue;
+    const AttrStream = struct {
+        base: u32,
+        stride: u32,
+        words: u32,
+    };
 
-                const clip_min_x: f32 = @floatFromInt(draw.clip_x);
-                const clip_min_y: f32 = @floatFromInt(draw.clip_y);
-                const clip_max_x: f32 = @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w);
-                const clip_max_y: f32 = @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h);
-
-                const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
-                const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
-                const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
-                const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
-                if (min_fx >= max_fx or min_fy >= max_fy) continue;
-
-                self.shaded_tris[self.shaded_tris_len] = .{
-                    .draw_idx = @intCast(draw_idx),
-                    .min_x = @intFromFloat(min_fx),
-                    .min_y = @intFromFloat(min_fy),
-                    .max_x = @intFromFloat(max_fx),
-                    .max_y = @intFromFloat(max_fy),
-                    .area = area,
-                    .v = verts,
+    fn decodeAttrStreams(
+        ram: []const u8,
+        rec_phys: u32,
+        num_attrs: u8,
+        vs_attr_mask: u8,
+        out: *[8]AttrStream,
+    ) struct { count: usize, vpm_words: usize } {
+        var count: usize = 0;
+        var vpm_words: usize = 0;
+        for (0..num_attrs) |ai| {
+            if (vs_attr_mask != 0 and (vs_attr_mask & (@as(u8, 1) << @intCast(ai))) == 0) continue;
+            const a_off = rec_phys + 36 + ai * 8;
+            const attr_base = std.mem.readInt(u32, ram[a_off..][0..4], .little) & 0x1FFFFFFF;
+            const attr_bytes: u32 = @as(u32, ram[a_off + 4]) + 1;
+            const attr_stride: u32 = ram[a_off + 5];
+            const words = (attr_bytes + 3) / 4;
+            if (count < out.len) {
+                out[count] = .{
+                    .base = attr_base,
+                    .stride = attr_stride,
+                    .words = words,
                 };
-                self.shaded_tris_len += 1;
+                count += 1;
+                vpm_words = @min(vpm_words + words, 32);
+            }
+        }
+        return .{ .count = count, .vpm_words = vpm_words };
+    }
+
+    inline fn populateBatchVpmIn(
+        ram: []const u8,
+        attrs: []const AttrStream,
+        v_indices: []const u32,
+        vpm_in: *[32]qpu_sim.Vec,
+    ) void {
+        var vpm_word: usize = 0;
+        const batch_verts = v_indices.len;
+        for (attrs) |attr| {
+            for (0..attr.words) |w_i| {
+                if (vpm_word >= 32) return;
+                const word_off: u32 = @intCast(w_i * 4);
+                var vec: qpu_sim.Vec = undefined;
+                for (v_indices, 0..) |vi, lane| {
+                    const v_addr = attr.base + vi * attr.stride + word_off;
+                    vec[lane] = if (v_addr + 4 <= ram.len) std.mem.readInt(u32, ram[v_addr..][0..4], .little) else 0;
+                }
+                const pad_val = if (batch_verts > 0) vec[batch_verts - 1] else 0;
+                for (batch_verts..16) |lane| {
+                    vec[lane] = pad_val;
+                }
+                vpm_in[vpm_word] = vec;
+                vpm_word += 1;
             }
         }
     }
@@ -1115,69 +1183,77 @@ pub const V3d = struct {
             else => 0,
         };
 
-        var tri_idx: u32 = 0;
-        while (tri_idx < num_tris) : (tri_idx += 1) {
-            var v_indices: [3]u32 = undefined;
-            switch (draw.mode) {
-                4 => {
-                    v_indices[0] = tri_idx * 3 + 0;
-                    v_indices[1] = tri_idx * 3 + 1;
-                    v_indices[2] = tri_idx * 3 + 2;
-                },
-                5 => {
-                    if ((tri_idx & 1) == 0) {
-                        v_indices[0] = tri_idx + 0;
-                        v_indices[1] = tri_idx + 1;
-                        v_indices[2] = tri_idx + 2;
-                    } else {
-                        v_indices[0] = tri_idx + 1;
-                        v_indices[1] = tri_idx + 0;
-                        v_indices[2] = tri_idx + 2;
-                    }
-                },
-                6 => {
-                    v_indices[0] = 0;
-                    v_indices[1] = tri_idx + 1;
-                    v_indices[2] = tri_idx + 2;
-                },
-                else => continue,
-            }
+        var attr_streams: [8]AttrStream = undefined;
+        const attr_info = decodeAttrStreams(ram, rec_phys, draw.num_attrs, vs_attr_mask, &attr_streams);
+        const active_attrs = attr_streams[0..attr_info.count];
+        const vpm_words = attr_info.vpm_words;
+        const n_var = @min(@as(usize, fs_num_varyings), 16);
+        const clip_min_x: f32 = @floatFromInt(draw.clip_x);
+        const clip_min_y: f32 = @floatFromInt(draw.clip_y);
+        const clip_max_x: f32 = @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w);
+        const clip_max_y: f32 = @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h);
 
-            for (&v_indices) |*vi| {
-                if (draw.indexed) {
-                    const idx_base = draw.index_buffer_addr & 0x1FFFFFFF;
-                    if (draw.u16_indices) {
+        var tri_idx: u32 = 0;
+        while (tri_idx < num_tris) {
+            const batch_tris: usize = @min(@as(usize, num_tris - tri_idx), 5);
+            const batch_verts: usize = batch_tris * 3;
+            var v_indices: [15]u32 = undefined;
+
+            for (0..batch_tris) |t_i| {
+                const cur_tri = tri_idx + @as(u32, @intCast(t_i));
+                const base_l = t_i * 3;
+                switch (draw.mode) {
+                    4 => {
+                        v_indices[base_l + 0] = cur_tri * 3 + 0;
+                        v_indices[base_l + 1] = cur_tri * 3 + 1;
+                        v_indices[base_l + 2] = cur_tri * 3 + 2;
+                    },
+                    5 => {
+                        if ((cur_tri & 1) == 0) {
+                            v_indices[base_l + 0] = cur_tri + 0;
+                            v_indices[base_l + 1] = cur_tri + 1;
+                            v_indices[base_l + 2] = cur_tri + 2;
+                        } else {
+                            v_indices[base_l + 0] = cur_tri + 1;
+                            v_indices[base_l + 1] = cur_tri + 0;
+                            v_indices[base_l + 2] = cur_tri + 2;
+                        }
+                    },
+                    6 => {
+                        v_indices[base_l + 0] = 0;
+                        v_indices[base_l + 1] = cur_tri + 1;
+                        v_indices[base_l + 2] = cur_tri + 2;
+                    },
+                    else => {
+                        v_indices[base_l + 0] = 0;
+                        v_indices[base_l + 1] = 0;
+                        v_indices[base_l + 2] = 0;
+                    },
+                }
+            }
+            tri_idx += @intCast(batch_tris);
+
+            if (draw.indexed) {
+                const idx_base = draw.index_buffer_addr & 0x1FFFFFFF;
+                if (draw.u16_indices) {
+                    for (v_indices[0..batch_verts]) |*vi| {
                         const off = idx_base + vi.* * 2;
                         vi.* = if (off + 2 <= ram.len) std.mem.readInt(u16, ram[off..][0..2], .little) else 0;
-                    } else {
+                    }
+                } else {
+                    for (v_indices[0..batch_verts]) |*vi| {
                         const off = idx_base + vi.*;
                         vi.* = if (off < ram.len) ram[off] else 0;
                     }
-                } else {
+                }
+            } else if (draw.first_or_offset != 0) {
+                for (v_indices[0..batch_verts]) |*vi| {
                     vi.* += draw.first_or_offset;
                 }
             }
 
-            var vpm_in: [32]qpu_sim.Vec = [_]qpu_sim.Vec{qpu_sim.splat(0)} ** 32;
-            var vpm_words: usize = 0;
-            for (0..draw.num_attrs) |ai| {
-                if (vs_attr_mask != 0 and (vs_attr_mask & (@as(u8, 1) << @intCast(ai))) == 0) continue;
-                const a_off = rec_phys + 36 + ai * 8;
-                const attr_base = std.mem.readInt(u32, ram[a_off..][0..4], .little) & 0x1FFFFFFF;
-                const attr_bytes: u32 = @as(u32, ram[a_off + 4]) + 1;
-                const attr_stride: u32 = ram[a_off + 5];
-                const words = (attr_bytes + 3) / 4;
-                for (0..words) |w_i| {
-                    if (vpm_words >= vpm_in.len) break;
-                    for (0..3) |lane| {
-                        const v_addr = attr_base + v_indices[lane] * attr_stride + @as(u32, @intCast(w_i * 4));
-                        if (v_addr + 4 <= ram.len) {
-                            vpm_in[vpm_words][lane] = std.mem.readInt(u32, ram[v_addr..][0..4], .little);
-                        }
-                    }
-                    vpm_words += 1;
-                }
-            }
+            var vpm_in: [32]qpu_sim.Vec = undefined;
+            populateBatchVpmIn(ram, active_attrs, v_indices[0..batch_verts], &vpm_in);
 
             const vs_res = qpu_sim.runDecoded(vs_decoded, .{
                 .uniforms = vs_unifs,
@@ -1185,46 +1261,49 @@ pub const V3d = struct {
             }) catch continue;
             if (vs_res.vpm_out_len < 3) continue;
 
-            var verts: [3]ShadedVertex = .{ .{}, .{}, .{} };
-            const n_var = @min(@as(usize, fs_num_varyings), 16);
-            for (0..3) |lane| {
-                const xy_packed = vs_res.vpm_out[0][lane];
-                const xs: i16 = @bitCast(@as(u16, @truncate(xy_packed)));
-                const ys: i16 = @bitCast(@as(u16, @truncate(xy_packed >> 16)));
-                verts[lane].x = @as(f32, @floatFromInt(xs)) / 16.0 + draw.vp_x;
-                verts[lane].y = @as(f32, @floatFromInt(ys)) / 16.0 + draw.vp_y;
-                verts[lane].z = @bitCast(vs_res.vpm_out[1][lane]);
-                const raw_inv_w: f32 = @bitCast(vs_res.vpm_out[2][lane]);
-                const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
-                verts[lane].inv_w = inv_w;
-                for (0..n_var) |vi| {
-                    if (3 + vi < vs_res.vpm_out_len) {
-                        const raw_v: f32 = @bitCast(vs_res.vpm_out[3 + vi][lane]);
-                        verts[lane].persp_varyings[vi] = raw_v * inv_w;
+            for (0..batch_tris) |t_i| {
+                const base_l = t_i * 3;
+                var verts: [3]ShadedVertex = .{ .{}, .{}, .{} };
+                for (0..3) |corner| {
+                    const lane = base_l + corner;
+                    const xy_packed = vs_res.vpm_out[0][lane];
+                    const xs: i16 = @bitCast(@as(u16, @truncate(xy_packed)));
+                    const ys: i16 = @bitCast(@as(u16, @truncate(xy_packed >> 16)));
+                    verts[corner].x = @as(f32, @floatFromInt(xs)) * (1.0 / 16.0) + draw.vp_x;
+                    verts[corner].y = @as(f32, @floatFromInt(ys)) * (1.0 / 16.0) + draw.vp_y;
+                    verts[corner].z = @bitCast(vs_res.vpm_out[1][lane]);
+                    const raw_inv_w: f32 = @bitCast(vs_res.vpm_out[2][lane]);
+                    const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
+                    verts[corner].inv_w = inv_w;
+                    for (0..n_var) |vi| {
+                        if (3 + vi < vs_res.vpm_out_len) {
+                            const raw_v: f32 = @bitCast(vs_res.vpm_out[3 + vi][lane]);
+                            verts[corner].persp_varyings[vi] = raw_v * inv_w;
+                        }
                     }
                 }
+
+                const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
+                    (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
+                if (@abs(area) < 1e-6) continue;
+
+                const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
+                const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
+                const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
+                const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
+                if (min_fx >= max_fx or min_fy >= max_fy) continue;
+
+                const tri = ShadedTriangle{
+                    .draw_idx = 0,
+                    .min_x = @intFromFloat(min_fx),
+                    .min_y = @intFromFloat(min_fy),
+                    .max_x = @intFromFloat(max_fx),
+                    .max_y = @intFromFloat(max_fy),
+                    .area = area,
+                    .v = verts,
+                };
+                self.rasterizeShadedTriangleDecodedInTile(ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, tile_px_x, tile_px_y, tile_size);
             }
-
-            const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
-                (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
-            if (@abs(area) < 1e-6) continue;
-
-            const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), @as(f32, @floatFromInt(draw.clip_x)));
-            const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), @as(f32, @floatFromInt(draw.clip_y)));
-            const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), @as(f32, @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w)));
-            const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), @as(f32, @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h)));
-            if (min_fx >= max_fx or min_fy >= max_fy) continue;
-
-            const tri = ShadedTriangle{
-                .draw_idx = 0,
-                .min_x = @intFromFloat(min_fx),
-                .min_y = @intFromFloat(min_fy),
-                .max_x = @intFromFloat(max_fx),
-                .max_y = @intFromFloat(max_fy),
-                .area = area,
-                .v = verts,
-            };
-            self.rasterizeShadedTriangleDecodedInTile(ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, tile_px_x, tile_px_y, tile_size);
         }
     }
 
