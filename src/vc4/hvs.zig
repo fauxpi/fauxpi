@@ -367,8 +367,10 @@ pub const Hvs = struct {
             return;
         }
 
+        var start_py: u32 = dst_y;
+
         // Fast path 2: Unity 32-bit T-tiled / LT-tiled plane aligned to (0, 0)
-        if (unity and tiling != 0 and !is_565 and dst_x == 0 and dst_y == 0 and (max_dx & 3) == 0 and (max_dy & 3) == 0) {
+        if (unity and tiling != 0 and !is_565 and dst_x == 0 and dst_y == 0 and (max_dx & 3) == 0) {
             const utiles_x = max_dx >> 2;
             const utiles_y = max_dy >> 2;
             var uy: u32 = 0;
@@ -399,10 +401,37 @@ pub const Hvs = struct {
                     }
                 }
             }
-            return;
+            if ((max_dy & 3) == 0) return;
+            start_py = utiles_y << 2;
         }
 
-        var py: u32 = dst_y;
+        // Fast path 3: Unity 16-bit RGB565 T-tiled / LT-tiled plane aligned to (0, 0) (8x4 utiles)
+        if (unity and tiling != 0 and is_565 and dst_x == 0 and dst_y == 0 and (max_dx & 7) == 0) {
+            const utiles_x = max_dx >> 3;
+            const utiles_y = max_dy >> 2;
+            var uy: u32 = 0;
+            while (uy < utiles_y) : (uy += 1) {
+                const py0 = uy << 2;
+                var ux: u32 = 0;
+                while (ux < utiles_x) : (ux += 1) {
+                    const px0 = ux << 3;
+                    const utile_off = ptr0 + texture.texelOffsetOf(.rgb565, tiled_w, src_h, px0, py0);
+                    if (utile_off + 64 > ram.len) continue;
+                    inline for (0..4) |ry| {
+                        const dst_row = out_argb[(py0 + @as(u32, @intCast(ry))) * out_w + px0 ..][0..8];
+                        const src_row_bytes = ram[utile_off + ry * 16 ..][0..16];
+                        inline for (0..8) |rx| {
+                            const p16 = std.mem.readInt(u16, src_row_bytes[rx * 2 ..][0..2], .little);
+                            dst_row[rx] = format_mod.fromRgb565(p16);
+                        }
+                    }
+                }
+            }
+            if ((max_dy & 3) == 0) return;
+            start_py = utiles_y << 2;
+        }
+
+        var py: u32 = start_py;
         while (py < max_dy) : (py += 1) {
             const sy: u32 = if (unity) (py - dst_y) else ((py - dst_y) * src_h) / dst_h;
             var px: u32 = dst_x;
@@ -558,8 +587,8 @@ test "HVS DLIST plane compositing" {
 test "HVS T-tiled RGB565 plane compositing (direct scanout of maximized window)" {
     var hvs = Hvs{};
     const w: u32 = 128;
-    const h: u32 = 64;
-    var ram: [128 * 64 * 2]u8 = [_]u8{0} ** (128 * 64 * 2);
+    const h: u32 = 69; // Non-multiple-of-4 height (like 1280x669 in Dazzle)
+    var ram: [128 * 96 * 2]u8 = [_]u8{0} ** (128 * 96 * 2);
 
     // Populate T-tiled RGB565 buffer with pure blue (0xff0000ff)
     const blue565 = format_mod.toRgb565(0xff0000ff);
@@ -582,7 +611,7 @@ test "HVS T-tiled RGB565 plane compositing (direct scanout of maximized window)"
     hvs.write32(Hvs.DLIST_OFFSET + 23 * 4, Hvs.SCALER_CTL0_END);
     hvs.write32(0x0024, 16);
 
-    var out: [128 * 64]u32 = [_]u32{0} ** (128 * 64);
+    var out: [128 * 69]u32 = [_]u32{0} ** (128 * 69);
     try std.testing.expect(hvs.compositeFrame(&ram, &out, w, h));
     for (out) |px| {
         try std.testing.expectEqual(@as(u32, 0xff0000ff), px);

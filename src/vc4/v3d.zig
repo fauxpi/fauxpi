@@ -751,10 +751,13 @@ pub const V3d = struct {
         const cpp: u32 = if (is_565) 2 else 4;
         const x0 = tile_x * tile_size;
         const y0 = tile_y * tile_size;
+        if (x0 >= fb_w or y0 >= fb_h) return;
+        const valid_w = @min(tile_size, fb_w - x0);
+        const valid_h = @min(tile_size, fb_h - y0);
 
-        if (!is_565 and tile_size == 64 and x0 + 64 <= fb_w and y0 + 64 <= fb_h) {
-            if (tiling == 0) {
-                for (0..64) |ty| {
+        if (!is_565 and tile_size == 64) {
+            if (tiling == 0 and valid_w == 64) {
+                for (0..valid_h) |ty| {
                     const py = y0 + @as(u32, @intCast(ty));
                     const off = base + (py * fb_w + x0) * 4;
                     if (off + 256 <= ram.len) {
@@ -762,9 +765,11 @@ pub const V3d = struct {
                     }
                 }
                 return;
-            } else {
-                for (0..16) |uy| {
-                    for (0..16) |ux| {
+            } else if (tiling != 0 and (valid_w & 3) == 0) {
+                const utiles_x = valid_w >> 2;
+                const utiles_y = valid_h >> 2;
+                for (0..utiles_y) |uy| {
+                    for (0..utiles_x) |ux| {
                         const px = x0 + @as(u32, @intCast(ux * 4));
                         const py = y0 + @as(u32, @intCast(uy * 4));
                         const utile_off = base + texture.texelOffsetOf(.argb8888, fb_w, fb_h, px, py);
@@ -779,16 +784,39 @@ pub const V3d = struct {
                         }
                     }
                 }
-                return;
+                if ((valid_h & 3) == 0) return;
             }
+        } else if (is_565 and tile_size == 64 and tiling != 0 and (valid_w & 7) == 0) {
+            const utiles_x = valid_w >> 3;
+            const utiles_y = valid_h >> 2;
+            for (0..utiles_y) |uy| {
+                for (0..utiles_x) |ux| {
+                    const px = x0 + @as(u32, @intCast(ux * 8));
+                    const py = y0 + @as(u32, @intCast(uy * 4));
+                    const utile_off = base + texture.texelOffsetOf(.rgb565, fb_w, fb_h, px, py);
+                    if (utile_off + 64 <= ram.len) {
+                        inline for (0..4) |ry| {
+                            const dst_row = self.tile_color[(uy * 4 + ry) * 64 + ux * 8 ..][0..8];
+                            const src_bytes = ram[utile_off + ry * 16 ..][0..16];
+                            inline for (0..8) |rx| {
+                                dst_row[rx] = format_mod.fromRgb565(std.mem.readInt(u16, src_bytes[rx * 2 ..][0..2], .little));
+                            }
+                        }
+                    }
+                }
+            }
+            if ((valid_h & 3) == 0) return;
         }
 
-        for (0..tile_size) |ty| {
+        const start_ty: usize = if (tile_size == 64 and tiling != 0 and ((!is_565 and (valid_w & 3) == 0) or (is_565 and (valid_w & 7) == 0)))
+            (valid_h & ~@as(u32, 3))
+        else
+            0;
+
+        for (start_ty..valid_h) |ty| {
             const py = y0 + @as(u32, @intCast(ty));
-            if (py >= fb_h) continue;
-            for (0..tile_size) |tx| {
+            for (0..valid_w) |tx| {
                 const px = x0 + @as(u32, @intCast(tx));
-                if (px >= fb_w) continue;
                 const off = base + if (tiling == 0)
                     (py * fb_w + px) * cpp
                 else
@@ -821,13 +849,16 @@ pub const V3d = struct {
         const cpp: u32 = if (is_565) 2 else 4;
         const x0 = tile_x * tile_size;
         const y0 = tile_y * tile_size;
+        if (x0 >= fb_w or y0 >= fb_h) return;
+        const valid_w = @min(tile_size, fb_w - x0);
+        const valid_h = @min(tile_size, fb_h - y0);
 
-        if (!is_565 and tile_size == 64 and x0 + 64 <= fb_w and y0 + 64 <= fb_h) {
-            if (tiling == 0) {
+        if (!is_565 and tile_size == 64) {
+            if (tiling == 0 and valid_w == 64) {
                 if (self.tile_color_solid) |solid_c| {
                     var solid_row: [64]u32 = @splat(solid_c);
                     const row_bytes = std.mem.asBytes(&solid_row);
-                    for (0..64) |ty| {
+                    for (0..valid_h) |ty| {
                         const py = y0 + @as(u32, @intCast(ty));
                         const off = base + (py * fb_w + x0) * 4;
                         if (off + 256 <= ram.len) {
@@ -835,7 +866,7 @@ pub const V3d = struct {
                         }
                     }
                 } else {
-                    for (0..64) |ty| {
+                    for (0..valid_h) |ty| {
                         const py = y0 + @as(u32, @intCast(ty));
                         const off = base + (py * fb_w + x0) * 4;
                         if (off + 256 <= ram.len) {
@@ -844,12 +875,14 @@ pub const V3d = struct {
                     }
                 }
                 return;
-            } else {
+            } else if (tiling != 0 and (valid_w & 3) == 0) {
+                const utiles_x = valid_w >> 2;
+                const utiles_y = valid_h >> 2;
                 if (self.tile_color_solid) |solid_c| {
                     var solid_utile: [16]u32 = @splat(solid_c);
                     const utile_bytes = std.mem.asBytes(&solid_utile);
-                    for (0..16) |uy| {
-                        for (0..16) |ux| {
+                    for (0..utiles_y) |uy| {
+                        for (0..utiles_x) |ux| {
                             const px = x0 + @as(u32, @intCast(ux * 4));
                             const py = y0 + @as(u32, @intCast(uy * 4));
                             const utile_off = base + texture.texelOffsetOf(.argb8888, fb_w, fb_h, px, py);
@@ -859,8 +892,8 @@ pub const V3d = struct {
                         }
                     }
                 } else {
-                    for (0..16) |uy| {
-                        for (0..16) |ux| {
+                    for (0..utiles_y) |uy| {
+                        for (0..utiles_x) |ux| {
                             const px = x0 + @as(u32, @intCast(ux * 4));
                             const py = y0 + @as(u32, @intCast(uy * 4));
                             const utile_off = base + texture.texelOffsetOf(.argb8888, fb_w, fb_h, px, py);
@@ -876,17 +909,57 @@ pub const V3d = struct {
                         }
                     }
                 }
-                return;
+                if ((valid_h & 3) == 0) return;
             }
         }
 
         const solid_565 = if (self.tile_color_solid) |sc| format_mod.toRgb565(sc) else 0;
-        for (0..tile_size) |ty| {
+        if (is_565 and tile_size == 64 and tiling != 0 and (valid_w & 7) == 0) {
+            const utiles_x = valid_w >> 3;
+            const utiles_y = valid_h >> 2;
+            if (self.tile_color_solid != null) {
+                var solid_utile: [32]u16 = @splat(solid_565);
+                const utile_bytes = std.mem.asBytes(&solid_utile);
+                for (0..utiles_y) |uy| {
+                    for (0..utiles_x) |ux| {
+                        const px = x0 + @as(u32, @intCast(ux * 8));
+                        const py = y0 + @as(u32, @intCast(uy * 4));
+                        const utile_off = base + texture.texelOffsetOf(.rgb565, fb_w, fb_h, px, py);
+                        if (utile_off + 64 <= ram.len) {
+                            @memcpy(ram[utile_off..][0..64], utile_bytes);
+                        }
+                    }
+                }
+            } else {
+                for (0..utiles_y) |uy| {
+                    for (0..utiles_x) |ux| {
+                        const px = x0 + @as(u32, @intCast(ux * 8));
+                        const py = y0 + @as(u32, @intCast(uy * 4));
+                        const utile_off = base + texture.texelOffsetOf(.rgb565, fb_w, fb_h, px, py);
+                        if (utile_off + 64 <= ram.len) {
+                            inline for (0..4) |ry| {
+                                const src_row = self.tile_color[(uy * 4 + ry) * 64 + ux * 8 ..][0..8];
+                                const dst_bytes = ram[utile_off + ry * 16 ..][0..16];
+                                inline for (0..8) |rx| {
+                                    std.mem.writeInt(u16, dst_bytes[rx * 2 ..][0..2], format_mod.toRgb565(src_row[rx]), .little);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if ((valid_h & 3) == 0) return;
+        }
+
+        const start_ty: usize = if (tile_size == 64 and tiling != 0 and ((!is_565 and (valid_w & 3) == 0) or (is_565 and (valid_w & 7) == 0)))
+            (valid_h & ~@as(u32, 3))
+        else
+            0;
+
+        for (start_ty..valid_h) |ty| {
             const py = y0 + @as(u32, @intCast(ty));
-            if (py >= fb_h) continue;
-            for (0..tile_size) |tx| {
+            for (0..valid_w) |tx| {
                 const px = x0 + @as(u32, @intCast(tx));
-                if (px >= fb_w) continue;
                 const off = base + if (tiling == 0)
                     (py * fb_w + px) * cpp
                 else
@@ -1500,6 +1573,37 @@ test "V3D quad top-left to bottom-right diagonal shades each pixel exactly once"
     for (10..30) |y| {
         for (10..30) |x| {
             try std.testing.expectEqual(@as(u32, 0xff101010), v3d.tile_color[y * 64 + x]);
+        }
+    }
+}
+
+test "V3D RGB565 8x4 utile storeTileToRam and loadTileFromRam round-trip" {
+    var v3d = V3d{};
+    const fb_w: u32 = 128;
+    const fb_h: u32 = 93; // tile_y=0 has full 64 rows, tile_y=1 has 29 rows (7 full utile rows + 1 remainder row)
+    var ram: [128 * 96 * 2]u8 = [_]u8{0} ** (128 * 96 * 2);
+
+    // 1. Solid clear store on tile (0, 0) and partial-height tile (1, 1)
+    v3d.tile_color_solid = 0xff00ff00;
+    v3d.storeTileToRam(&ram, 0x80000000, fb_w, fb_h, 0, 0, 64, 1, 2);
+    v3d.storeTileToRam(&ram, 0x80000000, fb_w, fb_h, 1, 1, 64, 1, 2);
+
+    // 2. Non-solid store on tile (0, 1) (29 rows high)
+    v3d.tile_color_solid = null;
+    for (0..29) |ty| {
+        for (0..64) |tx| {
+            v3d.tile_color[ty * 64 + tx] = if (((tx + ty) & 1) == 0) 0xffff0000 else 0xff0000ff;
+        }
+    }
+    v3d.storeTileToRam(&ram, 0x80000000, fb_w, fb_h, 0, 1, 64, 1, 2);
+
+    // 3. Clear tile_color and load back tile (0, 1) via loadTileFromRam
+    @memset(&v3d.tile_color, 0);
+    v3d.loadTileFromRam(&ram, 0x80000000, fb_w, fb_h, 0, 1, 64, 1, 2);
+    for (0..29) |ty| {
+        for (0..64) |tx| {
+            const expected: u32 = if (((tx + ty) & 1) == 0) 0xffff0000 else 0xff0000ff;
+            try std.testing.expectEqual(expected, v3d.tile_color[ty * 64 + tx]);
         }
     }
 }
