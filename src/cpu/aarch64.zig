@@ -695,9 +695,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     0b11 => .ands_reg32,
                                 };
                                 return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .rm = rm };
-                            } else if ((op2 & 0b1001) == 0b0001 and s == 0) {
-                                // Unshifted BIC / ORN (`MVN`)
-                                if (op0 == 0) {
+                            } else if ((op2 & 0b1001) == 0b0001 and op0 == 0) {
+                                // Unshifted BIC (s=0) / ORN (`MVN`, s=1)
+                                if (s == 0) {
                                     return .{ .raw = inst, .op = @intFromEnum(if (sf == 1) A64Op.bic_reg64 else A64Op.bic_reg32), .rd = rd, .rn = rn, .rm = rm };
                                 } else {
                                     return .{ .raw = inst, .op = @intFromEnum(if (sf == 1) A64Op.orn_reg64 else A64Op.orn_reg32), .rd = rd, .rn = rn, .rm = rm };
@@ -710,12 +710,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     (if (s == 1) (if (op0 == 1) .subs_reg32 else .adds_reg32) else (if (op0 == 1) .sub_reg32 else .add_reg32));
                                 return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .rm = rm };
                             }
-                        } else if (s == 0) {
+                        } else {
                             const shift_type: u2 = @truncate(inst >> 22);
-                            if ((op2 & 0b1001) == 0b1000 and shift_type == 0b00) {
+                            if (s == 0 and (op2 & 0b1001) == 0b1000 and shift_type == 0b00) {
                                 const op: A64Op = if (sf == 1) (if (op0 == 1) .sub_lsl64 else .add_lsl64) else (if (op0 == 1) .sub_lsl32 else .add_lsl32);
                                 return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
-                            } else if ((op2 & 0b1001) == 0 and sf == 1 and op0 == 1) {
+                            } else if ((op2 & 0b1001) == 0 and sf == 1 and op0 == 0 and s == 1) {
                                 if (shift_type == 0b00) {
                                     return .{ .raw = inst, .op = @intFromEnum(A64Op.orr_lsl64), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
                                 } else if (shift_type == 0b01) {
@@ -1083,14 +1083,20 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             _ = checkInterrupts64(cpu, bus);
             if (cpu.mmu.halted_wfi) return 0;
 
+            cpu.yield_slice = false;
+            cpu.last_dmb_pc = 0xffff_ffff;
+            defer cpu.excl_valid = false;
+
+            const limit = if (max_steps == 4096) max_steps + 256 else max_steps;
             const SlotType = @TypeOf(cpu.icache[0]);
             var executed: usize = 0;
             var priv: u1 = @intFromBool(currentEl(cpu) != 0);
             var code_vbase: u64 = 0xffff_ffff_ffff_ffff;
             var code_pbase: u32 = 0;
 
-            while (executed < max_steps) {
-                if (cpu.mmu.halted_wfi or !cpu.is_aarch64) break;
+            while (executed < limit) {
+                if (cpu.mmu.halted_wfi or cpu.yield_slice or !cpu.is_aarch64) break;
+                if (executed >= max_steps and (cpu.pstate & PstateFlags.I) == 0) break;
 
                 const cur_pc = cpu.pc64;
                 const inst: u32 = if ((cur_pc & ~@as(u64, 0xfff)) == code_vbase)
@@ -5124,6 +5130,30 @@ test "AArch64 A64 instruction execution, EL2->EL1 ERET transition, SVC exception
     // Check SVC ESR_EL1 (EC = 0b010101, IL = 1, ISS = 0x77)
     try std.testing.expectEqual(@as(u64, (0b010101 << 26) | (1 << 25) | 0x77), cpu.x[9]);
     try std.testing.expect(cpu.mmu.halted_wfi);
+
+    // Verify BIC, ORN, EON, and shifted ORR/EOR in decodeA64:
+    // 0x3000: orn x10, x4, x5             (0xaa25008a)
+    // 0x3004: eon x11, x4, x5             (0xca25008b)
+    // 0x3008: eor x12, x4, x5, lsl #4     (0xca05108c)
+    // 0x300c: orr x13, x4, x5, lsl #4     (0xaa05108d)
+    // 0x3010: wfi                         (0xd503207f)
+    const logic_prog = [_]u32{
+        0xaa25008a,
+        0xca25008b,
+        0xca05108c,
+        0xaa05108d,
+        0xd503207f,
+    };
+    for (logic_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x3000 + i * 4 ..][0..4], inst, .little);
+    }
+    cpu.mmu.halted_wfi = false;
+    cpu.pc64 = 0x3000;
+    _ = cpu.runSteps(&bus, 16);
+    try std.testing.expectEqual(@as(u64, 0x56781234) | ~@as(u64, 42), cpu.x[10]);
+    try std.testing.expectEqual(@as(u64, 0x56781234) ^ ~@as(u64, 42), cpu.x[11]);
+    try std.testing.expectEqual(@as(u64, 0x56781234) ^ (@as(u64, 42) << 4), cpu.x[12]);
+    try std.testing.expectEqual(@as(u64, 0x56781234) | (@as(u64, 42) << 4), cpu.x[13]);
 }
 
 test "AArch64 pre-decoded atomics, SBFM/SXTW, variable shifts, extended add, indexed/reg loads, and BLR" {
