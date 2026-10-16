@@ -308,6 +308,45 @@ pub const DmaController = struct {
 
         var y: u32 = 0;
         while (y < y_cnt) : (y += 1) {
+            if (x_len > 0 and !d_ign and d_inc and !isPeripAddr(dst) and !isPeripAddr(dst +% (x_len - 1))) {
+                const dp: usize = dst & 0x1FFFFFFF;
+                if (dp + x_len <= ram.len) {
+                    if (s_ign) {
+                        @memset(ram[dp .. dp + x_len], 0);
+                        if (s_inc) src +%= x_len;
+                        dst +%= x_len;
+                        src = @bitCast(@as(i32, @bitCast(src)) +% s_stride);
+                        dst = @bitCast(@as(i32, @bitCast(dst)) +% d_stride);
+                        continue;
+                    } else if (s_inc and !isPeripAddr(src) and !isPeripAddr(src +% (x_len - 1))) {
+                        const sp: usize = src & 0x1FFFFFFF;
+                        if (sp + x_len <= ram.len and (sp + x_len <= dp or dp + x_len <= sp)) {
+                            @memcpy(ram[dp .. dp + x_len], ram[sp .. sp + x_len]);
+                            src +%= x_len;
+                            dst +%= x_len;
+                            src = @bitCast(@as(i32, @bitCast(src)) +% s_stride);
+                            dst = @bitCast(@as(i32, @bitCast(dst)) +% d_stride);
+                            continue;
+                        }
+                    } else if (!s_inc and !isPeripAddr(src) and (src & 3) == 0 and (dst & 3) == 0 and (x_len & 3) == 0) {
+                        const sp: usize = src & 0x1FFFFFFF;
+                        const word: u32 = if (sp + 4 <= ram.len) std.mem.readInt(u32, ram[sp..][0..4], .little) else 0;
+                        if (word == 0) {
+                            @memset(ram[dp .. dp + x_len], 0);
+                        } else {
+                            var off: usize = 0;
+                            while (off < x_len) : (off += 4) {
+                                std.mem.writeInt(u32, ram[dp + off ..][0..4], word, .little);
+                            }
+                        }
+                        dst +%= x_len;
+                        src = @bitCast(@as(i32, @bitCast(src)) +% s_stride);
+                        dst = @bitCast(@as(i32, @bitCast(dst)) +% d_stride);
+                        continue;
+                    }
+                }
+            }
+
             var rem = x_len;
             while (rem > 0) {
                 if (rem >= 4 and (src & 3) == 0 and (dst & 3) == 0) {
@@ -379,3 +418,42 @@ test "DMA 1D memory-to-memory copy" {
     try std.testing.expectEqual(@as(u32, 0x12345678), std.mem.readInt(u32, ram[0x204..0x208], .little));
     try std.testing.expect(dma.channelIrqPending(0));
 }
+
+test "DMA zero-fill and constant-word fill fast paths" {
+    var dma = DmaController{};
+    var ram: [1024]u8 = [_]u8{0xAA} ** 1024;
+
+    // 1. TI_S_IGNORE zero-fill 64 bytes at 0x200
+    const cb1: u32 = 0x20;
+    std.mem.writeInt(u32, ram[cb1 + 0 ..][0..4], DmaController.TI_S_IGNORE | DmaController.TI_D_INC, .little);
+    std.mem.writeInt(u32, ram[cb1 + 4 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[cb1 + 8 ..][0..4], 0xc0000200, .little);
+    std.mem.writeInt(u32, ram[cb1 + 12 ..][0..4], 64, .little);
+    std.mem.writeInt(u32, ram[cb1 + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[cb1 + 20 ..][0..4], 0, .little);
+
+    dma.write32(0x04, 0xc0000020, &ram, null);
+    dma.write32(0x00, DmaController.CS_ACTIVE, &ram, null);
+
+    for (ram[0x200..0x240]) |b| {
+        try std.testing.expectEqual(@as(u8, 0), b);
+    }
+    try std.testing.expectEqual(@as(u8, 0xAA), ram[0x240]);
+
+    // 2. Constant-word fill (!TI_S_INC) with 0xDEADBEEF at 0x300
+    std.mem.writeInt(u32, ram[0x100..0x104], 0xDEADBEEF, .little);
+    std.mem.writeInt(u32, ram[cb1 + 0 ..][0..4], DmaController.TI_D_INC, .little);
+    std.mem.writeInt(u32, ram[cb1 + 4 ..][0..4], 0xc0000100, .little);
+    std.mem.writeInt(u32, ram[cb1 + 8 ..][0..4], 0xc0000300, .little);
+    std.mem.writeInt(u32, ram[cb1 + 12 ..][0..4], 16, .little);
+    std.mem.writeInt(u32, ram[cb1 + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[cb1 + 20 ..][0..4], 0, .little);
+
+    dma.write32(0x04, 0xc0000020, &ram, null);
+    dma.write32(0x00, DmaController.CS_ACTIVE, &ram, null);
+
+    for (0..4) |i| {
+        try std.testing.expectEqual(@as(u32, 0xDEADBEEF), std.mem.readInt(u32, ram[0x300 + i * 4 ..][0..4], .little));
+    }
+}
+
