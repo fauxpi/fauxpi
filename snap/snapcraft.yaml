@@ -1,0 +1,60 @@
+name: fauxpi
+base: core24
+version: '0.1.0'
+summary: Raspberry Pi hardware simulator
+description: |
+  FauxPi is a Raspberry Pi hardware simulator supporting the Raspberry Pi 1
+  (A+, B+), Raspberry Pi 3 (A+, B+), and Raspberry Pi Zero (Zero, Zero W,
+  Zero 2 W) families.
+
+  Features:
+  - VideoCore IV HVS/V3D graphics and HDMI display output
+  - Interactive board sheet to connect/disconnect peripherals, inspect GPIO
+    pins, and adjust CPU temperature
+  - Copy-on-write QCOW2 SD card image management
+  - USB HID keyboard/mouse, user-mode NAT Ethernet & Wi-Fi, and audio playback
+license: MIT
+grade: stable
+confinement: strict
+icon: data/io.github.robert_ancell.FauxPi.svg
+
+platforms:
+  amd64:
+  arm64:
+
+apps:
+  fauxpi:
+    command: usr/bin/fauxpi
+    desktop: usr/share/applications/io.github.robert_ancell.FauxPi.desktop
+    common-id: io.github.robert_ancell.FauxPi
+    environment:
+      XDG_DATA_HOME: $SNAP_USER_DATA/.local/share
+      LD_LIBRARY_PATH: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR:$SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pulseaudio${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+      PULSE_SERVER: unix:$XDG_RUNTIME_DIR/pulse/native
+    plugs:
+      - wayland
+      - desktop
+      - audio-playback
+      - network
+
+parts:
+  fauxpi:
+    plugin: nil
+    source: .
+    build-packages:
+      - ca-certificates
+      - curl
+      - python3
+      - tar
+      - xz-utils
+    stage-packages:
+      - libpulse0
+      - libasound2t64
+    override-build: |
+      ./scripts/zig build -Doptimize=ReleaseFast --prefix "$CRAFT_PART_INSTALL/usr"
+      install -Dm644 data/io.github.robert_ancell.FauxPi.desktop \
+        "$CRAFT_PART_INSTALL/usr/share/applications/io.github.robert_ancell.FauxPi.desktop"
+      install -Dm644 data/io.github.robert_ancell.FauxPi.svg \
+        "$CRAFT_PART_INSTALL/usr/share/icons/hicolor/scalable/apps/io.github.robert_ancell.FauxPi.svg"
+      install -Dm644 data/io.github.robert_ancell.FauxPi.metainfo.xml \
+        "$CRAFT_PART_INSTALL/usr/share/metainfo/io.github.robert_ancell.FauxPi.metainfo.xml"

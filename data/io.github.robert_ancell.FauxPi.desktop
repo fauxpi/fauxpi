@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=FauxPi
+GenericName=Raspberry Pi Simulator
+Comment=Simulate Raspberry Pi boards, VideoCore IV graphics, GPIO, and peripherals
+Exec=fauxpi
+Icon=io.github.robert_ancell.FauxPi
+Terminal=false
+Categories=System;Emulator;
+Keywords=Raspberry Pi;ARM;Emulator;Simulator;BCM2835;BCM2837;GPIO;
+StartupWMClass=fauxpi

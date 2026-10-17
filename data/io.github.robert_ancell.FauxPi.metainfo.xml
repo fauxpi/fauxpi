@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.robert_ancell.FauxPi</id>
+  <name>FauxPi</name>
+  <summary>Raspberry Pi hardware simulator</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.robert_ancell">
+    <name>FauxPi Contributors</name>
+  </developer>
+  <description>
+    <p>
+      FauxPi is a Raspberry Pi hardware simulator supporting the Raspberry Pi 1 (A+, B+),
+      Raspberry Pi 3 (A+, B+), and Raspberry Pi Zero (Zero, Zero W, Zero 2 W) families.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>VideoCore IV HVS/V3D graphics and HDMI display output</li>
+      <li>Interactive board sheet to connect/disconnect peripherals, inspect GPIO pins, and adjust CPU temperature</li>
+      <li>Copy-on-write QCOW2 SD card image management</li>
+      <li>USB HID keyboard/mouse, user-mode NAT Ethernet &amp; Wi-Fi, and HDMI/PWM audio</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">io.github.robert_ancell.FauxPi.desktop</launchable>
+  <url type="homepage">https://github.com/robert-ancell/fauxpi</url>
+  <url type="bugtracker">https://github.com/robert-ancell/fauxpi/issues</url>
+  <url type="vcs-browser">https://github.com/robert-ancell/fauxpi</url>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-10-18" />
+  </releases>
+</component>
