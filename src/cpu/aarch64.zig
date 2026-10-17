@@ -1563,12 +1563,19 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             var code_vbase: u64 = 0xffff_ffff_ffff_ffff;
             var code_pbase: u32 = 0;
             var code_page_ptr: [*]const u8 = bus.ram.ptr;
+            var data_r_vbase: u64 = 0xffff_ffff_ffff_ffff;
+            var data_w_vbase: u64 = 0xffff_ffff_ffff_ffff;
+            var data_page_ptr: [*]u8 = bus.ram.ptr;
 
             while (executed < limit) {
                 if (cpu.mmu.halted_wfi or cpu.yield_slice or !cpu.is_aarch64) break;
                 if ((executed & 255) == 0 and atomic_ram.busParallel(bus)) {
                     // Apply TLB invalidations other cores broadcast while this slice runs
-                    if (bus.smp.serviceTlb(cpu.mmu.core_id, &cpu.mmu)) code_vbase = 0xffff_ffff_ffff_ffff;
+                    if (bus.smp.serviceTlb(cpu.mmu.core_id, &cpu.mmu)) {
+                        code_vbase = 0xffff_ffff_ffff_ffff;
+                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                    }
                 }
                 if (executed >= max_steps and (cpu.pstate & PstateFlags.I) == 0) break;
 
@@ -1589,6 +1596,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         takeException64(cpu, target_el, 0x000, esr, cur_pc, cur_pc);
                         priv = 1;
                         code_vbase = 0xffff_ffff_ffff_ffff;
+                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                        data_w_vbase = 0xffff_ffff_ffff_ffff;
                         executed += 1;
                         continue;
                     };
@@ -1745,170 +1754,251 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     },
                     .ldr64_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            setX(cpu, @truncate(d.rd), std.mem.readInt(u64, bus.ram[paddr..][0..8], .little));
+                        if ((addr & ~@as(u64, 0xff8)) == data_r_vbase) {
+                            setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], .little));
                         } else {
-                            const val = readData64(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setX(cpu, @truncate(d.rd), val);
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], .little));
+                            } else {
+                                const val = readData64(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                setX(cpu, @truncate(d.rd), val);
+                            }
                         }
                     },
                     .str64_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
                         const val = getX(cpu, @truncate(d.rd));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
+                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase) {
+                            std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
                         } else {
-                            writeData64(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                            } else {
+                                writeData64(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     },
                     .ldr32_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            setW(cpu, @truncate(d.rd), std.mem.readInt(u32, bus.ram[paddr..][0..4], .little));
+                        if ((addr & ~@as(u64, 0xffc)) == data_r_vbase) {
+                            setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], .little));
                         } else {
-                            const val = readData32(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setW(cpu, @truncate(d.rd), val);
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..4], .little));
+                            } else {
+                                const val = readData32(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                setW(cpu, @truncate(d.rd), val);
+                            }
                         }
                     },
                     .str32_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
                         const val = getW(cpu, @truncate(d.rd));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
+                        if ((addr & ~@as(u64, 0xffc)) == data_w_vbase) {
+                            std.mem.writeInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
                         } else {
-                            writeData32(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
+                            } else {
+                                writeData32(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     },
                     .ldrsw_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        const val32: u32 = if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) blk: {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            break :blk std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
-                        } else readData32(cpu, bus, addr) catch {
-                            handleAbort64(cpu, cur_pc);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff_ffff_ffff;
-                            continue;
+                        const val32: u32 = if ((addr & ~@as(u64, 0xffc)) == data_r_vbase)
+                            std.mem.readInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], .little)
+                        else blk: {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                break :blk std.mem.readInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
+                            }
+                            break :blk readData32(cpu, bus, addr) catch {
+                                handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                continue;
+                            };
                         };
                         setX(cpu, @truncate(d.rd), @bitCast(@as(i64, @as(i32, @bitCast(val32)))));
                     },
                     .ldr16_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffe and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            setW(cpu, @truncate(d.rd), std.mem.readInt(u16, bus.ram[paddr..][0..2], .little));
+                        if ((addr & ~@as(u64, 0xffe)) == data_r_vbase) {
+                            setW(cpu, @truncate(d.rd), std.mem.readInt(u16, data_page_ptr[@as(usize, @truncate(addr & 0xffe))..][0..2], .little));
                         } else {
-                            const val = readData16(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setW(cpu, @truncate(d.rd), val);
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffe and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                setW(cpu, @truncate(d.rd), std.mem.readInt(u16, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..2], .little));
+                            } else {
+                                const val = readData16(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                setW(cpu, @truncate(d.rd), val);
+                            }
                         }
                     },
                     .str16_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
                         const val: u16 = @truncate(getW(cpu, @truncate(d.rd)));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffe and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u16, bus.ram[paddr..][0..2], val, .little);
+                        if ((addr & ~@as(u64, 0xffe)) == data_w_vbase) {
+                            std.mem.writeInt(u16, data_page_ptr[@as(usize, @truncate(addr & 0xffe))..][0..2], val, .little);
                         } else {
-                            writeData16(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffe and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u16, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..2], val, .little);
+                            } else {
+                                writeData16(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     },
                     .ldr8_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            setW(cpu, @truncate(d.rd), bus.ram[paddr]);
+                        if ((addr & ~@as(u64, 0xfff)) == data_r_vbase) {
+                            setW(cpu, @truncate(d.rd), data_page_ptr[@as(usize, @truncate(addr & 0xfff))]);
                         } else {
-                            const val = readData8(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setW(cpu, @truncate(d.rd), val);
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                setW(cpu, @truncate(d.rd), data_page_ptr[@as(usize, @truncate(addr & 0xfff))]);
+                            } else {
+                                const val = readData8(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                setW(cpu, @truncate(d.rd), val);
+                            }
                         }
                     },
                     .str8_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
                         const val: u8 = @truncate(getW(cpu, @truncate(d.rd)));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            bus.ram[paddr] = val;
+                        if ((addr & ~@as(u64, 0xfff)) == data_w_vbase) {
+                            data_page_ptr[@as(usize, @truncate(addr & 0xfff))] = val;
                         } else {
-                            writeData8(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                data_page_ptr[@as(usize, @truncate(addr & 0xfff))] = val;
+                            } else {
+                                writeData8(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -1917,15 +2007,24 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const base = getXOrSp(cpu, @truncate(d.rn));
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .ldr64_post) base else wb_addr;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        const val: u64 = if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) blk: {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            break :blk std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
-                        } else readData64(cpu, bus, addr) catch {
-                            handleAbort64(cpu, cur_pc);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff_ffff_ffff;
-                            continue;
+                        const val: u64 = if ((addr & ~@as(u64, 0xff8)) == data_r_vbase)
+                            std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], .little)
+                        else blk: {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                break :blk std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                            }
+                            break :blk readData64(cpu, bus, addr) catch {
+                                handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                continue;
+                            };
                         };
                         setX(cpu, @truncate(d.rd), val);
                         setXOrSp(cpu, @truncate(d.rn), wb_addr);
@@ -1935,24 +2034,35 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .str64_post) base else wb_addr;
                         const val = getX(cpu, @truncate(d.rd));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
+                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase) {
+                            std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
                             setXOrSp(cpu, @truncate(d.rn), wb_addr);
                         } else {
-                            writeData64(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setXOrSp(cpu, @truncate(d.rn), wb_addr);
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                                setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                            } else {
+                                writeData64(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -1961,15 +2071,24 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const base = getXOrSp(cpu, @truncate(d.rn));
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .ldr32_post) base else wb_addr;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        const val: u32 = if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) blk: {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            break :blk std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
-                        } else readData32(cpu, bus, addr) catch {
-                            handleAbort64(cpu, cur_pc);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff_ffff_ffff;
-                            continue;
+                        const val: u32 = if ((addr & ~@as(u64, 0xffc)) == data_r_vbase)
+                            std.mem.readInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], .little)
+                        else blk: {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                break :blk std.mem.readInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
+                            }
+                            break :blk readData32(cpu, bus, addr) catch {
+                                handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                continue;
+                            };
                         };
                         setW(cpu, @truncate(d.rd), val);
                         setXOrSp(cpu, @truncate(d.rn), wb_addr);
@@ -1979,141 +2098,206 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .str32_post) base else wb_addr;
                         const val = getW(cpu, @truncate(d.rd));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
+                        if ((addr & ~@as(u64, 0xffc)) == data_w_vbase) {
+                            std.mem.writeInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
                             setXOrSp(cpu, @truncate(d.rn), wb_addr);
                         } else {
-                            writeData32(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setXOrSp(cpu, @truncate(d.rn), wb_addr);
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
+                                setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                            } else {
+                                writeData32(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     },
                     .ldr64_reg_lsl => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            setX(cpu, @truncate(d.rd), std.mem.readInt(u64, bus.ram[paddr..][0..8], .little));
+                        if ((addr & ~@as(u64, 0xff8)) == data_r_vbase) {
+                            setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], .little));
                         } else {
-                            const val = readData64(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setX(cpu, @truncate(d.rd), val);
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], .little));
+                            } else {
+                                const val = readData64(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                setX(cpu, @truncate(d.rd), val);
+                            }
                         }
                     },
                     .str64_reg_lsl => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
                         const val = getX(cpu, @truncate(d.rd));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
+                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase) {
+                            std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
                         } else {
-                            writeData64(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                            } else {
+                                writeData64(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     },
                     .ldr32_reg_lsl => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            setW(cpu, @truncate(d.rd), std.mem.readInt(u32, bus.ram[paddr..][0..4], .little));
+                        if ((addr & ~@as(u64, 0xffc)) == data_r_vbase) {
+                            setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], .little));
                         } else {
-                            const val = readData32(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setW(cpu, @truncate(d.rd), val);
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..4], .little));
+                            } else {
+                                const val = readData32(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                setW(cpu, @truncate(d.rd), val);
+                            }
                         }
                     },
                     .str32_reg_lsl => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
                         const val = getW(cpu, @truncate(d.rd));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
+                        if ((addr & ~@as(u64, 0xffc)) == data_w_vbase) {
+                            std.mem.writeInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
                         } else {
-                            writeData32(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
+                            } else {
+                                writeData32(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     },
                     .ldr8_reg_lsl => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% getX(cpu, @truncate(d.rm));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            setW(cpu, @truncate(d.rd), bus.ram[paddr]);
+                        if ((addr & ~@as(u64, 0xfff)) == data_r_vbase) {
+                            setW(cpu, @truncate(d.rd), data_page_ptr[@as(usize, @truncate(addr & 0xfff))]);
                         } else {
-                            const val = readData8(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setW(cpu, @truncate(d.rd), val);
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                setW(cpu, @truncate(d.rd), data_page_ptr[@as(usize, @truncate(addr & 0xfff))]);
+                            } else {
+                                const val = readData8(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                setW(cpu, @truncate(d.rd), val);
+                            }
                         }
                     },
                     .str8_reg_lsl => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% getX(cpu, @truncate(d.rm));
                         const val: u8 = @truncate(getW(cpu, @truncate(d.rd)));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            bus.ram[paddr] = val;
+                        if ((addr & ~@as(u64, 0xfff)) == data_w_vbase) {
+                            data_page_ptr[@as(usize, @truncate(addr & 0xfff))] = val;
                         } else {
-                            writeData8(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                data_page_ptr[@as(usize, @truncate(addr & 0xfff))] = val;
+                            } else {
+                                writeData8(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -2133,6 +2317,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 handleAbort64(cpu, cur_pc);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                data_w_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                         }
@@ -2156,6 +2342,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 handleAbort64(cpu, cur_pc);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                data_w_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                         }
@@ -2175,6 +2363,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 handleAbort64(cpu, cur_pc);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                data_w_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                         }
@@ -2198,6 +2388,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 handleAbort64(cpu, cur_pc);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                data_w_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             };
                         }
@@ -2206,22 +2398,35 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const base = getXOrSp(cpu, @truncate(d.rn));
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .ldp64_post) base else wb_addr;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            const v1 = std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
-                            const v2 = std.mem.readInt(u64, bus.ram[paddr + 8 ..][0..8], .little);
+                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase) {
+                            const off: usize = @truncate(addr & 0xfff);
+                            const v1 = std.mem.readInt(u64, data_page_ptr[off..][0..8], .little);
+                            const v2 = std.mem.readInt(u64, data_page_ptr[off + 8 ..][0..8], .little);
                             setX(cpu, @truncate(d.rd), v1);
                             setX(cpu, @truncate(d.rm), v2);
                         } else {
-                            const pair = readData128(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setX(cpu, @truncate(d.rd), @truncate(pair));
-                            setX(cpu, @truncate(d.rm), @truncate(pair >> 64));
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                const off: usize = @truncate(addr & 0xfff);
+                                const v1 = std.mem.readInt(u64, data_page_ptr[off..][0..8], .little);
+                                const v2 = std.mem.readInt(u64, data_page_ptr[off + 8 ..][0..8], .little);
+                                setX(cpu, @truncate(d.rd), v1);
+                                setX(cpu, @truncate(d.rm), v2);
+                            } else {
+                                const pair = readData128(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                setX(cpu, @truncate(d.rd), @truncate(pair));
+                                setX(cpu, @truncate(d.rm), @truncate(pair >> 64));
+                            }
                         }
                         if (op != .ldp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
                     },
@@ -2231,25 +2436,39 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const addr = if (op == .stp64_post) base else wb_addr;
                         const v1 = getX(cpu, @truncate(d.rd));
                         const v2 = getX(cpu, @truncate(d.rm));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u64, bus.ram[paddr..][0..8], v1, .little);
-                            std.mem.writeInt(u64, bus.ram[paddr + 8 ..][0..8], v2, .little);
+                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase) {
+                            const off: usize = @truncate(addr & 0xfff);
+                            std.mem.writeInt(u64, data_page_ptr[off..][0..8], v1, .little);
+                            std.mem.writeInt(u64, data_page_ptr[off + 8 ..][0..8], v2, .little);
                             if (op != .stp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
                         } else {
-                            writeData128(cpu, bus, addr, @as(u128, v1) | (@as(u128, v2) << 64)) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if (op != .stp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                const off: usize = @truncate(addr & 0xfff);
+                                std.mem.writeInt(u64, data_page_ptr[off..][0..8], v1, .little);
+                                std.mem.writeInt(u64, data_page_ptr[off + 8 ..][0..8], v2, .little);
+                                if (op != .stp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                            } else {
+                                writeData128(cpu, bus, addr, @as(u128, v1) | (@as(u128, v2) << 64)) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if (op != .stp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -2258,28 +2477,43 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const base = getXOrSp(cpu, @truncate(d.rn));
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .ldp32_post) base else wb_addr;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            const v1 = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
-                            const v2 = std.mem.readInt(u32, bus.ram[paddr + 4 ..][0..4], .little);
+                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == data_r_vbase) {
+                            const off: usize = @truncate(addr & 0xfff);
+                            const v1 = std.mem.readInt(u32, data_page_ptr[off..][0..4], .little);
+                            const v2 = std.mem.readInt(u32, data_page_ptr[off + 4 ..][0..4], .little);
                             setW(cpu, @truncate(d.rd), v1);
                             setW(cpu, @truncate(d.rm), v2);
                         } else {
-                            const v1 = readData32(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            const v2 = readData32(cpu, bus, addr +% 4) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setW(cpu, @truncate(d.rd), v1);
-                            setW(cpu, @truncate(d.rm), v2);
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                const off: usize = @truncate(addr & 0xfff);
+                                const v1 = std.mem.readInt(u32, data_page_ptr[off..][0..4], .little);
+                                const v2 = std.mem.readInt(u32, data_page_ptr[off + 4 ..][0..4], .little);
+                                setW(cpu, @truncate(d.rd), v1);
+                                setW(cpu, @truncate(d.rm), v2);
+                            } else {
+                                const v1 = readData32(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                const v2 = readData32(cpu, bus, addr +% 4) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                setW(cpu, @truncate(d.rd), v1);
+                                setW(cpu, @truncate(d.rm), v2);
+                            }
                         }
                         if (op != .ldp32_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
                     },
@@ -2289,31 +2523,47 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const addr = if (op == .stp32_post) base else wb_addr;
                         const v1 = getW(cpu, @truncate(d.rd));
                         const v2 = getW(cpu, @truncate(d.rm));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u32, bus.ram[paddr..][0..4], v1, .little);
-                            std.mem.writeInt(u32, bus.ram[paddr + 4 ..][0..4], v2, .little);
+                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == data_w_vbase) {
+                            const off: usize = @truncate(addr & 0xfff);
+                            std.mem.writeInt(u32, data_page_ptr[off..][0..4], v1, .little);
+                            std.mem.writeInt(u32, data_page_ptr[off + 4 ..][0..4], v2, .little);
                             if (op != .stp32_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
                         } else {
-                            writeData32(cpu, bus, addr, v1) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            writeData32(cpu, bus, addr +% 4, v2) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if (op != .stp32_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                const off: usize = @truncate(addr & 0xfff);
+                                std.mem.writeInt(u32, data_page_ptr[off..][0..4], v1, .little);
+                                std.mem.writeInt(u32, data_page_ptr[off + 4 ..][0..4], v2, .little);
+                                if (op != .stp32_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                            } else {
+                                writeData32(cpu, bus, addr, v1) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                writeData32(cpu, bus, addr +% 4, v2) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                if (op != .stp32_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -2322,215 +2572,318 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const base = getXOrSp(cpu, @truncate(d.rn));
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .ldpsw_post) base else wb_addr;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            const v1: u64 = @bitCast(@as(i64, std.mem.readInt(i32, bus.ram[paddr..][0..4], .little)));
-                            const v2: u64 = @bitCast(@as(i64, std.mem.readInt(i32, bus.ram[paddr + 4 ..][0..4], .little)));
+                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == data_r_vbase) {
+                            const off: usize = @truncate(addr & 0xfff);
+                            const v1: u64 = @bitCast(@as(i64, std.mem.readInt(i32, data_page_ptr[off..][0..4], .little)));
+                            const v2: u64 = @bitCast(@as(i64, std.mem.readInt(i32, data_page_ptr[off + 4 ..][0..4], .little)));
                             setX(cpu, @truncate(d.rd), v1);
                             setX(cpu, @truncate(d.rm), v2);
                         } else {
-                            const pair = readData64(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            const v1: u64 = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(pair))))));
-                            const v2: u64 = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(pair >> 32))))));
-                            setX(cpu, @truncate(d.rd), v1);
-                            setX(cpu, @truncate(d.rm), v2);
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                const off: usize = @truncate(addr & 0xfff);
+                                const v1: u64 = @bitCast(@as(i64, std.mem.readInt(i32, data_page_ptr[off..][0..4], .little)));
+                                const v2: u64 = @bitCast(@as(i64, std.mem.readInt(i32, data_page_ptr[off + 4 ..][0..4], .little)));
+                                setX(cpu, @truncate(d.rd), v1);
+                                setX(cpu, @truncate(d.rm), v2);
+                            } else {
+                                const pair = readData64(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                const v1: u64 = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(pair))))));
+                                const v2: u64 = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(pair >> 32))))));
+                                setX(cpu, @truncate(d.rd), v1);
+                                setX(cpu, @truncate(d.rm), v2);
+                            }
                         }
                         if (op != .ldpsw_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
                     },
                     .ldr_fp32_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                        if ((addr & ~@as(u64, 0xffc)) == data_r_vbase) {
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], .little);
                         } else {
-                            const val = readData32(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
+                            } else {
+                                const val = readData32(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
+                            }
                         }
                     },
                     .str_fp32_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
                         const val: u32 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
+                        if ((addr & ~@as(u64, 0xffc)) == data_w_vbase) {
+                            std.mem.writeInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
                         } else {
-                            writeData32(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u32, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
+                            } else {
+                                writeData32(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     },
                     .ldr_fp64_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
+                        if ((addr & ~@as(u64, 0xff8)) == data_r_vbase) {
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], .little);
                         } else {
-                            const val = readData64(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                            } else {
+                                const val = readData64(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
+                            }
                         }
                     },
                     .str_fp64_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
                         const val: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
+                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase) {
+                            std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
                         } else {
-                            writeData64(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                            } else {
+                                writeData64(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     },
                     .ldr_fp128_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, bus.ram[paddr..][0..16], .little);
+                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase) {
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
                         } else {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
+                            } else {
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                            }
                         }
                     },
                     .str_fp128_uimm => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% d.imm;
                         const val = cpu.vfp.v[@as(u5, @truncate(d.rd))];
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u128, bus.ram[paddr..][0..16], val, .little);
+                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase) {
+                            std.mem.writeInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
                         } else {
-                            writeData128(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
+                            } else {
+                                writeData128(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     },
                     .ldr_fp64_reg_lsl => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
+                        if ((addr & ~@as(u64, 0xff8)) == data_r_vbase) {
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], .little);
                         } else {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData64(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                            } else {
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData64(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                            }
                         }
                     },
                     .str_fp64_reg_lsl => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
                         const val: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
+                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase) {
+                            std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
                         } else {
-                            writeData64(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                            } else {
+                                writeData64(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
                     },
                     .ldr_fp128_reg_lsl => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, bus.ram[paddr..][0..16], .little);
+                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase) {
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
                         } else {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
+                            } else {
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                            }
                         }
                     },
                     .str_fp128_reg_lsl => {
                         const addr = getXOrSp(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
                         const val = cpu.vfp.v[@as(u5, @truncate(d.rd))];
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u128, bus.ram[paddr..][0..16], val, .little);
+                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase) {
+                            std.mem.writeInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
                         } else {
-                            writeData128(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
+                            } else {
+                                writeData128(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -2539,15 +2892,24 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const base = getXOrSp(cpu, @truncate(d.rn));
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .ldr_fp64_post) base else wb_addr;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        const val: u64 = if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) blk: {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            break :blk std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
-                        } else readData64(cpu, bus, addr) catch {
-                            handleAbort64(cpu, cur_pc);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff_ffff_ffff;
-                            continue;
+                        const val: u64 = if ((addr & ~@as(u64, 0xff8)) == data_r_vbase)
+                            std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], .little)
+                        else blk: {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                break :blk std.mem.readInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                            }
+                            break :blk readData64(cpu, bus, addr) catch {
+                                handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                continue;
+                            };
                         };
                         cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
                         setXOrSp(cpu, @truncate(d.rn), wb_addr);
@@ -2557,24 +2919,35 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .str_fp64_post) base else wb_addr;
                         const val: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
+                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase) {
+                            std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
                             setXOrSp(cpu, @truncate(d.rn), wb_addr);
                         } else {
-                            writeData64(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setXOrSp(cpu, @truncate(d.rn), wb_addr);
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u64, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                                setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                            } else {
+                                writeData64(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -2583,17 +2956,25 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const base = getXOrSp(cpu, @truncate(d.rn));
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .ldr_fp128_post) base else wb_addr;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, bus.ram[paddr..][0..16], .little);
+                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase) {
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
                         } else {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
+                            } else {
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                            }
                         }
                         setXOrSp(cpu, @truncate(d.rn), wb_addr);
                     },
@@ -2602,24 +2983,35 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .str_fp128_post) base else wb_addr;
                         const val = cpu.vfp.v[@as(u5, @truncate(d.rd))];
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u128, bus.ram[paddr..][0..16], val, .little);
+                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase) {
+                            std.mem.writeInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
                             setXOrSp(cpu, @truncate(d.rn), wb_addr);
                         } else {
-                            writeData128(cpu, bus, addr, val) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            setXOrSp(cpu, @truncate(d.rn), wb_addr);
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                std.mem.writeInt(u128, data_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
+                                setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                            } else {
+                                writeData128(cpu, bus, addr, val) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -2628,22 +3020,35 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const base = getXOrSp(cpu, @truncate(d.rn));
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .ldp_fp64_post) base else wb_addr;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            const v1 = std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
-                            const v2 = std.mem.readInt(u64, bus.ram[paddr + 8 ..][0..8], .little);
+                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase) {
+                            const off: usize = @truncate(addr & 0xfff);
+                            const v1 = std.mem.readInt(u64, data_page_ptr[off..][0..8], .little);
+                            const v2 = std.mem.readInt(u64, data_page_ptr[off + 8 ..][0..8], .little);
                             cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
                             cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
                         } else {
-                            const pair = readData128(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @truncate(pair));
-                            cpu.vfp.v[@as(u5, @truncate(d.rm))] = @as(u64, @truncate(pair >> 64));
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                const off: usize = @truncate(addr & 0xfff);
+                                const v1 = std.mem.readInt(u64, data_page_ptr[off..][0..8], .little);
+                                const v2 = std.mem.readInt(u64, data_page_ptr[off + 8 ..][0..8], .little);
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
+                                cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
+                            } else {
+                                const pair = readData128(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @truncate(pair));
+                                cpu.vfp.v[@as(u5, @truncate(d.rm))] = @as(u64, @truncate(pair >> 64));
+                            }
                         }
                         if (op != .ldp_fp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
                     },
@@ -2653,25 +3058,39 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const addr = if (op == .stp_fp64_post) base else wb_addr;
                         const v1: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
                         const v2: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u64, bus.ram[paddr..][0..8], v1, .little);
-                            std.mem.writeInt(u64, bus.ram[paddr + 8 ..][0..8], v2, .little);
+                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase) {
+                            const off: usize = @truncate(addr & 0xfff);
+                            std.mem.writeInt(u64, data_page_ptr[off..][0..8], v1, .little);
+                            std.mem.writeInt(u64, data_page_ptr[off + 8 ..][0..8], v2, .little);
                             if (op != .stp_fp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
                         } else {
-                            writeData128(cpu, bus, addr, @as(u128, v1) | (@as(u128, v2) << 64)) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if (op != .stp_fp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                const off: usize = @truncate(addr & 0xfff);
+                                std.mem.writeInt(u64, data_page_ptr[off..][0..8], v1, .little);
+                                std.mem.writeInt(u64, data_page_ptr[off + 8 ..][0..8], v2, .little);
+                                if (op != .stp_fp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                            } else {
+                                writeData128(cpu, bus, addr, @as(u128, v1) | (@as(u128, v2) << 64)) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                if (op != .stp_fp64_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -2680,28 +3099,43 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const base = getXOrSp(cpu, @truncate(d.rn));
                         const wb_addr = base +% d.imm;
                         const addr = if (op == .ldp_fp128_post) base else wb_addr;
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            const v1 = std.mem.readInt(u128, bus.ram[paddr..][0..16], .little);
-                            const v2 = std.mem.readInt(u128, bus.ram[paddr + 16 ..][0..16], .little);
+                        if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase) {
+                            const off: usize = @truncate(addr & 0xfff);
+                            const v1 = std.mem.readInt(u128, data_page_ptr[off..][0..16], .little);
+                            const v2 = std.mem.readInt(u128, data_page_ptr[off + 16 ..][0..16], .little);
                             cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
                             cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
                         } else {
-                            const v1 = readData128(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            const v2 = readData128(cpu, bus, addr +% 16) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
-                            cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                const off: usize = @truncate(addr & 0xfff);
+                                const v1 = std.mem.readInt(u128, data_page_ptr[off..][0..16], .little);
+                                const v2 = std.mem.readInt(u128, data_page_ptr[off + 16 ..][0..16], .little);
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
+                                cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
+                            } else {
+                                const v1 = readData128(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                const v2 = readData128(cpu, bus, addr +% 16) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
+                                cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
+                            }
                         }
                         if (op != .ldp_fp128_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
                     },
@@ -2711,31 +3145,47 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const addr = if (op == .stp_fp128_post) base else wb_addr;
                         const v1 = cpu.vfp.v[@as(u5, @truncate(d.rd))];
                         const v2 = cpu.vfp.v[@as(u5, @truncate(d.rm))];
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            std.mem.writeInt(u128, bus.ram[paddr..][0..16], v1, .little);
-                            std.mem.writeInt(u128, bus.ram[paddr + 16 ..][0..16], v2, .little);
+                        if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase) {
+                            const off: usize = @truncate(addr & 0xfff);
+                            std.mem.writeInt(u128, data_page_ptr[off..][0..16], v1, .little);
+                            std.mem.writeInt(u128, data_page_ptr[off + 16 ..][0..16], v2, .little);
                             if (op != .stp_fp128_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
                         } else {
-                            writeData128(cpu, bus, addr, v1) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            writeData128(cpu, bus, addr +% 16, v2) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                continue;
-                            };
-                            if (op != .stp_fp128_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
-                            if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                if (checkInterrupts64(cpu, bus)) {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                const off: usize = @truncate(addr & 0xfff);
+                                std.mem.writeInt(u128, data_page_ptr[off..][0..16], v1, .little);
+                                std.mem.writeInt(u128, data_page_ptr[off + 16 ..][0..16], v2, .little);
+                                if (op != .stp_fp128_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                            } else {
+                                writeData128(cpu, bus, addr, v1) catch {
+                                    handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
+                                };
+                                writeData128(cpu, bus, addr +% 16, v2) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                };
+                                if (op != .stp_fp128_off) setXOrSp(cpu, @truncate(d.rn), wb_addr);
+                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -2749,14 +3199,17 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const rt: u5 = @truncate(d.rd);
                         const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((base >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
                         if ((base & 0xfff) + total_bytes <= 0x1000 and (base & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            var paddr = dslot.pbase | @as(u32, @truncate(base & 0xfff));
+                            data_r_vbase = dslot.r_vbase;
+                            data_w_vbase = dslot.w_vbase;
+                            data_page_ptr = bus.ram.ptr + dslot.pbase;
+                            var off: usize = @truncate(base & 0xfff);
                             var r_idx: u5 = 0;
                             while (r_idx < rpt) : (r_idx += 1) {
                                 cpu.vfp.v[rt +% r_idx] = if (q)
-                                    std.mem.readInt(u128, bus.ram[paddr..][0..16], .little)
+                                    std.mem.readInt(u128, data_page_ptr[off..][0..16], .little)
                                 else
-                                    std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
-                                paddr += @intCast(bytes_per_reg);
+                                    std.mem.readInt(u64, data_page_ptr[off..][0..8], .little);
+                                off += @intCast(bytes_per_reg);
                             }
                         } else {
                             var addr = base;
@@ -2780,6 +3233,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 handleAbort64(cpu, cur_pc);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                data_w_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             }
                         }
@@ -2797,15 +3252,18 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const rt: u5 = @truncate(d.rd);
                         const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((base >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
                         if ((base & 0xfff) + total_bytes <= 0x1000 and (base & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            var paddr = dslot.pbase | @as(u32, @truncate(base & 0xfff));
+                            data_r_vbase = dslot.r_vbase;
+                            data_w_vbase = dslot.w_vbase;
+                            data_page_ptr = bus.ram.ptr + dslot.pbase;
+                            var off: usize = @truncate(base & 0xfff);
                             var r_idx: u5 = 0;
                             while (r_idx < rpt) : (r_idx += 1) {
                                 if (q) {
-                                    std.mem.writeInt(u128, bus.ram[paddr..][0..16], cpu.vfp.v[rt +% r_idx], .little);
+                                    std.mem.writeInt(u128, data_page_ptr[off..][0..16], cpu.vfp.v[rt +% r_idx], .little);
                                 } else {
-                                    std.mem.writeInt(u64, bus.ram[paddr..][0..8], @truncate(cpu.vfp.v[rt +% r_idx]), .little);
+                                    std.mem.writeInt(u64, data_page_ptr[off..][0..8], @truncate(cpu.vfp.v[rt +% r_idx]), .little);
                                 }
-                                paddr += @intCast(bytes_per_reg);
+                                off += @intCast(bytes_per_reg);
                             }
                             if (d.rm < 32) {
                                 const inc: u64 = if (d.rm == 31) total_bytes else getX(cpu, @truncate(d.rm));
@@ -2833,6 +3291,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 handleAbort64(cpu, cur_pc);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                data_w_vbase = 0xffff_ffff_ffff_ffff;
                                 continue;
                             }
                             if (d.rm < 32) {
@@ -2843,6 +3303,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 if (checkInterrupts64(cpu, bus)) {
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
                                     continue;
                                 }
                             }
@@ -2890,11 +3352,15 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             handleAbort64(cpu, cur_pc);
                             priv = 1;
                             code_vbase = 0xffff_ffff_ffff_ffff;
+                            data_r_vbase = 0xffff_ffff_ffff_ffff;
+                            data_w_vbase = 0xffff_ffff_ffff_ffff;
                             continue;
                         };
                         if (checkInterrupts64(cpu, bus)) {
                             priv = 1;
                             code_vbase = 0xffff_ffff_ffff_ffff;
+                            data_r_vbase = 0xffff_ffff_ffff_ffff;
+                            data_w_vbase = 0xffff_ffff_ffff_ffff;
                             continue;
                         }
                     },
@@ -2903,15 +3369,21 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             handleAbort64(cpu, cur_pc);
                             priv = 1;
                             code_vbase = 0xffff_ffff_ffff_ffff;
+                            data_r_vbase = 0xffff_ffff_ffff_ffff;
+                            data_w_vbase = 0xffff_ffff_ffff_ffff;
                             continue;
                         };
                         if (checkInterrupts64(cpu, bus)) {
                             priv = 1;
                             code_vbase = 0xffff_ffff_ffff_ffff;
+                            data_r_vbase = 0xffff_ffff_ffff_ffff;
+                            data_w_vbase = 0xffff_ffff_ffff_ffff;
                             continue;
                         }
                         priv = @intFromBool(currentEl(cpu) != 0);
                         code_vbase = 0xffff_ffff_ffff_ffff;
+                        data_r_vbase = 0xffff_ffff_ffff_ffff;
+                        data_w_vbase = 0xffff_ffff_ffff_ffff;
                     },
                     .fmov_d_x => cpu.vfp.v[@as(u5, @truncate(d.rd))] = getX(cpu, @truncate(d.rn)),
                     .fmov_x_d => setX(cpu, @truncate(d.rd), @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])),
