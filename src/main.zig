@@ -111,6 +111,14 @@ fn monotonicNs() u64 {
     return host_posix.monotonicNs();
 }
 
+fn parseHdmiSize(spec: []const u8) ?struct { width: u16, height: u16 } {
+    const sep = std.mem.indexOfAny(u8, spec, "xX") orelse return null;
+    const w = std.fmt.parseInt(u16, spec[0..sep], 10) catch return null;
+    const h = std.fmt.parseInt(u16, spec[sep + 1 ..], 10) catch return null;
+    if (w == 0 or h == 0) return null;
+    return .{ .width = w, .height = h };
+}
+
 fn printUsage() void {
     const msg =
         \\Usage: fauxpi [options]
@@ -122,8 +130,7 @@ fn printUsage() void {
         \\  --dtb <path>        Device Tree Blob (.dtb) when using --kernel
         \\  --initramfs <path>  Optional initramfs.cpio when using --kernel
         \\  --cmdline <string>  Additional kernel command line parameters
-        \\  --width <px>        HDMI output width (default: 1280)
-        \\  --height <px>       HDMI output height (default: 720)
+        \\  --hdmi-size <WxH>   HDMI output size in pixels (default: 1280x720)
         \\  --headless          Run without opening a desktop window
         \\  --max-steps <n>     Stop simulation after <n> ARM instructions
         \\  --sequential-cores  Run all emulated cores on one host thread (deterministic)
@@ -198,12 +205,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
                 std.debug.print("Unknown model: {s} (expected zero, zero-w, zero-2-w, 1a+, 1b+, 3a+, or 3b+)\n", .{m});
                 return 1;
             }
-        } else if (std.mem.eql(u8, arg, "--width")) {
-            const s = args.next() orelse return 1;
-            opts.width = std.fmt.parseInt(u16, s, 10) catch return 1;
-        } else if (std.mem.eql(u8, arg, "--height")) {
-            const s = args.next() orelse return 1;
-            opts.height = std.fmt.parseInt(u16, s, 10) catch return 1;
+        } else if (std.mem.eql(u8, arg, "--hdmi-size")) {
+            const s = args.next() orelse {
+                printUsage();
+                return 1;
+            };
+            const sz = parseHdmiSize(s) orelse {
+                std.debug.print("Invalid --hdmi-size '{s}' (expected <width>x<height>, e.g. 1280x720)\n", .{s});
+                return 1;
+            };
+            opts.width = sz.width;
+            opts.height = sz.height;
         } else if (std.mem.eql(u8, arg, "--headless")) {
             opts.headless = true;
         } else if (std.mem.eql(u8, arg, "--max-steps")) {
@@ -930,3 +942,20 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 test {
     std.testing.refAllDecls(@This());
 }
+
+test "parseHdmiSize parses WxH strings and rejects malformed dimensions" {
+    const testing = std.testing;
+    const def = parseHdmiSize("1280x720").?;
+    try testing.expectEqual(@as(u16, 1280), def.width);
+    try testing.expectEqual(@as(u16, 720), def.height);
+
+    const upper = parseHdmiSize("800X480").?;
+    try testing.expectEqual(@as(u16, 800), upper.width);
+    try testing.expectEqual(@as(u16, 480), upper.height);
+
+    try testing.expect(parseHdmiSize("1280") == null);
+    try testing.expect(parseHdmiSize("0x720") == null);
+    try testing.expect(parseHdmiSize("1280x0") == null);
+    try testing.expect(parseHdmiSize("abcxdef") == null);
+}
+
