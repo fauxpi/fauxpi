@@ -109,10 +109,12 @@ pub const Radii = struct {
 
 /// Material Icons codepoints in `MaterialIcons-Regular.ttf`.
 pub const Icon = enum(u21) {
+    add = 0xe145,
     bolt = 0xea0b,
     check = 0xe5ca,
     close = 0xe5cd,
     crop_square = 0xe3c6,
+    delete = 0xe872,
     desktop_windows = 0xe30c,
     developer_board = 0xe30d,
     device_hub = 0xe335,

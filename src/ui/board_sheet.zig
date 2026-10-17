@@ -31,6 +31,7 @@ pub const SdCardEntry = struct {
     image_path_len: usize = 0,
     image_size_bytes: u64 = 0,
     size: SdCardSize = .gb_4,
+    has_persistent_file: bool = false,
     disk: Qcow2Disk,
 
     pub fn name(self: *const SdCardEntry) []const u8 {
@@ -45,6 +46,40 @@ pub const SdCardEntry = struct {
         self.disk.deinit();
     }
 };
+
+/// Formats a byte count using human-readable binary units (`B`, `KB`, `MB`, `GB`),
+/// matching `SdCardSize.label()` unit naming.
+pub fn formatByteSize(buf: []u8, bytes: u64) []const u8 {
+    const kb_unit: u64 = 1024;
+    const mb_unit: u64 = 1024 * 1024;
+    const gb_unit: u64 = 1024 * 1024 * 1024;
+
+    if (bytes >= gb_unit) {
+        const tenths = (bytes * 10 + gb_unit / 2) / gb_unit;
+        if (tenths % 10 == 0 or tenths >= 100) {
+            return std.fmt.bufPrint(buf, "{d} GB", .{tenths / 10}) catch "0 GB";
+        }
+        return std.fmt.bufPrint(buf, "{d}.{d} GB", .{ tenths / 10, tenths % 10 }) catch "0 GB";
+    }
+    if (bytes >= mb_unit) {
+        const tenths = (bytes * 10 + mb_unit / 2) / mb_unit;
+        if (tenths >= 10240) {
+            return std.fmt.bufPrint(buf, "1 GB", .{}) catch "1 GB";
+        }
+        if (tenths % 10 == 0 or tenths >= 100) {
+            return std.fmt.bufPrint(buf, "{d} MB", .{tenths / 10}) catch "0 MB";
+        }
+        return std.fmt.bufPrint(buf, "{d}.{d} MB", .{ tenths / 10, tenths % 10 }) catch "0 MB";
+    }
+    if (bytes >= kb_unit) {
+        const kb = (bytes + kb_unit - 1) / kb_unit;
+        if (kb >= 1024) {
+            return std.fmt.bufPrint(buf, "1 MB", .{}) catch "1 MB";
+        }
+        return std.fmt.bufPrint(buf, "{d} KB", .{kb}) catch "0 KB";
+    }
+    return std.fmt.bufPrint(buf, "{d} B", .{bytes}) catch "0 B";
+}
 
 /// Status colours.
 const red: Color = .rgb(0xe53935);
@@ -402,6 +437,7 @@ pub const BoardUi = struct {
     sd_card_menu_open: bool = false,
     hovered_sd_menu_idx: ?usize = null,
     sd_manage_open: bool = false,
+    sd_create_open: bool = false,
     new_card_name_buf: [64]u8 = @splat(0),
     new_card_name_len: usize = 0,
     sd_name_field_hovered: bool = false,
@@ -418,6 +454,8 @@ pub const BoardUi = struct {
     new_card_size: SdCardSize = .gb_4,
     hovered_sd_size_idx: ?usize = null,
     hovered_sd_card_row_idx: ?usize = null,
+    hovered_sd_card_delete_idx: ?usize = null,
+    sd_new_card_btn_hovered: bool = false,
     sd_browse_btn_hovered: bool = false,
     sd_add_btn_hovered: bool = false,
     sd_manage_close_hovered: bool = false,
@@ -459,6 +497,7 @@ pub const BoardUi = struct {
     sd_card_menu_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_manage_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_manage_close_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    sd_new_card_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_name_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_size_btn_rects: [SdCardSize.all.len]Rect = @splat(.{ .x = 0, .y = 0, .w = 0, .h = 0 }),
     sd_browse_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -496,6 +535,8 @@ pub const BoardUi = struct {
         hovered_sd_menu_idx: ?usize,
         hovered_sd_size_idx: ?usize,
         hovered_sd_card_row_idx: ?usize,
+        hovered_sd_card_delete_idx: ?usize,
+        sd_new_card_btn_hovered: bool,
         sd_name_field_hovered: bool,
         sd_browse_btn_hovered: bool,
         sd_add_btn_hovered: bool,
@@ -520,6 +561,8 @@ pub const BoardUi = struct {
             .hovered_sd_menu_idx = self.hovered_sd_menu_idx,
             .hovered_sd_size_idx = self.hovered_sd_size_idx,
             .hovered_sd_card_row_idx = self.hovered_sd_card_row_idx,
+            .hovered_sd_card_delete_idx = self.hovered_sd_card_delete_idx,
+            .sd_new_card_btn_hovered = self.sd_new_card_btn_hovered,
             .sd_name_field_hovered = self.sd_name_field_hovered,
             .sd_browse_btn_hovered = self.sd_browse_btn_hovered,
             .sd_add_btn_hovered = self.sd_add_btn_hovered,
@@ -695,7 +738,8 @@ pub const BoardUi = struct {
         if (self.hasCardNamed(card_name)) return;
         var disk = Qcow2Disk.openExistingFile(self.gpa, full_path) catch return;
         const sz = SdCardSize.smallestFitting(disk.virtual_size) orelse .gb_32;
-        const entry = makeNamedSdCardEntry(card_name, full_path, disk.diskAllocatedBytes(), sz, disk);
+        var entry = makeNamedSdCardEntry(card_name, full_path, disk.diskAllocatedBytes(), sz, disk);
+        entry.has_persistent_file = true;
         self.sd_cards.append(self.gpa, entry) catch {
             disk.deinit();
         };
@@ -978,16 +1022,50 @@ pub const BoardUi = struct {
             return;
         }
         if (self.pending_sd_image_size > self.new_card_size.bytes()) {
-            const img_mb = (self.pending_sd_image_size + (1024 * 1024 - 1)) / (1024 * 1024);
+            var sz_buf: [32]u8 = undefined;
+            const img_sz = formatByteSize(&sz_buf, self.pending_sd_image_size);
             const msg = std.fmt.bufPrint(
                 &self.sd_error_buf,
-                "Error: Image ({d} MB) is too large for a {s} SD card",
-                .{ img_mb, self.new_card_size.label() },
+                "Error: Image ({s}) is too large for a {s} SD card",
+                .{ img_sz, self.new_card_size.label() },
             ) catch "Error: Image is too large for selected SD card size";
             self.sd_error_len = msg.len;
         } else {
             self.sd_error_len = 0;
         }
+    }
+
+    /// Returns true when the Manage SD Cards modal should display the Create Card UI instead of the card list.
+    pub fn isSdCreateView(self: *const BoardUi) bool {
+        return self.sd_create_open or self.sd_cards.items.len == 0 or self.isCreatingSdCard();
+    }
+
+    /// Deletes SD card `idx`, closing its `Qcow2Disk` and unlinking its backing `.qcow2` file if persisted.
+    pub fn deleteSdCard(self: *BoardUi, idx: usize) bool {
+        if (idx >= self.sd_cards.items.len) return false;
+        var removed = self.sd_cards.orderedRemove(idx);
+        var path_buf: [512]u8 = undefined;
+        const path_len = removed.image_path_len;
+        @memcpy(path_buf[0..path_len], removed.image_path_buf[0..path_len]);
+        const is_persistent = removed.has_persistent_file;
+        removed.deinit();
+        if (is_persistent and path_len > 0) {
+            host_posix.unlinkFile(path_buf[0..path_len]);
+        }
+        if (self.sd_cards.items.len == 0) {
+            self.selected_sd_card_idx = null;
+            self.sd_create_open = true;
+        } else if (self.selected_sd_card_idx) |sel| {
+            if (sel == idx) {
+                self.selected_sd_card_idx = if (idx < self.sd_cards.items.len) idx else (self.sd_cards.items.len - 1);
+            } else if (sel > idx) {
+                self.selected_sd_card_idx = sel - 1;
+            }
+        }
+        self.hovered_sd_card_row_idx = null;
+        self.hovered_sd_card_delete_idx = null;
+        self.resetDefaultNewCardName();
+        return true;
     }
 
     /// Sets the pending image path and byte size in the Manage SD Cards dialog and validates it against `new_card_size`.
@@ -997,6 +1075,7 @@ pub const BoardUi = struct {
         self.pending_sd_image_path_len = n;
         self.pending_sd_image_size = size_bytes;
         self.pending_sd_image_slice = null;
+        self.sd_create_open = true;
         self.revalidatePendingSdImage();
     }
 
@@ -1007,6 +1086,7 @@ pub const BoardUi = struct {
         self.pending_sd_image_path_len = n;
         self.pending_sd_image_size = Qcow2Disk.getSliceLogicalSize(data) catch data.len;
         self.pending_sd_image_slice = data;
+        self.sd_create_open = true;
         self.revalidatePendingSdImage();
     }
 
@@ -1087,11 +1167,13 @@ pub const BoardUi = struct {
         errdefer disk.deinit();
 
         const entry_path = qcow2_path orelse label_or_path;
-        const entry = makeNamedSdCardEntry(card_name, entry_path, logical_size, size, disk);
+        var entry = makeNamedSdCardEntry(card_name, entry_path, logical_size, size, disk);
+        entry.has_persistent_file = (qcow2_path != null);
         try self.sd_cards.append(self.gpa, entry);
         const idx = self.sd_cards.items.len - 1;
         self.selected_sd_card_idx = idx;
         self.sd_error_len = 0;
+        self.sd_create_open = false;
         self.resetDefaultNewCardName();
         return idx;
     }
@@ -1120,11 +1202,13 @@ pub const BoardUi = struct {
         errdefer disk.deinit();
 
         const entry_path = qcow2_path orelse path;
-        const entry = makeNamedSdCardEntry(card_name, entry_path, file_size, size, disk);
+        var entry = makeNamedSdCardEntry(card_name, entry_path, file_size, size, disk);
+        entry.has_persistent_file = (qcow2_path != null);
         try self.sd_cards.append(self.gpa, entry);
         const idx = self.sd_cards.items.len - 1;
         self.selected_sd_card_idx = idx;
         self.sd_error_len = 0;
+        self.sd_create_open = false;
         self.resetDefaultNewCardName();
         return idx;
     }
@@ -1259,7 +1343,8 @@ pub const BoardUi = struct {
                 task.qcow2_path_buf[0..task.qcow2_path_len]
             else
                 task.src_path_buf[0..task.src_path_len];
-            const entry = makeNamedSdCardEntry(card_name, entry_path, task.image_size_bytes, task.size, owned_disk);
+            var entry = makeNamedSdCardEntry(card_name, entry_path, task.image_size_bytes, task.size, owned_disk);
+            entry.has_persistent_file = task.has_qcow2_path;
             self.sd_cards.append(self.gpa, entry) catch |err| {
                 owned_disk.deinit();
                 self.setSdError(@errorName(err));
@@ -1271,6 +1356,7 @@ pub const BoardUi = struct {
             self.pending_sd_image_size = 0;
             self.pending_sd_image_slice = null;
             self.resetDefaultNewCardName();
+            self.sd_create_open = false;
             self.sd_manage_open = false;
             return .completed_ok;
         } else {
@@ -1868,58 +1954,77 @@ pub const BoardUi = struct {
         const mg_y: f32 = @round(sheet_y + 18.0);
         self.sd_manage_close_rect = .{ .x = mg_x + mg_w - 40.0, .y = mg_y + 12.0, .w = 28.0, .h = 28.0 };
 
-        const list_y0: f32 = mg_y + 72.0;
-        const list_h: f32 = if (self.sd_cards.items.len == 0)
-            36.0
-        else
-            @as(f32, @floatFromInt(self.sd_cards.items.len)) * 32.0;
+        if (self.isSdCreateView()) {
+            self.sd_new_card_btn_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            const add_y0: f32 = mg_y + 52.0;
+            const name_row_y: f32 = add_y0 + 22.0;
+            self.sd_name_field_rect = .{
+                .x = mg_x + 16.0,
+                .y = name_row_y,
+                .w = mg_w - 32.0,
+                .h = 32.0,
+            };
 
-        const add_y0: f32 = list_y0 + list_h + 16.0;
-        const name_row_y: f32 = add_y0 + 24.0;
-        self.sd_name_field_rect = .{
-            .x = mg_x + 16.0,
-            .y = name_row_y,
-            .w = mg_w - 32.0,
-            .h = 32.0,
-        };
+            const size_row_y: f32 = name_row_y + 54.0;
+            const size_gap: f32 = 6.0;
+            const size_count: f32 = @floatFromInt(SdCardSize.all.len);
+            const size_btn_w: f32 = @floor((mg_w - 32.0 - (size_count - 1.0) * size_gap) / size_count);
+            for (0..SdCardSize.all.len) |i| {
+                const fi: f32 = @floatFromInt(i);
+                self.sd_size_btn_rects[i] = .{
+                    .x = mg_x + 16.0 + fi * (size_btn_w + size_gap),
+                    .y = size_row_y,
+                    .w = size_btn_w,
+                    .h = 28.0,
+                };
+            }
 
-        const size_row_y: f32 = name_row_y + 54.0;
-        const size_gap: f32 = 6.0;
-        const size_count: f32 = @floatFromInt(SdCardSize.all.len);
-        const size_btn_w: f32 = @floor((mg_w - 32.0 - (size_count - 1.0) * size_gap) / size_count);
-        for (0..SdCardSize.all.len) |i| {
-            const fi: f32 = @floatFromInt(i);
-            self.sd_size_btn_rects[i] = .{
-                .x = mg_x + 16.0 + fi * (size_btn_w + size_gap),
-                .y = size_row_y,
-                .w = size_btn_w,
-                .h = 28.0,
+            const img_row_y: f32 = size_row_y + 52.0;
+            self.sd_browse_btn_rect = .{
+                .x = mg_x + mg_w - 16.0 - 116.0,
+                .y = img_row_y,
+                .w = 116.0,
+                .h = 32.0,
+            };
+
+            const btn_row_y: f32 = img_row_y + (if (self.sd_error_len > 0) @as(f32, 70.0) else @as(f32, 44.0));
+            self.sd_add_btn_rect = .{
+                .x = mg_x + mg_w - 16.0 - 116.0,
+                .y = btn_row_y,
+                .w = 116.0,
+                .h = 32.0,
+            };
+
+            const mg_h: f32 = (btn_row_y + 32.0 + 16.0) - mg_y;
+            self.sd_manage_rect = .{
+                .x = mg_x,
+                .y = mg_y,
+                .w = mg_w,
+                .h = mg_h,
+            };
+        } else {
+            self.sd_name_field_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            self.sd_size_btn_rects = @splat(.{ .x = 0, .y = 0, .w = 0, .h = 0 });
+            self.sd_browse_btn_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            self.sd_add_btn_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+
+            const list_h: f32 = @as(f32, @floatFromInt(self.sd_cards.items.len)) * 36.0;
+            const new_btn_y: f32 = mg_y + 56.0 + list_h + 12.0;
+            self.sd_new_card_btn_rect = .{
+                .x = mg_x + mg_w - 16.0 - 124.0,
+                .y = new_btn_y,
+                .w = 124.0,
+                .h = 32.0,
+            };
+
+            const mg_h: f32 = (new_btn_y + 32.0 + 16.0) - mg_y;
+            self.sd_manage_rect = .{
+                .x = mg_x,
+                .y = mg_y,
+                .w = mg_w,
+                .h = mg_h,
             };
         }
-
-        const img_row_y: f32 = size_row_y + 52.0;
-        self.sd_browse_btn_rect = .{
-            .x = mg_x + mg_w - 16.0 - 116.0,
-            .y = img_row_y,
-            .w = 116.0,
-            .h = 32.0,
-        };
-
-        const btn_row_y: f32 = img_row_y + (if (self.sd_error_len > 0) @as(f32, 70.0) else @as(f32, 44.0));
-        self.sd_add_btn_rect = .{
-            .x = mg_x + mg_w - 16.0 - 116.0,
-            .y = btn_row_y,
-            .w = 116.0,
-            .h = 32.0,
-        };
-
-        const mg_h: f32 = (btn_row_y + 32.0 + 16.0) - mg_y;
-        self.sd_manage_rect = .{
-            .x = mg_x,
-            .y = mg_y,
-            .w = mg_w,
-            .h = mg_h,
-        };
 
         const collapsed_bottom: f32 = btn_y + btn_h + 14.0;
         const collapsed_sheet_h: f32 = collapsed_bottom - sheet_y;
@@ -2100,9 +2205,19 @@ pub const BoardUi = struct {
         const mr = self.sd_manage_rect;
         return .{
             .x = mr.x + 16.0,
-            .y = mr.y + 72.0 + @as(f32, @floatFromInt(idx)) * 32.0,
-            .w = mr.w - 32.0,
-            .h = 30.0,
+            .y = mr.y + 56.0 + @as(f32, @floatFromInt(idx)) * 36.0,
+            .w = mr.w - 32.0 - 36.0,
+            .h = 32.0,
+        };
+    }
+
+    pub fn sdManageCardDeleteRect(self: *const BoardUi, idx: usize) Rect {
+        const mr = self.sd_manage_rect;
+        return .{
+            .x = mr.x + mr.w - 16.0 - 32.0,
+            .y = mr.y + 56.0 + @as(f32, @floatFromInt(idx)) * 36.0,
+            .w = 32.0,
+            .h = 32.0,
         };
     }
 
@@ -2144,6 +2259,8 @@ pub const BoardUi = struct {
             self.hovered_sd_menu_idx = null;
             self.hovered_sd_size_idx = null;
             self.hovered_sd_card_row_idx = null;
+            self.hovered_sd_card_delete_idx = null;
+            self.sd_new_card_btn_hovered = false;
             self.sd_name_field_hovered = false;
             self.sd_browse_btn_hovered = false;
             self.sd_add_btn_hovered = false;
@@ -2158,32 +2275,52 @@ pub const BoardUi = struct {
                 self.sd_name_field_hovered = false;
                 self.sd_browse_btn_hovered = false;
                 self.sd_add_btn_hovered = false;
+                self.sd_new_card_btn_hovered = false;
                 self.hovered_sd_size_idx = null;
                 self.hovered_sd_card_row_idx = null;
+                self.hovered_sd_card_delete_idx = null;
                 return true;
             }
             self.sd_manage_close_hovered = self.sd_manage_close_rect.contains(pt);
-            self.sd_name_field_hovered = self.sd_name_field_rect.contains(pt);
-            self.sd_browse_btn_hovered = self.sd_browse_btn_rect.contains(pt);
-            self.sd_add_btn_hovered = self.sd_add_btn_rect.contains(pt);
-            self.hovered_sd_size_idx = null;
-            for (self.sd_size_btn_rects, 0..) |sr, idx| {
-                if (sr.contains(pt)) {
-                    self.hovered_sd_size_idx = idx;
-                    break;
+            if (self.isSdCreateView()) {
+                self.sd_name_field_hovered = self.sd_name_field_rect.contains(pt);
+                self.sd_browse_btn_hovered = self.sd_browse_btn_rect.contains(pt);
+                self.sd_add_btn_hovered = self.sd_add_btn_rect.contains(pt);
+                self.sd_new_card_btn_hovered = false;
+                self.hovered_sd_card_row_idx = null;
+                self.hovered_sd_card_delete_idx = null;
+                self.hovered_sd_size_idx = null;
+                for (self.sd_size_btn_rects, 0..) |sr, idx| {
+                    if (sr.contains(pt)) {
+                        self.hovered_sd_size_idx = idx;
+                        break;
+                    }
                 }
-            }
-            self.hovered_sd_card_row_idx = null;
-            for (0..self.sd_cards.items.len) |idx| {
-                if (self.sdManageCardRowRect(idx).contains(pt)) {
-                    self.hovered_sd_card_row_idx = idx;
-                    break;
+            } else {
+                self.sd_name_field_hovered = false;
+                self.sd_browse_btn_hovered = false;
+                self.sd_add_btn_hovered = false;
+                self.hovered_sd_size_idx = null;
+                self.sd_new_card_btn_hovered = self.sd_new_card_btn_rect.contains(pt);
+                self.hovered_sd_card_row_idx = null;
+                self.hovered_sd_card_delete_idx = null;
+                for (0..self.sd_cards.items.len) |idx| {
+                    if (self.sdManageCardDeleteRect(idx).contains(pt)) {
+                        self.hovered_sd_card_delete_idx = idx;
+                        break;
+                    }
+                    if (self.sdManageCardRowRect(idx).contains(pt)) {
+                        self.hovered_sd_card_row_idx = idx;
+                        break;
+                    }
                 }
             }
             return true;
         } else {
             self.hovered_sd_size_idx = null;
             self.hovered_sd_card_row_idx = null;
+            self.hovered_sd_card_delete_idx = null;
+            self.sd_new_card_btn_hovered = false;
             self.sd_name_field_hovered = false;
             self.sd_browse_btn_hovered = false;
             self.sd_add_btn_hovered = false;
@@ -2269,6 +2406,8 @@ pub const BoardUi = struct {
         self.hovered_sd_menu_idx = null;
         self.hovered_sd_size_idx = null;
         self.hovered_sd_card_row_idx = null;
+        self.hovered_sd_card_delete_idx = null;
+        self.sd_new_card_btn_hovered = false;
         self.sd_name_field_hovered = false;
         self.sd_browse_btn_hovered = false;
         self.sd_add_btn_hovered = false;
@@ -2324,6 +2463,7 @@ pub const BoardUi = struct {
                         self.board_menu_open = false;
                         self.sd_card_menu_open = false;
                         self.sd_manage_open = false;
+                        self.sd_create_open = false;
                     }
                     return .consumed;
                 }
@@ -2392,40 +2532,58 @@ pub const BoardUi = struct {
                 if (self.isCreatingSdCard()) {
                     return .consumed;
                 }
-                if (self.sd_name_field_rect.contains(pt)) {
-                    self.focused_field = .sd_card_name;
-                    return .consumed;
-                }
-                self.focused_field = .none;
                 if (self.sd_manage_close_rect.contains(pt)) {
+                    self.focused_field = .none;
                     self.sd_manage_open = false;
+                    self.sd_create_open = false;
                     return .consumed;
                 }
-                for (self.sd_size_btn_rects, 0..) |sr, idx| {
-                    if (sr.contains(pt)) {
-                        self.new_card_size = SdCardSize.all[idx];
-                        self.revalidatePendingSdImage();
+                if (self.isSdCreateView()) {
+                    if (self.sd_name_field_rect.contains(pt)) {
+                        self.focused_field = .sd_card_name;
                         return .consumed;
                     }
-                }
-                if (self.sd_browse_btn_rect.contains(pt)) {
-                    return .select_sd_image;
-                }
-                if (self.sd_add_btn_rect.contains(pt)) {
-                    if (self.addPendingSdCard()) {
-                        self.sd_manage_open = false;
-                        return .select_sd_card;
+                    self.focused_field = .none;
+                    for (self.sd_size_btn_rects, 0..) |sr, idx| {
+                        if (sr.contains(pt)) {
+                            self.new_card_size = SdCardSize.all[idx];
+                            self.revalidatePendingSdImage();
+                            return .consumed;
+                        }
                     }
-                    return .consumed;
-                }
-                for (0..self.sd_cards.items.len) |idx| {
-                    if (self.sdManageCardRowRect(idx).contains(pt)) {
-                        self.selected_sd_card_idx = idx;
-                        return .select_sd_card;
+                    if (self.sd_browse_btn_rect.contains(pt)) {
+                        return .select_sd_image;
+                    }
+                    if (self.sd_add_btn_rect.contains(pt)) {
+                        if (self.addPendingSdCard()) {
+                            self.sd_create_open = false;
+                            self.sd_manage_open = false;
+                            return .select_sd_card;
+                        }
+                        return .consumed;
+                    }
+                } else {
+                    self.focused_field = .none;
+                    if (self.sd_new_card_btn_rect.contains(pt)) {
+                        self.sd_create_open = true;
+                        self.sd_error_len = 0;
+                        self.resetDefaultNewCardName();
+                        return .consumed;
+                    }
+                    for (0..self.sd_cards.items.len) |idx| {
+                        if (self.sdManageCardDeleteRect(idx).contains(pt)) {
+                            _ = self.deleteSdCard(idx);
+                            return .select_sd_card;
+                        }
+                        if (self.sdManageCardRowRect(idx).contains(pt)) {
+                            self.selected_sd_card_idx = idx;
+                            return .select_sd_card;
+                        }
                     }
                 }
                 if (!self.sd_manage_rect.contains(pt)) {
                     self.sd_manage_open = false;
+                    self.sd_create_open = false;
                 }
                 return .consumed;
             }
@@ -2445,6 +2603,7 @@ pub const BoardUi = struct {
                         self.sd_card_menu_open = false;
                         self.hovered_sd_menu_idx = null;
                         self.sd_manage_open = true;
+                        self.sd_create_open = (self.sd_cards.items.len == 0);
                         if (self.new_card_name_len == 0) self.resetDefaultNewCardName();
                         return .consumed;
                     }
@@ -2534,9 +2693,10 @@ pub const BoardUi = struct {
                         .sd_card => blk: {
                             if (status.sd_connected) break :blk .toggle_sd;
                             if (self.sd_cards.items.len == 0) {
-                                // Initial list is empty: skip the menu and show Manage Cards popup directly
+                                // Initial list is empty: skip the card list and go directly to the Create Card UI
                                 self.sd_card_menu_open = false;
                                 self.sd_manage_open = true;
+                                self.sd_create_open = true;
                                 if (self.new_card_name_len == 0) self.resetDefaultNewCardName();
                             } else {
                                 self.sd_card_menu_open = !self.sd_card_menu_open;
@@ -3573,25 +3733,19 @@ pub const BoardUi = struct {
             );
         }
 
-        // 2. Manage SD Cards modal popup
+        // 2. Manage SD Cards / Create SD Card modal popup
         if (self.sd_manage_open) {
             const mr = self.sd_manage_rect;
             c.fillRoundedRect(mr, .all(12.0), t.surface_container_highest);
             c.strokeRoundedRect(mr, .all(12.0), 1.4, t.outline);
 
-            // Title & Close button
-            _ = c.drawText(16.0, mr.x + 16.0, mr.y + 31.0, "Manage SD Cards", t.on_surface);
+            const create_view = self.isSdCreateView();
+            const modal_title = if (create_view) "Create SD Card" else "Manage SD Cards";
+            _ = c.drawText(16.0, mr.x + 16.0, mr.y + 31.0, modal_title, t.on_surface);
             paintBarButton(c, t, self.sd_manage_close_rect, .close, self.sd_manage_close_hovered, false, false);
             c.fillRect(.{ .x = mr.x + 16.0, .y = mr.y + 44.0, .w = mr.w - 32.0, .h = 1.0 }, t.outline_variant.withAlpha(0.7));
 
-            // Existing cards section
-            _ = c.drawText(12.5, mr.x + 16.0, mr.y + 64.0, "SD Cards", t.on_surface_variant);
-            if (self.sd_cards.items.len == 0) {
-                const empty_r: Rect = .{ .x = mr.x + 16.0, .y = mr.y + 72.0, .w = mr.w - 32.0, .h = 34.0 };
-                c.fillRoundedRect(empty_r, .all(6.0), t.surface);
-                c.strokeRoundedRect(empty_r, .all(6.0), 1.0, t.outline_variant);
-                _ = c.drawText(12.5, empty_r.x + 12.0, empty_r.y + 22.0, "No SD cards added yet", t.on_surface_variant);
-            } else {
+            if (!create_view) {
                 for (self.sd_cards.items, 0..) |*card, idx| {
                     const row_r = self.sdManageCardRowRect(idx);
                     const is_sel = (self.selected_sd_card_idx == idx);
@@ -3600,11 +3754,12 @@ pub const BoardUi = struct {
                     c.strokeRoundedRect(row_r, .all(6.0), 1.0, if (is_sel) t.primary else t.outline_variant);
 
                     var row_buf: [128]u8 = undefined;
-                    const disk_kb = (card.disk.diskAllocatedBytes() + 1023) / 1024;
+                    var sz_buf: [32]u8 = undefined;
+                    const disk_sz = formatByteSize(&sz_buf, card.disk.diskAllocatedBytes());
                     const row_txt = std.fmt.bufPrint(
                         &row_buf,
-                        "{s}  ·  {s}  ({d} KB on disk)",
-                        .{ card.name(), card.size.label(), disk_kb },
+                        "{s}  ·  {s}  ({s} on disk)",
+                        .{ card.name(), card.size.label(), disk_sz },
                     ) catch card.name();
                     _ = c.drawText(
                         13.0,
@@ -3613,123 +3768,141 @@ pub const BoardUi = struct {
                         row_txt,
                         if (is_sel) t.primary else t.on_surface,
                     );
+
+                    const del_r = self.sdManageCardDeleteRect(idx);
+                    const del_hov = (self.hovered_sd_card_delete_idx == idx);
+                    c.fillRoundedRect(del_r, .all(6.0), if (del_hov) t.@"error".withAlpha(0.18) else t.surface);
+                    c.strokeRoundedRect(del_r, .all(6.0), 1.0, if (del_hov) t.@"error" else t.outline_variant);
+                    c.drawIcon(.delete, del_r.x + (del_r.w - 18.0) * 0.5, del_r.y + (del_r.h - 18.0) * 0.5, 18.0, if (del_hov) t.@"error" else t.on_surface_variant);
                 }
-            }
 
-            // Add Card section: Card Name + standard SD card sizes + image file selector
-            const list_h: f32 = if (self.sd_cards.items.len == 0) 36.0 else @as(f32, @floatFromInt(self.sd_cards.items.len)) * 32.0;
-            const add_y0: f32 = mr.y + 72.0 + list_h + 16.0;
-            _ = c.drawText(12.5, mr.x + 16.0, add_y0 + 18.0, "Add Card — Name", t.on_surface_variant);
-
-            var name_disp_buf: [68]u8 = undefined;
-            const name_slice = self.newCardName();
-            const name_disp = if (self.focused_field == .sd_card_name)
-                std.fmt.bufPrint(&name_disp_buf, "{s}|", .{name_slice}) catch name_slice
-            else
-                name_slice;
-            self.paintTextField(
-                c,
-                self.sd_name_field_rect,
-                name_disp,
-                self.focused_field == .sd_card_name,
-                self.sd_name_field_hovered,
-                false,
-            );
-
-            const size_row_y = self.sd_size_btn_rects[0].y;
-            _ = c.drawText(12.5, mr.x + 16.0, size_row_y - 6.0, "Card Size", t.on_surface_variant);
-
-            const pill_st: canvas_mod.Style = .{ .font = &self.font, .size = 11.5 };
-            for (SdCardSize.all, 0..) |sz, idx| {
-                const sr = self.sd_size_btn_rects[idx];
-                const is_sel = (self.new_card_size == sz);
-                const is_hov = (self.hovered_sd_size_idx == idx);
-                c.fillRoundedRect(sr, .all(6.0), if (is_sel) t.primary else if (is_hov) t.surface_container else t.surface);
-                c.strokeRoundedRect(sr, .all(6.0), 1.0, if (is_sel or is_hov) t.primary else t.outline_variant);
-                const tw = c.measureText(11.5, sz.label());
+                const nr = self.sd_new_card_btn_rect;
+                c.fillRoundedRect(nr, .all(6.0), if (self.sd_new_card_btn_hovered) t.primary else t.secondary_container);
+                c.strokeRoundedRect(nr, .all(6.0), 1.0, t.primary);
+                const new_lbl = "New Card...";
+                const new_tw = c.measureText(13.0, new_lbl);
                 _ = c.drawText(
-                    11.5,
-                    @round(sr.x + (sr.w - tw) * 0.5),
-                    @round(sr.y + (sr.h - pill_st.lineHeight()) * 0.5 + pill_st.ascent()),
-                    sz.label(),
-                    if (is_sel) t.on_primary else t.on_surface,
+                    13.0,
+                    @round(nr.x + (nr.w - new_tw) * 0.5),
+                    @round(nr.y + (nr.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
+                    new_lbl,
+                    if (self.sd_new_card_btn_hovered) t.on_primary else t.primary,
                 );
-            }
+            } else {
+                const add_y0: f32 = mr.y + 52.0;
+                _ = c.drawText(12.5, mr.x + 16.0, add_y0 + 16.0, "Card Name", t.on_surface_variant);
 
-            const img_row_y = self.sd_browse_btn_rect.y;
-            _ = c.drawText(12.5, mr.x + 16.0, img_row_y - 6.0, "OS Image File", t.on_surface_variant);
-            const path_box: Rect = .{
-                .x = mr.x + 16.0,
-                .y = img_row_y,
-                .w = self.sd_browse_btn_rect.x - (mr.x + 16.0) - 8.0,
-                .h = 32.0,
-            };
-            var img_lbl_buf: [128]u8 = undefined;
-            const img_lbl = if (self.pending_sd_image_path_len > 0) blk: {
-                const base = std.fs.path.basename(self.pending_sd_image_path_buf[0..self.pending_sd_image_path_len]);
-                const mb = (self.pending_sd_image_size + (1024 * 1024 - 1)) / (1024 * 1024);
-                break :blk std.fmt.bufPrint(&img_lbl_buf, "{s} ({d} MB)", .{ base, mb }) catch base;
-            } else "No image file selected";
-            self.paintTextField(c, path_box, img_lbl, false, false, self.pending_sd_image_path_len == 0);
+                var name_disp_buf: [68]u8 = undefined;
+                const name_slice = self.newCardName();
+                const name_disp = if (self.focused_field == .sd_card_name)
+                    std.fmt.bufPrint(&name_disp_buf, "{s}|", .{name_slice}) catch name_slice
+                else
+                    name_slice;
+                self.paintTextField(
+                    c,
+                    self.sd_name_field_rect,
+                    name_disp,
+                    self.focused_field == .sd_card_name,
+                    self.sd_name_field_hovered,
+                    false,
+                );
 
-            // Browse button
-            const br = self.sd_browse_btn_rect;
-            c.fillRoundedRect(br, .all(6.0), if (self.sd_browse_btn_hovered) t.secondary_container else t.surface);
-            c.strokeRoundedRect(br, .all(6.0), 1.0, if (self.sd_browse_btn_hovered) t.primary else t.outline_variant);
-            const br_lbl = "Choose Image...";
-            const br_tw = c.measureText(12.5, br_lbl);
-            _ = c.drawText(
-                12.5,
-                @round(br.x + (br.w - br_tw) * 0.5),
-                @round(br.y + (br.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
-                br_lbl,
-                t.on_surface,
-            );
+                const size_row_y = self.sd_size_btn_rects[0].y;
+                _ = c.drawText(12.5, mr.x + 16.0, size_row_y - 6.0, "Card Size", t.on_surface_variant);
 
-            // Error banner when image exceeds card size
-            if (self.sd_error_len > 0) {
-                const err_r: Rect = .{ .x = mr.x + 16.0, .y = img_row_y + 38.0, .w = mr.w - 32.0, .h = 24.0 };
-                c.fillRoundedRect(err_r, .all(5.0), t.@"error".withAlpha(0.16));
-                _ = c.drawText(12.0, err_r.x + 10.0, err_r.y + 16.5, self.sdErrorMessage(), t.@"error");
-            }
+                const pill_st: canvas_mod.Style = .{ .font = &self.font, .size = 11.5 };
+                for (SdCardSize.all, 0..) |sz, idx| {
+                    const sr = self.sd_size_btn_rects[idx];
+                    const is_sel = (self.new_card_size == sz);
+                    const is_hov = (self.hovered_sd_size_idx == idx);
+                    c.fillRoundedRect(sr, .all(6.0), if (is_sel) t.primary else if (is_hov) t.surface_container else t.surface);
+                    c.strokeRoundedRect(sr, .all(6.0), 1.0, if (is_sel or is_hov) t.primary else t.outline_variant);
+                    const tw = c.measureText(11.5, sz.label());
+                    _ = c.drawText(
+                        11.5,
+                        @round(sr.x + (sr.w - tw) * 0.5),
+                        @round(sr.y + (sr.h - pill_st.lineHeight()) * 0.5 + pill_st.ascent()),
+                        sz.label(),
+                        if (is_sel) t.on_primary else t.on_surface,
+                    );
+                }
 
-            // Progress spinner & status text when building an image in the background
-            if (self.sd_create_task) |task| {
-                const spin_cx = mr.x + 28.0;
-                const spin_cy = self.sd_add_btn_rect.y + self.sd_add_btn_rect.h * 0.5;
-                paintSpinner(c, .{ spin_cx, spin_cy }, 9.0, self.spinner_phase_rad, t.primary, t.outline_variant);
+                const img_row_y = self.sd_browse_btn_rect.y;
+                _ = c.drawText(12.5, mr.x + 16.0, img_row_y - 6.0, "OS Image File", t.on_surface_variant);
+                const path_box: Rect = .{
+                    .x = mr.x + 16.0,
+                    .y = img_row_y,
+                    .w = self.sd_browse_btn_rect.x - (mr.x + 16.0) - 8.0,
+                    .h = 32.0,
+                };
+                var img_lbl_buf: [128]u8 = undefined;
+                const img_lbl = if (self.pending_sd_image_path_len > 0) blk: {
+                    const base = std.fs.path.basename(self.pending_sd_image_path_buf[0..self.pending_sd_image_path_len]);
+                    var sz_buf: [32]u8 = undefined;
+                    const sz_lbl = formatByteSize(&sz_buf, self.pending_sd_image_size);
+                    break :blk std.fmt.bufPrint(&img_lbl_buf, "{s} ({s})", .{ base, sz_lbl }) catch base;
+                } else "No image file selected";
+                self.paintTextField(c, path_box, img_lbl, false, false, self.pending_sd_image_path_len == 0);
 
-                const done_bytes = task.progress_bytes.load(.monotonic);
-                const total_bytes = task.image_size_bytes;
-                var prog_buf: [96]u8 = undefined;
-                const prog_txt = if (total_bytes > 0) blk: {
-                    const pct = @min(@as(u64, 99), (done_bytes * 100) / total_bytes);
-                    break :blk std.fmt.bufPrint(&prog_buf, "Creating SD card image... {d}%", .{pct}) catch "Creating SD card image...";
-                } else "Creating SD card image...";
+                // Browse button
+                const br = self.sd_browse_btn_rect;
+                c.fillRoundedRect(br, .all(6.0), if (self.sd_browse_btn_hovered) t.secondary_container else t.surface);
+                c.strokeRoundedRect(br, .all(6.0), 1.0, if (self.sd_browse_btn_hovered) t.primary else t.outline_variant);
+                const br_lbl = "Choose Image...";
+                const br_tw = c.measureText(12.5, br_lbl);
                 _ = c.drawText(
                     12.5,
-                    spin_cx + 16.0,
-                    @round(self.sd_add_btn_rect.y + (self.sd_add_btn_rect.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
-                    prog_txt,
-                    t.on_surface_variant,
+                    @round(br.x + (br.w - br_tw) * 0.5),
+                    @round(br.y + (br.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
+                    br_lbl,
+                    t.on_surface,
+                );
+
+                // Error banner when image exceeds card size
+                if (self.sd_error_len > 0) {
+                    const err_r: Rect = .{ .x = mr.x + 16.0, .y = img_row_y + 38.0, .w = mr.w - 32.0, .h = 24.0 };
+                    c.fillRoundedRect(err_r, .all(5.0), t.@"error".withAlpha(0.16));
+                    _ = c.drawText(12.0, err_r.x + 10.0, err_r.y + 16.5, self.sdErrorMessage(), t.@"error");
+                }
+
+                // Progress spinner & status text when building an image in the background
+                if (self.sd_create_task) |task| {
+                    const spin_cx = mr.x + 28.0;
+                    const spin_cy = self.sd_add_btn_rect.y + self.sd_add_btn_rect.h * 0.5;
+                    paintSpinner(c, .{ spin_cx, spin_cy }, 9.0, self.spinner_phase_rad, t.primary, t.outline_variant);
+
+                    const done_bytes = task.progress_bytes.load(.monotonic);
+                    const total_bytes = task.image_size_bytes;
+                    var prog_buf: [96]u8 = undefined;
+                    const prog_txt = if (total_bytes > 0) blk: {
+                        const pct = @min(@as(u64, 99), (done_bytes * 100) / total_bytes);
+                        break :blk std.fmt.bufPrint(&prog_buf, "Creating SD card image... {d}%", .{pct}) catch "Creating SD card image...";
+                    } else "Creating SD card image...";
+                    _ = c.drawText(
+                        12.5,
+                        spin_cx + 16.0,
+                        @round(self.sd_add_btn_rect.y + (self.sd_add_btn_rect.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
+                        prog_txt,
+                        t.on_surface_variant,
+                    );
+                }
+
+                // Create Card button
+                const ar = self.sd_add_btn_rect;
+                const creating = self.isCreatingSdCard();
+                const can_add = !creating and self.pending_sd_image_path_len > 0 and !self.hasImageTooLargeError();
+                c.fillRoundedRect(ar, .all(6.0), if (can_add) t.primary else t.surface.withAlpha(0.5));
+                c.strokeRoundedRect(ar, .all(6.0), 1.0, if (can_add) t.primary else t.outline_variant);
+                const add_lbl = if (creating) "Creating..." else "Create Card";
+                const add_tw = c.measureText(13.0, add_lbl);
+                _ = c.drawText(
+                    13.0,
+                    @round(ar.x + (ar.w - add_tw) * 0.5),
+                    @round(ar.y + (ar.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
+                    add_lbl,
+                    if (can_add) t.on_primary else t.on_surface_variant.withAlpha(0.5),
                 );
             }
-
-            // Add Card button
-            const ar = self.sd_add_btn_rect;
-            const creating = self.isCreatingSdCard();
-            const can_add = !creating and self.pending_sd_image_path_len > 0 and !self.hasImageTooLargeError();
-            c.fillRoundedRect(ar, .all(6.0), if (can_add) t.primary else t.surface.withAlpha(0.5));
-            c.strokeRoundedRect(ar, .all(6.0), 1.0, if (can_add) t.primary else t.outline_variant);
-            const add_lbl = if (creating) "Creating..." else "Add Card";
-            const add_tw = c.measureText(13.0, add_lbl);
-            _ = c.drawText(
-                13.0,
-                @round(ar.x + (ar.w - add_tw) * 0.5),
-                @round(ar.y + (ar.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
-                add_lbl,
-                if (can_add) t.on_primary else t.on_surface_variant.withAlpha(0.5),
-            );
         }
     }
 
@@ -5924,8 +6097,19 @@ test "BoardUi persistent images and settings.json with custom and default card n
         ui.sd_cards.items[0].disk.writeByte(0, 0x42);
         ui.sd_cards.items[0].disk.writeByte(511, 0x99);
 
-        // Reopen Manage SD Cards dialog and edit the card name field via pointer + keyboard to "Custom OS"
+        // Reopen Manage SD Cards dialog: since 1 card exists, it starts in the card list view
         ui.sd_manage_open = true;
+        ui.sd_create_open = false;
+        ui.updateLayout(1280, 764, status, &hw);
+        try testing.expect(!ui.isSdCreateView());
+        try testing.expect(ui.sd_new_card_btn_rect.w > 0);
+        try testing.expectEqual(@as(f32, 0), ui.sd_name_field_rect.w);
+
+        // Clicking "New Card..." replaces the card list with the Create Card UI
+        _ = ui.pointerButton(ui.sd_new_card_btn_rect.x + 10, ui.sd_new_card_btn_rect.y + 10, true, status, &hw);
+        try testing.expectEqual(Action.consumed, ui.pointerButton(ui.sd_new_card_btn_rect.x + 10, ui.sd_new_card_btn_rect.y + 10, false, status, &hw));
+        try testing.expect(ui.isSdCreateView());
+
         ui.setPendingSdImageSlice("custom-os.img", &valid_img);
         ui.updateLayout(1280, 764, status, &hw);
         _ = ui.pointerButton(ui.sd_name_field_rect.x + 10, ui.sd_name_field_rect.y + 10, true, status, &hw);
@@ -5973,11 +6157,12 @@ test "BoardUi persistent images and settings.json with custom and default card n
         try ui.saveSettings(status);
     }
 
-    // 2. Initialize second BoardUi from the same tmp_dir and verify everything is restored
+    // 2. Initialize second BoardUi from the same tmp_dir, verify restoration, and test deleting cards
     {
         var ui2 = try BoardUi.init(testing.allocator);
         defer ui2.deinit();
 
+        var hw2: Gpio = .{};
         var status2 = SystemStatus{};
         ui2.configureDataDir(tmp_dir, &status2);
 
@@ -6000,6 +6185,31 @@ test "BoardUi persistent images and settings.json with custom and default card n
 
         // Default name for next card should be "Card 2" since "Card 1" exists
         try testing.expectEqualStrings("Card 2", ui2.newCardName());
+
+        // Open Manage SD Cards dialog and delete "Card 1" (index 0) via its delete button
+        ui2.sheet_open = true;
+        ui2.sd_manage_open = true;
+        ui2.sd_create_open = false;
+        ui2.updateLayout(1280, 764, status2, &hw2);
+        try testing.expect(!ui2.isSdCreateView());
+        const del0 = ui2.sdManageCardDeleteRect(0);
+        _ = ui2.pointerButton(del0.x + 10, del0.y + 10, true, status2, &hw2);
+        try testing.expectEqual(Action.select_sd_card, ui2.pointerButton(del0.x + 10, del0.y + 10, false, status2, &hw2));
+        try testing.expectEqual(@as(usize, 1), ui2.sd_cards.items.len);
+        try testing.expectEqualStrings("Custom OS", ui2.sd_cards.items[0].name());
+        try testing.expect(!fileExistsLinux("/tmp/fauxpi-test-xdg-data/images/Card 1.qcow2"));
+        try testing.expectEqualStrings("Card 1", ui2.newCardName());
+        try testing.expect(!ui2.isSdCreateView());
+
+        // Delete the remaining card ("Custom OS"): list becomes empty and switches directly to the Create Card UI
+        ui2.updateLayout(1280, 764, status2, &hw2);
+        const del_last = ui2.sdManageCardDeleteRect(0);
+        _ = ui2.pointerButton(del_last.x + 10, del_last.y + 10, true, status2, &hw2);
+        try testing.expectEqual(Action.select_sd_card, ui2.pointerButton(del_last.x + 10, del_last.y + 10, false, status2, &hw2));
+        try testing.expectEqual(@as(usize, 0), ui2.sd_cards.items.len);
+        try testing.expectEqual(@as(?usize, null), ui2.selected_sd_card_idx);
+        try testing.expect(!fileExistsLinux("/tmp/fauxpi-test-xdg-data/images/Custom OS.qcow2"));
+        try testing.expect(ui2.isSdCreateView());
     }
 }
 
@@ -6438,5 +6648,19 @@ test "BoardUi centers display with border when extra space is available and dock
     try testing.expect(!ui.sheet_docked_above);
     try testing.expect(!ui.sheet_open);
     try testing.expectEqual(BoardUi.board_btn_width, ui.boardBtnRect(800).w);
+}
+
+test "formatByteSize picks appropriate human-readable units" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("0 B", formatByteSize(&buf, 0));
+    try testing.expectEqualStrings("512 B", formatByteSize(&buf, 512));
+    try testing.expectEqualStrings("1 KB", formatByteSize(&buf, 1024));
+    try testing.expectEqualStrings("256 KB", formatByteSize(&buf, 256 * 1024));
+    try testing.expectEqualStrings("1 MB", formatByteSize(&buf, 1024 * 1024));
+    try testing.expectEqualStrings("1.5 MB", formatByteSize(&buf, 1536 * 1024));
+    try testing.expectEqualStrings("42 MB", formatByteSize(&buf, 42 * 1024 * 1024));
+    try testing.expectEqualStrings("1 GB", formatByteSize(&buf, 1024 * 1024 * 1024));
+    try testing.expectEqualStrings("1.5 GB", formatByteSize(&buf, 1536 * 1024 * 1024));
+    try testing.expectEqualStrings("16 GB", formatByteSize(&buf, 16 * 1024 * 1024 * 1024));
 }
 

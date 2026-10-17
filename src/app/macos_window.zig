@@ -1103,7 +1103,12 @@ pub const MacosWindow = struct {
                     return;
                 },
                 .select_sd_card => {
-                    self.sd_image_chosen = true;
+                    if (self.ui.activeSdCard() == null) {
+                        self.status.sd_connected = false;
+                        self.sd_disconnected = true;
+                    } else {
+                        self.sd_image_chosen = true;
+                    }
                     self.ui.saveSettings(self.status) catch {};
                     return;
                 },
@@ -1299,6 +1304,7 @@ pub const MacosWindow = struct {
             if (key == 1 and pressed and !is_repeat) {
                 if (self.ui.sd_manage_open) {
                     self.ui.sd_manage_open = false;
+                    self.ui.sd_create_open = false;
                     return;
                 }
                 if (self.ui.sd_card_menu_open) {
