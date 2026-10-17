@@ -428,6 +428,14 @@ pub const BoardUi = struct {
     sd_create_task: ?*AsyncSdCreateTask = null,
     spinner_phase_rad: f32 = 0.0,
 
+    /// Material 3 Snackbar notification bar at the bottom of the window (from dazzle/src/ui/snackbar.zig).
+    snackbar_buf: [256]u8 = @splat(0),
+    snackbar_len: usize = 0,
+    snackbar_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    snackbar_dismiss_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    snackbar_dismiss_hovered: bool = false,
+    snackbar_dismiss_pressed: bool = false,
+
     /// Last computed geometry for hit-testing.
     last_win_w: u32 = 1280,
     last_win_h: u32 = 764,
@@ -486,6 +494,7 @@ pub const BoardUi = struct {
         sd_add_btn_hovered: bool,
         sd_manage_close_hovered: bool,
         hovered_gpio_input_idx: ?usize,
+        snackbar_dismiss_hovered: bool,
     };
 
     inline fn snapshotHoverState(self: *const BoardUi) HoverStateSnapshot {
@@ -509,6 +518,7 @@ pub const BoardUi = struct {
             .sd_add_btn_hovered = self.sd_add_btn_hovered,
             .sd_manage_close_hovered = self.sd_manage_close_hovered,
             .hovered_gpio_input_idx = self.hovered_gpio_input_idx,
+            .snackbar_dismiss_hovered = self.snackbar_dismiss_hovered,
         };
     }
 
@@ -895,6 +905,54 @@ pub const BoardUi = struct {
 
     pub fn sdErrorMessage(self: *const BoardUi) []const u8 {
         return self.sd_error_buf[0..self.sd_error_len];
+    }
+
+    pub fn hasSnackbar(self: *const BoardUi) bool {
+        return self.snackbar_len > 0;
+    }
+
+    pub fn snackbarMessage(self: *const BoardUi) []const u8 {
+        return self.snackbar_buf[0..self.snackbar_len];
+    }
+
+    pub fn showSnackbar(self: *BoardUi, msg: []const u8) void {
+        const n = @min(msg.len, self.snackbar_buf.len);
+        @memcpy(self.snackbar_buf[0..n], msg[0..n]);
+        self.snackbar_len = n;
+        self.snackbar_dismiss_hovered = false;
+        self.snackbar_dismiss_pressed = false;
+        self.hover_dirty = true;
+    }
+
+    pub fn dismissSnackbar(self: *BoardUi) void {
+        if (self.snackbar_len > 0) {
+            self.snackbar_len = 0;
+            self.snackbar_dismiss_hovered = false;
+            self.snackbar_dismiss_pressed = false;
+            self.hover_dirty = true;
+        }
+    }
+
+    pub fn showBootErrorSnackbar(self: *BoardUi, err: anyerror) void {
+        var buf: [256]u8 = undefined;
+        const msg: []const u8 = switch (err) {
+            error.Requires64BitBoard => "64-bit OS image requires a 64-bit board (Raspberry Pi 3 or Zero 2 W)",
+            error.KernelNotFound => "Failed to boot SD card: kernel image not found on boot partition",
+            error.DtbNotFound => "Failed to boot SD card: device tree (.dtb) not found for this board",
+            error.InitramfsNotFound => "Failed to boot SD card: initramfs image not found on boot partition",
+            error.InvalidMbr,
+            error.NoBootPartition,
+            error.InvalidFatBootSector,
+            error.UnsupportedFatType,
+            => "Failed to boot SD card: no valid FAT boot partition found",
+            error.TruncatedImage => "Failed to boot SD card: disk image is truncated",
+            error.KernelTooLarge,
+            error.DtbTooLarge,
+            error.InitrdTooLarge,
+            => "Failed to boot SD card: boot image is too large for memory",
+            else => std.fmt.bufPrint(&buf, "Failed to boot SD card: {s}", .{@errorName(err)}) catch "Failed to boot SD card",
+        };
+        self.showSnackbar(msg);
     }
 
     pub fn hasImageTooLargeError(self: *const BoardUi) bool {
@@ -1857,6 +1915,28 @@ pub const BoardUi = struct {
             .w = sheet_w,
             .h = total_h,
         };
+
+        if (self.snackbar_len > 0) {
+            const msg_w = @import("../font/text.zig").measure(
+                .{ .font = &self.font, .size = self.theme.body_size },
+                self.snackbarMessage(),
+            );
+            const max_bar_w = @max(240.0, w_f - 32.0);
+            const bar_w = std.math.clamp(@ceil(16.0 + msg_w + 8.0 + 32.0 + 8.0), 240.0, max_bar_w);
+            const bar_h: f32 = 48.0;
+            const bar_x = @round((w_f - bar_w) * 0.5);
+            const bar_y = @round(@as(f32, @floatFromInt(win_h)) - 16.0 - bar_h);
+            self.snackbar_rect = .{ .x = bar_x, .y = bar_y, .w = bar_w, .h = bar_h };
+            self.snackbar_dismiss_rect = .{
+                .x = bar_x + bar_w - 8.0 - 32.0,
+                .y = bar_y + (bar_h - 32.0) * 0.5,
+                .w = 32.0,
+                .h = 32.0,
+            };
+        } else {
+            self.snackbar_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            self.snackbar_dismiss_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        }
     }
 
     /// Returns a 28-bit mask of BCM GPIO numbers (`0..27`) exposed on the board's 40-pin GPIO header.
@@ -1904,10 +1984,11 @@ pub const BoardUi = struct {
         };
     }
 
-    /// Returns true if `(x, y)` is over the TitleBar, an open BoardSheet, or the connected GPIO box.
+    /// Returns true if `(x, y)` is over the TitleBar, an open BoardSheet, the connected GPIO box, or the Snackbar.
     pub fn isPointInUi(self: *const BoardUi, x: f32, y: f32, status: SystemStatus) bool {
         if (y < @as(f32, @floatFromInt(title_bar_height))) return true;
         if (self.sheet_open) return true;
+        if (self.hasSnackbar() and self.snackbar_rect.contains(.{ x, y })) return true;
         if (status.gpio_connected and self.gpio_box_rect.contains(.{ x, y })) return true;
         return false;
     }
@@ -1944,7 +2025,7 @@ pub const BoardUi = struct {
     }
 
     /// Handles pointer motion at `(x, y)` in window coordinates.
-    /// Returns true if the pointer is over the TitleBar, an open BoardSheet, or the connected GPIO box.
+    /// Returns true if the pointer is over the TitleBar, an open BoardSheet, the connected GPIO box, or the Snackbar.
     pub fn pointerMotion(self: *BoardUi, x: f32, y: f32, status: SystemStatus, gpio_hw: *const Gpio) bool {
         const prev_hover = self.snapshotHoverState();
         defer if (!std.meta.eql(prev_hover, self.snapshotHoverState())) {
@@ -1956,10 +2037,11 @@ pub const BoardUi = struct {
         self.board_btn_hovered = self.boardBtnRect(self.last_win_w).contains(pt);
         self.max_btn_hovered = !host_posix.is_macos and maxBtnRect(self.last_win_w).contains(pt);
         self.close_btn_hovered = !host_posix.is_macos and closeBtnRect(self.last_win_w).contains(pt);
+        self.snackbar_dismiss_hovered = self.hasSnackbar() and self.snackbar_dismiss_rect.contains(pt);
 
         // Track hover over GPIO input switches in the GPIO box below the display
         self.hovered_gpio_input_idx = null;
-        if (status.gpio_connected and self.gpio_box_rect.contains(pt) and (!self.sheet_open or !self.sheet_rect.contains(pt))) {
+        if (status.gpio_connected and self.gpio_box_rect.contains(pt) and (!self.sheet_open or !self.sheet_rect.contains(pt)) and (!self.hasSnackbar() or !self.snackbar_rect.contains(pt))) {
             for (0..self.gpio_input_count) |idx| {
                 if (self.gpioInputSwitchRect(idx).contains(pt)) {
                     self.hovered_gpio_input_idx = idx;
@@ -1984,7 +2066,9 @@ pub const BoardUi = struct {
             self.sd_browse_btn_hovered = false;
             self.sd_add_btn_hovered = false;
             self.sd_manage_close_hovered = false;
-            return y < @as(f32, @floatFromInt(title_bar_height)) or (status.gpio_connected and self.gpio_box_rect.contains(pt));
+            return y < @as(f32, @floatFromInt(title_bar_height)) or
+                (self.hasSnackbar() and self.snackbar_rect.contains(pt)) or
+                (status.gpio_connected and self.gpio_box_rect.contains(pt));
         }
 
         if (self.sd_manage_open) {
@@ -2087,7 +2171,7 @@ pub const BoardUi = struct {
 
     pub fn pointerLeave(self: *BoardUi) void {
         const prev_hover = self.snapshotHoverState();
-        const had_pressed = self.board_btn_pressed or self.max_btn_pressed or self.close_btn_pressed or self.settings_btn_pressed;
+        const had_pressed = self.board_btn_pressed or self.max_btn_pressed or self.close_btn_pressed or self.settings_btn_pressed or self.snackbar_dismiss_pressed;
         self.board_btn_hovered = false;
         self.board_btn_pressed = false;
         self.max_btn_hovered = false;
@@ -2110,6 +2194,8 @@ pub const BoardUi = struct {
         self.sd_add_btn_hovered = false;
         self.sd_manage_close_hovered = false;
         self.hovered_gpio_input_idx = null;
+        self.snackbar_dismiss_hovered = false;
+        self.snackbar_dismiss_pressed = false;
         self.hovered_target = null;
         if (had_pressed or !std.meta.eql(prev_hover, self.snapshotHoverState())) {
             self.hover_dirty = true;
@@ -2174,6 +2260,20 @@ pub const BoardUi = struct {
         self.board_btn_pressed = false;
         self.max_btn_pressed = false;
         self.close_btn_pressed = false;
+
+        // Snackbar at the bottom of the window
+        if (self.hasSnackbar() and self.snackbar_rect.contains(pt)) {
+            if (pressed) {
+                self.snackbar_dismiss_pressed = self.snackbar_dismiss_rect.contains(pt);
+            } else {
+                defer self.snackbar_dismiss_pressed = false;
+                if (self.snackbar_dismiss_pressed and self.snackbar_dismiss_rect.contains(pt)) {
+                    self.dismissSnackbar();
+                }
+            }
+            return .consumed;
+        }
+        self.snackbar_dismiss_pressed = false;
 
         // GPIO box below the display (interactive when not covered by the drop-down sheet)
         if (status.gpio_connected and self.gpio_box_rect.contains(pt) and (!self.sheet_open or !self.sheet_rect.contains(pt))) {
@@ -2418,6 +2518,46 @@ pub const BoardUi = struct {
         if (self.sheet_open) {
             self.paintSheet(&c, win_w, disp_bottom_h, status);
         }
+        if (self.hasSnackbar()) {
+            self.paintSnackbar(&c);
+        }
+    }
+
+    /// Renders a Material 3 Snackbar at the bottom of the window (matching `dazzle/src/ui/snackbar.zig`).
+    fn paintSnackbar(self: *const BoardUi, c: *Canvas) void {
+        if (!self.hasSnackbar()) return;
+        const t = &self.theme;
+        const r = self.snackbar_rect;
+        const dr = self.snackbar_dismiss_rect;
+
+        c.fillRoundedRect(r, .all(8.0), t.surface_container_highest);
+        c.strokeRoundedRect(r, .all(8.0), 1.0, t.outline_variant);
+
+        const text_x = @round(r.x + 16.0);
+        const max_text_w = @max(0.0, dr.x - 8.0 - text_x);
+        if (max_text_w > 0.0) {
+            const old_clip = c.clipTo(.{ .x = text_x, .y = r.y, .w = max_text_w, .h = r.h });
+            defer c.restoreClip(old_clip);
+            const style: canvas_mod.Style = .{ .font = &self.font, .size = t.body_size };
+            const base_y = @round(r.y + (r.h - style.lineHeight()) * 0.5 + style.ascent());
+            _ = c.drawText(t.body_size, text_x, base_y, self.snackbarMessage(), t.on_surface);
+        }
+
+        if (self.snackbar_dismiss_hovered or self.snackbar_dismiss_pressed) {
+            c.fillCircle(
+                .{ dr.x + dr.w * 0.5, dr.y + dr.h * 0.5 },
+                dr.w * 0.5,
+                t.on_surface.withAlpha(if (self.snackbar_dismiss_pressed) 0.16 else 0.08),
+            );
+        }
+        const icon_sz: f32 = 18.0;
+        c.drawIcon(
+            .close,
+            @round(dr.x + (dr.w - icon_sz) * 0.5),
+            @round(dr.y + (dr.h - icon_sz) * 0.5),
+            icon_sz,
+            t.on_surface_variant,
+        );
     }
 
     fn paintNoSignal(self: *BoardUi, c: *Canvas, win_w: u32, disp_bottom_h: u32, hdmi_connected: bool) void {
@@ -5810,5 +5950,42 @@ test "BoardUi threaded SD card image creation with progress spinner" {
     try testing.expectEqual(@as(?usize, 0), ui.selected_sd_card_idx);
     try testing.expectEqual(@as(u8, 0x55), ui.sd_cards.items[0].disk.readByte(510));
     try testing.expectEqual(@as(u8, 0xAA), ui.sd_cards.items[0].disk.readByte(511));
+}
+
+test "BoardUi snackbar displays boot errors and dismisses on close button click" {
+    var ui = try BoardUi.init(testing.allocator);
+    defer ui.deinit();
+
+    var hw: Gpio = .{};
+    const status: SystemStatus = .{};
+    const win_w: u32 = 1280;
+    const win_h: u32 = 764;
+    const pixels = try testing.allocator.alloc(u32, win_w * win_h);
+    defer testing.allocator.free(pixels);
+    @memset(pixels, 0xff000000);
+
+    ui.sheet_open = false;
+    try testing.expect(!ui.hasSnackbar());
+
+    ui.showBootErrorSnackbar(error.Requires64BitBoard);
+    try testing.expect(ui.hasSnackbar());
+    try testing.expectEqualStrings(
+        "64-bit OS image requires a 64-bit board (Raspberry Pi 3 or Zero 2 W)",
+        ui.snackbarMessage(),
+    );
+
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testing.expect(ui.snackbar_rect.w >= 240.0);
+    try testing.expectEqual(@as(f32, 48.0), ui.snackbar_rect.h);
+    try testing.expect(ui.isPointInUi(ui.snackbar_rect.x + 10.0, ui.snackbar_rect.y + 10.0, status));
+
+    // Clicking the dismiss button closes the snackbar
+    const dx = ui.snackbar_dismiss_rect.x + 16.0;
+    const dy = ui.snackbar_dismiss_rect.y + 16.0;
+    _ = ui.pointerMotion(dx, dy, status, &hw);
+    try testing.expect(ui.snackbar_dismiss_hovered);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(dx, dy, true, status, &hw));
+    try testing.expectEqual(Action.consumed, ui.pointerButton(dx, dy, false, status, &hw));
+    try testing.expect(!ui.hasSnackbar());
 }
 

@@ -368,6 +368,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     var cpus: [4]Cpu = @splat(.{});
     var num_cores: usize = 1;
     var guest_booted = false;
+    var boot_failed = false;
 
     const initial_power = opts.power or opts.headless;
 
@@ -378,11 +379,17 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         wl_win = try window.Window.create(gpa, environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
         wl_win.?.status.power_connected = opts.power;
         if (opts.sd_path) |sd_path| {
-            const fsize = try qcow2.Qcow2Disk.getFileSizeLinux(sd_path);
-            const card_sz = ui_board_sheet.SdCardSize.smallestFitting(@max(fsize, 256 * 1024 * 1024)) orelse .gb_32;
-            _ = try wl_win.?.ui.addSdCardFromFile(sd_path, card_sz);
-            wl_win.?.status.sd_connected = true;
-            wl_win.?.ui.saveSettings(wl_win.?.status) catch {};
+            if (qcow2.Qcow2Disk.getFileSizeLinux(sd_path)) |fsize| {
+                const card_sz = ui_board_sheet.SdCardSize.smallestFitting(@max(fsize, 256 * 1024 * 1024)) orelse .gb_32;
+                if (wl_win.?.ui.addSdCardFromFile(sd_path, card_sz)) |_| {
+                    wl_win.?.status.sd_connected = true;
+                    wl_win.?.ui.saveSettings(wl_win.?.status) catch {};
+                } else |err| {
+                    wl_win.?.ui.showBootErrorSnackbar(err);
+                }
+            } else |err| {
+                wl_win.?.ui.showBootErrorSnackbar(err);
+            }
         }
         if (opts.board_model) |bm| {
             wl_win.?.setBoardModel(bm);
@@ -405,10 +412,19 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             &(headless_qcow2.?)
         else
             null;
-        const boot_res = try loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, if (initial_sd) sd_image_buf else null, bm, serial, mac, wifi_mac);
-        if (wl_win) |w| syncWindowPeripheralsToSoc(w, &soc);
-        resetCpusForBoard(&cpus, &num_cores, bm, boot_res);
-        guest_booted = true;
+        if (loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, if (initial_sd) sd_image_buf else null, bm, serial, mac, wifi_mac)) |boot_res| {
+            if (wl_win) |w| syncWindowPeripheralsToSoc(w, &soc);
+            resetCpusForBoard(&cpus, &num_cores, bm, boot_res);
+            guest_booted = true;
+        } else |err| {
+            if (wl_win) |w| {
+                std.debug.print("fauxpi: failed to boot SD image: {s}\n", .{@errorName(err)});
+                w.ui.showBootErrorSnackbar(err);
+                boot_failed = true;
+            } else {
+                return err;
+            }
+        }
     }
 
     const host_audio: ?*app_audio.HostAudioOutput = if (!opts.headless)
@@ -442,11 +458,13 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
             if (w.sd_disconnected) {
                 w.sd_disconnected = false;
+                boot_failed = false;
                 soc.sdhost.detach();
             }
 
             if (w.sd_reconnected) {
                 w.sd_reconnected = false;
+                boot_failed = false;
                 if (w.ui.activeSdCard()) |card| {
                     soc.sdhost.attachQcow2(&card.disk);
                 } else if (sd_image_buf) |img| {
@@ -456,6 +474,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
             if (w.sd_image_chosen) {
                 w.sd_image_chosen = false;
+                boot_failed = false;
                 if (w.ui.activeSdCard()) |card| {
                     if (w.status.sd_connected) {
                         soc.sdhost.attachQcow2(&card.disk);
@@ -467,7 +486,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             const has_boot_media = (w.status.sd_connected and has_sd_media) or opts.kernel_path != null;
             if (!w.status.power_connected) {
                 guest_booted = false;
-            } else if (w.power_reconnected or (!guest_booted and has_boot_media)) {
+                boot_failed = false;
+            } else if (w.power_reconnected or (!guest_booted and !boot_failed and has_boot_media)) {
                 w.power_reconnected = false;
                 const active_qcow2: ?*qcow2.Qcow2Disk = if (w.status.sd_connected and w.ui.activeSdCard() != null) &w.ui.activeSdCard().?.disk else null;
                 const active_sd = if (w.status.sd_connected) sd_image_buf else null;
@@ -477,13 +497,18 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                         syncWindowPeripheralsToSoc(w, &soc);
                         resetCpusForBoard(&cpus, &num_cores, w.status.board_model, reboot_res);
                         guest_booted = true;
+                        boot_failed = false;
+                        w.ui.dismissSnackbar();
                         last_guest_vblank_us = 0;
                         active_us_accum = 0;
                         idle_us_accum = 0;
                         if (host_audio) |ha| ha.setPaused(false);
                     } else |err| {
                         std.debug.print("fauxpi: failed to boot SD image: {s}\n", .{@errorName(err)});
+                        w.ui.showBootErrorSnackbar(err);
+                        w.ui_dirty = true;
                         guest_booted = false;
+                        boot_failed = true;
                     }
                 } else {
                     guest_booted = false;

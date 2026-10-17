@@ -565,9 +565,10 @@ pub const WaylandWindow = struct {
         const dh: usize = self.display_height;
         const b_idx: usize = self.cur_buf;
 
+        const has_overlay = self.ui.sheet_open or self.ui.hasSnackbar();
         if (self.status.hdmi_connected and self.status.hdmi_active) {
             const need_hdmi_blit = (self.buf_hdmi_gen[b_idx] != self.hdmi_gen) or
-                self.ui.sheet_open or
+                has_overlay or
                 self.buf_had_sheet[b_idx];
             if (need_hdmi_blit) {
                 board_sheet.BoardUi.blitHdmiToBackbuffer(full, buf_w, top_phys_rows, self.hdmi_fb, dw, dh, sc);
@@ -580,7 +581,7 @@ pub const WaylandWindow = struct {
             self.buf_hdmi_gen[b_idx] = 0;
             self.last_composite_damaged_hdmi = true;
         }
-        self.buf_had_sheet[b_idx] = self.ui.sheet_open;
+        self.buf_had_sheet[b_idx] = has_overlay;
 
         self.ui.paint(full, self.width, self.height, sc, self.status, self.gpio);
     }

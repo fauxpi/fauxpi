@@ -209,7 +209,13 @@ pub fn loadFromSdImageForModel(
                     const fallback_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, fb_name });
                     if (fs.readFileAlloc(alloc, fallback_path)) |kb| break :blk kb else |_| {}
                 }
+            } else if (!board_model.isBcm2837() and !cfg.kernel_explicit) {
+                const k8_path = try std.fmt.allocPrint(alloc, "{s}kernel8.img", .{cfg.os_prefix});
+                if (fs.readFileAlloc(alloc, k8_path)) |_| {
+                    return error.Requires64BitBoard;
+                } else |_| {}
             }
+            if (err == error.FileNotFound) return error.KernelNotFound;
             return err;
         }
     };
@@ -228,7 +234,10 @@ pub fn loadFromSdImageForModel(
 
     const initrd_bytes: ?[]const u8 = if (cfg.initramfs) |rd_name| blk: {
         const p = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, rd_name });
-        break :blk try fs.readFileAlloc(alloc, p);
+        break :blk fs.readFileAlloc(alloc, p) catch |err| {
+            if (err == error.FileNotFound) return error.InitramfsNotFound;
+            return err;
+        };
     } else if (cfg.auto_initramfs) blk: {
         const auto_name = if (std.mem.indexOf(u8, cfg.kernel, "8") != null or (cfg.arm_64bit orelse board_model.isBcm2837()))
             "initramfs8"

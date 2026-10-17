@@ -606,9 +606,10 @@ pub const WindowsWindow = struct {
         const dw: usize = self.display_width;
         const dh: usize = self.display_height;
 
+        const has_overlay = self.ui.sheet_open or self.ui.hasSnackbar();
         if (self.status.hdmi_connected and self.status.hdmi_active) {
             const need_hdmi_blit = (self.backbuf_hdmi_gen != self.hdmi_gen) or
-                self.ui.sheet_open or
+                has_overlay or
                 self.backbuf_had_sheet;
             if (need_hdmi_blit) {
                 board_sheet.BoardUi.blitHdmiToBackbuffer(full, buf_w, top_phys_rows, self.hdmi_fb, dw, dh, sc);
@@ -617,7 +618,7 @@ pub const WindowsWindow = struct {
         } else {
             self.backbuf_hdmi_gen = 0;
         }
-        self.backbuf_had_sheet = self.ui.sheet_open;
+        self.backbuf_had_sheet = has_overlay;
 
         self.ui.paint(full, self.width, self.height, sc, self.status, self.gpio);
     }
