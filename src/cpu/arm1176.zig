@@ -92,6 +92,10 @@ pub const ArmOp = enum(u8) {
     strh_imm_al,
     ldrsb_imm_al,
     ldrsh_imm_al,
+    ldrh_reg_al,
+    strh_reg_al,
+    ldrsb_reg_al,
+    ldrsh_reg_al,
     ldrd_imm_al,
     strd_imm_al,
     ldr_wb_al,
@@ -121,8 +125,12 @@ pub const ArmOp = enum(u8) {
     smlal_al,
     ldrex_al,
     strex_al,
+    ldrexd_al,
+    strexd_al,
     ldrexb_al,
     strexb_al,
+    ldrexh_al,
+    strexh_al,
     uxtb_al,
     uxth_al,
     sxtb_al,
@@ -234,44 +242,71 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                             switch (sync_op) {
                                 0b1001 => return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldrex_al), .rd = rd, .rn = rn },
                                 0b1000 => if (rm != 15) return .{ .raw = inst, .op = @intFromEnum(ArmOp.strex_al), .rd = rd, .rn = rn, .rm = rm },
+                                0b1011 => if ((rd & 1) == 0 and rd != 14) return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldrexd_al), .rd = rd, .rn = rn },
+                                0b1010 => if ((rm & 1) == 0 and rm != 14) return .{ .raw = inst, .op = @intFromEnum(ArmOp.strexd_al), .rd = rd, .rn = rn, .rm = rm },
                                 0b1101 => return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldrexb_al), .rd = rd, .rn = rn },
                                 0b1100 => if (rm != 15) return .{ .raw = inst, .op = @intFromEnum(ArmOp.strexb_al), .rd = rd, .rn = rn, .rm = rm },
+                                0b1111 => return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldrexh_al), .rd = rd, .rn = rn },
+                                0b1110 => if (rm != 15) return .{ .raw = inst, .op = @intFromEnum(ArmOp.strexh_al), .rd = rd, .rn = rn, .rm = rm },
                                 else => {},
                             }
                         }
                     }
-                } else if ((inst & (1 << 24)) != 0 and (inst & (1 << 22)) != 0 and (inst & (1 << 21)) == 0) {
+                } else if ((inst & (1 << 24)) != 0 and (inst & (1 << 21)) == 0) {
                     const rn: u4 = @truncate((inst >> 16) & 0xf);
                     const rd: u4 = @truncate((inst >> 12) & 0xf);
+                    const u = (inst & (1 << 23)) != 0;
+                    const l = (inst & (1 << 20)) != 0;
                     if (rd != 15 and rn != 15) {
-                        const imm8: u32 = (((inst >> 8) & 0xf) << 4) | (inst & 0xf);
-                        const u = (inst & (1 << 23)) != 0;
-                        const l = (inst & (1 << 20)) != 0;
-                        const signed_off: u32 = if (u) imm8 else (0 -% imm8);
-                        if (sh == 0b01) {
-                            return .{
-                                .raw = inst,
-                                .op = @intFromEnum(if (l) ArmOp.ldrh_imm_al else ArmOp.strh_imm_al),
-                                .rd = rd,
-                                .rn = rn,
-                                .imm = signed_off,
-                            };
-                        } else if (l) {
-                            return .{
-                                .raw = inst,
-                                .op = @intFromEnum(if (sh == 0b10) ArmOp.ldrsb_imm_al else ArmOp.ldrsh_imm_al),
-                                .rd = rd,
-                                .rn = rn,
-                                .imm = signed_off,
-                            };
-                        } else if ((rd & 1) == 0 and rd != 14) {
-                            return .{
-                                .raw = inst,
-                                .op = @intFromEnum(if (sh == 0b10) ArmOp.ldrd_imm_al else ArmOp.strd_imm_al),
-                                .rd = rd,
-                                .rn = rn,
-                                .imm = signed_off,
-                            };
+                        if ((inst & (1 << 22)) != 0) {
+                            const imm8: u32 = (((inst >> 8) & 0xf) << 4) | (inst & 0xf);
+                            const signed_off: u32 = if (u) imm8 else (0 -% imm8);
+                            if (sh == 0b01) {
+                                return .{
+                                    .raw = inst,
+                                    .op = @intFromEnum(if (l) ArmOp.ldrh_imm_al else ArmOp.strh_imm_al),
+                                    .rd = rd,
+                                    .rn = rn,
+                                    .imm = signed_off,
+                                };
+                            } else if (l) {
+                                return .{
+                                    .raw = inst,
+                                    .op = @intFromEnum(if (sh == 0b10) ArmOp.ldrsb_imm_al else ArmOp.ldrsh_imm_al),
+                                    .rd = rd,
+                                    .rn = rn,
+                                    .imm = signed_off,
+                                };
+                            } else if ((rd & 1) == 0 and rd != 14) {
+                                return .{
+                                    .raw = inst,
+                                    .op = @intFromEnum(if (sh == 0b10) ArmOp.ldrd_imm_al else ArmOp.strd_imm_al),
+                                    .rd = rd,
+                                    .rn = rn,
+                                    .imm = signed_off,
+                                };
+                            }
+                        } else if (u) {
+                            const rm: u4 = @truncate(inst & 0xf);
+                            if (rm != 15) {
+                                if (sh == 0b01) {
+                                    return .{
+                                        .raw = inst,
+                                        .op = @intFromEnum(if (l) ArmOp.ldrh_reg_al else ArmOp.strh_reg_al),
+                                        .rd = rd,
+                                        .rn = rn,
+                                        .rm = rm,
+                                    };
+                                } else if (l) {
+                                    return .{
+                                        .raw = inst,
+                                        .op = @intFromEnum(if (sh == 0b10) ArmOp.ldrsb_reg_al else ArmOp.ldrsh_reg_al),
+                                        .rd = rd,
+                                        .rn = rn,
+                                        .rm = rm,
+                                    };
+                                }
+                            }
                         }
                     }
                 }
@@ -1029,6 +1064,30 @@ pub fn Arm1176(comptime Bus: type) type {
 
         // --- Memory Access via SoftMMU & Bus ---
 
+        inline fn read64(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u64 {
+            const priv: u1 = @intFromBool(self.isPrivileged());
+            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                const paddr = slot.pbase | (vaddr & 0xfff);
+                return std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
+            }
+            const lo: u64 = try self.read32(bus, vaddr);
+            const hi: u64 = try self.read32(bus, vaddr +% 4);
+            return lo | (hi << 32);
+        }
+
+        inline fn write64(self: *Self, bus: *Bus, vaddr: u32, val: u64) error{Abort}!void {
+            const priv: u1 = @intFromBool(self.isPrivileged());
+            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                const paddr = slot.pbase | (vaddr & 0xfff);
+                std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
+                return;
+            }
+            try self.write32(bus, vaddr, @truncate(val));
+            try self.write32(bus, vaddr +% 4, @truncate(val >> 32));
+        }
+
         inline fn read32(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u32 {
             const priv: u1 = @intFromBool(self.isPrivileged());
             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
@@ -1181,6 +1240,7 @@ pub fn Arm1176(comptime Bus: type) type {
         /// Executes up to `max_steps` instructions, stopping early if the CPU
         /// enters `WFI` or an interrupt becomes pending.
         pub fn runSteps(self: *Self, bus: *Bus, max_steps: usize) usize {
+            @setEvalBranchQuota(10000);
             if (self.halted_spin) return 0;
             if (self.is_aarch64) {
                 const A64 = aarch64_mod.Aarch64Exec(Self, Bus);
@@ -1397,7 +1457,8 @@ pub fn Arm1176(comptime Bus: type) type {
                                 continue;
                             };
                             self.excl_valid = true;
-                            self.excl_paddr = self.mmu.translate(bus.ram, vaddr, .read, priv != 0) catch 0;
+                            const slot2 = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                            self.excl_paddr = if ((vaddr & 0xffff_f000) == slot2.r_vbase) (slot2.pbase | (vaddr & 0xfff)) else 0;
                         }
                     },
                     .strex_al => {
@@ -1412,6 +1473,15 @@ pub fn Arm1176(comptime Bus: type) type {
                             } else {
                                 self.r[d.rd] = 1;
                             }
+                        } else if (self.excl_valid) {
+                            self.write32(bus, vaddr, val) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                            self.r[d.rd] = 0;
+                            self.excl_valid = false;
                         } else {
                             _ = self.mmu.translate(bus.ram, vaddr, .write, priv != 0) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -1419,18 +1489,51 @@ pub fn Arm1176(comptime Bus: type) type {
                                 code_vbase = 0xffff_ffff;
                                 continue;
                             };
+                            self.r[d.rd] = 1;
+                        }
+                    },
+                    .ldrexd_al => {
+                        const vaddr = self.r[d.rn];
+                        const pair = self.read64(bus, vaddr) catch {
+                            self.enterException(.abt, 0x10, pc +% 8, false);
+                            priv = 1;
+                            code_vbase = 0xffff_ffff;
+                            continue;
+                        };
+                        self.r[d.rd] = @truncate(pair);
+                        self.r[d.rd + 1] = @truncate(pair >> 32);
+                        self.excl_valid = true;
+                    },
+                    .strexd_al => {
+                        const vaddr = self.r[d.rn];
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
                             if (self.excl_valid) {
-                                self.write32(bus, vaddr, val) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    continue;
-                                };
+                                const val: u64 = @as(u64, self.r[d.rm]) | (@as(u64, self.r[d.rm + 1]) << 32);
+                                std.mem.writeInt(u64, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..8], val, .little);
                                 self.r[d.rd] = 0;
                                 self.excl_valid = false;
                             } else {
                                 self.r[d.rd] = 1;
                             }
+                        } else if (self.excl_valid) {
+                            const val: u64 = @as(u64, self.r[d.rm]) | (@as(u64, self.r[d.rm + 1]) << 32);
+                            self.write64(bus, vaddr, val) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                            self.r[d.rd] = 0;
+                            self.excl_valid = false;
+                        } else {
+                            _ = self.mmu.translate(bus.ram, vaddr, .write, priv != 0) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                            self.r[d.rd] = 1;
                         }
                     },
                     .ldrexb_al => {
@@ -1458,6 +1561,43 @@ pub fn Arm1176(comptime Bus: type) type {
                                 bus.ram[slot.pbase | (vaddr & 0xfff)] = val;
                             } else {
                                 self.write8(bus, vaddr, val) catch {
+                                    self.enterException(.abt, 0x10, pc +% 8, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    continue;
+                                };
+                            }
+                            self.r[d.rd] = 0;
+                            self.excl_valid = false;
+                        } else {
+                            self.r[d.rd] = 1;
+                        }
+                    },
+                    .ldrexh_al => {
+                        const vaddr = self.r[d.rn];
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                            self.r[d.rd] = std.mem.readInt(u16, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..2], .little);
+                            self.excl_valid = true;
+                        } else {
+                            self.r[d.rd] = self.read16(bus, vaddr) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                            self.excl_valid = true;
+                        }
+                    },
+                    .strexh_al => {
+                        const vaddr = self.r[d.rn];
+                        const val: u16 = @truncate(self.r[d.rm]);
+                        if (self.excl_valid) {
+                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                            if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
+                                std.mem.writeInt(u16, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..2], val, .little);
+                            } else {
+                                self.write16(bus, vaddr, val) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
@@ -1635,31 +1775,99 @@ pub fn Arm1176(comptime Bus: type) type {
                             };
                         self.r[d.rd] = @bitCast(@as(i32, @as(i16, @bitCast(half_val))));
                     },
+                    .ldrh_reg_al => {
+                        const vaddr = self.r[d.rn] +% self.r[d.rm];
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                            self.r[d.rd] = std.mem.readInt(u16, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..2], .little);
+                        } else {
+                            self.r[d.rd] = self.read16(bus, vaddr) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                        }
+                    },
+                    .strh_reg_al => {
+                        const vaddr = self.r[d.rn] +% self.r[d.rm];
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
+                            std.mem.writeInt(u16, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..2], @truncate(self.r[d.rd]), .little);
+                        } else {
+                            self.write16(bus, vaddr, @truncate(self.r[d.rd])) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                            if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                if (self.checkInterrupts(bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                }
+                            }
+                        }
+                    },
+                    .ldrsb_reg_al => {
+                        const vaddr = self.r[d.rn] +% self.r[d.rm];
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        const byte_val: u8 = if ((vaddr & 0xffff_f000) == slot.r_vbase)
+                            bus.ram[slot.pbase | (vaddr & 0xfff)]
+                        else
+                            self.read8(bus, vaddr) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                        self.r[d.rd] = @bitCast(@as(i32, @as(i8, @bitCast(byte_val))));
+                    },
+                    .ldrsh_reg_al => {
+                        const vaddr = self.r[d.rn] +% self.r[d.rm];
+                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                        const half_val: u16 = if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase)
+                            std.mem.readInt(u16, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..2], .little)
+                        else
+                            self.read16(bus, vaddr) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                        self.r[d.rd] = @bitCast(@as(i32, @as(i16, @bitCast(half_val))));
+                    },
                     .ldrd_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                        if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                            const paddr = slot.pbase | (vaddr & 0xfff);
-                            self.r[d.rd] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
-                            self.r[d.rd + 1] = std.mem.readInt(u32, bus.ram[paddr + 4 ..][0..4], .little);
-                        } else {
-                            self.executeMultipliesAndExtraLoadStore(bus, pc, inst);
-                            priv = @intFromBool(self.isPrivileged());
+                        const pair = self.read64(bus, vaddr) catch {
+                            self.enterException(.abt, 0x10, pc +% 8, false);
+                            priv = 1;
                             code_vbase = 0xffff_ffff;
-                        }
+                            continue;
+                        };
+                        self.r[d.rd] = @truncate(pair);
+                        self.r[d.rd + 1] = @truncate(pair >> 32);
                     },
                     .strd_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
+                        const val: u64 = @as(u64, self.r[d.rd]) | (@as(u64, self.r[d.rd + 1]) << 32);
                         const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                         if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
                             const paddr = slot.pbase | (vaddr & 0xfff);
-                            std.mem.writeInt(u32, bus.ram[paddr..][0..4], self.r[d.rd], .little);
-                            std.mem.writeInt(u32, bus.ram[paddr + 4 ..][0..4], self.r[d.rd + 1], .little);
+                            std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
                         } else {
-                            self.executeMultipliesAndExtraLoadStore(bus, pc, inst);
-                            _ = self.checkInterrupts(bus);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
+                            self.write64(bus, vaddr, val) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                continue;
+                            };
+                            if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                if (self.checkInterrupts(bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                }
+                            }
                         }
                     },
                     .ldr_wb_al => {
@@ -4844,4 +5052,45 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     try std.testing.expectEqual(@as(u32, 0x0000_dead), cpu.r[2]);
     try std.testing.expectEqual(@as(u32, 0xffff_dead), cpu.r[3]);
     try std.testing.expectEqual(@as(u32, 0xdead_beef), cpu.r[5]);
+
+    // Verify ARM32 pre-decoded LDREXD/STREXD/LDREXH/STREXH and register-offset LDRH/STRH/LDRSB/LDRSH
+    cpu.cpsr &= ~PsrFlags.T;
+    cpu.r[15] = 0x1900;
+    cpu.r[0] = 0x2500;
+    cpu.r[1] = 8;
+    std.mem.writeInt(u64, ram[0x2500..][0..8], 0x88776655_44332211, .little);
+    // 0x1900: ldrexd r2, r3, [r0]       (0xe1b02f9f) -> r2=0x44332211, r3=0x88776655
+    // 0x1904: add r2, r2, #1            (0xe2822001) -> r2=0x44332212
+    // 0x1908: strexd r4, r2, r3, [r0]   (0xe1a04f92) -> [0x2500]=0x88776655_44332212, r4=0
+    // 0x190c: strh r2, [r0, r1]         (0xe18020b1) -> [0x2508]=0x2212
+    // 0x1910: ldrh r5, [r0, r1]         (0xe19050b1) -> r5=0x2212
+    // 0x1914: ldrsh r6, [r0, r1]        (0xe19060f1) -> r6=0x0000_2212
+    // 0x1918: ldrsb r7, [r0, r1]        (0xe19070d1) -> r7=0x0000_0012
+    const sync_reg_prog = [_]u32{
+        0xe1b02f9f,
+        0xe2822001,
+        0xe1a04f92,
+        0xe18020b1,
+        0xe19050b1,
+        0xe19060f1,
+        0xe19070d1,
+    };
+    for (sync_reg_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1900 + i * 4 ..][0..4], inst, .little);
+    }
+    try std.testing.expectEqual(ArmOp.ldrexd_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[0]).op)));
+    try std.testing.expectEqual(ArmOp.strexd_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[2]).op)));
+    try std.testing.expectEqual(ArmOp.strh_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[3]).op)));
+    try std.testing.expectEqual(ArmOp.ldrh_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[4]).op)));
+    try std.testing.expectEqual(ArmOp.ldrsh_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[5]).op)));
+    try std.testing.expectEqual(ArmOp.ldrsb_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[6]).op)));
+
+    _ = cpu.runSteps(&bus, sync_reg_prog.len);
+    try std.testing.expectEqual(@as(u32, 0x4433_2212), cpu.r[2]);
+    try std.testing.expectEqual(@as(u32, 0x8877_6655), cpu.r[3]);
+    try std.testing.expectEqual(@as(u32, 0), cpu.r[4]);
+    try std.testing.expectEqual(@as(u64, 0x88776655_44332212), std.mem.readInt(u64, ram[0x2500..][0..8], .little));
+    try std.testing.expectEqual(@as(u32, 0x2212), cpu.r[5]);
+    try std.testing.expectEqual(@as(u32, 0x2212), cpu.r[6]);
+    try std.testing.expectEqual(@as(u32, 0x12), cpu.r[7]);
 }
