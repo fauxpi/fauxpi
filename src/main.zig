@@ -71,6 +71,7 @@ const CliOptions = struct {
     headless: bool = false,
     max_steps: u64 = 0,
     sequential_cores: bool = false,
+    strict: bool = false,
 };
 
 fn readFileLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -126,6 +127,7 @@ fn printUsage() void {
         \\  --headless          Run without opening a desktop window
         \\  --max-steps <n>     Stop simulation after <n> ARM instructions
         \\  --sequential-cores  Run all emulated cores on one host thread (deterministic)
+        \\  --strict            Stop if the guest uses firmware calls or peripherals fauxpi does not emulate
         \\  --help              Show this help message
         \\
     ;
@@ -209,6 +211,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             opts.max_steps = std.fmt.parseInt(u64, s, 10) catch return 1;
         } else if (std.mem.eql(u8, arg, "--sequential-cores")) {
             opts.sequential_cores = true;
+        } else if (std.mem.eql(u8, arg, "--strict")) {
+            opts.strict = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return 0;
@@ -384,6 +388,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     if (!opts.sequential_cores) runner.start();
     defer runner.deinit();
     var guest_booted = false;
+    var strict_stopped = false;
     var boot_failed = false;
 
     const initial_power = opts.power or opts.headless;
@@ -568,6 +573,11 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             idle_rendered_booted = null;
         }
         if (soc.pm.reboot_requested) break;
+        if (opts.strict and soc.unsupportedHardwareUsed()) {
+            std.debug.print("fauxpi: stopping (--strict): the guest used unemulated hardware (see warnings above)\n", .{});
+            strict_stopped = true;
+            break;
+        }
         if (opts.max_steps != 0 and cpus[0].cycles >= opts.max_steps) break;
 
         // Check secondary core wakeup via bcm2836-l1-intc mailbox 3 or spin-table at 0xd8..0xf0
@@ -914,6 +924,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             },
         );
     }
+    if (strict_stopped) return error.UnsupportedHardwareUsed;
 }
 
 test {

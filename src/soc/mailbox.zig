@@ -11,6 +11,14 @@ pub const Mailbox = struct {
     pub const MBOX_EMPTY: u32 = 0x40000000;
     pub const MBOX_IHAVEDATAIRQEN: u32 = 0x00000001;
 
+    /// Other peripheral state some property tags report on
+    pub const Context = struct {
+        vchiq: ?*audio_mod.Vchiq = null,
+        hdmi_connected: bool = false,
+        /// EDID of the attached HDMI display (one or more 128-byte blocks)
+        hdmi_edid: []const u8 = &.{},
+    };
+
     /// Response FIFO (up to 16 entries)
     fifo: [16]u32 = @splat(0),
     fifo_head: u4 = 0,
@@ -18,6 +26,12 @@ pub const Mailbox = struct {
     fifo_count: u5 = 0,
 
     config: u32 = 0,
+
+    /// Unhandled property tags already reported (each is logged once per boot)
+    unknown_tags: [32]u32 = @splat(0),
+    unknown_tag_count: u8 = 0,
+    /// Set whenever the guest uses a property tag fauxpi does not implement (`--strict` stops on it)
+    unsupported_used: bool = false,
 
     /// Framebuffer state (when allocated via Mailbox channel 1 or Property Tag 0x00040001)
     fb_width: u32 = 1280,
@@ -55,6 +69,18 @@ pub const Mailbox = struct {
         return (self.config & MBOX_IHAVEDATAIRQEN) != 0 and self.fifo_count > 0;
     }
 
+    fn reportUnknownTag(self: *Mailbox, tag_id: u32) void {
+        self.unsupported_used = true;
+        for (self.unknown_tags[0..self.unknown_tag_count]) |t| {
+            if (t == tag_id) return;
+        }
+        if (self.unknown_tag_count < self.unknown_tags.len) {
+            self.unknown_tags[self.unknown_tag_count] = tag_id;
+            self.unknown_tag_count += 1;
+        }
+        std.debug.print("fauxpi: mailbox: unsupported firmware property tag 0x{x:0>8}\n", .{tag_id});
+    }
+
     fn pushResponse(self: *Mailbox, val: u32) void {
         if (self.fifo_count < 16) {
             self.fifo[self.fifo_tail] = val;
@@ -84,17 +110,17 @@ pub const Mailbox = struct {
     }
 
     pub fn write32(self: *Mailbox, offset: u32, val: u32, ram: []u8) void {
-        self.write32WithVchiq(offset, val, ram, null);
+        self.write32WithContext(offset, val, ram, .{});
     }
 
-    pub fn write32WithVchiq(self: *Mailbox, offset: u32, val: u32, ram: []u8, vchiq: ?*audio_mod.Vchiq) void {
+    pub fn write32WithContext(self: *Mailbox, offset: u32, val: u32, ram: []u8, ctx: Context) void {
         switch (offset) {
             0x00, 0x20 => {
                 const channel: u4 = @truncate(val & 0xF);
                 const data_bus = val & ~@as(u32, 0xF);
                 const phys = data_bus & 0x1FFFFFFF;
                 if (channel == 8) {
-                    self.processPropertyTags(phys, ram, vchiq);
+                    self.processPropertyTags(phys, ram, ctx);
                 } else if (channel == 1) {
                     self.processLegacyFramebuffer(phys, ram);
                 }
@@ -146,7 +172,7 @@ pub const Mailbox = struct {
         };
     }
 
-    fn processPropertyTags(self: *Mailbox, phys: u32, ram: []u8, vchiq: ?*audio_mod.Vchiq) void {
+    fn processPropertyTags(self: *Mailbox, phys: u32, ram: []u8, ctx: Context) void {
         if (phys + 12 > ram.len) return;
         const total_size = std.mem.readInt(u32, ram[phys..][0..4], .little);
         if (total_size < 12 or phys + total_size > ram.len) return;
@@ -166,6 +192,7 @@ pub const Mailbox = struct {
             if (payload + buf_size > end) break;
 
             var resp_len: u32 = buf_size;
+            var handled = true;
 
             const readU32 = struct {
                 fn f(mem: []const u8, p: u32, off: u32, sz: u32) u32 {
@@ -185,6 +212,14 @@ pub const Mailbox = struct {
                 0x00000001 => { // Get firmware revision
                     writeU32(ram, payload, 0, buf_size, 0x6187b965);
                     resp_len = 4;
+                },
+                0x00000002 => { // Get firmware variant (1 = start.elf)
+                    writeU32(ram, payload, 0, buf_size, 1);
+                    resp_len = 4;
+                },
+                0x00000003 => { // Get firmware hash (5 words; fauxpi has no firmware build to report)
+                    for (0..5) |i| writeU32(ram, payload, @intCast(i * 4), buf_size, 0);
+                    resp_len = 20;
                 },
                 0x00010001 => { // Get board model
                     writeU32(ram, payload, 0, buf_size, 0);
@@ -462,9 +497,50 @@ pub const Mailbox = struct {
                     writeU32(ram, payload, 4, buf_size, self.fb_virt_y);
                     resp_len = 8;
                 },
+                // Display enumeration and HDMI display information (vc4 firmware KMS, snd_bcm2835).
+                // Drivers size arrays and loops from these and pass uninitialised request values,
+                // so leaving them unanswered hands back guest garbage.
+                0x00040013 => { // Get number of displays
+                    writeU32(ram, payload, 0, buf_size, if (ctx.hdmi_connected) 1 else 0);
+                    resp_len = 4;
+                },
+                0x00040016 => { // Get display ID for a display index (DISPMANX_ID_HDMI0 = 2)
+                    const index = readU32(ram, payload, 0, buf_size);
+                    writeU32(ram, payload, 0, buf_size, if (index == 0) 2 else 0);
+                    resp_len = 4;
+                },
+                0x00048013 => { // Set display number for the following framebuffer tags
+                    resp_len = 4;
+                },
+                0x00040017 => { // Get display timing: clock 0 means no fixed mode, so the driver reads the EDID
+                    var off: u32 = 4;
+                    while (off < 36) : (off += 4) writeU32(ram, payload, off, buf_size, 0);
+                    resp_len = 36;
+                },
+                0x00040018 => { // Get display config: maximum pixel clock (Hz) for HDMI0 and HDMI1
+                    writeU32(ram, payload, 0, buf_size, 162_000_000);
+                    writeU32(ram, payload, 4, buf_size, 0);
+                    resp_len = 8;
+                },
+                0x00030020, 0x00030023 => { // Get EDID block (0x00030023: for a display number)
+                    // Response: u32 block, u32 status (non-zero = no such block), 128 bytes of EDID.
+                    const block = readU32(ram, payload, 0, buf_size);
+                    const start = @as(usize, block) * 128;
+                    const present = ctx.hdmi_connected and start + 128 <= ctx.hdmi_edid.len;
+                    writeU32(ram, payload, 4, buf_size, if (present) 0 else 1);
+                    if (buf_size >= 8) {
+                        const n = @min(128, buf_size - 8);
+                        const dst = ram[payload + 8 ..][0..n];
+                        if (present) @memcpy(dst, ctx.hdmi_edid[start..][0..n]) else @memset(dst, 0);
+                    }
+                    resp_len = 136;
+                },
+                0x00030066 => { // Notify display done (KMS has taken over the display)
+                    resp_len = 0;
+                },
                 0x00048010 => { // RPI_FIRMWARE_VCHIQ_INIT
                     const channel_base = readU32(ram, payload, 0, buf_size);
-                    const status: u32 = if (vchiq) |v| v.initSlotZero(channel_base, ram) else 0;
+                    const status: u32 = if (ctx.vchiq) |v| v.initSlotZero(channel_base, ram) else 0;
                     writeU32(ram, payload, 0, buf_size, status);
                     resp_len = 4;
                 },
@@ -473,11 +549,13 @@ pub const Mailbox = struct {
                     resp_len = 4;
                 },
                 else => {
-                    // Default: leave request payload or zero-fill and mark succeeded
+                    // Like the firmware, ignore the tag: the value is left as sent and the response bit clear.
+                    self.reportUnknownTag(tag_id);
+                    handled = false;
                 },
             }
 
-            std.mem.writeInt(u32, ram[pos + 8 ..][0..4], 0x80000000 | @min(resp_len, buf_size), .little);
+            if (handled) std.mem.writeInt(u32, ram[pos + 8 ..][0..4], 0x80000000 | @min(resp_len, buf_size), .little);
             pos = payload + ((buf_size + 3) & ~@as(u32, 3));
         }
     }
@@ -516,4 +594,75 @@ test "Mailbox property tags: board revision and clock rate" {
     try std.testing.expectEqual(@as(u32, 0x80000000), std.mem.readInt(u32, ram[base + 4 ..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 0x00900093), std.mem.readInt(u32, ram[base + 20 ..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 1_000_000_000), std.mem.readInt(u32, ram[base + 40 ..][0..4], .little));
+}
+
+test "Mailbox property tags: display enumeration" {
+    var mbox = Mailbox{};
+    var ram: [1024]u8 = @splat(0);
+
+    // Drivers pass uninitialised values in these tags (snd_bcm2835 set_hdmi_enables,
+    // vc4 firmware KMS), so the request words are deliberately garbage.
+    // Tag 1: 0x00040013 (Get number of displays, 4 bytes)
+    // Tag 2: 0x00040016 (Get display ID for index 0, 4 bytes)
+    const base: u32 = 0x100;
+    std.mem.writeInt(u32, ram[base + 0 ..][0..4], 40, .little); // size
+    std.mem.writeInt(u32, ram[base + 4 ..][0..4], 0, .little); // request
+
+    std.mem.writeInt(u32, ram[base + 8 ..][0..4], 0x00040013, .little);
+    std.mem.writeInt(u32, ram[base + 12 ..][0..4], 4, .little);
+    std.mem.writeInt(u32, ram[base + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[base + 20 ..][0..4], 0xdead_beef, .little);
+
+    std.mem.writeInt(u32, ram[base + 24 ..][0..4], 0x00040016, .little);
+    std.mem.writeInt(u32, ram[base + 28 ..][0..4], 4, .little);
+    std.mem.writeInt(u32, ram[base + 32 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[base + 36 ..][0..4], 0, .little); // display index 0
+
+    std.mem.writeInt(u32, ram[base + 40 ..][0..4], 0, .little); // end tag
+
+    mbox.write32WithContext(0x20, base | 8, &ram, .{ .hdmi_connected = true });
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ram[base + 20 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, ram[base + 36 ..][0..4], .little));
+}
+
+test "Mailbox property tags: unknown tags are ignored like the firmware" {
+    var mbox = Mailbox{};
+    var ram: [1024]u8 = @splat(0);
+
+    const base: u32 = 0x100;
+    std.mem.writeInt(u32, ram[base + 0 ..][0..4], 28, .little); // size
+    std.mem.writeInt(u32, ram[base + 4 ..][0..4], 0, .little); // request
+    std.mem.writeInt(u32, ram[base + 8 ..][0..4], 0x0004ffff, .little); // unknown tag
+    std.mem.writeInt(u32, ram[base + 12 ..][0..4], 4, .little);
+    std.mem.writeInt(u32, ram[base + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[base + 20 ..][0..4], 0x1234_5678, .little);
+    std.mem.writeInt(u32, ram[base + 24 ..][0..4], 0, .little); // end tag
+
+    mbox.write32(0x20, base | 8, &ram);
+    // Buffer succeeds, but the tag keeps its request value and its response bit stays clear.
+    try std.testing.expectEqual(@as(u32, 0x80000000), std.mem.readInt(u32, ram[base + 4 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, ram[base + 16 ..][0..4], .little));
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), std.mem.readInt(u32, ram[base + 20 ..][0..4], .little));
+    try std.testing.expect(mbox.unsupported_used);
+}
+
+test "Mailbox property tags: HDMI EDID block for display" {
+    var mbox = Mailbox{};
+    var ram: [1024]u8 = @splat(0);
+    var edid: [256]u8 = undefined;
+    for (&edid, 0..) |*b, i| b.* = @truncate(i);
+
+    const base: u32 = 0x100;
+    std.mem.writeInt(u32, ram[base + 0 ..][0..4], 12 + 12 + 136 + 4, .little); // size
+    std.mem.writeInt(u32, ram[base + 4 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[base + 8 ..][0..4], 0x00030023, .little);
+    std.mem.writeInt(u32, ram[base + 12 ..][0..4], 136, .little);
+    std.mem.writeInt(u32, ram[base + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[base + 20 ..][0..4], 1, .little); // block 1
+    std.mem.writeInt(u32, ram[base + 24 ..][0..4], 0, .little); // display 0
+    std.mem.writeInt(u32, ram[base + 12 + 12 + 136 ..][0..4], 0, .little); // end tag
+
+    mbox.write32WithContext(0x20, base | 8, &ram, .{ .hdmi_connected = true, .hdmi_edid = &edid });
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, ram[base + 24 ..][0..4], .little)); // status ok
+    try std.testing.expectEqualSlices(u8, edid[128..256], ram[base + 28 ..][0..128]);
 }

@@ -72,6 +72,11 @@ pub const Bcm2835 = struct {
     spi0: spi_mod.Spi0 = .{},
     smp: smp_mod.Smp = .{},
 
+    /// Unemulated peripheral pages the guest touched (each is logged once per boot)
+    unmapped_pages: [32]u32 = @splat(0),
+    unmapped_page_count: u8 = 0,
+    unmapped_mmio_used: bool = false,
+
     display_width: u16 = 1280,
     display_height: u16 = 720,
     audio_connected: bool = true,
@@ -127,6 +132,24 @@ pub const Bcm2835 = struct {
 
     pub inline fn hasPendingFiq(self: *const Bcm2835) bool {
         return self.hasPendingFiqForCore(0);
+    }
+
+    fn reportUnmappedMmio(self: *Bcm2835, addr: u32) void {
+        self.unmapped_mmio_used = true;
+        const page = addr & ~@as(u32, 0xfff);
+        for (self.unmapped_pages[0..self.unmapped_page_count]) |p| {
+            if (p == page) return;
+        }
+        if (self.unmapped_page_count < self.unmapped_pages.len) {
+            self.unmapped_pages[self.unmapped_page_count] = page;
+            self.unmapped_page_count += 1;
+        }
+        std.debug.print("fauxpi: mmio: access to unemulated peripheral at bus address 0x{x:0>8}\n", .{page - PERIPH_BASE + 0x7e000000});
+    }
+
+    /// True once the guest has used a firmware property tag or peripheral fauxpi does not emulate.
+    pub fn unsupportedHardwareUsed(self: *const Bcm2835) bool {
+        return self.mailbox.unsupported_used or self.unmapped_mmio_used;
     }
 
     /// Recomputes `smp.irq_summary` from the interrupt controllers for every core.
@@ -668,7 +691,10 @@ pub const Bcm2835 = struct {
         const periph_off = addr -% PERIPH_BASE;
         if (periph_off < (PERIPH_END - PERIPH_BASE)) {
             return switch (MMIO_PAGE_TABLE[periph_off >> 12]) {
-                .none => 0,
+                .none => blk: {
+                    self.reportUnmappedMmio(addr);
+                    break :blk 0;
+                },
                 .timer => if (addr -% TIMER_BASE < TIMER_SIZE) self.timer.read32(addr - TIMER_BASE) else 0,
                 .txp => if (addr -% hdmi_mod.Txp.BASE_ADDR < hdmi_mod.Txp.SIZE) self.txp.read32(addr - hdmi_mod.Txp.BASE_ADDR) else 0,
                 .dma => self.dma.read32(addr - dma_mod.DmaController.BASE_ADDR),
@@ -748,7 +774,7 @@ pub const Bcm2835 = struct {
         const periph_off = addr -% PERIPH_BASE;
         if (periph_off < (PERIPH_END - PERIPH_BASE)) {
             switch (MMIO_PAGE_TABLE[periph_off >> 12]) {
-                .none => {},
+                .none => self.reportUnmappedMmio(addr),
                 .timer => if (addr -% TIMER_BASE < TIMER_SIZE) {
                     self.timer.write32(addr - TIMER_BASE, val, &self.intc);
                     self.updateIrqsBank1();
@@ -783,7 +809,11 @@ pub const Bcm2835 = struct {
                         );
                         self.updateIrqsBank0();
                     } else if (addr -% mailbox_mod.Mailbox.BASE_ADDR < mailbox_mod.Mailbox.SIZE) {
-                        self.mailbox.write32WithVchiq(addr - mailbox_mod.Mailbox.BASE_ADDR, val, self.ram, &self.vchiq);
+                        self.mailbox.write32WithContext(addr - mailbox_mod.Mailbox.BASE_ADDR, val, self.ram, .{
+                            .vchiq = &self.vchiq,
+                            .hdmi_connected = self.hdmi.connected,
+                            .hdmi_edid = &self.bsc2.edid,
+                        });
                         self.updateIrqsBank0();
                     }
                 },
