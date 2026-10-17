@@ -124,10 +124,13 @@ pub const V3d = struct {
         edge2: EdgeSetup = .{},
         dz0: f32 = 0,
         dz1: f32 = 0,
+        dz_dx: f32 = 0,
         dinvw0: f32 = 0,
         dinvw1: f32 = 0,
+        dinvw_dx: f32 = 0,
         dvar0: [16]f32 = @splat(0),
         dvar1: [16]f32 = @splat(0),
+        dvar_dx: [16]f32 = @splat(0),
         all_unit_w: bool = true,
         setup_valid: bool = false,
 
@@ -144,14 +147,27 @@ pub const V3d = struct {
             const abs_area = @abs(area);
             const area_sign = std.math.sign(area);
             const inv_area = if (abs_area > 0) (1.0 / abs_area) else 0.0;
+            const edge0 = EdgeSetup.init(verts[1].x, verts[1].y, verts[2].x, verts[2].y, area_sign);
+            const edge1 = EdgeSetup.init(verts[2].x, verts[2].y, verts[0].x, verts[0].y, area_sign);
+            const edge2 = EdgeSetup.init(verts[0].x, verts[0].y, verts[1].x, verts[1].y, area_sign);
+            const dw0_dx = edge0.step_x * inv_area;
+            const dw1_dx = edge1.step_x * inv_area;
             const z2 = verts[2].z;
             const invw2 = verts[2].inv_w;
+            const dz0 = verts[0].z - z2;
+            const dz1 = verts[1].z - z2;
+            const dinvw0 = verts[0].inv_w - invw2;
+            const dinvw1 = verts[1].inv_w - invw2;
             var dvar0: [16]f32 = @splat(0);
             var dvar1: [16]f32 = @splat(0);
+            var dvar_dx: [16]f32 = @splat(0);
             for (0..n_var) |vi| {
                 const v2 = verts[2].persp_varyings[vi];
-                dvar0[vi] = verts[0].persp_varyings[vi] - v2;
-                dvar1[vi] = verts[1].persp_varyings[vi] - v2;
+                const dv0 = verts[0].persp_varyings[vi] - v2;
+                const dv1 = verts[1].persp_varyings[vi] - v2;
+                dvar0[vi] = dv0;
+                dvar1[vi] = dv1;
+                dvar_dx[vi] = dw0_dx * dv0 + dw1_dx * dv1;
             }
             return .{
                 .draw_idx = draw_idx,
@@ -162,15 +178,18 @@ pub const V3d = struct {
                 .area = area,
                 .v = verts,
                 .inv_area = inv_area,
-                .edge0 = EdgeSetup.init(verts[1].x, verts[1].y, verts[2].x, verts[2].y, area_sign),
-                .edge1 = EdgeSetup.init(verts[2].x, verts[2].y, verts[0].x, verts[0].y, area_sign),
-                .edge2 = EdgeSetup.init(verts[0].x, verts[0].y, verts[1].x, verts[1].y, area_sign),
-                .dz0 = verts[0].z - z2,
-                .dz1 = verts[1].z - z2,
-                .dinvw0 = verts[0].inv_w - invw2,
-                .dinvw1 = verts[1].inv_w - invw2,
+                .edge0 = edge0,
+                .edge1 = edge1,
+                .edge2 = edge2,
+                .dz0 = dz0,
+                .dz1 = dz1,
+                .dz_dx = dw0_dx * dz0 + dw1_dx * dz1,
+                .dinvw0 = dinvw0,
+                .dinvw1 = dinvw1,
+                .dinvw_dx = dw0_dx * dinvw0 + dw1_dx * dinvw1,
                 .dvar0 = dvar0,
                 .dvar1 = dvar1,
+                .dvar_dx = dvar_dx,
                 .all_unit_w = (verts[0].inv_w == 1.0 and verts[1].inv_w == 1.0 and verts[2].inv_w == 1.0),
                 .setup_valid = true,
             };
@@ -1877,15 +1896,18 @@ pub const V3d = struct {
         const z2 = setup_tri.v[2].z;
         const dz0 = setup_tri.dz0;
         const dz1 = setup_tri.dz1;
+        const dz_dx = setup_tri.dz_dx;
 
         const all_unit_w = setup_tri.all_unit_w;
         const invw2 = setup_tri.v[2].inv_w;
         const dinvw0 = setup_tri.dinvw0;
         const dinvw1 = setup_tri.dinvw1;
+        const dinvw_dx = setup_tri.dinvw_dx;
 
         const var2 = &setup_tri.v[2].persp_varyings;
         const dvar0 = &setup_tri.dvar0;
         const dvar1 = &setup_tri.dvar1;
+        const dvar_dx = &setup_tri.dvar_dx;
 
         // Batch up to 16 covered pixels per SIMD QPU invocation
         var batch_idx: [16]u32 = undefined;
@@ -1984,8 +2006,16 @@ pub const V3d = struct {
         const step_x0 = edge0.step_x;
         const step_x1 = edge1.step_x;
         const step_x2 = edge2.step_x;
-        const step16_e0 = @as(@Vector(16, f32), @splat(step_x0)) * lane_f_offsets;
-        const step16_e1 = @as(@Vector(16, f32), @splat(step_x1)) * lane_f_offsets;
+        const step16_z = @as(@Vector(16, f32), @splat(dz_dx)) * lane_f_offsets;
+        const step4_z = @as(@Vector(4, f32), @splat(dz_dx)) * lane4_f_offsets;
+        const step16_invw = @as(@Vector(16, f32), @splat(dinvw_dx)) * lane_f_offsets;
+        const step4_invw = @as(@Vector(4, f32), @splat(dinvw_dx)) * lane4_f_offsets;
+        var step16_var: [16]@Vector(16, f32) = undefined;
+        var step4_var: [16]@Vector(4, f32) = undefined;
+        for (0..n_var) |vi| {
+            step16_var[vi] = @as(@Vector(16, f32), @splat(dvar_dx[vi])) * lane_f_offsets;
+            step4_var[vi] = @as(@Vector(4, f32), @splat(dvar_dx[vi])) * lane4_f_offsets;
+        }
         const step4_e0 = @as(@Vector(4, f32), @splat(step_x0)) * lane4_f_offsets;
         const step4_e1 = @as(@Vector(4, f32), @splat(step_x1)) * lane4_f_offsets;
         const step4_e2 = @as(@Vector(4, f32), @splat(step_x2)) * lane4_f_offsets;
@@ -2062,11 +2092,10 @@ pub const V3d = struct {
                             tile_materialized = true;
                         }
                         const tile_idx = row_base + (px - tile_px_x);
-                        const e0_vec = @as(@Vector(16, f32), @splat(cur_e0)) + step16_e0;
-                        const e1_vec = @as(@Vector(16, f32), @splat(cur_e1)) + step16_e1;
-                        const w0_vec = e0_vec * @as(@Vector(16, f32), @splat(inv_area));
-                        const w1_vec = e1_vec * @as(@Vector(16, f32), @splat(inv_area));
-                        const z_vec = @as(@Vector(16, f32), @splat(z2)) + w0_vec * @as(@Vector(16, f32), @splat(dz0)) + w1_vec * @as(@Vector(16, f32), @splat(dz1));
+                        const w0_base = cur_e0 * inv_area;
+                        const w1_base = cur_e1 * inv_area;
+                        const z_base = z2 + w0_base * dz0 + w1_base * dz1;
+                        const z_vec = @as(@Vector(16, f32), @splat(z_base)) + step16_z;
 
                         const depth_all_pass: bool = if (depth_func == 7) true else blk: {
                             const cur_z_vec: @Vector(16, f32) = self.tile_depth[tile_idx..][0..16].*;
@@ -2086,17 +2115,15 @@ pub const V3d = struct {
                             const w_vec: @Vector(16, f32) = if (all_unit_w)
                                 @splat(1.0)
                             else blk: {
-                                const interp_inv_w = @as(@Vector(16, f32), @splat(invw2)) +
-                                    w0_vec * @as(@Vector(16, f32), @splat(dinvw0)) +
-                                    w1_vec * @as(@Vector(16, f32), @splat(dinvw1));
+                                const invw_base = invw2 + w0_base * dinvw0 + w1_base * dinvw1;
+                                const interp_inv_w = @as(@Vector(16, f32), @splat(invw_base)) + step16_invw;
                                 const valid_mask = @abs(interp_inv_w) > @as(@Vector(16, f32), @splat(1e-12));
                                 break :blk @select(f32, valid_mask, @as(@Vector(16, f32), @splat(1.0)) / interp_inv_w, @as(@Vector(16, f32), @splat(1.0)));
                             };
 
                             for (0..n_var) |vi| {
-                                const p_vec = (@as(@Vector(16, f32), @splat(var2[vi])) +
-                                    w0_vec * @as(@Vector(16, f32), @splat(dvar0[vi])) +
-                                    w1_vec * @as(@Vector(16, f32), @splat(dvar1[vi]))) * w_vec;
+                                const var_base = var2[vi] + w0_base * dvar0[vi] + w1_base * dvar1[vi];
+                                const p_vec = (@as(@Vector(16, f32), @splat(var_base)) + step16_var[vi]) * w_vec;
                                 span_vary_vecs[vi] = @bitCast(p_vec);
                             }
 
@@ -2165,9 +2192,10 @@ pub const V3d = struct {
                         tile_materialized = true;
                     }
 
-                    const w0_4 = e0_4 * @as(@Vector(4, f32), @splat(inv_area));
-                    const w1_4 = e1_4 * @as(@Vector(4, f32), @splat(inv_area));
-                    const z_4 = @as(@Vector(4, f32), @splat(z2)) + w0_4 * @as(@Vector(4, f32), @splat(dz0)) + w1_4 * @as(@Vector(4, f32), @splat(dz1));
+                    const w0_base = cur_e0 * inv_area;
+                    const w1_base = cur_e1 * inv_area;
+                    const z_base = z2 + w0_base * dz0 + w1_base * dz1;
+                    const z_4 = @as(@Vector(4, f32), @splat(z_base)) + step4_z;
                     const base_tile_idx = row_base + (px - tile_px_x);
 
                     if (depth_func != 7) {
@@ -2195,9 +2223,8 @@ pub const V3d = struct {
                     const w_vec_4: @Vector(4, f32) = if (all_unit_w)
                         @splat(1.0)
                     else blk: {
-                        const interp_inv_w = @as(@Vector(4, f32), @splat(invw2)) +
-                            w0_4 * @as(@Vector(4, f32), @splat(dinvw0)) +
-                            w1_4 * @as(@Vector(4, f32), @splat(dinvw1));
+                        const invw_base = invw2 + w0_base * dinvw0 + w1_base * dinvw1;
+                        const interp_inv_w = @as(@Vector(4, f32), @splat(invw_base)) + step4_invw;
                         const valid_mask = @abs(interp_inv_w) > @as(@Vector(4, f32), @splat(1e-12));
                         break :blk @select(f32, valid_mask, @as(@Vector(4, f32), @splat(1.0)) / interp_inv_w, @as(@Vector(4, f32), @splat(1.0)));
                     };
@@ -2212,9 +2239,8 @@ pub const V3d = struct {
                         tlb_in[batch_len..][0..4].* = self.tile_color[base_tile_idx..][0..4].*;
 
                         for (0..n_var) |vi| {
-                            const p_4 = (@as(@Vector(4, f32), @splat(var2[vi])) +
-                                w0_4 * @as(@Vector(4, f32), @splat(dvar0[vi])) +
-                                w1_4 * @as(@Vector(4, f32), @splat(dvar1[vi]))) * w_vec_4;
+                            const var_base = var2[vi] + w0_base * dvar0[vi] + w1_base * dvar1[vi];
+                            const p_4 = (@as(@Vector(4, f32), @splat(var_base)) + step4_var[vi]) * w_vec_4;
                             vary_vecs[vi][batch_len..][0..4].* = @bitCast(p_4);
                         }
 
@@ -2247,18 +2273,17 @@ pub const V3d = struct {
                     }
 
                     const w_val_4: [4]f32 = w_vec_4;
-                    const w0_arr: [4]f32 = w0_4;
-                    const w1_arr: [4]f32 = w1_4;
                     const z_arr: [4]f32 = z_4;
 
                     while (mask4 != 0) {
                         const k: usize = @ctz(mask4);
                         mask4 &= mask4 - 1;
                         const tile_idx = base_tile_idx + @as(u32, @intCast(k));
-                        const w0 = w0_arr[k];
-                        const w1 = w1_arr[k];
                         const z = z_arr[k];
                         const w_val = w_val_4[k];
+                        const kf: f32 = @floatFromInt(k);
+                        const w0 = w0_base + kf * (step_x0 * inv_area);
+                        const w1 = w1_base + kf * (step_x1 * inv_area);
 
                         const lane = batch_len;
                         batch_idx[lane] = tile_idx;

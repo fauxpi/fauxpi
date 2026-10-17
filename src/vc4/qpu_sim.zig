@@ -507,10 +507,44 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
         }
 
         if (d.waddr_add != qpu.W.nop) {
-            try write(RType, &s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0);
+            if (d.cond_add == .always and d.add_pack_a == 0) {
+                if (d.waddr_add < 32) {
+                    const bit = @as(u32, 1) << @intCast(d.waddr_add);
+                    if (d.add_file == .a) {
+                        s.ra_init |= bit;
+                        s.ra[d.waddr_add] = add_result;
+                    } else {
+                        s.rb_init |= bit;
+                        s.rb[d.waddr_add] = add_result;
+                    }
+                } else if (d.waddr_add >= qpu.W.acc0 and d.waddr_add <= qpu.W.acc0 + 3) {
+                    s.acc[d.waddr_add - qpu.W.acc0] = add_result;
+                } else {
+                    try write(RType, &s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0);
+                }
+            } else {
+                try write(RType, &s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0);
+            }
         }
         if (d.waddr_mul != qpu.W.nop) {
-            try write(RType, &s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m);
+            if (d.cond_mul == .always and d.mul_pack_a == 0 and d.mul_pack_m == 0) {
+                if (d.waddr_mul < 32) {
+                    const bit = @as(u32, 1) << @intCast(d.waddr_mul);
+                    if (d.mul_file == .a) {
+                        s.ra_init |= bit;
+                        s.ra[d.waddr_mul] = mul_result;
+                    } else {
+                        s.rb_init |= bit;
+                        s.rb[d.waddr_mul] = mul_result;
+                    }
+                } else if (d.waddr_mul >= qpu.W.acc0 and d.waddr_mul <= qpu.W.acc0 + 3) {
+                    s.acc[d.waddr_mul - qpu.W.acc0] = mul_result;
+                } else {
+                    try write(RType, &s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m);
+                }
+            } else {
+                try write(RType, &s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m);
+            }
         }
 
         switch (d.sig) {
