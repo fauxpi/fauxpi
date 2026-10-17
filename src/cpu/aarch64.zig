@@ -668,6 +668,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             mrs_sys,
             msr_safe,
             dc_zva,
+            fcvt_int,
+            fop_misc,
+            simd_mul_mla,
+            simd_xtn_shrn,
+            simd_shll,
             dp_imm_other,
             dp_reg_other,
             load_store_other,
@@ -1448,6 +1453,22 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     return .{ .raw = inst, .op = @intFromEnum(A64Op.fmov_x_d_hi), .rd = rd, .rn = rn };
                                 } else if (opcode == 0b111 and rmode == 0b01 and sf) {
                                     return .{ .raw = inst, .op = @intFromEnum(A64Op.fmov_d_hi_x), .rd = rd, .rn = rn };
+                                } else if ((opcode == 0b010 or opcode == 0b011) and rmode == 0b00) {
+                                    return .{
+                                        .raw = inst,
+                                        .op = @intFromEnum(A64Op.fcvt_int),
+                                        .rd = rd,
+                                        .rn = rn,
+                                        .imm = (@as(u64, opcode) << 2) | (@as(u64, @intFromBool(sf)) << 1) | @intFromBool(is_dbl),
+                                    };
+                                } else if ((opcode == 0b000 or opcode == 0b001) and rmode == 0b11) {
+                                    return .{
+                                        .raw = inst,
+                                        .op = @intFromEnum(A64Op.fcvt_int),
+                                        .rd = rd,
+                                        .rn = rn,
+                                        .imm = (@as(u64, opcode) << 2) | (@as(u64, @intFromBool(sf)) << 1) | @intFromBool(is_dbl),
+                                    };
                                 }
                             } else if ((inst & 0xffa0_1fe0) == 0x1e20_1000) {
                                 const imm8: u8 = @truncate(inst >> 13);
@@ -1465,8 +1486,19 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 if (fp2_op) |fop| {
                                     return .{ .raw = inst, .op = @intFromEnum(fop), .rd = rd, .rn = rn, .rm = rm };
                                 }
+                                if (opc >= 4 and opc <= 8) {
+                                    const sub_op: u64 = switch (opc) {
+                                        4, 6 => 1, // FMAX / FMAXNM
+                                        5, 7 => 2, // FMIN / FMINNM
+                                        else => 3, // FNMUL
+                                    };
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.fop_misc), .rd = rd, .rn = rn, .rm = rm, .imm = (sub_op << 1) | @intFromBool(is_dbl) };
+                                }
                             } else if ((inst & 0xffa0_7c00) == 0x1e20_4000) {
                                 const opc: u6 = @truncate(inst >> 15);
+                                if (opc == 3) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.fop_misc), .rd = rd, .rn = rn, .imm = @intFromBool(is_dbl) };
+                                }
                                 const fp1_op: ?A64Op = switch (opc) {
                                     0 => if (is_dbl) .fmov_f64 else .fmov_f32,
                                     1 => if (is_dbl) .fabs_f64 else .fabs_f32,
@@ -1485,6 +1517,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 else
                                     (if (cmp_zero) .fcmpz_f32 else .fcmp_f32);
                                 return .{ .raw = inst, .op = @intFromEnum(fcmp_op), .rn = rn, .rm = rm };
+                            } else if ((inst & 0xffa0_0c00) == 0x1e20_0c00) {
+                                const cond: u64 = (inst >> 12) & 0xf;
+                                return .{ .raw = inst, .op = @intFromEnum(A64Op.fop_misc), .rd = rd, .rn = rn, .rm = rm, .imm = (@as(u64, 4) << 1) | @as(u64, @intFromBool(is_dbl)) | (cond << 4) };
                             }
                         }
                     } else if ((inst & 0x5f00_0000) == 0x1f00_0000) {
@@ -1627,9 +1662,19 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 .rm = rm,
                                 .imm = q_imm,
                             };
+                        } else if ((opcode == 0b10010 or (opcode == 0b10011 and !u)) and size < 3) {
+                            const kind: u64 = if (opcode == 0b10011) 0 else if (!u) 1 else 2; // 0=MUL, 1=MLA, 2=MLS
+                            return .{
+                                .raw = inst,
+                                .op = @intFromEnum(A64Op.simd_mul_mla),
+                                .rd = rd,
+                                .rn = rn,
+                                .rm = rm,
+                                .imm = (@as(u64, size) << 3) | (kind << 1) | q_imm,
+                            };
                         }
                     } else if ((inst & 0x9f3e_0c00) == 0x0e20_0800) {
-                        // 5. AdvSIMD two-register misc (`NOT`/`MVN`, `CMEQ v.16b, #0`)
+                        // 5. AdvSIMD two-register misc (`NOT`/`MVN`, `CMEQ v.16b, #0`, `XTN`, `SHLL`)
                         const q = ((inst >> 30) & 1) != 0;
                         const u = ((inst >> 29) & 1) != 0;
                         const size: u2 = @truncate(inst >> 22);
@@ -1639,6 +1684,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_not), .rd = rd, .rn = rn, .imm = q_imm };
                         } else if (opcode == 0b01001 and !u and size == 0) {
                             return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_cmeqz_8), .rd = rd, .rn = rn, .imm = q_imm };
+                        } else if (opcode == 0b10010 and !u and size < 3) {
+                            return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_xtn_shrn), .rd = rd, .rn = rn, .rm = size, .imm = q_imm };
+                        } else if (opcode == 0b10011 and u and size < 3) {
+                            const src_bits: u8 = @as(u8, 8) << size;
+                            return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_shll), .rd = rd, .rn = rn, .rm = src_bits, .imm = (@as(u64, size) << 2) | 2 | q_imm };
                         }
                     } else if ((inst & 0xbf20_8400) == 0x2e00_0000) {
                         // 6. AdvSIMD EXT (`EXT Vd.<T>, Vn.<T>, Vm.<T>, #imm4`)
@@ -1655,7 +1705,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             };
                         }
                     } else if ((inst & 0x9f80_0400) == 0x0f00_0400 and ((inst >> 19) & 0xf) != 0) {
-                        // 7. AdvSIMD vector shift by immediate (`USHR`, `SHL`)
+                        // 7. AdvSIMD vector shift by immediate (`USHR`, `SHL`, `SHRN`/`RSHRN`, `SSHLL`/`USHLL`)
                         const q = ((inst >> 30) & 1) != 0;
                         const u = ((inst >> 29) & 1) != 0;
                         const immh: u4 = @truncate(inst >> 19);
@@ -1699,6 +1749,31 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 .rn = rn,
                                 .rm = (@as(u8, @intFromBool(q)) << 6) | @as(u8, lshift),
                                 .imm = rep_mask64,
+                            };
+                        } else if ((opcode == 0b10000 or opcode == 0b10001) and !u and esize < 64) {
+                            // SHRN / SHRN2 / RSHRN / RSHRN2
+                            const size_idx: u8 = if (esize == 8) 0 else if (esize == 16) 1 else 2;
+                            const rshift: u6 = @intCast((esize * 2) - immhb);
+                            const round: u64 = if ((opcode & 1) != 0 and rshift > 0) (@as(u64, 1) << (rshift - 1)) else 0;
+                            return .{
+                                .raw = inst,
+                                .op = @intFromEnum(A64Op.simd_xtn_shrn),
+                                .rd = rd,
+                                .rn = rn,
+                                .rm = size_idx | (@as(u8, rshift) << 2),
+                                .imm = (round << 1) | @intFromBool(q),
+                            };
+                        } else if (opcode == 0b10100 and esize < 64) {
+                            // SSHLL / USHLL
+                            const size_idx: u64 = if (esize == 8) 0 else if (esize == 16) 1 else 2;
+                            const lshift: u8 = @intCast(immhb - esize);
+                            return .{
+                                .raw = inst,
+                                .op = @intFromEnum(A64Op.simd_shll),
+                                .rd = rd,
+                                .rn = rn,
+                                .rm = lshift,
+                                .imm = (size_idx << 2) | (@as(u64, @intFromBool(u)) << 1) | @intFromBool(q),
                             };
                         }
                     }
@@ -4216,6 +4291,196 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const sh: u7 = @truncate(d.rm & 0x3f);
                         const mask128: u128 = if ((d.rm & 0x40) != 0) (@as(u128, d.imm) | (@as(u128, d.imm) << 64)) else d.imm;
                         cpu.vfp.v[@as(u5, @truncate(d.rd))] = (va << sh) & mask128;
+                    },
+                    .fcvt_int => {
+                        const is_dbl = (d.imm & 1) != 0;
+                        const sf = ((d.imm >> 1) & 1) != 0;
+                        const opcode: u3 = @truncate(d.imm >> 2);
+                        const rd_idx: u5 = @truncate(d.rd);
+                        const rn_idx: u5 = @truncate(d.rn);
+                        if (opcode == 0b010) { // SCVTF
+                            const iv: f64 = if (sf) @floatFromInt(@as(i64, @bitCast(getX(cpu, rn_idx)))) else @floatFromInt(@as(i32, @bitCast(getW(cpu, rn_idx))));
+                            cpu.vfp.v[rd_idx] = if (is_dbl) @as(u64, @bitCast(iv)) else @as(u32, @bitCast(@as(f32, @floatCast(iv))));
+                        } else if (opcode == 0b011) { // UCVTF
+                            const uv: f64 = if (sf) @floatFromInt(getX(cpu, rn_idx)) else @floatFromInt(getW(cpu, rn_idx));
+                            cpu.vfp.v[rd_idx] = if (is_dbl) @as(u64, @bitCast(uv)) else @as(u32, @bitCast(@as(f32, @floatCast(uv))));
+                        } else { // FCVTZS (0b000) / FCVTZU (0b001)
+                            const raw_fv: f64 = if (is_dbl) @bitCast(@as(u64, @truncate(cpu.vfp.v[rn_idx]))) else @as(f64, @as(f32, @bitCast(@as(u32, @truncate(cpu.vfp.v[rn_idx])))));
+                            const fv = @trunc(raw_fv);
+                            if (std.math.isNan(fv)) {
+                                if (sf) setX(cpu, rd_idx, 0) else setW(cpu, rd_idx, 0);
+                            } else if (opcode == 0b000) {
+                                if (sf) {
+                                    const clamped = std.math.clamp(fv, -9223372036854775808.0, 9223372036854774784.0);
+                                    setX(cpu, rd_idx, @bitCast(@as(i64, @intFromFloat(clamped))));
+                                } else {
+                                    const clamped = std.math.clamp(fv, -2147483648.0, 2147483647.0);
+                                    setW(cpu, rd_idx, @bitCast(@as(i32, @intFromFloat(clamped))));
+                                }
+                            } else {
+                                if (sf) {
+                                    const clamped = std.math.clamp(fv, 0.0, 18446744073709549568.0);
+                                    setX(cpu, rd_idx, @intFromFloat(clamped));
+                                } else {
+                                    const clamped = std.math.clamp(fv, 0.0, 4294967295.0);
+                                    setW(cpu, rd_idx, @intFromFloat(clamped));
+                                }
+                            }
+                        }
+                    },
+                    .fop_misc => {
+                        const is_dbl = (d.imm & 1) != 0;
+                        const sub_op: u3 = @truncate((d.imm >> 1) & 7);
+                        const rd_idx: u5 = @truncate(d.rd);
+                        const rn_idx: u5 = @truncate(d.rn);
+                        const rm_idx: u5 = @truncate(d.rm);
+                        if (sub_op == 4) { // FCSEL
+                            const cond: u4 = @truncate(d.imm >> 4);
+                            const sel = if (evalCond(cpu.pstate, cond)) cpu.vfp.v[rn_idx] else cpu.vfp.v[rm_idx];
+                            cpu.vfp.v[rd_idx] = if (is_dbl) @as(u64, @truncate(sel)) else @as(u32, @truncate(sel));
+                        } else if (is_dbl) {
+                            const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[rn_idx])));
+                            if (sub_op == 0) {
+                                cpu.vfp.v[rd_idx] = @as(u64, @bitCast(@sqrt(a)));
+                            } else {
+                                const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[rm_idx])));
+                                const res: f64 = switch (sub_op) {
+                                    1 => @max(a, b),
+                                    2 => @min(a, b),
+                                    else => -(a * b),
+                                };
+                                cpu.vfp.v[rd_idx] = @as(u64, @bitCast(res));
+                            }
+                        } else {
+                            const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[rn_idx])));
+                            if (sub_op == 0) {
+                                cpu.vfp.v[rd_idx] = @as(u32, @bitCast(@sqrt(a)));
+                            } else {
+                                const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[rm_idx])));
+                                const res: f32 = switch (sub_op) {
+                                    1 => @max(a, b),
+                                    2 => @min(a, b),
+                                    else => -(a * b),
+                                };
+                                cpu.vfp.v[rd_idx] = @as(u32, @bitCast(res));
+                            }
+                        }
+                    },
+                    .simd_mul_mla => {
+                        const mask: u128 = if ((d.imm & 1) != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                        const kind: u2 = @truncate((d.imm >> 1) & 3);
+                        const size: u2 = @truncate(d.imm >> 3);
+                        const rd_idx: u5 = @truncate(d.rd);
+                        const raw_a = cpu.vfp.v[@as(u5, @truncate(d.rn))];
+                        const raw_b = cpu.vfp.v[@as(u5, @truncate(d.rm))];
+                        const raw_d = cpu.vfp.v[rd_idx];
+                        const res128: u128 = switch (size) {
+                            0 => blk: {
+                                const va: @Vector(16, u8) = @bitCast(raw_a);
+                                const vb: @Vector(16, u8) = @bitCast(raw_b);
+                                const prod = va *% vb;
+                                if (kind == 0) break :blk @bitCast(prod);
+                                const vd: @Vector(16, u8) = @bitCast(raw_d);
+                                break :blk @bitCast(if (kind == 1) (vd +% prod) else (vd -% prod));
+                            },
+                            1 => blk: {
+                                const va: @Vector(8, u16) = @bitCast(raw_a);
+                                const vb: @Vector(8, u16) = @bitCast(raw_b);
+                                const prod = va *% vb;
+                                if (kind == 0) break :blk @bitCast(prod);
+                                const vd: @Vector(8, u16) = @bitCast(raw_d);
+                                break :blk @bitCast(if (kind == 1) (vd +% prod) else (vd -% prod));
+                            },
+                            else => blk: {
+                                const va: @Vector(4, u32) = @bitCast(raw_a);
+                                const vb: @Vector(4, u32) = @bitCast(raw_b);
+                                const prod = va *% vb;
+                                if (kind == 0) break :blk @bitCast(prod);
+                                const vd: @Vector(4, u32) = @bitCast(raw_d);
+                                break :blk @bitCast(if (kind == 1) (vd +% prod) else (vd -% prod));
+                            },
+                        };
+                        cpu.vfp.v[rd_idx] = res128 & mask;
+                    },
+                    .simd_xtn_shrn => {
+                        const q = (d.imm & 1) != 0;
+                        const round: u64 = d.imm >> 1;
+                        const size: u2 = @truncate(d.rm & 3);
+                        const rshift: u6 = @truncate(d.rm >> 2);
+                        const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
+                        const rd_idx: u5 = @truncate(d.rd);
+                        const narrow64: u64 = switch (size) {
+                            0 => blk: {
+                                const v16: @Vector(8, u16) = @bitCast(va);
+                                const rvec: @Vector(8, u16) = @splat(@truncate(round));
+                                const shvec: @Vector(8, u4) = @splat(@truncate(rshift));
+                                const narrow: @Vector(8, u8) = @truncate((v16 +% rvec) >> shvec);
+                                break :blk @bitCast(narrow);
+                            },
+                            1 => blk: {
+                                const v32: @Vector(4, u32) = @bitCast(va);
+                                const rvec: @Vector(4, u32) = @splat(@truncate(round));
+                                const shvec: @Vector(4, u5) = @splat(@truncate(rshift));
+                                const narrow: @Vector(4, u16) = @truncate((v32 +% rvec) >> shvec);
+                                break :blk @bitCast(narrow);
+                            },
+                            else => blk: {
+                                const v64: @Vector(2, u64) = @bitCast(va);
+                                const rvec: @Vector(2, u64) = @splat(round);
+                                const shvec: @Vector(2, u6) = @splat(rshift);
+                                const narrow: @Vector(2, u32) = @truncate((v64 +% rvec) >> shvec);
+                                break :blk @bitCast(narrow);
+                            },
+                        };
+                        if (q) {
+                            cpu.vfp.v[rd_idx] = (cpu.vfp.v[rd_idx] & 0xffff_ffff_ffff_ffff) | (@as(u128, narrow64) << 64);
+                        } else {
+                            cpu.vfp.v[rd_idx] = narrow64;
+                        }
+                    },
+                    .simd_shll => {
+                        const q = (d.imm & 1) != 0;
+                        const is_unsigned = ((d.imm >> 1) & 1) != 0;
+                        const size: u2 = @truncate(d.imm >> 2);
+                        const lshift: u6 = @truncate(d.rm);
+                        const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
+                        const src64: u64 = if (q) @truncate(va >> 64) else @truncate(va);
+                        const out128: u128 = switch (size) {
+                            0 => if (is_unsigned) blk: {
+                                const v8: @Vector(8, u8) = @bitCast(src64);
+                                const wide: @Vector(8, u16) = v8;
+                                const sh: @Vector(8, u4) = @splat(@truncate(lshift));
+                                break :blk @bitCast(wide << sh);
+                            } else blk: {
+                                const v8: @Vector(8, i8) = @bitCast(src64);
+                                const wide: @Vector(8, u16) = @bitCast(@as(@Vector(8, i16), v8));
+                                const sh: @Vector(8, u4) = @splat(@truncate(lshift));
+                                break :blk @bitCast(wide << sh);
+                            },
+                            1 => if (is_unsigned) blk: {
+                                const v16: @Vector(4, u16) = @bitCast(src64);
+                                const wide: @Vector(4, u32) = v16;
+                                const sh: @Vector(4, u5) = @splat(@truncate(lshift));
+                                break :blk @bitCast(wide << sh);
+                            } else blk: {
+                                const v16: @Vector(4, i16) = @bitCast(src64);
+                                const wide: @Vector(4, u32) = @bitCast(@as(@Vector(4, i32), v16));
+                                const sh: @Vector(4, u5) = @splat(@truncate(lshift));
+                                break :blk @bitCast(wide << sh);
+                            },
+                            else => if (is_unsigned) blk: {
+                                const v32: @Vector(2, u32) = @bitCast(src64);
+                                const wide: @Vector(2, u64) = v32;
+                                const sh: @Vector(2, u6) = @splat(lshift);
+                                break :blk @bitCast(wide << sh);
+                            } else blk: {
+                                const v32: @Vector(2, i32) = @bitCast(src64);
+                                const wide: @Vector(2, u64) = @bitCast(@as(@Vector(2, i64), v32));
+                                const sh: @Vector(2, u6) = @splat(lshift);
+                                break :blk @bitCast(wide << sh);
+                            },
+                        };
+                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = out128;
                     },
                     .fp_simd => executeFpSimd(cpu, inst),
                     .nop => {},
