@@ -1530,9 +1530,10 @@ pub fn Arm1176(comptime Bus: type) type {
             var code_pbase: u32 = 0;
             var code_page_ptr: [*]const u8 = bus.ram.ptr;
             var code_icache_ptr: [*]DecodedSlot = self.icache[0..].ptr;
-            var data_r_vbase: u32 = 0xffff_ffff;
-            var data_w_vbase: u32 = 0xffff_ffff;
-            var data_page_ptr: [*]u8 = bus.ram.ptr;
+            var data_r_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
+            var data_w_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
+            var data_r_page_ptr: [2][*]const u8 = .{ bus.ram.ptr, bus.ram.ptr };
+            var data_w_page_ptr: [2][*]u8 = .{ bus.ram.ptr, bus.ram.ptr };
 
             step_loop: while (true) {
                 if (executed >= max_steps) {
@@ -1542,8 +1543,8 @@ pub fn Arm1176(comptime Bus: type) type {
                     // Apply TLB invalidations other cores broadcast while this slice runs
                     if (bus.smp.serviceTlb(self.mmu.core_id, &self.mmu)) {
                         code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     }
                 }
                 const batch_end = if (executed >= max_steps)
@@ -1572,8 +1573,8 @@ pub fn Arm1176(comptime Bus: type) type {
                                 self.enterException(.abt, 0x0c, pc +% 4, false);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 executed += 1;
                                 continue;
                             };
@@ -1589,13 +1590,13 @@ pub fn Arm1176(comptime Bus: type) type {
                         };
                         self.r[15] = pc +% 2;
                         executed += 1;
-                        if (self.executeThumb(bus, pc, inst16, priv, code_vbase, code_pbase, &data_r_vbase, &data_w_vbase, &data_page_ptr)) {
+                        if (self.executeThumb(bus, pc, inst16, priv, code_vbase, code_pbase, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
                             if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
                             _ = self.checkInterrupts(bus);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                         continue;
                     }
@@ -1618,8 +1619,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.enterException(.abt, 0x0c, pc +% 4, false);
                             priv = 1;
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             executed += 1;
                             continue;
                         };
@@ -1652,6 +1653,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     }
 
                 const imm32: u32 = @truncate(d.imm);
+                const bank: usize = @intFromBool(d.rn >= 11);
                 const op: ArmOp = @enumFromInt(d.op);
                 switch (op) {
                     .add_imm_al => self.r[d.rd] = self.r[d.rn] +% imm32,
@@ -1801,11 +1803,10 @@ pub fn Arm1176(comptime Bus: type) type {
                         const vaddr = self.r[d.rn];
                         const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                         if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                            data_r_vbase = slot.r_vbase;
-                            data_w_vbase = slot.w_vbase;
-                            data_page_ptr = bus.ram.ptr + slot.pbase;
+                            data_r_vbase[bank] = slot.r_vbase;
+                            data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
                             const paddr = slot.pbase | (vaddr & 0xfff);
-                            self.r[d.rd] = std.mem.readInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], .little);
+                            self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
                             self.excl_valid = true;
                             self.excl_paddr = paddr;
                             self.excl_val = self.r[d.rd];
@@ -1814,8 +1815,8 @@ pub fn Arm1176(comptime Bus: type) type {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 continue;
                             };
                             self.excl_valid = true;
@@ -1829,9 +1830,8 @@ pub fn Arm1176(comptime Bus: type) type {
                         const val = self.r[d.rm];
                         const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                         if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                            data_r_vbase = slot.r_vbase;
-                            data_w_vbase = slot.w_vbase;
-                            data_page_ptr = bus.ram.ptr + slot.pbase;
+                            data_w_vbase[bank] = slot.w_vbase;
+                            data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
                             if (self.excl_valid) {
                                 const stored = atomic_ram.compareAndSwap(u32, bus.ram, slot.pbase | (vaddr & 0xfff), @truncate(self.excl_val), val);
                                 self.r[d.rd] = if (stored) 0 else 1;
@@ -1844,8 +1844,8 @@ pub fn Arm1176(comptime Bus: type) type {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 continue;
                             };
                         }
@@ -1856,8 +1856,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.enterException(.abt, 0x10, pc +% 8, false);
                             priv = 1;
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             continue;
                         };
                         self.r[d.rd] = @truncate(pair);
@@ -1872,29 +1872,28 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.enterException(.abt, 0x10, pc +% 8, false);
                             priv = 1;
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             continue;
                         };
                     },
                     .ldrexb_al => {
                         const vaddr = self.r[d.rn];
-                        if ((vaddr & 0xffff_f000) == data_r_vbase) {
-                            self.r[d.rd] = data_page_ptr[vaddr & 0xfff];
+                        if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
+                            self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = data_page_ptr[vaddr & 0xfff];
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                             } else {
                                 self.r[d.rd] = self.read8(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                             }
@@ -1909,29 +1908,28 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.enterException(.abt, 0x10, pc +% 8, false);
                             priv = 1;
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             continue;
                         };
                     },
                     .ldrexh_al => {
                         const vaddr = self.r[d.rn];
-                        if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase) {
-                            self.r[d.rd] = std.mem.readInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], .little);
+                        if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank]) {
+                            self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = std.mem.readInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], .little);
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
                             } else {
                                 self.r[d.rd] = self.read16(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                             }
@@ -1946,8 +1944,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.enterException(.abt, 0x10, pc +% 8, false);
                             priv = 1;
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             continue;
                         };
                     },
@@ -2013,22 +2011,21 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldr_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase) {
-                            self.r[d.rd] = std.mem.readInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], .little);
+                        if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank]) {
+                            self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = std.mem.readInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], .little);
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
                             } else {
                                 self.r[d.rd] = self.read32(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                             }
@@ -2036,30 +2033,29 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .str_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase) {
-                            std.mem.writeInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                        if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
+                            std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
                             } else {
                                 self.write32(bus, vaddr, self.r[d.rd]) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                                 if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
                                     if (self.checkInterrupts(bus)) {
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
-                                        data_r_vbase = 0xffff_ffff;
-                                        data_w_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     }
                                 }
                             }
@@ -2067,22 +2063,21 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldrb_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & 0xffff_f000) == data_r_vbase) {
-                            self.r[d.rd] = data_page_ptr[vaddr & 0xfff];
+                        if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
+                            self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = data_page_ptr[vaddr & 0xfff];
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                             } else {
                                 self.r[d.rd] = self.read8(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                             }
@@ -2090,30 +2085,29 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .strb_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & 0xffff_f000) == data_w_vbase) {
-                            data_page_ptr[vaddr & 0xfff] = @truncate(self.r[d.rd]);
+                        if ((vaddr & 0xffff_f000) == data_w_vbase[bank]) {
+                            data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xffff_f000) == slot.w_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                data_page_ptr[vaddr & 0xfff] = @truncate(self.r[d.rd]);
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
                             } else {
                                 self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                                 if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
                                     if (self.checkInterrupts(bus)) {
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
-                                        data_r_vbase = 0xffff_ffff;
-                                        data_w_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     }
                                 }
                             }
@@ -2123,22 +2117,21 @@ pub fn Arm1176(comptime Bus: type) type {
                         const vaddr = (pc +% 8) +% imm32;
                         if ((vaddr & ~@as(u32, 0xffc)) == code_vbase) {
                             self.r[d.rd] = std.mem.readInt(u32, code_page_ptr[vaddr & 0xffc ..][0..4], .little);
-                        } else if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase) {
-                            self.r[d.rd] = std.mem.readInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], .little);
+                        } else if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[0]) {
+                            self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[0][vaddr & 0xffc ..][0..4], .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = std.mem.readInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], .little);
+                                data_r_vbase[0] = slot.r_vbase;
+                                data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[0][vaddr & 0xffc ..][0..4], .little);
                             } else {
                                 self.r[d.rd] = self.read32(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                             }
@@ -2146,22 +2139,21 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldrh_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase) {
-                            self.r[d.rd] = std.mem.readInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], .little);
+                        if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank]) {
+                            self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = std.mem.readInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], .little);
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
                             } else {
                                 self.r[d.rd] = self.read16(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                             }
@@ -2169,30 +2161,29 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .strh_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffe)) == data_w_vbase) {
-                            std.mem.writeInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
+                        if ((vaddr & ~@as(u32, 0xffe)) == data_w_vbase[bank]) {
+                            std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
                             } else {
                                 self.write16(bus, vaddr, @truncate(self.r[d.rd])) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                                 if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
                                     if (self.checkInterrupts(bus)) {
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
-                                        data_r_vbase = 0xffff_ffff;
-                                        data_w_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     }
                                 }
                             }
@@ -2200,22 +2191,21 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldrsb_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        const byte_val: u8 = if ((vaddr & 0xffff_f000) == data_r_vbase)
-                            data_page_ptr[vaddr & 0xfff]
+                        const byte_val: u8 = if ((vaddr & 0xffff_f000) == data_r_vbase[bank])
+                            data_r_page_ptr[bank][vaddr & 0xfff]
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                break :blk data_page_ptr[vaddr & 0xfff];
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                break :blk data_r_page_ptr[bank][vaddr & 0xfff];
                             }
                             break :blk self.read8(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 continue;
                             };
                         };
@@ -2223,22 +2213,21 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldrsh_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        const half_val: u16 = if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase)
-                            std.mem.readInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], .little)
+                        const half_val: u16 = if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank])
+                            std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little)
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                break :blk std.mem.readInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], .little);
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                break :blk std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
                             }
                             break :blk self.read16(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 continue;
                             };
                         };
@@ -2246,22 +2235,21 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldrh_reg_al => {
                         const vaddr = self.r[d.rn] +% self.r[d.rm];
-                        if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase) {
-                            self.r[d.rd] = std.mem.readInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], .little);
+                        if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank]) {
+                            self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = std.mem.readInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], .little);
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
                             } else {
                                 self.r[d.rd] = self.read16(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                             }
@@ -2269,30 +2257,29 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .strh_reg_al => {
                         const vaddr = self.r[d.rn] +% self.r[d.rm];
-                        if ((vaddr & ~@as(u32, 0xffe)) == data_w_vbase) {
-                            std.mem.writeInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
+                        if ((vaddr & ~@as(u32, 0xffe)) == data_w_vbase[bank]) {
+                            std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
                             } else {
                                 self.write16(bus, vaddr, @truncate(self.r[d.rd])) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                                 if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
                                     if (self.checkInterrupts(bus)) {
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
-                                        data_r_vbase = 0xffff_ffff;
-                                        data_w_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     }
                                 }
                             }
@@ -2300,22 +2287,21 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldrsb_reg_al => {
                         const vaddr = self.r[d.rn] +% self.r[d.rm];
-                        const byte_val: u8 = if ((vaddr & 0xffff_f000) == data_r_vbase)
-                            data_page_ptr[vaddr & 0xfff]
+                        const byte_val: u8 = if ((vaddr & 0xffff_f000) == data_r_vbase[bank])
+                            data_r_page_ptr[bank][vaddr & 0xfff]
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                break :blk data_page_ptr[vaddr & 0xfff];
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                break :blk data_r_page_ptr[bank][vaddr & 0xfff];
                             }
                             break :blk self.read8(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 continue;
                             };
                         };
@@ -2323,22 +2309,21 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldrsh_reg_al => {
                         const vaddr = self.r[d.rn] +% self.r[d.rm];
-                        const half_val: u16 = if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase)
-                            std.mem.readInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], .little)
+                        const half_val: u16 = if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank])
+                            std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little)
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                break :blk std.mem.readInt(u16, data_page_ptr[vaddr & 0xffe ..][0..2], .little);
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                break :blk std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
                             }
                             break :blk self.read16(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 continue;
                             };
                         };
@@ -2346,22 +2331,21 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .ldrd_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
-                        const pair: u64 = if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == data_r_vbase)
-                            std.mem.readInt(u64, data_page_ptr[vaddr & 0xffc ..][0..8], .little)
+                        const pair: u64 = if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
+                            std.mem.readInt(u64, data_r_page_ptr[bank][vaddr & 0xffc ..][0..8], .little)
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                break :blk std.mem.readInt(u64, data_page_ptr[vaddr & 0xffc ..][0..8], .little);
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                break :blk std.mem.readInt(u64, data_r_page_ptr[bank][vaddr & 0xffc ..][0..8], .little);
                             }
                             break :blk self.read64(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 continue;
                             };
                         };
@@ -2371,30 +2355,29 @@ pub fn Arm1176(comptime Bus: type) type {
                     .strd_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
                         const val: u64 = @as(u64, self.r[d.rd]) | (@as(u64, self.r[d.rd + 1]) << 32);
-                        if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == data_w_vbase) {
-                            std.mem.writeInt(u64, data_page_ptr[vaddr & 0xffc ..][0..8], val, .little);
+                        if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
+                            std.mem.writeInt(u64, data_w_page_ptr[bank][vaddr & 0xffc ..][0..8], val, .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u64, data_page_ptr[vaddr & 0xffc ..][0..8], val, .little);
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][vaddr & 0xffc ..][0..8], val, .little);
                             } else {
                                 self.write64(bus, vaddr, val) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                                 if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
                                     if (self.checkInterrupts(bus)) {
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
-                                        data_r_vbase = 0xffff_ffff;
-                                        data_w_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     }
                                 }
                             }
@@ -2404,22 +2387,21 @@ pub fn Arm1176(comptime Bus: type) type {
                         const base_val = self.r[d.rn];
                         const vaddr = base_val +% imm32;
                         const wb_off: u32 = @truncate(d.imm >> 32);
-                        const val: u32 = if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase)
-                            std.mem.readInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], .little)
+                        const val: u32 = if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
+                            std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little)
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                break :blk std.mem.readInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], .little);
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                break :blk std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
                             }
                             break :blk self.read32(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 continue;
                             };
                         };
@@ -2434,24 +2416,23 @@ pub fn Arm1176(comptime Bus: type) type {
                         const base_val = self.r[d.rn];
                         const vaddr = base_val +% imm32;
                         const wb_off: u32 = @truncate(d.imm >> 32);
-                        if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase) {
-                            std.mem.writeInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                        if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
+                            std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
                             self.r[d.rn] = base_val +% wb_off;
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
                                 self.r[d.rn] = base_val +% wb_off;
                             } else {
                                 self.write32(bus, vaddr, self.r[d.rd]) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                                 self.r[d.rn] = base_val +% wb_off;
@@ -2459,8 +2440,8 @@ pub fn Arm1176(comptime Bus: type) type {
                                     if (self.checkInterrupts(bus)) {
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
-                                        data_r_vbase = 0xffff_ffff;
-                                        data_w_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     }
                                 }
                             }
@@ -2470,22 +2451,21 @@ pub fn Arm1176(comptime Bus: type) type {
                         const base_val = self.r[d.rn];
                         const vaddr = base_val +% imm32;
                         const wb_off: u32 = @truncate(d.imm >> 32);
-                        if ((vaddr & 0xffff_f000) == data_r_vbase) {
-                            self.r[d.rd] = data_page_ptr[vaddr & 0xfff];
+                        if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
+                            self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = data_page_ptr[vaddr & 0xfff];
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                             } else {
                                 self.r[d.rd] = self.read8(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                             }
@@ -2496,24 +2476,23 @@ pub fn Arm1176(comptime Bus: type) type {
                         const base_val = self.r[d.rn];
                         const vaddr = base_val +% imm32;
                         const wb_off: u32 = @truncate(d.imm >> 32);
-                        if ((vaddr & 0xffff_f000) == data_w_vbase) {
-                            data_page_ptr[vaddr & 0xfff] = @truncate(self.r[d.rd]);
+                        if ((vaddr & 0xffff_f000) == data_w_vbase[bank]) {
+                            data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
                             self.r[d.rn] = base_val +% wb_off;
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xffff_f000) == slot.w_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                data_page_ptr[vaddr & 0xfff] = @truncate(self.r[d.rd]);
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
                                 self.r[d.rn] = base_val +% wb_off;
                             } else {
                                 self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                                 self.r[d.rn] = base_val +% wb_off;
@@ -2521,8 +2500,8 @@ pub fn Arm1176(comptime Bus: type) type {
                                     if (self.checkInterrupts(bus)) {
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
-                                        data_r_vbase = 0xffff_ffff;
-                                        data_w_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     }
                                 }
                             }
@@ -2534,22 +2513,21 @@ pub fn Arm1176(comptime Bus: type) type {
                         else
                             (self.r[d.rm] << @as(u5, @truncate(imm32)));
                         const vaddr = if (op == .ldr_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
-                        if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase) {
-                            self.r[d.rd] = std.mem.readInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], .little);
+                        if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank]) {
+                            self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = std.mem.readInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], .little);
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
                             } else {
                                 self.r[d.rd] = self.read32(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                             }
@@ -2561,30 +2539,29 @@ pub fn Arm1176(comptime Bus: type) type {
                         else
                             (self.r[d.rm] << @as(u5, @truncate(imm32)));
                         const vaddr = if (op == .str_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
-                        if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase) {
-                            std.mem.writeInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                        if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
+                            std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
                             } else {
                                 self.write32(bus, vaddr, self.r[d.rd]) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                                 if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
                                     if (self.checkInterrupts(bus)) {
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
-                                        data_r_vbase = 0xffff_ffff;
-                                        data_w_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     }
                                 }
                             }
@@ -2593,22 +2570,21 @@ pub fn Arm1176(comptime Bus: type) type {
                     .ldrb_reg_lsl_al, .ldrb_reg_sub_lsl_al => {
                         const scaled = self.r[d.rm] << @as(u5, @truncate(imm32));
                         const vaddr = if (op == .ldrb_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
-                        if ((vaddr & 0xffff_f000) == data_r_vbase) {
-                            self.r[d.rd] = data_page_ptr[vaddr & 0xfff];
+                        if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
+                            self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = data_page_ptr[vaddr & 0xfff];
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                             } else {
                                 self.r[d.rd] = self.read8(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                             }
@@ -2617,30 +2593,29 @@ pub fn Arm1176(comptime Bus: type) type {
                     .strb_reg_lsl_al, .strb_reg_sub_lsl_al => {
                         const scaled = self.r[d.rm] << @as(u5, @truncate(imm32));
                         const vaddr = if (op == .strb_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
-                        if ((vaddr & 0xffff_f000) == data_w_vbase) {
-                            data_page_ptr[vaddr & 0xfff] = @truncate(self.r[d.rd]);
+                        if ((vaddr & 0xffff_f000) == data_w_vbase[bank]) {
+                            data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
                         } else {
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & 0xffff_f000) == slot.w_vbase) {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                data_page_ptr[vaddr & 0xfff] = @truncate(self.r[d.rd]);
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
                             } else {
                                 self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
                                 if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
                                     if (self.checkInterrupts(bus)) {
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
-                                        data_r_vbase = 0xffff_ffff;
-                                        data_w_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     }
                                 }
                             }
@@ -2652,18 +2627,17 @@ pub fn Arm1176(comptime Bus: type) type {
                         const start_addr = base_val +% @as(u32, @bitCast(start_off));
                         const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
                         const last_addr = start_addr +% last_off;
-                        const hit_page: ?[*]u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_r_vbase and
-                            (last_addr & ~@as(u32, 0xffc)) == data_r_vbase)
-                            data_page_ptr
+                        const hit_page: ?[*]const u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_r_vbase[bank] and
+                            (last_addr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
+                            data_r_page_ptr[bank]
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
                             if ((start_addr & ~@as(u32, 0xffc)) == slot.r_vbase and
                                 (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
                             {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                break :blk data_page_ptr;
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                break :blk data_r_page_ptr[bank];
                             }
                             break :blk null;
                         };
@@ -2707,8 +2681,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeLoadStoreMultiple(bus, pc, inst);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .stm_al => {
@@ -2717,18 +2691,17 @@ pub fn Arm1176(comptime Bus: type) type {
                         const start_addr = base_val +% @as(u32, @bitCast(start_off));
                         const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
                         const last_addr = start_addr +% last_off;
-                        const hit_page: ?[*]u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_w_vbase and
-                            (last_addr & ~@as(u32, 0xffc)) == data_w_vbase)
-                            data_page_ptr
+                        const hit_page: ?[*]u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_w_vbase[bank] and
+                            (last_addr & ~@as(u32, 0xffc)) == data_w_vbase[bank])
+                            data_w_page_ptr[bank]
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
                             if ((start_addr & ~@as(u32, 0xffc)) == slot.w_vbase and
                                 (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
                             {
-                                data_r_vbase = slot.r_vbase;
-                                data_w_vbase = slot.w_vbase;
-                                data_page_ptr = bus.ram.ptr + slot.pbase;
-                                break :blk data_page_ptr;
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                break :blk data_w_page_ptr[bank];
                             }
                             break :blk null;
                         };
@@ -2772,8 +2745,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             }
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .b_al => {
@@ -2829,8 +2802,8 @@ pub fn Arm1176(comptime Bus: type) type {
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                     .dp_reg_general => {
                         self.executeGroup000(bus, pc, inst);
@@ -2838,8 +2811,8 @@ pub fn Arm1176(comptime Bus: type) type {
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                     .mrs_cpsr_al => self.r[d.rd] = self.cpsr,
                     .msr_cpsr_c_al => {
@@ -2850,16 +2823,16 @@ pub fn Arm1176(comptime Bus: type) type {
                                 if (self.checkInterrupts(bus)) {
                                     priv = @intFromBool(self.isPrivileged());
                                     code_vbase = 0xffff_ffff;
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 }
                             } else {
                                 self.setCpsr((self.cpsr & 0xffff_ff00) | (val & 0xff));
                                 _ = self.checkInterrupts(bus);
                                 priv = @intFromBool(self.isPrivileged());
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             }
                         }
                     },
@@ -2872,8 +2845,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.enterException(.und, 0x04, pc +% 4, false);
                             priv = 1;
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .mcr_barrier_al => self.memoryBarrier(bus, d.rd != 0),
@@ -2901,8 +2874,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             if (self.checkInterrupts(bus)) {
                                 priv = @intFromBool(self.isPrivileged());
                                 code_vbase = 0xffff_ffff;
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             }
                         }
                     },
@@ -2911,40 +2884,40 @@ pub fn Arm1176(comptime Bus: type) type {
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                     .mul_extra_ls => {
                         self.executeMultipliesAndExtraLoadStore(bus, pc, inst);
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                     .ls_wb_imm => {
                         self.executeLoadStoreWordByte(bus, pc, inst, false);
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                     .ls_wb_reg => {
                         self.executeLoadStoreWordByte(bus, pc, inst, true);
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                     .ls_multiple => {
                         self.executeLoadStoreMultiple(bus, pc, inst);
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                     .media => {
                         self.executeMediaGroup(pc, inst);
@@ -2955,17 +2928,17 @@ pub fn Arm1176(comptime Bus: type) type {
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                     .vldr_f64_al => {
                         if (self.vfpReady(priv)) {
                             const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
                             const vaddr = base +% imm32;
-                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == data_r_vbase) {
+                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == data_r_vbase[bank]) {
                                 const off: usize = vaddr & 0xfff;
-                                self.vfp.s[d.rd] = std.mem.readInt(u32, data_page_ptr[off..][0..4], .little);
-                                self.vfp.s[d.rd + 1] = std.mem.readInt(u32, data_page_ptr[off + 4 ..][0..4], .little);
+                                self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][off..][0..4], .little);
+                                self.vfp.s[d.rd + 1] = std.mem.readInt(u32, data_r_page_ptr[bank][off + 4 ..][0..4], .little);
                             } else if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == code_vbase) {
                                 const off: usize = vaddr & 0xfff;
                                 self.vfp.s[d.rd] = std.mem.readInt(u32, code_page_ptr[off..][0..4], .little);
@@ -2973,117 +2946,113 @@ pub fn Arm1176(comptime Bus: type) type {
                             } else {
                                 const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                                 if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == slot.r_vbase) {
-                                    data_r_vbase = slot.r_vbase;
-                                    data_w_vbase = slot.w_vbase;
-                                    data_page_ptr = bus.ram.ptr + slot.pbase;
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
                                     const off: usize = vaddr & 0xfff;
-                                    self.vfp.s[d.rd] = std.mem.readInt(u32, data_page_ptr[off..][0..4], .little);
-                                    self.vfp.s[d.rd + 1] = std.mem.readInt(u32, data_page_ptr[off + 4 ..][0..4], .little);
+                                    self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][off..][0..4], .little);
+                                    self.vfp.s[d.rd + 1] = std.mem.readInt(u32, data_r_page_ptr[bank][off + 4 ..][0..4], .little);
                                 } else {
                                     self.executeVfp(bus, pc, inst, true);
                                     priv = @intFromBool(self.isPrivileged());
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 }
                             }
                         } else {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vstr_f64_al => {
                         if (self.vfpReady(priv)) {
                             const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
                             const vaddr = base +% imm32;
-                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == data_w_vbase) {
+                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == data_w_vbase[bank]) {
                                 const off: usize = vaddr & 0xfff;
-                                std.mem.writeInt(u32, data_page_ptr[off..][0..4], self.vfp.s[d.rd], .little);
-                                std.mem.writeInt(u32, data_page_ptr[off + 4 ..][0..4], self.vfp.s[d.rd + 1], .little);
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][off..][0..4], self.vfp.s[d.rd], .little);
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][off + 4 ..][0..4], self.vfp.s[d.rd + 1], .little);
                             } else {
                                 const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                                 if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == slot.w_vbase) {
-                                    data_r_vbase = slot.r_vbase;
-                                    data_w_vbase = slot.w_vbase;
-                                    data_page_ptr = bus.ram.ptr + slot.pbase;
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
                                     const off: usize = vaddr & 0xfff;
-                                    std.mem.writeInt(u32, data_page_ptr[off..][0..4], self.vfp.s[d.rd], .little);
-                                    std.mem.writeInt(u32, data_page_ptr[off + 4 ..][0..4], self.vfp.s[d.rd + 1], .little);
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][off..][0..4], self.vfp.s[d.rd], .little);
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][off + 4 ..][0..4], self.vfp.s[d.rd + 1], .little);
                                 } else {
                                     self.executeVfp(bus, pc, inst, true);
                                     _ = self.checkInterrupts(bus);
                                     priv = @intFromBool(self.isPrivileged());
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 }
                             }
                         } else {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vldr_f32_al => {
                         if (self.vfpReady(priv)) {
                             const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
                             const vaddr = base +% imm32;
-                            if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == data_r_vbase) {
-                                self.vfp.s[d.rd] = std.mem.readInt(u32, data_page_ptr[vaddr & 0xfff ..][0..4], .little);
+                            if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == data_r_vbase[bank]) {
+                                self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xfff ..][0..4], .little);
                             } else if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == code_vbase) {
                                 self.vfp.s[d.rd] = std.mem.readInt(u32, code_page_ptr[vaddr & 0xfff ..][0..4], .little);
                             } else {
                                 const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                                 if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == slot.r_vbase) {
-                                    data_r_vbase = slot.r_vbase;
-                                    data_w_vbase = slot.w_vbase;
-                                    data_page_ptr = bus.ram.ptr + slot.pbase;
-                                    self.vfp.s[d.rd] = std.mem.readInt(u32, data_page_ptr[vaddr & 0xfff ..][0..4], .little);
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xfff ..][0..4], .little);
                                 } else {
                                     self.executeVfp(bus, pc, inst, false);
                                     priv = @intFromBool(self.isPrivileged());
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 }
                             }
                         } else {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vstr_f32_al => {
                         if (self.vfpReady(priv)) {
                             const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
                             const vaddr = base +% imm32;
-                            if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == data_w_vbase) {
-                                std.mem.writeInt(u32, data_page_ptr[vaddr & 0xfff ..][0..4], self.vfp.s[d.rd], .little);
+                            if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xfff ..][0..4], self.vfp.s[d.rd], .little);
                             } else {
                                 const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                                 if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == slot.w_vbase) {
-                                    data_r_vbase = slot.r_vbase;
-                                    data_w_vbase = slot.w_vbase;
-                                    data_page_ptr = bus.ram.ptr + slot.pbase;
-                                    std.mem.writeInt(u32, data_page_ptr[vaddr & 0xfff ..][0..4], self.vfp.s[d.rd], .little);
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xfff ..][0..4], self.vfp.s[d.rd], .little);
                                 } else {
                                     self.executeVfp(bus, pc, inst, false);
                                     _ = self.checkInterrupts(bus);
                                     priv = @intFromBool(self.isPrivileged());
-                                    data_r_vbase = 0xffff_ffff;
-                                    data_w_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 }
                             }
                         } else {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmov_r_f64_al => {
@@ -3094,8 +3063,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmov_f64_r_al => {
@@ -3106,8 +3075,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmov_r_f32_al => {
@@ -3117,8 +3086,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmov_f32_r_al => {
@@ -3128,8 +3097,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmrs_apsr_al => {
@@ -3139,8 +3108,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vadd_f64_al => {
@@ -3150,8 +3119,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vsub_f64_al => {
@@ -3161,8 +3130,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmul_f64_al => {
@@ -3172,8 +3141,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vdiv_f64_al => {
@@ -3183,8 +3152,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmla_f64_al => {
@@ -3194,8 +3163,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmls_f64_al => {
@@ -3205,8 +3174,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmov_f64_al => {
@@ -3216,8 +3185,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vcmp_f64_al => {
@@ -3227,8 +3196,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vcmpz_f64_al => {
@@ -3238,8 +3207,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, true);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vadd_f32_al => {
@@ -3249,8 +3218,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vsub_f32_al => {
@@ -3260,8 +3229,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmul_f32_al => {
@@ -3271,8 +3240,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vdiv_f32_al => {
@@ -3282,8 +3251,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmla_f32_al => {
@@ -3293,8 +3262,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmls_f32_al => {
@@ -3304,8 +3273,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vmov_f32_al => {
@@ -3315,8 +3284,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, false);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vfp_dp_al => {
@@ -3326,8 +3295,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.executeVfp(bus, pc, inst, ((inst >> 8) & 0xf) == 11);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vldm_al => {
@@ -3337,18 +3306,17 @@ pub fn Arm1176(comptime Bus: type) type {
                             const start_addr = base_val +% @as(u32, @bitCast(start_off));
                             const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
                             const last_addr = start_addr +% last_off;
-                            const hit_page: ?[*]u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_r_vbase and
-                                (last_addr & ~@as(u32, 0xffc)) == data_r_vbase)
-                                data_page_ptr
+                            const hit_page: ?[*]const u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_r_vbase[bank] and
+                                (last_addr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
+                                data_r_page_ptr[bank]
                             else blk: {
                                 const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
                                 if ((start_addr & ~@as(u32, 0xffc)) == slot.r_vbase and
                                     (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
                                 {
-                                    data_r_vbase = slot.r_vbase;
-                                    data_w_vbase = slot.w_vbase;
-                                    data_page_ptr = bus.ram.ptr + slot.pbase;
-                                    break :blk data_page_ptr;
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    break :blk data_r_page_ptr[bank];
                                 }
                                 break :blk null;
                             };
@@ -3370,15 +3338,15 @@ pub fn Arm1176(comptime Bus: type) type {
                             } else {
                                 self.executeVfp(bus, pc, inst, d.rm != 0);
                                 priv = @intFromBool(self.isPrivileged());
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             }
                         } else {
                             self.executeVfp(bus, pc, inst, d.rm != 0);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vstm_al => {
@@ -3388,18 +3356,17 @@ pub fn Arm1176(comptime Bus: type) type {
                             const start_addr = base_val +% @as(u32, @bitCast(start_off));
                             const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
                             const last_addr = start_addr +% last_off;
-                            const hit_page: ?[*]u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_w_vbase and
-                                (last_addr & ~@as(u32, 0xffc)) == data_w_vbase)
-                                data_page_ptr
+                            const hit_page: ?[*]u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_w_vbase[bank] and
+                                (last_addr & ~@as(u32, 0xffc)) == data_w_vbase[bank])
+                                data_w_page_ptr[bank]
                             else blk: {
                                 const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
                                 if ((start_addr & ~@as(u32, 0xffc)) == slot.w_vbase and
                                     (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
                                 {
-                                    data_r_vbase = slot.r_vbase;
-                                    data_w_vbase = slot.w_vbase;
-                                    data_page_ptr = bus.ram.ptr + slot.pbase;
-                                    break :blk data_page_ptr;
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    break :blk data_w_page_ptr[bank];
                                 }
                                 break :blk null;
                             };
@@ -3421,22 +3388,22 @@ pub fn Arm1176(comptime Bus: type) type {
                             } else {
                                 self.executeVfp(bus, pc, inst, d.rm != 0);
                                 priv = @intFromBool(self.isPrivileged());
-                                data_r_vbase = 0xffff_ffff;
-                                data_w_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             }
                         } else {
                             self.executeVfp(bus, pc, inst, d.rm != 0);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
-                            data_r_vbase = 0xffff_ffff;
-                            data_w_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
                     .vfp_ls_multi_al => {
                         self.executeVfp(bus, pc, inst, d.rm != 0);
                         priv = @intFromBool(self.isPrivileged());
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                     .unconditional => {
                         self.executeUnconditional(bus, pc, inst);
@@ -3444,8 +3411,8 @@ pub fn Arm1176(comptime Bus: type) type {
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                 }
                 }
@@ -3465,10 +3432,11 @@ pub fn Arm1176(comptime Bus: type) type {
                     return;
                 };
                 self.r[15] = pc +% 2;
-                var data_r_vbase: u32 = 0xffff_ffff;
-                var data_w_vbase: u32 = 0xffff_ffff;
-                var data_page_ptr: [*]u8 = bus.ram.ptr;
-                _ = self.executeThumb(bus, pc, inst16, @intFromBool(self.isPrivileged()), 0xffff_ffff, 0, &data_r_vbase, &data_w_vbase, &data_page_ptr);
+                var data_r_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
+                var data_w_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
+                var data_r_page_ptr: [2][*]const u8 = .{ bus.ram.ptr, bus.ram.ptr };
+                var data_w_page_ptr: [2][*]u8 = .{ bus.ram.ptr, bus.ram.ptr };
+                _ = self.executeThumb(bus, pc, inst16, @intFromBool(self.isPrivileged()), 0xffff_ffff, 0, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr);
                 return;
             }
 
@@ -4884,9 +4852,10 @@ pub fn Arm1176(comptime Bus: type) type {
             priv: u1,
             code_vbase: u32,
             code_pbase: u32,
-            data_r_vbase: *u32,
-            data_w_vbase: *u32,
-            data_page_ptr: *[*]u8,
+            data_r_vbase: *[2]u32,
+            data_w_vbase: *[2]u32,
+            data_r_page_ptr: *[2][*]const u8,
+            data_w_page_ptr: *[2][*]u8,
         ) bool {
             const top3: u3 = @truncate(inst >> 13);
             switch (top3) {
@@ -5048,16 +5017,15 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.r[rd] = std.mem.readInt(u32, bus.ram[(code_pbase | (addr & 0xffc))..][0..4], .little);
                             return false;
                         }
-                        if ((addr & 0xffff_f000) == data_r_vbase.*) {
-                            self.r[rd] = std.mem.readInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], .little);
+                        if ((addr & 0xffff_f000) == data_r_vbase[0]) {
+                            self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
                             return false;
                         }
                         const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                         if ((addr & 0xffff_f000) == slot.r_vbase) {
-                            data_r_vbase.* = slot.r_vbase;
-                            data_w_vbase.* = slot.w_vbase;
-                            data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                            self.r[rd] = std.mem.readInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], .little);
+                            data_r_vbase[0] = slot.r_vbase;
+                            data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                            self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
                             return false;
                         }
                         const val = self.read32(bus, addr) catch {
@@ -5075,16 +5043,15 @@ pub fn Arm1176(comptime Bus: type) type {
                         const addr = self.r[rn] +% self.r[rm];
                         switch (op) {
                             0b000 => {
-                                if ((addr & ~@as(u32, 0xffc)) == data_w_vbase.*) {
-                                    std.mem.writeInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], self.r[rd], .little);
+                                if ((addr & ~@as(u32, 0xffc)) == data_w_vbase[0]) {
+                                    std.mem.writeInt(u32, data_w_page_ptr[0][addr & 0xffc ..][0..4], self.r[rd], .little);
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                                 if ((addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                    data_r_vbase.* = slot.r_vbase;
-                                    data_w_vbase.* = slot.w_vbase;
-                                    data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                    std.mem.writeInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], self.r[rd], .little);
+                                    data_w_vbase[0] = slot.w_vbase;
+                                    data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                    std.mem.writeInt(u32, data_w_page_ptr[0][addr & 0xffc ..][0..4], self.r[rd], .little);
                                     return false;
                                 }
                                 self.write32(bus, addr, self.r[rd]) catch {
@@ -5094,16 +5061,15 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return true;
                             },
                             0b001 => {
-                                if ((addr & ~@as(u32, 0xffe)) == data_w_vbase.*) {
-                                    std.mem.writeInt(u16, data_page_ptr.*[addr & 0xffe ..][0..2], @truncate(self.r[rd]), .little);
+                                if ((addr & ~@as(u32, 0xffe)) == data_w_vbase[0]) {
+                                    std.mem.writeInt(u16, data_w_page_ptr[0][addr & 0xffe ..][0..2], @truncate(self.r[rd]), .little);
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                                 if ((addr & ~@as(u32, 0xffe)) == slot.w_vbase) {
-                                    data_r_vbase.* = slot.r_vbase;
-                                    data_w_vbase.* = slot.w_vbase;
-                                    data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                    std.mem.writeInt(u16, data_page_ptr.*[addr & 0xffe ..][0..2], @truncate(self.r[rd]), .little);
+                                    data_w_vbase[0] = slot.w_vbase;
+                                    data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                    std.mem.writeInt(u16, data_w_page_ptr[0][addr & 0xffe ..][0..2], @truncate(self.r[rd]), .little);
                                     return false;
                                 }
                                 self.write16(bus, addr, @truncate(self.r[rd])) catch {
@@ -5113,16 +5079,15 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return true;
                             },
                             0b010 => {
-                                if ((addr & 0xffff_f000) == data_w_vbase.*) {
-                                    data_page_ptr.*[addr & 0xfff] = @truncate(self.r[rd]);
+                                if ((addr & 0xffff_f000) == data_w_vbase[0]) {
+                                    data_w_page_ptr[0][addr & 0xfff] = @truncate(self.r[rd]);
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                                 if ((addr & 0xffff_f000) == slot.w_vbase) {
-                                    data_r_vbase.* = slot.r_vbase;
-                                    data_w_vbase.* = slot.w_vbase;
-                                    data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                    data_page_ptr.*[addr & 0xfff] = @truncate(self.r[rd]);
+                                    data_w_vbase[0] = slot.w_vbase;
+                                    data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                    data_w_page_ptr[0][addr & 0xfff] = @truncate(self.r[rd]);
                                     return false;
                                 }
                                 self.write8(bus, addr, @truncate(self.r[rd])) catch {
@@ -5132,17 +5097,16 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return true;
                             },
                             0b011 => {
-                                if ((addr & 0xffff_f000) == data_r_vbase.*) {
-                                    const bval = data_page_ptr.*[addr & 0xfff];
+                                if ((addr & 0xffff_f000) == data_r_vbase[0]) {
+                                    const bval = data_r_page_ptr[0][addr & 0xfff];
                                     self.r[rd] = @bitCast(@as(i32, @as(i8, @bitCast(bval))));
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                                 if ((addr & 0xffff_f000) == slot.r_vbase) {
-                                    data_r_vbase.* = slot.r_vbase;
-                                    data_w_vbase.* = slot.w_vbase;
-                                    data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                    const bval = data_page_ptr.*[addr & 0xfff];
+                                    data_r_vbase[0] = slot.r_vbase;
+                                    data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                    const bval = data_r_page_ptr[0][addr & 0xfff];
                                     self.r[rd] = @bitCast(@as(i32, @as(i8, @bitCast(bval))));
                                     return false;
                                 }
@@ -5154,16 +5118,15 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             },
                             0b100 => {
-                                if ((addr & ~@as(u32, 0xffc)) == data_r_vbase.*) {
-                                    self.r[rd] = std.mem.readInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], .little);
+                                if ((addr & ~@as(u32, 0xffc)) == data_r_vbase[0]) {
+                                    self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                                 if ((addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                    data_r_vbase.* = slot.r_vbase;
-                                    data_w_vbase.* = slot.w_vbase;
-                                    data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                    self.r[rd] = std.mem.readInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], .little);
+                                    data_r_vbase[0] = slot.r_vbase;
+                                    data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                    self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
                                     return false;
                                 }
                                 self.r[rd] = self.read32(bus, addr) catch {
@@ -5173,16 +5136,15 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             },
                             0b101 => {
-                                if ((addr & ~@as(u32, 0xffe)) == data_r_vbase.*) {
-                                    self.r[rd] = std.mem.readInt(u16, data_page_ptr.*[addr & 0xffe ..][0..2], .little);
+                                if ((addr & ~@as(u32, 0xffe)) == data_r_vbase[0]) {
+                                    self.r[rd] = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                                 if ((addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                    data_r_vbase.* = slot.r_vbase;
-                                    data_w_vbase.* = slot.w_vbase;
-                                    data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                    self.r[rd] = std.mem.readInt(u16, data_page_ptr.*[addr & 0xffe ..][0..2], .little);
+                                    data_r_vbase[0] = slot.r_vbase;
+                                    data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                    self.r[rd] = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
                                     return false;
                                 }
                                 self.r[rd] = self.read16(bus, addr) catch {
@@ -5192,16 +5154,15 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             },
                             0b110 => {
-                                if ((addr & 0xffff_f000) == data_r_vbase.*) {
-                                    self.r[rd] = data_page_ptr.*[addr & 0xfff];
+                                if ((addr & 0xffff_f000) == data_r_vbase[0]) {
+                                    self.r[rd] = data_r_page_ptr[0][addr & 0xfff];
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                                 if ((addr & 0xffff_f000) == slot.r_vbase) {
-                                    data_r_vbase.* = slot.r_vbase;
-                                    data_w_vbase.* = slot.w_vbase;
-                                    data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                    self.r[rd] = data_page_ptr.*[addr & 0xfff];
+                                    data_r_vbase[0] = slot.r_vbase;
+                                    data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                    self.r[rd] = data_r_page_ptr[0][addr & 0xfff];
                                     return false;
                                 }
                                 self.r[rd] = self.read8(bus, addr) catch {
@@ -5211,17 +5172,16 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             },
                             0b111 => {
-                                if ((addr & ~@as(u32, 0xffe)) == data_r_vbase.*) {
-                                    const hval = std.mem.readInt(u16, data_page_ptr.*[addr & 0xffe ..][0..2], .little);
+                                if ((addr & ~@as(u32, 0xffe)) == data_r_vbase[0]) {
+                                    const hval = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
                                     self.r[rd] = @bitCast(@as(i32, @as(i16, @bitCast(hval))));
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                                 if ((addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                    data_r_vbase.* = slot.r_vbase;
-                                    data_w_vbase.* = slot.w_vbase;
-                                    data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                    const hval = std.mem.readInt(u16, data_page_ptr.*[addr & 0xffe ..][0..2], .little);
+                                    data_r_vbase[0] = slot.r_vbase;
+                                    data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                    const hval = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
                                     self.r[rd] = @bitCast(@as(i32, @as(i16, @bitCast(hval))));
                                     return false;
                                 }
@@ -5245,16 +5205,15 @@ pub fn Arm1176(comptime Bus: type) type {
                     const addr = self.r[rn] +% (if (b) imm5 else imm5 * 4);
                     if (l) {
                         if (b) {
-                            if ((addr & 0xffff_f000) == data_r_vbase.*) {
-                                self.r[rd] = data_page_ptr.*[addr & 0xfff];
+                            if ((addr & 0xffff_f000) == data_r_vbase[0]) {
+                                self.r[rd] = data_r_page_ptr[0][addr & 0xfff];
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                             if ((addr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase.* = slot.r_vbase;
-                                data_w_vbase.* = slot.w_vbase;
-                                data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                self.r[rd] = data_page_ptr.*[addr & 0xfff];
+                                data_r_vbase[0] = slot.r_vbase;
+                                data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                self.r[rd] = data_r_page_ptr[0][addr & 0xfff];
                                 return false;
                             }
                             self.r[rd] = self.read8(bus, addr) catch {
@@ -5262,16 +5221,15 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return true;
                             };
                         } else {
-                            if ((addr & ~@as(u32, 0xffc)) == data_r_vbase.*) {
-                                self.r[rd] = std.mem.readInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], .little);
+                            if ((addr & ~@as(u32, 0xffc)) == data_r_vbase[0]) {
+                                self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                             if ((addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase.* = slot.r_vbase;
-                                data_w_vbase.* = slot.w_vbase;
-                                data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                self.r[rd] = std.mem.readInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], .little);
+                                data_r_vbase[0] = slot.r_vbase;
+                                data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
                                 return false;
                             }
                             self.r[rd] = self.read32(bus, addr) catch {
@@ -5282,16 +5240,15 @@ pub fn Arm1176(comptime Bus: type) type {
                         return false;
                     } else {
                         if (b) {
-                            if ((addr & 0xffff_f000) == data_w_vbase.*) {
-                                data_page_ptr.*[addr & 0xfff] = @truncate(self.r[rd]);
+                            if ((addr & 0xffff_f000) == data_w_vbase[0]) {
+                                data_w_page_ptr[0][addr & 0xfff] = @truncate(self.r[rd]);
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                             if ((addr & 0xffff_f000) == slot.w_vbase) {
-                                data_r_vbase.* = slot.r_vbase;
-                                data_w_vbase.* = slot.w_vbase;
-                                data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                data_page_ptr.*[addr & 0xfff] = @truncate(self.r[rd]);
+                                data_w_vbase[0] = slot.w_vbase;
+                                data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                data_w_page_ptr[0][addr & 0xfff] = @truncate(self.r[rd]);
                                 return false;
                             }
                             self.write8(bus, addr, @truncate(self.r[rd])) catch {
@@ -5300,16 +5257,15 @@ pub fn Arm1176(comptime Bus: type) type {
                             };
                             return true;
                         } else {
-                            if ((addr & ~@as(u32, 0xffc)) == data_w_vbase.*) {
-                                std.mem.writeInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], self.r[rd], .little);
+                            if ((addr & ~@as(u32, 0xffc)) == data_w_vbase[0]) {
+                                std.mem.writeInt(u32, data_w_page_ptr[0][addr & 0xffc ..][0..4], self.r[rd], .little);
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                             if ((addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                data_r_vbase.* = slot.r_vbase;
-                                data_w_vbase.* = slot.w_vbase;
-                                data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], self.r[rd], .little);
+                                data_w_vbase[0] = slot.w_vbase;
+                                data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                std.mem.writeInt(u32, data_w_page_ptr[0][addr & 0xffc ..][0..4], self.r[rd], .little);
                                 return false;
                             }
                             self.write32(bus, addr, self.r[rd]) catch {
@@ -5329,16 +5285,15 @@ pub fn Arm1176(comptime Bus: type) type {
                         const rd: u4 = @truncate(inst & 7);
                         const addr = self.r[rn] +% imm5;
                         if (l) {
-                            if ((addr & ~@as(u32, 0xffe)) == data_r_vbase.*) {
-                                self.r[rd] = std.mem.readInt(u16, data_page_ptr.*[addr & 0xffe ..][0..2], .little);
+                            if ((addr & ~@as(u32, 0xffe)) == data_r_vbase[0]) {
+                                self.r[rd] = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                             if ((addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase.* = slot.r_vbase;
-                                data_w_vbase.* = slot.w_vbase;
-                                data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                self.r[rd] = std.mem.readInt(u16, data_page_ptr.*[addr & 0xffe ..][0..2], .little);
+                                data_r_vbase[0] = slot.r_vbase;
+                                data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                self.r[rd] = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
                                 return false;
                             }
                             self.r[rd] = self.read16(bus, addr) catch {
@@ -5347,16 +5302,15 @@ pub fn Arm1176(comptime Bus: type) type {
                             };
                             return false;
                         } else {
-                            if ((addr & ~@as(u32, 0xffe)) == data_w_vbase.*) {
-                                std.mem.writeInt(u16, data_page_ptr.*[addr & 0xffe ..][0..2], @truncate(self.r[rd]), .little);
+                            if ((addr & ~@as(u32, 0xffe)) == data_w_vbase[0]) {
+                                std.mem.writeInt(u16, data_w_page_ptr[0][addr & 0xffe ..][0..2], @truncate(self.r[rd]), .little);
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                             if ((addr & ~@as(u32, 0xffe)) == slot.w_vbase) {
-                                data_r_vbase.* = slot.r_vbase;
-                                data_w_vbase.* = slot.w_vbase;
-                                data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u16, data_page_ptr.*[addr & 0xffe ..][0..2], @truncate(self.r[rd]), .little);
+                                data_w_vbase[0] = slot.w_vbase;
+                                data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                std.mem.writeInt(u16, data_w_page_ptr[0][addr & 0xffe ..][0..2], @truncate(self.r[rd]), .little);
                                 return false;
                             }
                             self.write16(bus, addr, @truncate(self.r[rd])) catch {
@@ -5372,16 +5326,15 @@ pub fn Arm1176(comptime Bus: type) type {
                         const imm: u32 = (@as(u32, inst & 0xff)) * 4;
                         const addr = self.r[13] +% imm;
                         if (l) {
-                            if ((addr & ~@as(u32, 0xffc)) == data_r_vbase.*) {
-                                self.r[rd] = std.mem.readInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], .little);
+                            if ((addr & ~@as(u32, 0xffc)) == data_r_vbase[1]) {
+                                self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[1][addr & 0xffc ..][0..4], .little);
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                             if ((addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase.* = slot.r_vbase;
-                                data_w_vbase.* = slot.w_vbase;
-                                data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                self.r[rd] = std.mem.readInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], .little);
+                                data_r_vbase[1] = slot.r_vbase;
+                                data_r_page_ptr[1] = bus.ram.ptr + slot.pbase;
+                                self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[1][addr & 0xffc ..][0..4], .little);
                                 return false;
                             }
                             self.r[rd] = self.read32(bus, addr) catch {
@@ -5390,16 +5343,15 @@ pub fn Arm1176(comptime Bus: type) type {
                             };
                             return false;
                         } else {
-                            if ((addr & ~@as(u32, 0xffc)) == data_w_vbase.*) {
-                                std.mem.writeInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], self.r[rd], .little);
+                            if ((addr & ~@as(u32, 0xffc)) == data_w_vbase[1]) {
+                                std.mem.writeInt(u32, data_w_page_ptr[1][addr & 0xffc ..][0..4], self.r[rd], .little);
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
                             if ((addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                data_r_vbase.* = slot.r_vbase;
-                                data_w_vbase.* = slot.w_vbase;
-                                data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u32, data_page_ptr.*[addr & 0xffc ..][0..4], self.r[rd], .little);
+                                data_w_vbase[1] = slot.w_vbase;
+                                data_w_page_ptr[1] = bus.ram.ptr + slot.pbase;
+                                std.mem.writeInt(u32, data_w_page_ptr[1][addr & 0xffc ..][0..4], self.r[rd], .little);
                                 return false;
                             }
                             self.write32(bus, addr, self.r[rd]) catch {
@@ -5421,7 +5373,7 @@ pub fn Arm1176(comptime Bus: type) type {
                         return false;
                     } else {
                         // Misc 16-bit Thumb (ADD/SUB SP, SXTH/SXTB/UXTH/UXTB, PUSH/POP, REV, BKPT)
-                        return self.executeThumbMisc(bus, inst_pc, inst, priv, data_r_vbase, data_w_vbase, data_page_ptr);
+                        return self.executeThumbMisc(bus, inst_pc, inst, priv, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr);
                     }
                 },
                 0b110 => {
@@ -5436,18 +5388,17 @@ pub fn Arm1176(comptime Bus: type) type {
                             const total_bytes = count * 4;
                             const last_addr = base_val +% total_bytes -% 4;
                             if (l) {
-                                const hit_page: ?[*]u8 = if ((base_val & ~@as(u32, 0xffc)) == data_r_vbase.* and
-                                    (last_addr & ~@as(u32, 0xffc)) == data_r_vbase.*)
-                                    data_page_ptr.*
+                                const hit_page: ?[*]const u8 = if ((base_val & ~@as(u32, 0xffc)) == data_r_vbase[0] and
+                                    (last_addr & ~@as(u32, 0xffc)) == data_r_vbase[0])
+                                    data_r_page_ptr[0]
                                 else blk: {
                                     const slot = self.mmu.soft_tlb32[priv][(base_val >> 12) & Mmu.soft_tlb_mask];
                                     if ((base_val & ~@as(u32, 0xffc)) == slot.r_vbase and
                                         (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
                                     {
-                                        data_r_vbase.* = slot.r_vbase;
-                                        data_w_vbase.* = slot.w_vbase;
-                                        data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                        break :blk data_page_ptr.*;
+                                        data_r_vbase[0] = slot.r_vbase;
+                                        data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                        break :blk data_r_page_ptr[0];
                                     }
                                     break :blk null;
                                 };
@@ -5463,18 +5414,17 @@ pub fn Arm1176(comptime Bus: type) type {
                                     return false;
                                 }
                             } else {
-                                const hit_page: ?[*]u8 = if ((base_val & ~@as(u32, 0xffc)) == data_w_vbase.* and
-                                    (last_addr & ~@as(u32, 0xffc)) == data_w_vbase.*)
-                                    data_page_ptr.*
+                                const hit_page: ?[*]u8 = if ((base_val & ~@as(u32, 0xffc)) == data_w_vbase[0] and
+                                    (last_addr & ~@as(u32, 0xffc)) == data_w_vbase[0])
+                                    data_w_page_ptr[0]
                                 else blk: {
                                     const slot = self.mmu.soft_tlb32[priv][(base_val >> 12) & Mmu.soft_tlb_mask];
                                     if ((base_val & ~@as(u32, 0xffc)) == slot.w_vbase and
                                         (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
                                     {
-                                        data_r_vbase.* = slot.r_vbase;
-                                        data_w_vbase.* = slot.w_vbase;
-                                        data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                        break :blk data_page_ptr.*;
+                                        data_w_vbase[0] = slot.w_vbase;
+                                        data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                        break :blk data_w_page_ptr[0];
                                     }
                                     break :blk null;
                                 };
@@ -5578,9 +5528,10 @@ pub fn Arm1176(comptime Bus: type) type {
             inst_pc: u32,
             inst: u16,
             priv: u1,
-            data_r_vbase: *u32,
-            data_w_vbase: *u32,
-            data_page_ptr: *[*]u8,
+            data_r_vbase: *[2]u32,
+            data_w_vbase: *[2]u32,
+            data_r_page_ptr: *[2][*]const u8,
+            data_w_page_ptr: *[2][*]u8,
         ) bool {
             const sub: u4 = @truncate((inst >> 8) & 0xf);
             switch (sub) {
@@ -5610,18 +5561,17 @@ pub fn Arm1176(comptime Bus: type) type {
                     const start_sp = self.r[13] -% (count * 4);
                     if (count > 0) {
                         const last_addr = self.r[13] -% 4;
-                        const hit_page: ?[*]u8 = if ((start_sp & ~@as(u32, 0xffc)) == data_w_vbase.* and
-                            (last_addr & ~@as(u32, 0xffc)) == data_w_vbase.*)
-                            data_page_ptr.*
+                        const hit_page: ?[*]u8 = if ((start_sp & ~@as(u32, 0xffc)) == data_w_vbase[1] and
+                            (last_addr & ~@as(u32, 0xffc)) == data_w_vbase[1])
+                            data_w_page_ptr[1]
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(start_sp >> 12) & Mmu.soft_tlb_mask];
                             if ((start_sp & ~@as(u32, 0xffc)) == slot.w_vbase and
                                 (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
                             {
-                                data_r_vbase.* = slot.r_vbase;
-                                data_w_vbase.* = slot.w_vbase;
-                                data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                break :blk data_page_ptr.*;
+                                data_w_vbase[1] = slot.w_vbase;
+                                data_w_page_ptr[1] = bus.ram.ptr + slot.pbase;
+                                break :blk data_w_page_ptr[1];
                             }
                             break :blk null;
                         };
@@ -5670,18 +5620,17 @@ pub fn Arm1176(comptime Bus: type) type {
                     const start_sp = self.r[13];
                     if (count > 0) {
                         const last_addr = start_sp +% (count * 4) -% 4;
-                        const hit_page: ?[*]u8 = if ((start_sp & ~@as(u32, 0xffc)) == data_r_vbase.* and
-                            (last_addr & ~@as(u32, 0xffc)) == data_r_vbase.*)
-                            data_page_ptr.*
+                        const hit_page: ?[*]const u8 = if ((start_sp & ~@as(u32, 0xffc)) == data_r_vbase[1] and
+                            (last_addr & ~@as(u32, 0xffc)) == data_r_vbase[1])
+                            data_r_page_ptr[1]
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(start_sp >> 12) & Mmu.soft_tlb_mask];
                             if ((start_sp & ~@as(u32, 0xffc)) == slot.r_vbase and
                                 (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
                             {
-                                data_r_vbase.* = slot.r_vbase;
-                                data_w_vbase.* = slot.w_vbase;
-                                data_page_ptr.* = bus.ram.ptr + slot.pbase;
-                                break :blk data_page_ptr.*;
+                                data_r_vbase[1] = slot.r_vbase;
+                                data_r_page_ptr[1] = bus.ram.ptr + slot.pbase;
+                                break :blk data_r_page_ptr[1];
                             }
                             break :blk null;
                         };
