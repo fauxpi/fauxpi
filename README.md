@@ -7,13 +7,13 @@ FauxPi is a Raspberry Pi hardware simulator application.
 ## Features
 
 - **Supported Boards**:
-  - Raspberry Pi 1 (Model A+, Model B+)
-  - Raspberry Pi 3 (Model A+, Model B+)
+  - Raspberry Pi 1 A+ and B+
+  - Raspberry Pi 3 A+ and B+
   - Raspberry Pi Zero, Zero W, and Zero 2 W
 - **VideoCore IV Graphics**: Efficiently simulates accelerated video.
-- **Interactive Board Sheet**: Connect and disconnect power, HDMI, analog audio, USB devices (hub, keyboard, mouse), Ethernet, SD cards, and a 40-pin GPIO ribbon cable with live output LEDs and input switches.
-- **Storage**: Make multiple SD card images of different Raspberry Pi software.
-- **Networking & Audio**: Simulates Ethernet and Wi-Fi and audio output from analog audio jack and across HDMI.
+- **Interactive Board Sheet**: Connect and disconnect connectors like a read piece of hardware.
+- **Storage**: Manager multiple SD card images.
+- **Networking & Audio**: Ethernet, Wi-Fi and audio supported.
 
 ## Building and Running
 
