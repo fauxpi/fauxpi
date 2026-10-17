@@ -708,8 +708,7 @@ pub fn applyBoardConfigToRamDtb(
     allocator: std.mem.Allocator,
     ram: []u8,
     dtb_size: usize,
-    model_str: []const u8,
-    revision: u32,
+    board_model: BoardModel,
     serial: u64,
     wifi_mac: ?[6]u8,
 ) !usize {
@@ -719,7 +718,7 @@ pub fn applyBoardConfigToRamDtb(
 
     if (dtb_load_addr + dtb_size > ram.len) return error.DtbTooLarge;
     var tree = try fdt.Tree.parse(alloc, ram[dtb_load_addr .. dtb_load_addr + dtb_size]);
-    try tree.setBoardModel(model_str, revision);
+    try tree.setBoardModel(board_model);
     try tree.setBoardSerial(serial);
     if (wifi_mac) |wmac| {
         try tree.setWirelessMac(wmac);
@@ -734,10 +733,6 @@ pub fn applyBoardConfigToRamDtb(
     return updated_dtb.len;
 }
 
-/// Updates `/system/linux,serial` and `/serial-number` in the in-RAM DTB at `dtb_load_addr`.
-pub fn applyBoardSerialToRamDtb(allocator: std.mem.Allocator, ram: []u8, dtb_size: usize, serial: u64) !usize {
-    return applyBoardConfigToRamDtb(allocator, ram, dtb_size, "Raspberry Pi Zero Rev 1.3", 0x00900093, serial, null);
-}
 
 
 test "parse config.txt" {

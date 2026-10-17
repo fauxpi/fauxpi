@@ -381,7 +381,7 @@ pub const MacosWindow = struct {
         };
 
         gpio.setExternalPin(46, !win.status.hdmi_connected);
-        hid.setHubKind(@import("../usb/hid.zig").HubKind.fromModel(win.status.model));
+        hid.setHubKind(win.status.board_model.hubKind());
         hid.hub_connected = win.status.usb_hub_connected;
         hid.keyboard_connected = win.status.usb_keyboard_connected;
         hid.mouse_connected = win.status.usb_mouse_connected;
@@ -1083,7 +1083,6 @@ pub const MacosWindow = struct {
                         self.power_reconnected = true;
                     } else {
                         self.status.hdmi_active = false;
-                        self.status.cpu_busy_percent = 0.0;
                         self.gpio.resetSocState();
                     }
                     return;
@@ -1177,7 +1176,6 @@ pub const MacosWindow = struct {
 
     pub fn setBoardModel(self: *MacosWindow, bm: board_sheet.BoardModel) void {
         self.status.board_model = bm;
-        self.status.model = bm.dtModel();
         self.status.serial_u64 = self.ui.parsedSerial();
         self.status.mac_address = self.ui.parsedMac();
         self.status.wifi_mac_address = self.ui.parsedWifiMac();
@@ -1186,7 +1184,7 @@ pub const MacosWindow = struct {
             self.status.usb_hub_connected = true;
         }
         if (self.hid) |h| {
-            h.setHubKind(@import("../usb/hid.zig").HubKind.fromModel(self.status.model));
+            h.setHubKind(bm.hubKind());
             h.hub_connected = self.status.usb_hub_connected;
         }
         self.ui_dirty = true;

@@ -10,6 +10,7 @@
 //! - Applies `.dtbo` overlays and `__overrides__` parameters (`dtoverlay=` / `dtparam=`).
 
 const std = @import("std");
+const BoardModel = @import("../ui/board.zig").BoardModel;
 const HubKind = @import("../usb/hid.zig").HubKind;
 
 pub const fdt_magic: u32 = 0xd00dfeed;
@@ -271,13 +272,12 @@ pub const Tree = struct {
         try self.root.setStringProp(self.allocator, "serial-number", sstr);
     }
 
-    pub fn setBoardModel(self: *Tree, model_str: []const u8, revision: u32) !void {
-        try self.root.setStringProp(self.allocator, "model", model_str);
+    pub fn setBoardModel(self: *Tree, board_model: BoardModel) !void {
+        try self.root.setStringProp(self.allocator, "model", board_model.dtModel());
         const sys_node = try self.findOrCreateNode("/system");
-        try sys_node.setU32Prop(self.allocator, "linux,revision", revision);
-        try self.setBuiltInUsbHub(HubKind.fromModel(model_str));
-        const has_headphone_jack = std.mem.indexOf(u8, model_str, "Zero") == null;
-        try self.setHeadphoneAudioEnabled(has_headphone_jack);
+        try sys_node.setU32Prop(self.allocator, "linux,revision", board_model.boardRevision());
+        try self.setBuiltInUsbHub(board_model.hubKind());
+        try self.setHeadphoneAudioEnabled(board_model.hasHeadphoneJack());
     }
 
     pub fn setHeadphoneAudioEnabled(self: *Tree, enabled: bool) !void {
@@ -517,9 +517,6 @@ pub const Tree = struct {
         if (self.findNode("usb") orelse self.findNode("/soc/usb@7e980000")) |usb| {
             try usb.setStringProp(self.allocator, "compatible", "brcm,bcm2835-usb");
             try usb.setStringProp(self.allocator, "status", "okay");
-        }
-        if (self.root.getStringProp("model")) |m| {
-            try self.setBuiltInUsbHub(HubKind.fromModel(m));
         }
 
         // Configure audio_pins so /soc/mailbox@7e00b840 (vchiq) probes without pinctrl errors
@@ -1275,13 +1272,13 @@ test "FDT roundtrip and Pi Zero patching" {
     const hvs_parsed = parsed.findNode("/soc/hvs@7e400000").?;
     try std.testing.expectEqualStrings("okay", hvs_parsed.getStringProp("status").?);
 
-    // Built-in USB hub node usb1@1 is populated for boards with built-in hubs (e.g. Pi 3 Model B -> usb424,9514)
-    try parsed.setBoardModel("Raspberry Pi 3 Model B Rev 1.2", 0x00a02082);
+    // Built-in USB hub node usb1@1 is populated for boards with built-in hubs (e.g. Pi 1 Model B+ -> usb424,9514)
+    try parsed.setBoardModel(.pi_1_b_plus);
     const hub_node = parsed.findNode("/soc/usb@7e980000/usb1@1").?;
     try std.testing.expectEqualStrings("usb424,9514", hub_node.getStringProp("compatible").?);
 
     // And removed for boards with an external hub (e.g. Pi Zero)
-    try parsed.setBoardModel("Raspberry Pi Zero Rev 1.3", 0x00900093);
+    try parsed.setBoardModel(.pi_zero);
     try std.testing.expect(parsed.findNode("/soc/usb@7e980000/usb1@1") == null);
 
     const mmcnr_parsed = parsed.findNode("/soc/mmcnr@7e300000").?;

@@ -242,7 +242,7 @@ fn loadGuestBoot(
     soc.mailbox.board_revision = board_model.boardRevision();
     soc.mailbox.board_serial = board_serial;
     soc.mailbox.mac_address = if (board_model.hasWireless()) wifi_mac_address else mac_address;
-    soc.usb.hid.setHubKind(hid.HubKind.fromModel(board_model.dtModel()));
+    soc.usb.hid.setHubKind(board_model.hubKind());
     soc.usb.hid.net.guest_mac = mac_address;
     soc.sdhci.wireless_enabled = board_model.hasWireless();
     soc.sdhci.wifi.mac_address = wifi_mac_address;
@@ -268,8 +268,7 @@ fn loadGuestBoot(
         gpa,
         ram,
         boot_res.dtb_size,
-        board_model.dtModel(),
-        board_model.boardRevision(),
+        board_model,
         board_serial,
         wifi_mac_opt,
     );
@@ -309,7 +308,7 @@ fn resetCpusForBoard(
 fn syncWindowPeripheralsToSoc(w: *const window.Window, soc: *Bcm2835) void {
     soc.setHdmiConnected(w.status.hdmi_connected);
     soc.setAudioConnected(w.status.audio_connected);
-    soc.usb.hid.setHubKind(hid.HubKind.fromModel(w.status.model));
+    soc.usb.hid.setHubKind(w.status.board_model.hubKind());
     soc.usb.hid.hub_connected = w.status.usb_hub_connected;
     soc.usb.hid.keyboard_connected = w.status.usb_keyboard_connected;
     soc.usb.hid.mouse_connected = w.status.usb_mouse_connected;
@@ -433,7 +432,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     var last_vblank_ns: u64 = monotonicNs();
     var last_guest_vblank_us: u64 = 0;
     var active_us_accum: u64 = 0;
-    var idle_us_accum: u64 = 0;
 
     while (true) {
         if (wl_win) |w| {
@@ -484,7 +482,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                         w.ui.dismissSnackbar();
                         last_guest_vblank_us = 0;
                         active_us_accum = 0;
-                        idle_us_accum = 0;
                         if (host_audio) |ha| ha.setPaused(false);
                     } else |err| {
                         std.debug.print("fauxpi: failed to boot SD image: {s}\n", .{@errorName(err)});
@@ -514,8 +511,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     const elapsed_ns = now_ns -| last_vblank_ns;
                     if (state_changed or elapsed_ns >= vblank_interval_ns) {
                         last_vblank_ns = now_ns;
-                        w.status.cpu_busy_percent = 0.0;
-                        w.status.temperature_c = 25.0;
                         w.status.hdmi_active = false;
                         w.status.act_led_on = false;
                         w.status.pwr_led_on = w.status.power_connected;
@@ -695,7 +690,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     @min(elapsed_sleep_us, timer_wait_us)
                 else
                     @max(elapsed_sleep_us, sleep_us);
-                idle_us_accum += jump;
                 soc.timer.advance(jump, &soc.intc);
                 soc.arm_timer.advance(jump, &soc.intc);
                 soc.pm.advance(jump);
@@ -730,7 +724,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 var jump = @min(timer_wait_us, @max(until_vblank_us, 1));
                 if (usb_active) jump = @min(jump, 1000);
                 jump = @max(jump, 1);
-                idle_us_accum += jump;
                 soc.timer.advance(jump, &soc.intc);
                 soc.arm_timer.advance(jump, &soc.intc);
                 soc.pm.advance(jump);
@@ -773,15 +766,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
             if (wl_win) |w| {
                 const frame_active_us = active_us_accum;
-                const total_us = active_us_accum + idle_us_accum;
-                if (total_us > 0) {
-                    const busy = (@as(f32, @floatFromInt(active_us_accum)) * 100.0) / @as(f32, @floatFromInt(total_us));
-                    const weight: f32 = if (total_us >= 100_000) 1.0 else 0.3;
-                    w.status.cpu_busy_percent = w.status.cpu_busy_percent * (1.0 - weight) + busy * weight;
-                    w.status.temperature_c = 38.0 + (w.status.cpu_busy_percent * 0.14);
-                }
                 active_us_accum = 0;
-                idle_us_accum = 0;
 
                 try w.pollEvents();
                 soc.setHdmiConnected(w.status.hdmi_connected);

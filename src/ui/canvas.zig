@@ -1,6 +1,5 @@
 //! Software 2D anti-aliased canvas for FauxPi's window decorations and
-//! Board & GPIO drop-down sheet, matching dazzle's `gfx.Canvas`, `ui.Theme`,
-//! and `ui.icons` APIs.
+//! Board & GPIO drop-down sheet.
 
 const std = @import("std");
 const text_mod = @import("../font/text.zig");
@@ -29,13 +28,6 @@ pub const Color = struct {
         };
     }
 
-    /// From 0xAARRGGBB.
-    pub fn argb(hex: u32) Color {
-        var c = rgb(@truncate(hex));
-        c.a = @as(f32, @floatFromInt(hex >> 24)) / 255.0;
-        return c;
-    }
-
     pub fn withAlpha(c: Color, a: f32) Color {
         var out = c;
         out.a = a;
@@ -62,10 +54,6 @@ pub const Rect = struct {
         return p[0] >= r.x and p[0] < r.x + r.w and p[1] >= r.y and p[1] < r.y + r.h;
     }
 
-    pub fn intersects(a: Rect, b: Rect) bool {
-        return a.x < b.x + b.w and b.x < a.x + a.w and a.y < b.y + b.h and b.y < a.y + a.h;
-    }
-
     pub fn intersect(a: Rect, b: Rect) ?Rect {
         const x0 = @max(a.x, b.x);
         const y0 = @max(a.y, b.y);
@@ -73,17 +61,6 @@ pub const Rect = struct {
         const y1 = @min(a.y + a.h, b.y + b.h);
         if (x1 <= x0 or y1 <= y0) return null;
         return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
-    }
-
-    pub fn unite(a: Rect, b: Rect) Rect {
-        const x0 = @min(a.x, b.x);
-        const y0 = @min(a.y, b.y);
-        return .{
-            .x = x0,
-            .y = y0,
-            .w = @max(a.x + a.w, b.x + b.w) - x0,
-            .h = @max(a.y + a.h, b.y + b.h) - y0,
-        };
     }
 
     pub fn outset(r: Rect, d: f32) Rect {
@@ -109,15 +86,11 @@ pub const Radii = struct {
 
 /// Material Icons codepoints in `MaterialIcons-Regular.ttf`.
 pub const Icon = enum(u21) {
-    add = 0xe145,
     bolt = 0xea0b,
-    check = 0xe5ca,
     close = 0xe5cd,
     crop_square = 0xe3c6,
     delete = 0xe872,
-    desktop_windows = 0xe30c,
     developer_board = 0xe30d,
-    device_hub = 0xe335,
     expand_less = 0xe5ce,
     expand_more = 0xe5cf,
     filter_none = 0xe3e0,
@@ -126,15 +99,8 @@ pub const Icon = enum(u21) {
     lan = 0xeb2f,
     monitor = 0xef5b,
     mouse = 0xe323,
-    power = 0xe63c,
-    power_settings_new = 0xe8ac,
-    print = 0xe8ad,
     priority_high = 0xe645,
-    sports_esports = 0xea28,
-    tv = 0xe333,
     usb = 0xe1e0,
-    videocam = 0xe04b,
-    wifi = 0xe63e,
 
     pub fn text(icon: Icon, buf: *[4]u8) []const u8 {
         const len = std.unicode.utf8Encode(@intFromEnum(icon), buf) catch return "";
@@ -142,12 +108,10 @@ pub const Icon = enum(u21) {
     }
 };
 
-/// Material 3 colour scheme from `dazzle/src/ui/theme.zig`.
+/// Material 3 dark colour scheme.
 pub const Theme = struct {
     primary: Color,
     on_primary: Color,
-    primary_container: Color,
-    on_primary_container: Color,
     secondary_container: Color,
     surface: Color,
     surface_container: Color,
@@ -158,14 +122,10 @@ pub const Theme = struct {
     outline_variant: Color,
     @"error": Color,
     body_size: f32 = 14,
-    label_size: f32 = 14,
-    title_size: f32 = 22,
 
     pub const dark: Theme = .{
         .primary = .rgb(0xd0bcff),
         .on_primary = .rgb(0x381e72),
-        .primary_container = .rgb(0x4f378b),
-        .on_primary_container = .rgb(0xeaddff),
         .secondary_container = .rgb(0x4a4458),
         .surface = .rgb(0x141218),
         .surface_container = .rgb(0x211f26),

@@ -1,15 +1,12 @@
 const std = @import("std");
 const net_mod = @import("net.zig");
-const board_mod = @import("../ui/board.zig");
 
 /// USB Hub hardware topology variant:
-/// - `.external`: External 3-port USB 2.0 Hub with Ethernet (Pi Zero / Zero W / Zero 2 W / Model A / A+)
-/// - `.lan9512`: Built-in SMSC LAN9512 3-port USB 2.0 Hub + 10/100 Ethernet (Pi 1 Model B)
-/// - `.lan9514`: Built-in SMSC LAN9514 5-port USB 2.0 Hub + 10/100 Ethernet (Pi 1 B+, Pi 2 B, Pi 3 B)
-/// - `.lan7515`: Built-in Microchip LAN7515 (USB2514B 5-port Hub + LAN7800 Ethernet, Pi 3 B+)
+/// - `.external`: External 3-port USB 2.0 Hub with Ethernet (Pi Zero / Zero W / Zero 2 W / Model A+)
+/// - `.lan9514`: Built-in SMSC LAN9514 5-port USB 2.0 Hub + 10/100 Ethernet (Pi 1 Model B+)
+/// - `.lan7515`: Built-in Microchip LAN7515 (USB2514B 5-port Hub + LAN7800 Ethernet, Pi 3 Model B+)
 pub const HubKind = enum {
     external,
-    lan9512,
     lan9514,
     lan7515,
 
@@ -20,7 +17,6 @@ pub const HubKind = enum {
     pub fn numPorts(self: HubKind) u8 {
         return switch (self) {
             .external => 4, // Port 1: Ethernet, Ports 2..4: 3 USB-A ports
-            .lan9512 => 3, // Port 1: Ethernet, Ports 2..3: 2 USB-A ports
             .lan9514, .lan7515 => 5, // Port 1: Ethernet, Ports 2..5: 4 USB-A ports
         };
     }
@@ -28,14 +24,13 @@ pub const HubKind = enum {
     pub fn hubVendorId(self: HubKind) u16 {
         return switch (self) {
             .external => 0x1d6b,
-            .lan9512, .lan9514, .lan7515 => 0x0424,
+            .lan9514, .lan7515 => 0x0424,
         };
     }
 
     pub fn hubProductId(self: HubKind) u16 {
         return switch (self) {
             .external => 0x0101,
-            .lan9512 => 0x9512,
             .lan9514 => 0x9514,
             .lan7515 => 0x2514,
         };
@@ -44,7 +39,7 @@ pub const HubKind = enum {
     pub fn hubBcdDevice(self: HubKind) u16 {
         return switch (self) {
             .external => 0x0100,
-            .lan9512, .lan9514 => 0x0200,
+            .lan9514 => 0x0200,
             .lan7515 => 0x0bb3,
         };
     }
@@ -52,14 +47,14 @@ pub const HubKind = enum {
     pub fn ethVendorId(self: HubKind) u16 {
         return switch (self) {
             .external => 0x1d6b,
-            .lan9512, .lan9514, .lan7515 => 0x0424,
+            .lan9514, .lan7515 => 0x0424,
         };
     }
 
     pub fn ethProductId(self: HubKind) u16 {
         return switch (self) {
             .external => 0x0105,
-            .lan9512, .lan9514 => 0xec00,
+            .lan9514 => 0xec00,
             .lan7515 => 0x7800,
         };
     }
@@ -67,7 +62,7 @@ pub const HubKind = enum {
     pub fn ethBcdDevice(self: HubKind) u16 {
         return switch (self) {
             .external => 0x0100,
-            .lan9512, .lan9514 => 0x0200,
+            .lan9514 => 0x0200,
             .lan7515 => 0x0300,
         };
     }
@@ -75,23 +70,9 @@ pub const HubKind = enum {
     pub fn dtHubCompatible(self: HubKind) ?[]const u8 {
         return switch (self) {
             .external => null,
-            .lan9512 => "usb424,9512",
             .lan9514 => "usb424,9514",
             .lan7515 => "usb424,2514",
         };
-    }
-
-    pub fn fromModel(model: []const u8) HubKind {
-        if (board_mod.forModel(model)) |drawing| {
-            for (drawing.parts) |part| {
-                if (part.kind == .usb_ethernet) {
-                    if (std.mem.eql(u8, part.chip, "LAN9512")) return .lan9512;
-                    if (std.mem.eql(u8, part.chip, "LAN9514")) return .lan9514;
-                    if (std.mem.eql(u8, part.chip, "LAN7515")) return .lan7515;
-                }
-            }
-        }
-        return .external;
     }
 };
 
@@ -1446,14 +1427,12 @@ test "USB HID mouse target tracking and HVS hotspot sync" {
 }
 
 test "USB HubKind mapping for RPi boards and separate Hub/Ethernet/Keyboard/Mouse descriptors" {
-    try std.testing.expectEqual(HubKind.external, HubKind.fromModel("Raspberry Pi Zero Rev 1.3"));
-    try std.testing.expectEqual(HubKind.external, HubKind.fromModel("Raspberry Pi Zero W Rev 1.1"));
-    try std.testing.expectEqual(HubKind.external, HubKind.fromModel("Raspberry Pi 3 Model A Plus Rev 1.0"));
-    try std.testing.expectEqual(HubKind.lan9512, HubKind.fromModel("Raspberry Pi Model B Rev 2"));
-    try std.testing.expectEqual(HubKind.lan9514, HubKind.fromModel("Raspberry Pi Model B Plus Rev 1.2"));
-    try std.testing.expectEqual(HubKind.lan9514, HubKind.fromModel("Raspberry Pi 2 Model B Rev 1.1"));
-    try std.testing.expectEqual(HubKind.lan9514, HubKind.fromModel("Raspberry Pi 3 Model B Rev 1.2"));
-    try std.testing.expectEqual(HubKind.lan7515, HubKind.fromModel("Raspberry Pi 3 Model B Plus Rev 1.3"));
+    const BoardModel = @import("../ui/board.zig").BoardModel;
+    try std.testing.expectEqual(HubKind.external, BoardModel.pi_zero.hubKind());
+    try std.testing.expectEqual(HubKind.external, BoardModel.pi_zero_w.hubKind());
+    try std.testing.expectEqual(HubKind.external, BoardModel.pi_3_a_plus.hubKind());
+    try std.testing.expectEqual(HubKind.lan9514, BoardModel.pi_1_b_plus.hubKind());
+    try std.testing.expectEqual(HubKind.lan7515, BoardModel.pi_3_b_plus.hubKind());
 
     var hid = UsbHidComposite{};
     hid.setHubKind(.lan9514);

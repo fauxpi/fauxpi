@@ -68,29 +68,6 @@ pub const Box = struct {
     y_max: i16,
 };
 
-/// One layer of a multi-layer colour glyph (`COLR` / `CPAL`).
-pub const ColorLayer = struct {
-    glyph: u16,
-    /// 0xAARRGGBB from the font's first palette, or null when the layer uses
-    /// the text's foreground colour (`palette_index == 0xFFFF`).
-    color: ?u32,
-};
-
-/// Iterator over the back-to-front layers of a `COLR` v0 base glyph.
-pub const ColorLayers = struct {
-    font: *const Font,
-    first: u16,
-    count: u16,
-    index: u16 = 0,
-
-    pub fn next(it: *ColorLayers) ?ColorLayer {
-        if (it.index >= it.count) return null;
-        const layer = it.font.colorLayer(@as(usize, it.first) + it.index) catch return null;
-        it.index += 1;
-        return layer;
-    }
-};
-
 pub const Font = struct {
     data: []const u8,
     units_per_em: u16,
@@ -110,22 +87,6 @@ pub const Font = struct {
     /// GPOS lookups of the `kern` feature.
     kern_lookups: [max_kern_lookups]u16 = undefined,
     num_kern_lookups: usize = 0,
-    /// Optional colour glyph tables (`COLR` v0 and `CPAL` v0) and `GSUB`
-    /// `ccmp` ligature lookups (for multi-codepoint emoji sequences).
-    colr: []const u8 = &.{},
-    cpal: []const u8 = &.{},
-    gsub: []const u8 = &.{},
-    ccmp_lookups: [max_kern_lookups]u16 = undefined,
-    num_ccmp_lookups: usize = 0,
-    /// Optional fallback font (e.g. the system emoji font) consulted when a
-    /// codepoint is missing from this font or requests emoji presentation.
-    fallback: ?*const Font = null,
-
-    pub const Ligature = struct {
-        glyph: u16,
-        /// How many additional glyphs from `rest` were consumed.
-        consumed: usize,
-    };
 
     const max_kern_lookups = 32;
 
@@ -144,9 +105,6 @@ pub const Font = struct {
             glyf: ?[]const u8 = null,
             cmap: ?[]const u8 = null,
             gpos: ?[]const u8 = null,
-            colr: ?[]const u8 = null,
-            cpal: ?[]const u8 = null,
-            gsub: ?[]const u8 = null,
         } = .{};
         for (0..num_tables) |i| {
             const rec = 12 + i * 16;
@@ -160,9 +118,6 @@ pub const Font = struct {
             if (t == tag("glyf")) tables.glyf = table;
             if (t == tag("cmap")) tables.cmap = table;
             if (t == tag("GPOS")) tables.gpos = table;
-            if (t == tag("COLR")) tables.colr = table;
-            if (t == tag("CPAL")) tables.cpal = table;
-            if (t == tag("GSUB")) tables.gsub = table;
         }
         const head = tables.head orelse return error.Malformed;
         const hhea = tables.hhea orelse return error.Malformed;
@@ -182,17 +137,12 @@ pub const Font = struct {
             .glyf = tables.glyf orelse return error.Unsupported,
             .cmap = undefined,
             .cmap_format = undefined,
-            .colr = tables.colr orelse &.{},
-            .cpal = tables.cpal orelse &.{},
         };
         if (f.units_per_em == 0 or f.num_hmetrics == 0) return error.Malformed;
         try f.chooseCmap(cmap);
         if (tables.gpos) |g| f.findKernLookups(g) catch {
             // Kerning is optional; lay out without it.
             f.num_kern_lookups = 0;
-        };
-        if (tables.gsub) |g| f.findCcmpLookups(g) catch {
-            f.num_ccmp_lookups = 0;
         };
         return f;
     }
@@ -281,13 +231,6 @@ pub const Font = struct {
     pub fn advance(f: *const Font, glyph: u16) u16 {
         const i = @min(glyph, f.num_hmetrics - 1);
         return read(u16, f.hmtx, @as(usize, i) * 4) catch 0;
-    }
-
-    /// Left side bearing in font units.
-    pub fn leftSideBearing(f: *const Font, glyph: u16) i16 {
-        if (glyph < f.num_hmetrics) return read(i16, f.hmtx, @as(usize, glyph) * 4 + 2) catch 0;
-        const at = @as(usize, f.num_hmetrics) * 4 + (@as(usize, glyph) - f.num_hmetrics) * 2;
-        return read(i16, f.hmtx, at) catch 0;
     }
 
     /// The glyph's data in `glyf`; empty for glyphs with no outline (such as
@@ -431,118 +374,6 @@ pub const Font = struct {
             if (try pairAdjustment(g, st, left, right)) |v| return v;
         }
         return 0;
-    }
-
-    // --- Colour glyphs and ligatures ----------------------------------------
-
-    /// The back-to-front colour layers of `glyph` from the `COLR` v0 and
-    /// `CPAL` tables, or null if `glyph` is not a layered colour glyph.
-    pub fn colorLayers(f: *const Font, glyph: u16) ?ColorLayers {
-        if (f.colr.len < 14 or f.cpal.len < 14) return null;
-        return f.findColorLayers(glyph) catch null;
-    }
-
-    fn findColorLayers(f: *const Font, glyph: u16) Error!?ColorLayers {
-        const colr = f.colr;
-        const num_base = try read(u16, colr, 2);
-        const base_off = try read(u32, colr, 4);
-        var lo: usize = 0;
-        var hi: usize = num_base;
-        while (lo < hi) {
-            const mid = (lo + hi) / 2;
-            const rec = @as(usize, base_off) + mid * 6;
-            const g = try read(u16, colr, rec);
-            if (g == glyph) {
-                const first = try read(u16, colr, rec + 2);
-                const count = try read(u16, colr, rec + 4);
-                if (count == 0) return null;
-                return .{ .font = f, .first = first, .count = count };
-            }
-            if (g < glyph) lo = mid + 1 else hi = mid;
-        }
-        return null;
-    }
-
-    fn colorLayer(f: *const Font, index: usize) Error!ColorLayer {
-        const colr = f.colr;
-        const layer_off = try read(u32, colr, 8);
-        const num_layers = try read(u16, colr, 12);
-        if (index >= num_layers) return error.Malformed;
-        const rec = @as(usize, layer_off) + index * 4;
-        const glyph = try read(u16, colr, rec);
-        if (glyph >= f.num_glyphs) return error.Malformed;
-        const palette_index = try read(u16, colr, rec + 2);
-        if (palette_index == 0xffff) return .{ .glyph = glyph, .color = null };
-        const cpal = f.cpal;
-        const num_entries = try read(u16, cpal, 2);
-        const num_palettes = try read(u16, cpal, 4);
-        const num_records = try read(u16, cpal, 6);
-        const records_off = try read(u32, cpal, 8);
-        if (num_palettes == 0 or palette_index >= num_entries) return error.Malformed;
-        const first_color = try read(u16, cpal, 12);
-        const color_index = @as(usize, first_color) + palette_index;
-        if (color_index >= num_records) return error.Malformed;
-        const crec = @as(usize, records_off) + color_index * 4;
-        const b: u32 = try read(u8, cpal, crec);
-        const g: u32 = try read(u8, cpal, crec + 1);
-        const r: u32 = try read(u8, cpal, crec + 2);
-        const a: u32 = try read(u8, cpal, crec + 3);
-        return .{ .glyph = glyph, .color = (a << 24) | (r << 16) | (g << 8) | b };
-    }
-
-    fn findCcmpLookups(f: *Font, gsub: []const u8) Error!void {
-        f.gsub = gsub;
-        const feature_list = try read(u16, gsub, 6);
-        const lookup_list = try read(u16, gsub, 8);
-        const n = try read(u16, gsub, feature_list);
-        for (0..n) |i| {
-            const rec = feature_list + 2 + i * 6;
-            if (try read(u32, gsub, rec) != tag("ccmp")) continue;
-            const feature = feature_list + @as(usize, try read(u16, gsub, rec + 4));
-            const count = try read(u16, gsub, feature + 2);
-            for (0..count) |j| {
-                const lookup_idx = try read(u16, gsub, feature + 4 + j * 2);
-                const lookup = lookup_list + @as(usize, try read(u16, gsub, lookup_list + 2 + @as(usize, lookup_idx) * 2));
-                const lookup_type = try read(u16, gsub, lookup);
-                if (lookup_type != 4 and lookup_type != 7) continue;
-                const known = std.mem.indexOfScalar(u16, f.ccmp_lookups[0..f.num_ccmp_lookups], lookup_idx) != null;
-                if (known or f.num_ccmp_lookups == max_kern_lookups) continue;
-                f.ccmp_lookups[f.num_ccmp_lookups] = lookup_idx;
-                f.num_ccmp_lookups += 1;
-            }
-        }
-    }
-
-    /// Ligature substitution from the `GSUB` `ccmp` feature (used by emoji
-    /// fonts for flags, skin tones, keycaps, and ZWJ sequences), or null if no
-    /// ligature starts with `first` followed by a prefix of `rest`.
-    pub fn ligature(f: *const Font, first: u16, rest: []const u16) ?Ligature {
-        if (rest.len == 0 or f.num_ccmp_lookups == 0) return null;
-        for (f.ccmp_lookups[0..f.num_ccmp_lookups]) |lookup| {
-            if (f.lookupLigature(lookup, first, rest) catch null) |lig| return lig;
-        }
-        return null;
-    }
-
-    fn lookupLigature(f: *const Font, lookup_index: u16, first: u16, rest: []const u16) Error!?Ligature {
-        const g = f.gsub;
-        const lookup_list = try read(u16, g, 8);
-        const lookup = lookup_list + @as(usize, try read(u16, g, lookup_list + 2 + @as(usize, lookup_index) * 2));
-        const lookup_type = try read(u16, g, lookup);
-        const count = try read(u16, g, lookup + 4);
-        for (0..count) |i| {
-            var st = lookup + @as(usize, try read(u16, g, lookup + 6 + i * 2));
-            var subtable_type = lookup_type;
-            if (lookup_type == 7) {
-                subtable_type = try read(u16, g, st + 2);
-                st += try read(u32, g, st + 4);
-            }
-            if (subtable_type != 4) continue;
-            if (try ligatureSubst(g, st, first, rest)) |lig| {
-                if (lig.glyph < f.num_glyphs) return lig;
-            }
-        }
-        return null;
     }
 };
 
@@ -768,28 +599,6 @@ fn pairAdjustment(g: []const u8, st: usize, left: u16, right: u16) Error!?i16 {
     const size = valueRecordSize(vf1) + valueRecordSize(vf2);
     const rec = st + 16 + (@as(usize, c1) * class2_count + c2) * size;
     return try xAdvance(g, rec, vf1);
-}
-
-fn ligatureSubst(g: []const u8, st: usize, first: u16, rest: []const u16) Error!?Font.Ligature {
-    const format = try read(u16, g, st);
-    if (format != 1) return null;
-    const coverage = st + @as(usize, try read(u16, g, st + 2));
-    const set_count = try read(u16, g, st + 4);
-    const index = try coverageIndex(g, coverage, first) orelse return null;
-    if (index >= set_count) return error.Malformed;
-    const set = st + @as(usize, try read(u16, g, st + 6 + index * 2));
-    const lig_count = try read(u16, g, set);
-    next_lig: for (0..lig_count) |i| {
-        const lig = set + @as(usize, try read(u16, g, set + 2 + i * 2));
-        const lig_glyph = try read(u16, g, lig);
-        const comp_count = try read(u16, g, lig + 2);
-        if (comp_count < 2 or comp_count - 1 > rest.len) continue;
-        for (0..comp_count - 1) |k| {
-            if (try read(u16, g, lig + 4 + k * 2) != rest[k]) continue :next_lig;
-        }
-        return .{ .glyph = lig_glyph, .consumed = comp_count - 1 };
-    }
-    return null;
 }
 
 // --- Tests ------------------------------------------------------------------

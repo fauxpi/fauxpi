@@ -89,123 +89,15 @@ const orange: Color = .rgb(0xfb8c00);
 const line_w: f32 = 1.25;
 const heavy_w: f32 = 1.75;
 
-pub const BoardModel = enum {
-    pi_1_a_plus,
-    pi_1_b_plus,
-    pi_3_a_plus,
-    pi_3_b_plus,
-    pi_zero,
-    pi_zero_w,
-    pi_zero_2_w,
-
-    pub const all = [_]BoardModel{
-        .pi_1_a_plus,
-        .pi_1_b_plus,
-        .pi_3_a_plus,
-        .pi_3_b_plus,
-        .pi_zero,
-        .pi_zero_w,
-        .pi_zero_2_w,
-    };
-
-    pub fn windowTitle(self: BoardModel) []const u8 {
-        return switch (self) {
-            .pi_1_a_plus => "Raspberry Pi 1 Model A+",
-            .pi_1_b_plus => "Raspberry Pi 1 Model B+",
-            .pi_3_a_plus => "Raspberry Pi 3 Model A+",
-            .pi_3_b_plus => "Raspberry Pi 3 Model B+",
-            .pi_zero => "Raspberry Pi Zero",
-            .pi_zero_w => "Raspberry Pi Zero W",
-            .pi_zero_2_w => "Raspberry Pi Zero 2 W",
-        };
-    }
-
-    pub fn dtModel(self: BoardModel) []const u8 {
-        return switch (self) {
-            .pi_1_a_plus => "Raspberry Pi Model A Plus Rev 1.1",
-            .pi_1_b_plus => "Raspberry Pi Model B Plus Rev 1.2",
-            .pi_3_a_plus => "Raspberry Pi 3 Model A Plus Rev 1.0",
-            .pi_3_b_plus => "Raspberry Pi 3 Model B Plus Rev 1.3",
-            .pi_zero => "Raspberry Pi Zero Rev 1.3",
-            .pi_zero_w => "Raspberry Pi Zero W Rev 1.1",
-            .pi_zero_2_w => "Raspberry Pi Zero 2 W Rev 1.0",
-        };
-    }
-
-    pub fn boardRevision(self: BoardModel) u32 {
-        return switch (self) {
-            .pi_1_a_plus => 0x00900021,
-            .pi_1_b_plus => 0x00900032,
-            .pi_3_a_plus => 0x009020e0,
-            .pi_3_b_plus => 0x00a020d3,
-            .pi_zero => 0x00900093,
-            .pi_zero_w => 0x009000c1,
-            .pi_zero_2_w => 0x00902120,
-        };
-    }
-
-    pub fn hasWireless(self: BoardModel) bool {
-        return switch (self) {
-            .pi_1_a_plus, .pi_1_b_plus, .pi_zero => false,
-            .pi_3_a_plus, .pi_3_b_plus, .pi_zero_w, .pi_zero_2_w => true,
-        };
-    }
-
-    pub fn usesExternalUsbHub(self: BoardModel) bool {
-        return switch (self) {
-            .pi_1_b_plus, .pi_3_b_plus => false,
-            .pi_1_a_plus, .pi_3_a_plus, .pi_zero, .pi_zero_w, .pi_zero_2_w => true,
-        };
-    }
-
-    pub fn isBcm2837(self: BoardModel) bool {
-        return switch (self) {
-            .pi_3_a_plus, .pi_3_b_plus, .pi_zero_2_w => true,
-            .pi_1_a_plus, .pi_1_b_plus, .pi_zero, .pi_zero_w => false,
-        };
-    }
-
-    pub fn fromModel(model: []const u8) BoardModel {
-        if (std.mem.indexOf(u8, model, "Zero 2 W") != null) return .pi_zero_2_w;
-        if (std.mem.indexOf(u8, model, "Zero W") != null) return .pi_zero_w;
-        if (std.mem.indexOf(u8, model, "3 Model B Plus") != null or std.mem.indexOf(u8, model, "3 Model B+") != null) return .pi_3_b_plus;
-        if (std.mem.indexOf(u8, model, "3 Model A Plus") != null or std.mem.indexOf(u8, model, "3 Model A+") != null) return .pi_3_a_plus;
-        if (std.mem.indexOf(u8, model, "Model B Plus") != null or std.mem.indexOf(u8, model, "Model B+") != null) return .pi_1_b_plus;
-        if (std.mem.indexOf(u8, model, "Model A Plus") != null or std.mem.indexOf(u8, model, "Model A+") != null) return .pi_1_a_plus;
-        return .pi_zero;
-    }
-
-    pub fn id(self: BoardModel) []const u8 {
-        return switch (self) {
-            .pi_1_a_plus => "pi_1_a_plus",
-            .pi_1_b_plus => "pi_1_b_plus",
-            .pi_3_a_plus => "pi_3_a_plus",
-            .pi_3_b_plus => "pi_3_b_plus",
-            .pi_zero => "pi_zero",
-            .pi_zero_w => "pi_zero_w",
-            .pi_zero_2_w => "pi_zero_2_w",
-        };
-    }
-
-    pub fn fromId(s: []const u8) ?BoardModel {
-        for (all) |bm| {
-            if (std.mem.eql(u8, s, bm.id()) or std.mem.eql(u8, s, bm.windowTitle())) return bm;
-        }
-        return null;
-    }
-};
+pub const BoardModel = board.BoardModel;
 
 pub const SystemStatus = struct {
     board_model: BoardModel = .pi_zero,
-    model: []const u8 = "Raspberry Pi Zero Rev 1.3",
     serial: []const u8 = "00000000fa000001",
     serial_u64: u64 = 0x00000000fa000001,
     mac_address: [6]u8 = .{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 },
     wifi_mac_address: [6]u8 = .{ 0xb8, 0x27, 0xeb, 0x65, 0x43, 0x21 },
     dhcp_enabled: bool = true,
-    cpu_busy_percent: f32 = 0.0,
-    temperature_c: f32 = 42.0,
-    mem_total_mb: u32 = 512,
     hdmi_width: u16 = 1280,
     hdmi_height: u16 = 720,
     hdmi_connected: bool = true,
@@ -882,7 +774,6 @@ pub const BoardUi = struct {
             if (BoardModel.fromId(bm_str)) |bm| {
                 self.selected_board_model = bm;
                 status.board_model = bm;
-                status.model = bm.dtModel();
                 self.title = bm.windowTitle();
             }
         }
@@ -1501,7 +1392,7 @@ pub const BoardUi = struct {
                     };
                     if (rectContainsMm(gpio_hit, pt)) return .gpio;
                 },
-                .micro_sd, .sd => {
+                .micro_sd => {
                     const ext_w: f32 = if (sd_connected) 9.0 else HubLayout.sd_ext_left_mm;
                     const sd_card_hit: board.Rect = .{
                         .x = p.rect.x - ext_w,
@@ -1512,7 +1403,7 @@ pub const BoardUi = struct {
                     if (rectContainsMm(sd_card_hit, pt)) return .sd_card;
                     if (rectContainsMm(p.rect, pt)) return .sd_connector;
                 },
-                .mini_hdmi, .hdmi, .micro_hdmi => {
+                .mini_hdmi, .hdmi => {
                     const hdmi_hit: board.Rect = .{
                         .x = p.rect.x,
                         .y = p.rect.y,
@@ -1521,7 +1412,7 @@ pub const BoardUi = struct {
                     };
                     if (rectContainsMm(hdmi_hit, pt)) return .hdmi;
                 },
-                .power, .usb_c_power => {
+                .power => {
                     const pwr_hit: board.Rect = .{
                         .x = p.rect.x,
                         .y = p.rect.y,
@@ -1793,7 +1684,7 @@ pub const BoardUi = struct {
     pub fn updateLayout(self: *BoardUi, win_w: u32, win_h: u32, status: SystemStatus, gpio_hw: *const Gpio) void {
         self.last_win_w = win_w;
         self.last_win_h = win_h;
-        const cur_board = BoardModel.fromModel(status.model);
+        const cur_board = status.board_model;
         self.title = cur_board.windowTitle();
         if (status.power_connected and self.focused_field != .sd_card_name) {
             self.focused_field = .none;
@@ -1819,7 +1710,7 @@ pub const BoardUi = struct {
 
         // Populate ordered header GPIO outputs and inputs by RPi physical header pin number (1..40),
         // skipping 3.3V (pins 1, 17), 5V (pins 2, 4), and Ground (pins 6, 9, 14, 20, 25, 30, 34, 39).
-        const hdr = gpio_model.headerFor(status.model) orelse &gpio_model.header_40;
+        const hdr = &gpio_model.header_40;
         var out_n: usize = 0;
         var in_n: usize = 0;
         for (hdr, 0..) |entry, hdr_idx| {
@@ -1875,7 +1766,7 @@ pub const BoardUi = struct {
         const avail_above_disp: f32 = content_h - req_disp_h - min_disp_margin;
         const can_fit_sheet_above = (w_f >= req_disp_w) and (avail_above_disp >= 180.0 + sheet_chrome_h);
 
-        const drawing = board.forModel(status.model) orelse &board.pi_zero;
+        const drawing = status.board_model.drawing();
         const bounds = boardBoundsWithPeripherals(drawing);
         const max_bw: f32 = sheet_w - 2.0 * pad;
         const max_bh: f32 = if (can_fit_sheet_above) @min(300.0, avail_above_disp - sheet_chrome_h) else 300.0;
@@ -2119,10 +2010,9 @@ pub const BoardUi = struct {
     }
 
     /// Returns a 28-bit mask of BCM GPIO numbers (`0..27`) exposed on the board's 40-pin GPIO header.
-    pub fn headerGpioMask(model: []const u8) u32 {
-        const hdr = gpio_model.headerFor(model) orelse return 0x0fff_ffff;
+    pub fn headerGpioMask() u32 {
         var mask: u32 = 0;
-        for (hdr) |p| {
+        for (gpio_model.header_40) |p| {
             switch (p) {
                 .gpio => |bcm| {
                     if (bcm < 28) mask |= (@as(u32, 1) << @intCast(bcm));
@@ -2375,7 +2265,7 @@ pub const BoardUi = struct {
             self.dhcp_toggle_hovered = false;
         }
 
-        const drawing = board.forModel(status.model) orelse &board.pi_zero;
+        const drawing = status.board_model.drawing();
         if (self.board_rect.contains(pt)) {
             const tr = boardTransform(drawing, self.board_rect);
             self.hovered_target = targetAt(drawing, .{ (x - tr.x) / tr.scale, (y - tr.y) / tr.scale }, status.sd_connected);
@@ -2635,7 +2525,7 @@ pub const BoardUi = struct {
                             if (idx < BoardModel.all.len) {
                                 const chosen = BoardModel.all[idx];
                                 self.selected_board_model = chosen;
-                                if (chosen != BoardModel.fromModel(status.model)) {
+                                if (chosen != status.board_model) {
                                     self.randomizeIdentity();
                                 }
                                 return .select_board;
@@ -2684,7 +2574,7 @@ pub const BoardUi = struct {
 
             self.focused_field = .none;
 
-            const drawing = board.forModel(status.model) orelse &board.pi_zero;
+            const drawing = status.board_model.drawing();
             if (self.board_rect.contains(pt)) {
                 const tr = boardTransform(drawing, self.board_rect);
                 if (targetAt(drawing, .{ (x - tr.x) / tr.scale, (y - tr.y) / tr.scale }, status.sd_connected)) |target| {
@@ -2788,7 +2678,7 @@ pub const BoardUi = struct {
         if (status.gpio_connected and win_h > gpio_panel_height) {
             self.paintGpioBox(&c, win_w, status, gpio_hw);
         }
-        self.paintTitleBar(&c, win_w);
+        self.paintTitleBar(&c, win_w, status.board_model);
         if (self.sheet_open) {
             self.paintSheet(&c, win_w, disp_bottom_h, status, backdrop_already_dimmed);
         }
@@ -2935,7 +2825,7 @@ pub const BoardUi = struct {
         );
     }
 
-    fn paintTitleBar(self: *BoardUi, c: *Canvas, win_w: u32) void {
+    fn paintTitleBar(self: *BoardUi, c: *Canvas, win_w: u32, board_model: BoardModel) void {
         const sc: u32 = @intFromFloat(@max(c.scale, 1.0));
         const bar_px_w = win_w * sc;
         const bar_px_h = title_bar_height * sc;
@@ -2945,7 +2835,7 @@ pub const BoardUi = struct {
         const key: TitleCacheKey = .{
             .win_w = win_w,
             .scale = sc,
-            .board_model = BoardModel.fromModel(self.title),
+            .board_model = board_model,
             .maximized = self.maximized,
             .sheet_open = self.sheet_open,
             .sheet_docked_above = self.sheet_docked_above,
@@ -3305,7 +3195,7 @@ pub const BoardUi = struct {
                 .w_px = box_w_px,
                 .h_px = box_h_px,
                 .scale = sc,
-                .board_model = BoardModel.fromModel(status.model),
+                .board_model = status.board_model,
                 .hovered_target = self.hovered_target,
                 .sd_card_name_hash = std.hash.Wyhash.hash(0, self.activeSdCardName()),
                 .sd_connected = status.sd_connected,
@@ -3339,7 +3229,7 @@ pub const BoardUi = struct {
                         .icon_font = &self.icon_font,
                         .cache = &self.cache,
                     };
-                    const drawing = board.forModel(status.model) orelse &board.pi_zero;
+                    const drawing = status.board_model.drawing();
                     self.paintBoardDrawing(&sub_c, drawing, self.board_rect, status);
                     self.board_cache_key = bkey;
                 }
@@ -3360,7 +3250,7 @@ pub const BoardUi = struct {
         if (backdrop_already_dimmed) {
             c.fillRect(.{ .x = sr.x + 2.0, .y = sr.y + 2.0, .w = sr.w - 4.0, .h = sr.h - 18.0 }, t.surface);
         }
-        const drawing = board.forModel(status.model) orelse &board.pi_zero;
+        const drawing = status.board_model.drawing();
         self.paintBoardDrawing(c, drawing, self.board_rect, status);
         self.paintSettingsSection(c, status);
         self.paintSdPopups(c);
@@ -3386,7 +3276,7 @@ pub const BoardUi = struct {
         const box_h_px: u32 = gpio_panel_height * sc;
         if (box_y_px + box_h_px > c.height or box_w_px > c.width) return;
 
-        const hdr_mask = headerGpioMask(status.model);
+        const hdr_mask = headerGpioMask();
         var out_mask: u32 = 0;
         var in_mask: u32 = 0;
         var level_mask: u32 = 0;
@@ -3406,7 +3296,7 @@ pub const BoardUi = struct {
         const gkey: GpioCacheKey = .{
             .win_w = win_w,
             .scale = sc,
-            .board_model = BoardModel.fromModel(status.model),
+            .board_model = status.board_model,
             .output_mask = out_mask,
             .input_mask = in_mask,
             .level_mask = level_mask,
@@ -3597,7 +3487,7 @@ pub const BoardUi = struct {
         const row_sub_col = if (boot_disabled) t.on_surface_variant.withAlpha(0.42) else t.on_surface_variant;
 
         // Row 0: Board Model Menu Button
-        const cur_board = BoardModel.fromModel(status.model);
+        const cur_board = status.board_model;
         const row0_y = self.board_menu_btn_rect.y;
         _ = c.drawText(14.0, pr.x + 16.0, row0_y + 15.0, "Board", row_title_col);
         _ = c.drawText(11.5, pr.x + 16.0, row0_y + 30.0, "Hardware model", row_sub_col);
@@ -4021,16 +3911,6 @@ pub const BoardUi = struct {
         c.fillRoundedRect(outline, .all(b.corner * s), t.on_surface.withAlpha(0.04));
         c.strokeRoundedRect(outline, .all(b.corner * s), heavy_w, ink);
 
-        if (b.notches.len > 0) {
-            const old = c.clipTo(outline.outset(heavy_w));
-            for (b.notches) |notch| {
-                const center: Point = .{ tr.x + notch.x * s, tr.y + notch.y * s };
-                c.fillCircle(center, notch.r * s + heavy_w * 0.5, t.surface);
-                c.strokeCircle(center, notch.r * s, heavy_w, ink);
-            }
-            c.restoreClip(old);
-        }
-
         for (b.holes) |h| {
             c.strokeCircle(.{ tr.x + h[0] * s, tr.y + h[1] * s }, b.hole_diameter * 0.5 * s, line_w, ink);
         }
@@ -4043,10 +3923,10 @@ pub const BoardUi = struct {
         var usb_double_idx: usize = 0;
         for (b.parts) |part| {
             const part_hovered = switch (part.kind) {
-                .micro_sd, .sd => self.hovered_target == .sd_connector or (status.sd_connected and self.hovered_target == .sd_card),
-                .mini_hdmi, .hdmi, .micro_hdmi => self.hovered_target == .hdmi,
+                .micro_sd => self.hovered_target == .sd_connector or (status.sd_connected and self.hovered_target == .sd_card),
+                .mini_hdmi, .hdmi => self.hovered_target == .hdmi,
                 .audio => self.hovered_target == .audio,
-                .power, .usb_c_power => self.hovered_target == .power,
+                .power => self.hovered_target == .power,
                 .usb_otg => self.hovered_target == .usb_hub,
                 .usb => hl.has_external_hub and self.hovered_target == .usb_hub,
                 .usb_double => blk: {
@@ -4104,7 +3984,7 @@ pub const BoardUi = struct {
         const sd_card_name = self.activeSdCardName();
         const show_sd_warning = !status.sd_connected and (status.power_connected or self.hovered_target == .power);
         for (b.parts) |part| {
-            if (part.kind == .micro_sd or part.kind == .sd) {
+            if (part.kind == .micro_sd) {
                 const hovered = (self.hovered_target == .sd_card) or (status.sd_connected and self.hovered_target == .sd_connector);
                 const slot_r = map(tr, part.rect);
                 drawSdCard(
@@ -4187,8 +4067,8 @@ pub const BoardUi = struct {
 
         // 3. HDMI, Power, and 3.5 mm Audio cables & plugs on the bottom edge
         for (b.parts) |part| {
-            const is_hdmi = (part.kind == .mini_hdmi or part.kind == .hdmi or part.kind == .micro_hdmi);
-            const is_power = (part.kind == .power or part.kind == .usb_c_power);
+            const is_hdmi = (part.kind == .mini_hdmi or part.kind == .hdmi);
+            const is_power = (part.kind == .power);
             const is_audio = (part.kind == .audio);
             if (is_hdmi or is_power or is_audio) {
                 const hovered = if (is_power)
@@ -4230,22 +4110,13 @@ fn partOverhangsBoard(b: *const board.Board, part: *const board.Part) bool {
 
 fn partRadius(part: *const board.Part, s: f32) Radii {
     return switch (part.kind) {
-        .usb, .usb_double, .ethernet, .hdmi, .mini_hdmi, .micro_hdmi, .power, .usb_c_power, .power_button, .usb_otg, .micro_sd, .sd => .all(0.4 * s),
-        .antenna, .camera, .display, .camera_display, .pcie => .all(0.3 * s),
+        .usb, .usb_double, .ethernet, .hdmi, .mini_hdmi, .power, .usb_otg, .micro_sd => .all(0.4 * s),
+        .antenna, .camera, .display => .all(0.3 * s),
         else => .all(0.6 * s),
     };
 }
 
 fn fillOverhangingPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, surface_bg: Color, board_tint: Color) void {
-    if (part.kind == .composite) {
-        const body: Rect = .{ .x = r.x, .y = r.y + r.h * 0.45, .w = r.w, .h = r.h * 0.55 };
-        const barrel: Rect = .{ .x = r.x + r.w * 0.2, .y = r.y, .w = r.w * 0.6, .h = r.h * 0.45 };
-        c.fillRoundedRect(body, .all(0.6 * s), surface_bg);
-        c.fillRoundedRect(body, .all(0.6 * s), board_tint);
-        c.fillRoundedRect(barrel, .all(0.4 * s), surface_bg);
-        c.fillRoundedRect(barrel, .all(0.4 * s), board_tint);
-        return;
-    }
     const rad = partRadius(part, s);
     c.fillRoundedRect(r, rad, surface_bg);
     c.fillRoundedRect(r, rad, board_tint);
@@ -4255,7 +4126,7 @@ fn fillOverhangingPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, sur
 pub fn drawPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, ink: Color) void {
     const radius: Radii = .all(0.6 * s);
     switch (part.kind) {
-        .soc, .soc_with_ram, .ram, .usb_ethernet, .usb_controller, .southbridge, .ethernet_phy, .wireless, .pmic, .emmc => {
+        .soc, .soc_with_ram, .ram, .usb_ethernet, .wireless, .pmic => {
             c.strokeRoundedRect(r, radius, heavy_w, ink);
             if (part.lidded) {
                 c.strokeRoundedRect(r.outset(-1.2 * s), radius, line_w, ink);
@@ -4282,7 +4153,7 @@ pub fn drawPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, ink: Color
                     c.strokeCircle(center, @max(1.0, 0.6 * s), line_w, ink);
             };
         },
-        .usb, .usb_double, .ethernet, .hdmi, .mini_hdmi, .micro_hdmi, .power, .usb_c_power, .power_button, .usb_otg, .micro_sd, .sd => {
+        .usb, .usb_double, .ethernet, .hdmi, .mini_hdmi, .power, .usb_otg, .micro_sd => {
             c.strokeRoundedRect(r, .all(0.4 * s), line_w, ink);
             const e = part.faces orelse return;
             const ports: usize = if (part.kind == .usb_double) 2 else 1;
@@ -4321,11 +4192,7 @@ pub fn drawPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, ink: Color
             };
             c.strokeCircle(center, 1.2 * s, line_w, ink);
         },
-        .composite => {
-            c.strokeRoundedRect(.{ .x = r.x, .y = r.y + r.h * 0.45, .w = r.w, .h = r.h * 0.55 }, .all(0.6 * s), line_w, ink);
-            c.strokeRoundedRect(.{ .x = r.x + r.w * 0.2, .y = r.y, .w = r.w * 0.6, .h = r.h * 0.45 }, .all(0.4 * s), line_w, ink);
-        },
-        .camera, .display, .camera_display, .pcie => {
+        .camera, .display => {
             c.strokeRoundedRect(r, .all(0.3 * s), line_w, ink);
             const slot: Rect = if (r.w > r.h)
                 .{ .x = r.x + 1.2 * s, .y = r.y + r.h * 0.35, .w = r.w - 2.4 * s, .h = r.h * 0.3 }
@@ -4343,7 +4210,6 @@ pub fn drawPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, ink: Color
             };
             c.strokeRoundedRect(lens, .all(0.15 * s), line_w, ink.withAlpha(0.75));
         },
-        .edge => {},
     }
 }
 
@@ -5913,10 +5779,9 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item0_y, false, status, &hw));
     try testing.expectEqual(BoardModel.pi_1_a_plus, ui.selected_board_model);
     status.board_model = ui.selected_board_model;
-    status.model = status.board_model.dtModel();
     ui.updateLayout(win_w, win_h, status, &hw);
     try testing.expectEqualStrings("Raspberry Pi 1 Model A+", ui.title);
-    try testing.expect(board.forModel(status.model).? == &board.pi1_a_plus);
+    try testing.expect(board.forModel(status.board_model) == &board.pi1_a_plus);
     try testing.expectEqual(@as(f32, 0.0), ui.wifi_mac_field_rect.w);
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
 
@@ -5928,10 +5793,9 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item1_y, false, status, &hw));
     try testing.expectEqual(BoardModel.pi_1_b_plus, ui.selected_board_model);
     status.board_model = ui.selected_board_model;
-    status.model = status.board_model.dtModel();
     ui.updateLayout(win_w, win_h, status, &hw);
     try testing.expectEqualStrings("Raspberry Pi 1 Model B+", ui.title);
-    try testing.expect(board.forModel(status.model).? == &board.pi1_b_plus);
+    try testing.expect(board.forModel(status.board_model) == &board.pi1_b_plus);
     try testing.expect(!status.board_model.usesExternalUsbHub());
     try testing.expectEqual(InteractiveTarget.usb_keyboard, BoardUi.targetAt(&board.pi1_b_plus, .{ 92.0, 9.0 }, true).?);
     try testing.expectEqual(InteractiveTarget.usb_mouse, BoardUi.targetAt(&board.pi1_b_plus, .{ 92.0, 27.0 }, true).?);
@@ -5951,10 +5815,9 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item2_y, false, status, &hw));
     try testing.expectEqual(BoardModel.pi_3_a_plus, ui.selected_board_model);
     status.board_model = ui.selected_board_model;
-    status.model = status.board_model.dtModel();
     ui.updateLayout(win_w, win_h, status, &hw);
     try testing.expectEqualStrings("Raspberry Pi 3 Model A+", ui.title);
-    try testing.expect(board.forModel(status.model).? == &board.pi3_a_plus);
+    try testing.expect(board.forModel(status.board_model) == &board.pi3_a_plus);
     try testing.expect(status.board_model.usesExternalUsbHub());
     try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
@@ -5967,10 +5830,9 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item3_y, false, status, &hw));
     try testing.expectEqual(BoardModel.pi_3_b_plus, ui.selected_board_model);
     status.board_model = ui.selected_board_model;
-    status.model = status.board_model.dtModel();
     ui.updateLayout(win_w, win_h, status, &hw);
     try testing.expectEqualStrings("Raspberry Pi 3 Model B+", ui.title);
-    try testing.expect(board.forModel(status.model).? == &board.pi3_b_plus);
+    try testing.expect(board.forModel(status.board_model) == &board.pi3_b_plus);
     try testing.expect(!status.board_model.usesExternalUsbHub());
     try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
@@ -5983,10 +5845,9 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item5_y, false, status, &hw));
     try testing.expectEqual(BoardModel.pi_zero_w, ui.selected_board_model);
     status.board_model = ui.selected_board_model;
-    status.model = status.board_model.dtModel();
     ui.updateLayout(win_w, win_h, status, &hw);
     try testing.expectEqualStrings("Raspberry Pi Zero W", ui.title);
-    try testing.expect(board.forModel(status.model).? == &board.pi_zero_w);
+    try testing.expect(board.forModel(status.board_model) == &board.pi_zero_w);
     // Wireless MAC row is now visible
     try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
 
@@ -5998,10 +5859,9 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.select_board, ui.pointerButton(ui.board_menu_rect.x + 20, item6_y, false, status, &hw));
     try testing.expectEqual(BoardModel.pi_zero_2_w, ui.selected_board_model);
     status.board_model = ui.selected_board_model;
-    status.model = status.board_model.dtModel();
     ui.updateLayout(win_w, win_h, status, &hw);
     try testing.expectEqualStrings("Raspberry Pi Zero 2 W", ui.title);
-    try testing.expect(board.forModel(status.model).? == &board.pi_zero_2_w);
+    try testing.expect(board.forModel(status.board_model) == &board.pi_zero_2_w);
     try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
 
     _ = ui.pointerButton(ui.serial_field_rect.x + 10, ui.serial_field_rect.y + 10, true, status, &hw);
@@ -6022,7 +5882,6 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     // 9. Verify board outline stops at the edge of overhanging connectors (e.g. HDMI on B+)
     ui.sheet_open = true;
     status.board_model = .pi_1_b_plus;
-    status.model = status.board_model.dtModel();
     ui.updateLayout(win_w, win_h, status, &hw);
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
 
@@ -6069,7 +5928,6 @@ test "BoardUi persistent images and settings.json with custom and default card n
 
         var status = SystemStatus{
             .board_model = .pi_zero,
-            .model = BoardModel.pi_zero.dtModel(),
         };
         ui.configureDataDir(tmp_dir, &status);
 
@@ -6146,7 +6004,6 @@ test "BoardUi persistent images and settings.json with custom and default card n
 
         // Customize board settings and save
         status.board_model = .pi_zero_2_w;
-        status.model = status.board_model.dtModel();
         ui.setHexField(&ui.serial_hex, &ui.serial_len, "00000000cafebabe", false);
         ui.setHexField(&ui.mac_hex, &ui.mac_len, "B827EB112233", true);
         ui.setHexField(&ui.wifi_mac_hex, &ui.wifi_mac_len, "B827EB445566", true);
