@@ -141,6 +141,7 @@ pub const FocusedSettingField = enum {
     mac,
     wifi_mac,
     sd_card_name,
+    sd_card_rename,
 };
 
 pub const InteractiveTarget = enum {
@@ -346,7 +347,11 @@ pub const BoardUi = struct {
     new_card_size: SdCardSize = .gb_4,
     hovered_sd_size_idx: ?usize = null,
     hovered_sd_card_row_idx: ?usize = null,
+    hovered_sd_card_rename_idx: ?usize = null,
     hovered_sd_card_delete_idx: ?usize = null,
+    renaming_sd_card_idx: ?usize = null,
+    rename_card_name_buf: [64]u8 = @splat(0),
+    rename_card_name_len: usize = 0,
     sd_new_card_btn_hovered: bool = false,
     sd_browse_btn_hovered: bool = false,
     sd_add_btn_hovered: bool = false,
@@ -427,6 +432,7 @@ pub const BoardUi = struct {
         hovered_sd_menu_idx: ?usize,
         hovered_sd_size_idx: ?usize,
         hovered_sd_card_row_idx: ?usize,
+        hovered_sd_card_rename_idx: ?usize,
         hovered_sd_card_delete_idx: ?usize,
         sd_new_card_btn_hovered: bool,
         sd_name_field_hovered: bool,
@@ -453,6 +459,7 @@ pub const BoardUi = struct {
             .hovered_sd_menu_idx = self.hovered_sd_menu_idx,
             .hovered_sd_size_idx = self.hovered_sd_size_idx,
             .hovered_sd_card_row_idx = self.hovered_sd_card_row_idx,
+            .hovered_sd_card_rename_idx = self.hovered_sd_card_rename_idx,
             .hovered_sd_card_delete_idx = self.hovered_sd_card_delete_idx,
             .sd_new_card_btn_hovered = self.sd_new_card_btn_hovered,
             .sd_name_field_hovered = self.sd_name_field_hovered,
@@ -934,6 +941,7 @@ pub const BoardUi = struct {
     /// Deletes SD card `idx`, closing its `Qcow2Disk` and unlinking its backing `.qcow2` file if persisted.
     pub fn deleteSdCard(self: *BoardUi, idx: usize) bool {
         if (idx >= self.sd_cards.items.len) return false;
+        self.cancelRenamingSdCard();
         var removed = self.sd_cards.orderedRemove(idx);
         var path_buf: [512]u8 = undefined;
         const path_len = removed.image_path_len;
@@ -954,7 +962,112 @@ pub const BoardUi = struct {
             }
         }
         self.hovered_sd_card_row_idx = null;
+        self.hovered_sd_card_rename_idx = null;
         self.hovered_sd_card_delete_idx = null;
+        self.resetDefaultNewCardName();
+        return true;
+    }
+
+    pub fn renameCardName(self: *const BoardUi) []const u8 {
+        return self.rename_card_name_buf[0..self.rename_card_name_len];
+    }
+
+    pub fn setRenameCardName(self: *BoardUi, name: []const u8) void {
+        const n = @min(name.len, self.rename_card_name_buf.len);
+        @memcpy(self.rename_card_name_buf[0..n], name[0..n]);
+        self.rename_card_name_len = n;
+    }
+
+    pub fn startRenamingSdCard(self: *BoardUi, idx: usize) bool {
+        if (idx >= self.sd_cards.items.len) return false;
+        if (self.renaming_sd_card_idx) |prev_idx| {
+            if (prev_idx != idx) {
+                _ = self.commitRenamingSdCard();
+            }
+        }
+        self.renaming_sd_card_idx = idx;
+        self.setRenameCardName(self.sd_cards.items[idx].name());
+        self.focused_field = .sd_card_rename;
+        return true;
+    }
+
+    pub fn cancelRenamingSdCard(self: *BoardUi) void {
+        self.renaming_sd_card_idx = null;
+        self.rename_card_name_len = 0;
+        if (self.focused_field == .sd_card_rename) {
+            self.focused_field = .none;
+        }
+    }
+
+    pub fn commitRenamingSdCard(self: *BoardUi) bool {
+        const idx = self.renaming_sd_card_idx orelse return false;
+        var name_copy: [64]u8 = undefined;
+        const len = self.rename_card_name_len;
+        @memcpy(name_copy[0..len], self.rename_card_name_buf[0..len]);
+        self.renaming_sd_card_idx = null;
+        self.rename_card_name_len = 0;
+        if (self.focused_field == .sd_card_rename) {
+            self.focused_field = .none;
+        }
+        return self.renameSdCard(idx, name_copy[0..len]);
+    }
+
+    /// Renames SD card `idx` to `new_name` (and renames its persistent `.qcow2` file on disk if present).
+    pub fn renameSdCard(self: *BoardUi, idx: usize, new_name: []const u8) bool {
+        if (idx >= self.sd_cards.items.len) return false;
+        const trimmed = std.mem.trim(u8, new_name, " \t\r\n");
+        if (trimmed.len == 0) return false;
+
+        var safe_buf: [64]u8 = undefined;
+        var safe_len: usize = 0;
+        for (trimmed) |ch| {
+            if (safe_len >= safe_buf.len) break;
+            if (ch == '/' or ch == '\\' or ch < 0x20) {
+                safe_buf[safe_len] = '_';
+            } else {
+                safe_buf[safe_len] = ch;
+            }
+            safe_len += 1;
+        }
+        if (safe_len == 0) return false;
+        const clean_name = safe_buf[0..safe_len];
+
+        const card = &self.sd_cards.items[idx];
+        if (std.mem.eql(u8, card.name(), clean_name)) return true;
+
+        for (self.sd_cards.items, 0..) |*other, other_idx| {
+            if (other_idx != idx and std.ascii.eqlIgnoreCase(other.name(), clean_name)) {
+                return false;
+            }
+        }
+
+        if (card.has_persistent_file and card.image_path_len > 0 and self.images_dir_len > 0) {
+            var new_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const cand_path = std.fmt.bufPrint(&new_path_buf, "{s}/{s}.qcow2", .{ self.imagesDir(), clean_name }) catch return false;
+            if (cand_path.len > card.image_path_buf.len) return false;
+
+            const old_path = card.imagePath();
+            if (!std.mem.eql(u8, old_path, cand_path)) {
+                if (!std.ascii.eqlIgnoreCase(old_path, cand_path) and fileExistsLinux(cand_path)) {
+                    return false;
+                }
+                card.disk.flush() catch {};
+                if (host_posix.is_windows) {
+                    host_posix.close(card.disk.fd);
+                    const ok = host_posix.renameFile(old_path, cand_path);
+                    const reopen_path = if (ok) cand_path else old_path;
+                    card.disk.fd = host_posix.openReadWrite(reopen_path) catch -1;
+                    if (!ok) return false;
+                } else {
+                    if (!host_posix.renameFile(old_path, cand_path)) return false;
+                }
+                @memcpy(card.image_path_buf[0..cand_path.len], cand_path);
+                card.image_path_len = cand_path.len;
+            }
+        }
+
+        @memcpy(card.name_buf[0..clean_name.len], clean_name);
+        card.name_len = clean_name.len;
         self.resetDefaultNewCardName();
         return true;
     }
@@ -1599,11 +1712,11 @@ pub const BoardUi = struct {
         return (self.ctrl_mask != 0) or self.xkb_ctrl;
     }
 
-    /// Handles an evdev key press when a text field (`serial`, `mac`, `wifi_mac`, or `sd_card_name`) is focused.
+    /// Handles an evdev key press when a text field (`serial`, `mac`, `wifi_mac`, `sd_card_name`, or `sd_card_rename`) is focused.
     /// Returns true if the key was consumed by the editor.
     pub fn handleKey(self: *BoardUi, evdev_key: u32) bool {
         if (!self.sheet_open or self.focused_field == .none or self.isCreatingSdCard()) return false;
-        if (self.focused_field == .sd_card_name) {
+        if (self.focused_field == .sd_card_name or self.focused_field == .sd_card_rename) {
             if (!self.sd_manage_open) return false;
         } else {
             if (!self.settings_open) return false;
@@ -1619,8 +1732,18 @@ pub const BoardUi = struct {
             else => {},
         }
 
-        // Enter (28), Keypad Enter (96), or Escape (1) unfocuses the text field
-        if (evdev_key == 28 or evdev_key == 96 or evdev_key == 1) {
+        // Enter (28), Keypad Enter (96), or Escape (1) unfocuses the text field (committing or cancelling card rename)
+        if (evdev_key == 28 or evdev_key == 96) {
+            if (self.focused_field == .sd_card_rename) {
+                _ = self.commitRenamingSdCard();
+            }
+            self.focused_field = .none;
+            return true;
+        }
+        if (evdev_key == 1) {
+            if (self.focused_field == .sd_card_rename) {
+                self.cancelRenamingSdCard();
+            }
             self.focused_field = .none;
             return true;
         }
@@ -1640,6 +1763,9 @@ pub const BoardUi = struct {
                 .sd_card_name => if (self.new_card_name_len > 0) {
                     self.new_card_name_len -= 1;
                 },
+                .sd_card_rename => if (self.rename_card_name_len > 0) {
+                    self.rename_card_name_len -= 1;
+                },
                 .none => {},
             }
             return true;
@@ -1652,6 +1778,16 @@ pub const BoardUi = struct {
                 if (self.new_card_name_len < self.new_card_name_buf.len) {
                     self.new_card_name_buf[self.new_card_name_len] = ch;
                     self.new_card_name_len += 1;
+                }
+            }
+            return true;
+        }
+
+        if (self.focused_field == .sd_card_rename) {
+            if (self.lookupKeyChar(evdev_key)) |ch| {
+                if (self.rename_card_name_len < self.rename_card_name_buf.len) {
+                    self.rename_card_name_buf[self.rename_card_name_len] = ch;
+                    self.rename_card_name_len += 1;
                 }
             }
             return true;
@@ -1672,7 +1808,7 @@ pub const BoardUi = struct {
                         self.wifi_mac_hex[self.wifi_mac_len] = std.ascii.toUpper(ch);
                         self.wifi_mac_len += 1;
                     },
-                    .sd_card_name, .none => {},
+                    .sd_card_name, .sd_card_rename, .none => {},
                 }
             }
             return true;
@@ -1686,7 +1822,7 @@ pub const BoardUi = struct {
         self.last_win_h = win_h;
         const cur_board = status.board_model;
         self.title = cur_board.windowTitle();
-        if (status.power_connected and self.focused_field != .sd_card_name) {
+        if (status.power_connected and self.focused_field != .sd_card_name and self.focused_field != .sd_card_rename) {
             self.focused_field = .none;
             self.board_menu_open = false;
         }
@@ -2096,7 +2232,17 @@ pub const BoardUi = struct {
         return .{
             .x = mr.x + 16.0,
             .y = mr.y + 56.0 + @as(f32, @floatFromInt(idx)) * 36.0,
-            .w = mr.w - 32.0 - 36.0,
+            .w = mr.w - 32.0 - 72.0,
+            .h = 32.0,
+        };
+    }
+
+    pub fn sdManageCardRenameRect(self: *const BoardUi, idx: usize) Rect {
+        const mr = self.sd_manage_rect;
+        return .{
+            .x = mr.x + mr.w - 16.0 - 68.0,
+            .y = mr.y + 56.0 + @as(f32, @floatFromInt(idx)) * 36.0,
+            .w = 32.0,
             .h = 32.0,
         };
     }
@@ -2149,6 +2295,7 @@ pub const BoardUi = struct {
             self.hovered_sd_menu_idx = null;
             self.hovered_sd_size_idx = null;
             self.hovered_sd_card_row_idx = null;
+            self.hovered_sd_card_rename_idx = null;
             self.hovered_sd_card_delete_idx = null;
             self.sd_new_card_btn_hovered = false;
             self.sd_name_field_hovered = false;
@@ -2168,6 +2315,7 @@ pub const BoardUi = struct {
                 self.sd_new_card_btn_hovered = false;
                 self.hovered_sd_size_idx = null;
                 self.hovered_sd_card_row_idx = null;
+                self.hovered_sd_card_rename_idx = null;
                 self.hovered_sd_card_delete_idx = null;
                 return true;
             }
@@ -2178,6 +2326,7 @@ pub const BoardUi = struct {
                 self.sd_add_btn_hovered = self.sd_add_btn_rect.contains(pt);
                 self.sd_new_card_btn_hovered = false;
                 self.hovered_sd_card_row_idx = null;
+                self.hovered_sd_card_rename_idx = null;
                 self.hovered_sd_card_delete_idx = null;
                 self.hovered_sd_size_idx = null;
                 for (self.sd_size_btn_rects, 0..) |sr, idx| {
@@ -2193,10 +2342,15 @@ pub const BoardUi = struct {
                 self.hovered_sd_size_idx = null;
                 self.sd_new_card_btn_hovered = self.sd_new_card_btn_rect.contains(pt);
                 self.hovered_sd_card_row_idx = null;
+                self.hovered_sd_card_rename_idx = null;
                 self.hovered_sd_card_delete_idx = null;
                 for (0..self.sd_cards.items.len) |idx| {
                     if (self.sdManageCardDeleteRect(idx).contains(pt)) {
                         self.hovered_sd_card_delete_idx = idx;
+                        break;
+                    }
+                    if (self.sdManageCardRenameRect(idx).contains(pt)) {
+                        self.hovered_sd_card_rename_idx = idx;
                         break;
                     }
                     if (self.sdManageCardRowRect(idx).contains(pt)) {
@@ -2209,6 +2363,7 @@ pub const BoardUi = struct {
         } else {
             self.hovered_sd_size_idx = null;
             self.hovered_sd_card_row_idx = null;
+            self.hovered_sd_card_rename_idx = null;
             self.hovered_sd_card_delete_idx = null;
             self.sd_new_card_btn_hovered = false;
             self.sd_name_field_hovered = false;
@@ -2296,6 +2451,7 @@ pub const BoardUi = struct {
         self.hovered_sd_menu_idx = null;
         self.hovered_sd_size_idx = null;
         self.hovered_sd_card_row_idx = null;
+        self.hovered_sd_card_rename_idx = null;
         self.hovered_sd_card_delete_idx = null;
         self.sd_new_card_btn_hovered = false;
         self.sd_name_field_hovered = false;
@@ -2349,6 +2505,7 @@ pub const BoardUi = struct {
                     if (self.isCreatingSdCard()) return .consumed;
                     self.sheet_open = !self.sheet_open;
                     if (!self.sheet_open) {
+                        _ = self.commitRenamingSdCard();
                         self.focused_field = .none;
                         self.board_menu_open = false;
                         self.sd_card_menu_open = false;
@@ -2423,6 +2580,7 @@ pub const BoardUi = struct {
                     return .consumed;
                 }
                 if (self.sd_manage_close_rect.contains(pt)) {
+                    _ = self.commitRenamingSdCard();
                     self.focused_field = .none;
                     self.sd_manage_open = false;
                     self.sd_create_open = false;
@@ -2453,8 +2611,9 @@ pub const BoardUi = struct {
                         return .consumed;
                     }
                 } else {
-                    self.focused_field = .none;
                     if (self.sd_new_card_btn_rect.contains(pt)) {
+                        _ = self.commitRenamingSdCard();
+                        self.focused_field = .none;
                         self.sd_create_open = true;
                         self.sd_error_len = 0;
                         self.resetDefaultNewCardName();
@@ -2465,13 +2624,30 @@ pub const BoardUi = struct {
                             _ = self.deleteSdCard(idx);
                             return .select_sd_card;
                         }
+                        if (self.sdManageCardRenameRect(idx).contains(pt)) {
+                            if (self.renaming_sd_card_idx == idx) {
+                                _ = self.commitRenamingSdCard();
+                            } else {
+                                _ = self.startRenamingSdCard(idx);
+                            }
+                            return .consumed;
+                        }
                         if (self.sdManageCardRowRect(idx).contains(pt)) {
+                            if (self.renaming_sd_card_idx == idx) {
+                                self.focused_field = .sd_card_rename;
+                                return .consumed;
+                            }
+                            _ = self.commitRenamingSdCard();
+                            self.focused_field = .none;
                             self.selected_sd_card_idx = idx;
                             return .select_sd_card;
                         }
                     }
+                    _ = self.commitRenamingSdCard();
+                    self.focused_field = .none;
                 }
                 if (!self.sd_manage_rect.contains(pt)) {
+                    _ = self.commitRenamingSdCard();
                     self.sd_manage_open = false;
                     self.sd_create_open = false;
                 }
@@ -3640,24 +3816,52 @@ pub const BoardUi = struct {
                     const row_r = self.sdManageCardRowRect(idx);
                     const is_sel = (self.selected_sd_card_idx == idx);
                     const is_hov = (self.hovered_sd_card_row_idx == idx);
-                    c.fillRoundedRect(row_r, .all(6.0), if (is_sel) t.secondary_container else if (is_hov) t.surface_container else t.surface);
-                    c.strokeRoundedRect(row_r, .all(6.0), 1.0, if (is_sel) t.primary else t.outline_variant);
+                    const is_renaming = (self.renaming_sd_card_idx == idx);
 
-                    var row_buf: [128]u8 = undefined;
-                    var sz_buf: [32]u8 = undefined;
-                    const disk_sz = formatByteSize(&sz_buf, card.disk.diskAllocatedBytes());
-                    const row_txt = std.fmt.bufPrint(
-                        &row_buf,
-                        "{s}  ·  {s}  ({s} on disk)",
-                        .{ card.name(), card.size.label(), disk_sz },
-                    ) catch card.name();
-                    _ = c.drawText(
-                        13.0,
-                        row_r.x + 12.0,
-                        @round(row_r.y + (row_r.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
-                        row_txt,
-                        if (is_sel) t.primary else t.on_surface,
-                    );
+                    if (is_renaming) {
+                        var rename_disp_buf: [68]u8 = undefined;
+                        const rename_slice = self.renameCardName();
+                        const is_focused = (self.focused_field == .sd_card_rename);
+                        const rename_disp = if (is_focused)
+                            std.fmt.bufPrint(&rename_disp_buf, "{s}|", .{rename_slice}) catch rename_slice
+                        else
+                            rename_slice;
+                        self.paintTextField(c, row_r, rename_disp, is_focused, is_hov, false);
+                    } else {
+                        c.fillRoundedRect(row_r, .all(6.0), if (is_sel) t.secondary_container else if (is_hov) t.surface_container else t.surface);
+                        c.strokeRoundedRect(row_r, .all(6.0), 1.0, if (is_sel) t.primary else t.outline_variant);
+
+                        var row_buf: [128]u8 = undefined;
+                        var sz_buf: [32]u8 = undefined;
+                        const disk_sz = formatByteSize(&sz_buf, card.disk.diskAllocatedBytes());
+                        const row_txt = std.fmt.bufPrint(
+                            &row_buf,
+                            "{s}  ·  {s}  ({s} on disk)",
+                            .{ card.name(), card.size.label(), disk_sz },
+                        ) catch card.name();
+                        _ = c.drawText(
+                            13.0,
+                            row_r.x + 12.0,
+                            @round(row_r.y + (row_r.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
+                            row_txt,
+                            if (is_sel) t.primary else t.on_surface,
+                        );
+                    }
+
+                    const ren_r = self.sdManageCardRenameRect(idx);
+                    const ren_hov = (self.hovered_sd_card_rename_idx == idx);
+                    const ren_bg = if (is_renaming)
+                        (if (ren_hov) t.primary else t.secondary_container)
+                    else
+                        (if (ren_hov) t.surface_container else t.surface);
+                    const ren_border = if (is_renaming or ren_hov) t.primary else t.outline_variant;
+                    const ren_fg = if (is_renaming)
+                        (if (ren_hov) t.on_primary else t.primary)
+                    else
+                        (if (ren_hov) t.primary else t.on_surface_variant);
+                    c.fillRoundedRect(ren_r, .all(6.0), ren_bg);
+                    c.strokeRoundedRect(ren_r, .all(6.0), 1.0, ren_border);
+                    c.drawIcon(if (is_renaming) .check else .edit, ren_r.x + (ren_r.w - 18.0) * 0.5, ren_r.y + (ren_r.h - 18.0) * 0.5, 18.0, ren_fg);
 
                     const del_r = self.sdManageCardDeleteRect(idx);
                     const del_hov = (self.hovered_sd_card_delete_idx == idx);
@@ -6520,4 +6724,129 @@ test "formatByteSize picks appropriate human-readable units" {
     try testing.expectEqualStrings("1.5 GB", formatByteSize(&buf, 1536 * 1024 * 1024));
     try testing.expectEqualStrings("16 GB", formatByteSize(&buf, 16 * 1024 * 1024 * 1024));
 }
+
+test "BoardUi renames SD cards via UI and updates persistent .qcow2 files" {
+    const tmp_dir: [:0]const u8 = "/tmp/fauxpi-test-rename-data";
+    const tmp_images_dir: [:0]const u8 = "/tmp/fauxpi-test-rename-data/images";
+    const tmp_settings_path: [:0]const u8 = "/tmp/fauxpi-test-rename-data/settings.json";
+    defer {
+        host_posix.unlinkFile("/tmp/fauxpi-test-rename-data/images/Card 1.qcow2");
+        host_posix.unlinkFile("/tmp/fauxpi-test-rename-data/images/Card 2.qcow2");
+        host_posix.unlinkFile("/tmp/fauxpi-test-rename-data/images/Ubuntu.qcow2");
+        host_posix.unlinkFile("/tmp/fauxpi-test-rename-data/images/Debian.qcow2");
+        host_posix.unlinkFile(tmp_settings_path);
+        host_posix.removeDir(tmp_images_dir);
+        host_posix.removeDir(tmp_dir);
+    }
+    host_posix.unlinkFile("/tmp/fauxpi-test-rename-data/images/Card 1.qcow2");
+    host_posix.unlinkFile("/tmp/fauxpi-test-rename-data/images/Card 2.qcow2");
+    host_posix.unlinkFile("/tmp/fauxpi-test-rename-data/images/Ubuntu.qcow2");
+    host_posix.unlinkFile("/tmp/fauxpi-test-rename-data/images/Debian.qcow2");
+    host_posix.unlinkFile(tmp_settings_path);
+    host_posix.removeDir(tmp_images_dir);
+    host_posix.removeDir(tmp_dir);
+
+    {
+        var ui = try BoardUi.init(testing.allocator);
+        defer ui.deinit();
+
+        var hw: Gpio = .{};
+        var status = SystemStatus{};
+        ui.configureDataDir(tmp_dir, &status);
+
+        var valid_img: [512]u8 = @splat(0);
+        valid_img[510] = 0x55;
+        valid_img[511] = 0xAA;
+        _ = try ui.addSdCardFromSlice("card1.img", .mb_256, &valid_img);
+        _ = try ui.addSdCardFromSlice("card2.img", .mb_256, &valid_img);
+        ui.sd_cards.items[0].disk.writeByte(0, 0xAB);
+
+        try testing.expectEqualStrings("Card 1", ui.sd_cards.items[0].name());
+        try testing.expectEqualStrings("Card 2", ui.sd_cards.items[1].name());
+        try testing.expect(fileExistsLinux("/tmp/fauxpi-test-rename-data/images/Card 1.qcow2"));
+        try testing.expect(fileExistsLinux("/tmp/fauxpi-test-rename-data/images/Card 2.qcow2"));
+
+        ui.sheet_open = true;
+        ui.sd_manage_open = true;
+        ui.sd_create_open = false;
+        ui.updateLayout(1280, 764, status, &hw);
+
+        // 1. Click the rename (edit) button on Card 1 (row 0)
+        const ren0 = ui.sdManageCardRenameRect(0);
+        _ = ui.pointerMotion(ren0.x + 10, ren0.y + 10, status, &hw);
+        try testing.expectEqual(@as(?usize, 0), ui.hovered_sd_card_rename_idx);
+        _ = ui.pointerButton(ren0.x + 10, ren0.y + 10, true, status, &hw);
+        try testing.expectEqual(Action.consumed, ui.pointerButton(ren0.x + 10, ren0.y + 10, false, status, &hw));
+        try testing.expectEqual(@as(?usize, 0), ui.renaming_sd_card_idx);
+        try testing.expectEqual(FocusedSettingField.sd_card_rename, ui.focused_field);
+        try testing.expectEqualStrings("Card 1", ui.renameCardName());
+
+        // Clear and type "Ubuntu", then press Enter (28) to commit
+        for (0..10) |_| {
+            _ = ui.handleKey(14);
+        }
+        _ = ui.handleKey(42); // Shift down
+        _ = ui.handleKey(22); // 'U'
+        ui.updateModifierKey(42, false);
+        _ = ui.handleKey(48); // 'b'
+        _ = ui.handleKey(22); // 'u'
+        _ = ui.handleKey(49); // 'n'
+        _ = ui.handleKey(20); // 't'
+        _ = ui.handleKey(22); // 'u'
+        try testing.expectEqualStrings("Ubuntu", ui.renameCardName());
+        try testing.expect(ui.handleKey(28)); // Enter commits rename
+
+        try testing.expectEqual(@as(?usize, null), ui.renaming_sd_card_idx);
+        try testing.expectEqual(FocusedSettingField.none, ui.focused_field);
+        try testing.expectEqualStrings("Ubuntu", ui.sd_cards.items[0].name());
+        try testing.expect(!fileExistsLinux("/tmp/fauxpi-test-rename-data/images/Card 1.qcow2"));
+        try testing.expect(fileExistsLinux("/tmp/fauxpi-test-rename-data/images/Ubuntu.qcow2"));
+        // Since "Card 1" was renamed to "Ubuntu", "Card 1" is now the default name for the next new card
+        try testing.expectEqualStrings("Card 1", ui.newCardName());
+
+        // 2. Start renaming Card 2 (row 1), type something, then press Escape (1) to cancel
+        const ren1 = ui.sdManageCardRenameRect(1);
+        _ = ui.pointerButton(ren1.x + 10, ren1.y + 10, true, status, &hw);
+        _ = ui.pointerButton(ren1.x + 10, ren1.y + 10, false, status, &hw);
+        try testing.expectEqual(@as(?usize, 1), ui.renaming_sd_card_idx);
+        _ = ui.handleKey(14); // backspace
+        try testing.expect(ui.handleKey(1)); // Escape cancels rename
+        try testing.expectEqual(@as(?usize, null), ui.renaming_sd_card_idx);
+        try testing.expectEqualStrings("Card 2", ui.sd_cards.items[1].name());
+
+        // 3. Rename Card 2 to "Debian" by clicking the rename button again (which shows the check icon while renaming)
+        _ = ui.pointerButton(ren1.x + 10, ren1.y + 10, true, status, &hw);
+        _ = ui.pointerButton(ren1.x + 10, ren1.y + 10, false, status, &hw);
+        ui.setRenameCardName("Debian");
+        _ = ui.pointerButton(ren1.x + 10, ren1.y + 10, true, status, &hw);
+        try testing.expectEqual(Action.consumed, ui.pointerButton(ren1.x + 10, ren1.y + 10, false, status, &hw));
+        try testing.expectEqual(@as(?usize, null), ui.renaming_sd_card_idx);
+        try testing.expectEqualStrings("Debian", ui.sd_cards.items[1].name());
+        try testing.expect(!fileExistsLinux("/tmp/fauxpi-test-rename-data/images/Card 2.qcow2"));
+        try testing.expect(fileExistsLinux("/tmp/fauxpi-test-rename-data/images/Debian.qcow2"));
+
+        // Duplicate card names are rejected
+        try testing.expect(!ui.renameSdCard(1, "Ubuntu"));
+        try testing.expectEqualStrings("Debian", ui.sd_cards.items[1].name());
+
+        ui.selected_sd_card_idx = 0;
+        try ui.saveSettings(status);
+    }
+
+    // Reload from tmp_dir and verify the renamed cards and data persisted across restart
+    {
+        var ui2 = try BoardUi.init(testing.allocator);
+        defer ui2.deinit();
+
+        var status2 = SystemStatus{};
+        ui2.configureDataDir(tmp_dir, &status2);
+        try testing.expectEqual(@as(usize, 2), ui2.sd_cards.items.len);
+        // Cards are sorted alphabetically on load: "Debian" (0), "Ubuntu" (1)
+        try testing.expectEqualStrings("Debian", ui2.sd_cards.items[0].name());
+        try testing.expectEqualStrings("Ubuntu", ui2.sd_cards.items[1].name());
+        try testing.expectEqual(@as(?usize, 1), ui2.selected_sd_card_idx);
+        try testing.expectEqual(@as(u8, 0xAB), ui2.sd_cards.items[1].disk.readByte(0));
+    }
+}
+
 

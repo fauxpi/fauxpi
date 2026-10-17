@@ -95,6 +95,7 @@ extern "c" fn _rmdir(path: [*:0]const u8) c_int;
 extern "c" fn _mkdir(path: [*:0]const u8) c_int;
 extern "c" fn _access(path: [*:0]const u8, mode: c_int) c_int;
 extern "c" fn _get_osfhandle(fd: c_int) isize;
+extern "c" fn rename(old_path: [*:0]const u8, new_path: [*:0]const u8) c_int;
 
 extern "kernel32" fn ReadFile(
     hFile: isize,
@@ -496,6 +497,27 @@ pub fn unlinkFile(path: []const u8) void {
         _ = _unlink(path_z[0..path.len :0]);
     } else {
         _ = std.c.unlink(path_z[0..path.len :0]);
+    }
+}
+
+pub fn renameFile(old_path: []const u8, new_path: []const u8) bool {
+    var old_z: [std.fs.max_path_bytes]u8 = undefined;
+    var new_z: [std.fs.max_path_bytes]u8 = undefined;
+    if (old_path.len == 0 or old_path.len >= old_z.len) return false;
+    if (new_path.len == 0 or new_path.len >= new_z.len) return false;
+    @memcpy(old_z[0..old_path.len], old_path);
+    old_z[old_path.len] = 0;
+    @memcpy(new_z[0..new_path.len], new_path);
+    new_z[new_path.len] = 0;
+    if (is_linux) {
+        return std.os.linux.errno(std.os.linux.renameat(
+            std.os.linux.AT.FDCWD,
+            old_z[0..old_path.len :0],
+            std.os.linux.AT.FDCWD,
+            new_z[0..new_path.len :0],
+        )) == .SUCCESS;
+    } else {
+        return rename(old_z[0..old_path.len :0], new_z[0..new_path.len :0]) == 0;
     }
 }
 
