@@ -391,6 +391,23 @@ pub const Tree = struct {
         }
     }
 
+    pub fn setSimpleFramebuffer(self: *Tree, width: u32, height: u32) !void {
+        const chosen = try self.findOrCreateNode("/chosen");
+        try chosen.setU32Prop(self.allocator, "#address-cells", 1);
+        try chosen.setU32Prop(self.allocator, "#size-cells", 1);
+        try chosen.setProp(self.allocator, "ranges", &.{});
+        const fb_node = try chosen.findOrCreateChild(self.allocator, "framebuffer@1c100000");
+        const stride: u32 = width * 4;
+        const fb_size: u32 = stride * height;
+        try fb_node.setStringProp(self.allocator, "compatible", "simple-framebuffer");
+        try fb_node.setCellsProp(self.allocator, "reg", &.{ 0x1c10_0000, fb_size });
+        try fb_node.setU32Prop(self.allocator, "width", width);
+        try fb_node.setU32Prop(self.allocator, "height", height);
+        try fb_node.setU32Prop(self.allocator, "stride", stride);
+        try fb_node.setStringProp(self.allocator, "format", "x8r8g8b8");
+        try fb_node.setStringProp(self.allocator, "status", "okay");
+    }
+
     pub fn patchForPiZero(
         self: *Tree,
         ram_size: u32,
@@ -398,9 +415,10 @@ pub const Tree = struct {
         initrd: ?InitrdRange,
         enable_vc4_kms: bool,
     ) !void {
-        // 1. Memory size
+        // 1. Memory size (reserve top 64 MiB at 0x1c000000..0x20000000 for VideoCore framebuffer & allocations)
+        const arm_ram_size: u32 = if (enable_vc4_kms and ram_size > 0x1c00_0000) 0x1c00_0000 else ram_size;
         const mem_node = self.findNode("/memory@0") orelse self.findNode("/memory") orelse try self.findOrCreateNode("/memory@0");
-        try mem_node.setCellsProp(self.allocator, "reg", &.{ 0, ram_size });
+        try mem_node.setCellsProp(self.allocator, "reg", &.{ 0, arm_ram_size });
 
         // 2. /chosen bootargs, initrd, and rng-seed (initializes kernel CRNG immediately at boot)
         const chosen = try self.findOrCreateNode("/chosen");
@@ -523,6 +541,8 @@ pub const Tree = struct {
             if (self.findNode("cma") orelse self.findNode("/reserved-memory/linux,cma")) |cma| {
                 try cma.setU32Prop(self.allocator, "size", 128 * 1024 * 1024);
             }
+            // Populate /chosen/framebuffer@1c100000 for early boot simpledrm / simplefb console output
+            try self.setSimpleFramebuffer(1280, 720);
         }
     }
 
@@ -644,6 +664,16 @@ test "FDT roundtrip and Pi Zero patching" {
     const chosen = parsed.findNode("/chosen").?;
     try std.testing.expectEqualStrings("console=ttyAMA0,115200", chosen.getStringProp("bootargs").?);
     try std.testing.expectEqual(@as(u32, 0x02000000), std.mem.readInt(u32, chosen.getProp("linux,initrd-start").?[0..4], .big));
+
+    const mem_parsed = parsed.findNode("/memory@0").?;
+    try std.testing.expectEqual(@as(u32, 0x1c000000), std.mem.readInt(u32, mem_parsed.getProp("reg").?[4..8], .big));
+
+    const fb_parsed = parsed.findNode("/chosen/framebuffer@1c100000").?;
+    try std.testing.expectEqualStrings("simple-framebuffer", fb_parsed.getStringProp("compatible").?);
+    try std.testing.expectEqualStrings("x8r8g8b8", fb_parsed.getStringProp("format").?);
+    try std.testing.expectEqualStrings("okay", fb_parsed.getStringProp("status").?);
+    try std.testing.expectEqual(@as(u32, 1280), std.mem.readInt(u32, fb_parsed.getProp("width").?[0..4], .big));
+    try std.testing.expectEqual(@as(u32, 720), std.mem.readInt(u32, fb_parsed.getProp("height").?[0..4], .big));
 
     const usb_parsed = parsed.findNode("/soc/usb@7e980000").?;
     try std.testing.expectEqualStrings("brcm,bcm2835-usb", usb_parsed.getStringProp("compatible").?);
