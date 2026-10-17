@@ -279,10 +279,8 @@ pub fn loadFromSdImage(
     allocator: std.mem.Allocator,
     ram: []u8,
     sd_image: []const u8,
-    extra_cmdline: ?[]const u8,
-    override_kernel: ?[]const u8,
 ) !BootResult {
-    return loadFromSdImageForModel(allocator, ram, sd_image, .pi_zero, extra_cmdline, override_kernel);
+    return loadFromSdImageForModel(allocator, ram, sd_image, .pi_zero);
 }
 
 /// Loads a Raspberry Pi system for `board_model` from an SD card image (`sd_image`) into `ram`.
@@ -291,8 +289,6 @@ pub fn loadFromSdImageForModel(
     ram: []u8,
     sd_image: []const u8,
     board_model: BoardModel,
-    extra_cmdline: ?[]const u8,
-    override_kernel: ?[]const u8,
 ) !BootResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -303,7 +299,7 @@ pub fn loadFromSdImageForModel(
     const config_txt = fs.readFileAlloc(alloc, "config.txt") catch "";
     const cfg = BootConfig.parseForModel(config_txt, board_model);
 
-    const kernel_bytes = if (override_kernel) |ok| ok else blk: {
+    const kernel_bytes = blk: {
         const kernel_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, cfg.kernel });
         if (fs.readFileAlloc(alloc, kernel_path)) |kb| break :blk kb else |err| {
             if (board_model.isBcm2837() and !cfg.kernel_explicit) {
@@ -358,9 +354,7 @@ pub fn loadFromSdImageForModel(
         (fs.readFileAlloc(alloc, "cmdline.txt") catch "");
     const trimmed_cmdline = std.mem.trim(u8, raw_cmdline, " \t\r\n");
 
-    const full_cmdline = if (extra_cmdline) |extra|
-        try std.fmt.allocPrint(alloc, "{s} {s}", .{ trimmed_cmdline, extra })
-    else if (std.mem.indexOf(u8, trimmed_cmdline, "console=") == null)
+    const full_cmdline = if (std.mem.indexOf(u8, trimmed_cmdline, "console=") == null)
         try std.fmt.allocPrint(alloc, "console=ttyAMA0,115200 {s}", .{trimmed_cmdline})
     else
         trimmed_cmdline;

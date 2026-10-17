@@ -60,10 +60,6 @@ const Cpu = arm1176.Arm1176(Bcm2835);
 
 const CliOptions = struct {
     sd_path: ?[]const u8 = null,
-    kernel_path: ?[]const u8 = null,
-    dtb_path: ?[]const u8 = null,
-    initramfs_path: ?[]const u8 = null,
-    cmdline: ?[]const u8 = null,
     board_model: ?ui_board_sheet.BoardModel = null,
     width: u16 = 1280,
     height: u16 = 720,
@@ -73,10 +69,6 @@ const CliOptions = struct {
     sequential_cores: bool = false,
     strict: bool = false,
 };
-
-fn readFileLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return readFileWithMinSizeLinux(allocator, path, 0);
-}
 
 fn readSdImageLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     // Ensure simulated SD card is at least 256 MiB so guest OSes (like Dazzle) have room
@@ -126,10 +118,6 @@ fn printUsage() void {
         \\Options:
         \\  --sd <path>         Insert a Raspberry Pi SD card image (FAT32 + rootfs)
         \\  --power             Start with the 5V power supply connected
-        \\  --kernel <path>     Boot kernel.img / zImage directly
-        \\  --dtb <path>        Device Tree Blob (.dtb) when using --kernel
-        \\  --initramfs <path>  Optional initramfs.cpio when using --kernel
-        \\  --cmdline <string>  Additional kernel command line parameters
         \\  --hdmi-size <WxH>   HDMI output size in pixels (default: 1280x720)
         \\  --headless          Run without opening a desktop window
         \\  --max-steps <n>     Stop simulation after <n> ARM instructions
@@ -162,26 +150,6 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             };
         } else if (std.mem.eql(u8, arg, "--power")) {
             opts.power = true;
-        } else if (std.mem.eql(u8, arg, "--kernel")) {
-            opts.kernel_path = args.next() orelse {
-                printUsage();
-                return 1;
-            };
-        } else if (std.mem.eql(u8, arg, "--dtb")) {
-            opts.dtb_path = args.next() orelse {
-                printUsage();
-                return 1;
-            };
-        } else if (std.mem.eql(u8, arg, "--initramfs")) {
-            opts.initramfs_path = args.next() orelse {
-                printUsage();
-                return 1;
-            };
-        } else if (std.mem.eql(u8, arg, "--cmdline")) {
-            opts.cmdline = args.next() orelse {
-                printUsage();
-                return 1;
-            };
         } else if (std.mem.eql(u8, arg, "--model")) {
             const m = args.next() orelse {
                 printUsage();
@@ -225,7 +193,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             opts.sequential_cores = true;
         } else if (std.mem.eql(u8, arg, "--strict")) {
             opts.strict = true;
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+        } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage();
             return 0;
         } else {
@@ -235,7 +203,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         }
     }
 
-    if (opts.headless and opts.sd_path == null and opts.kernel_path == null) {
+    if (opts.headless and opts.sd_path == null) {
         printUsage();
         return 1;
     }
@@ -287,31 +255,11 @@ fn loadGuestBoot(
         soc.sdhost.attachQcow2(disk);
         const boot_vol = try disk.readBootVolumeAlloc(gpa);
         defer gpa.free(boot_vol);
-        const k_override = if (opts.kernel_path) |kp| try readFileLinux(gpa, kp) else null;
-        defer if (k_override) |ko| gpa.free(ko);
-        break :blk try loader.loadFromSdImageForModel(gpa, ram, boot_vol, board_model, opts.cmdline, k_override);
+        break :blk try loader.loadFromSdImageForModel(gpa, ram, boot_vol, board_model);
     } else if (sd_image_buf) |img| blk: {
         soc.sdhost.attachMutableSlice(img);
-        const k_override = if (opts.kernel_path) |kp| try readFileLinux(gpa, kp) else null;
-        defer if (k_override) |ko| gpa.free(ko);
-        break :blk try loader.loadFromSdImageForModel(gpa, ram, img, board_model, opts.cmdline, k_override);
-    } else blk: {
-        const k_path = opts.kernel_path orelse return error.MissingKernel;
-        const d_path = opts.dtb_path orelse return error.MissingDtb;
-        const k_bytes = try readFileLinux(gpa, k_path);
-        defer gpa.free(k_bytes);
-        const d_bytes = try readFileLinux(gpa, d_path);
-        defer gpa.free(d_bytes);
-        const rd_bytes = if (opts.initramfs_path) |rd_p| try readFileLinux(gpa, rd_p) else null;
-        defer if (rd_bytes) |rd| gpa.free(rd);
-
-        const default_cmdline = if (board_model.isBcm2837())
-            "console=ttyAMA0,115200 earlycon=pl011,0x3f201000"
-        else
-            "console=ttyAMA0,115200 earlycon=pl011,0x20201000";
-        const cmdline = opts.cmdline orelse default_cmdline;
-        break :blk try loader.loadDirect(gpa, ram, k_bytes, d_bytes, rd_bytes, cmdline, true);
-    };
+        break :blk try loader.loadFromSdImageForModel(gpa, ram, img, board_model);
+    } else return error.MissingSdImage;
 
     const wifi_mac_opt: ?[6]u8 = if (board_model.hasWireless()) wifi_mac_address else null;
     _ = try loader.applyBoardConfigToRamDtb(
@@ -434,7 +382,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     else
         (sd_image_buf != null or headless_qcow2 != null);
 
-    if (initial_power and (initial_sd or opts.kernel_path != null)) {
+    if (initial_power and initial_sd) {
         const bm = if (wl_win) |w| w.status.board_model else (opts.board_model orelse .pi_zero);
         const serial = if (wl_win) |w| w.status.serial_u64 else 0x00000000fa000001;
         const mac = if (wl_win) |w| w.status.mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
@@ -516,7 +464,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             }
 
             const has_sd_media = (w.ui.activeSdCard() != null) or (sd_image_buf != null);
-            const has_boot_media = (w.status.sd_connected and has_sd_media) or opts.kernel_path != null;
+            const has_boot_media = w.status.sd_connected and has_sd_media;
             if (!w.status.power_connected) {
                 guest_booted = false;
                 boot_failed = false;
@@ -524,7 +472,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 w.power_reconnected = false;
                 const active_qcow2: ?*qcow2.Qcow2Disk = if (w.status.sd_connected and w.ui.activeSdCard() != null) &w.ui.activeSdCard().?.disk else null;
                 const active_sd = if (w.status.sd_connected) sd_image_buf else null;
-                if (active_qcow2 != null or active_sd != null or opts.kernel_path != null) {
+                if (active_qcow2 != null or active_sd != null) {
                     if (host_audio) |ha| ha.setPaused(true);
                     if (loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, active_sd, w.status.board_model, w.status.serial_u64, w.status.mac_address, w.status.wifi_mac_address)) |reboot_res| {
                         syncWindowPeripheralsToSoc(w, &soc);
