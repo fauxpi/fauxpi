@@ -141,16 +141,19 @@ pub const Mmu = struct {
     /// Entries are populated only for 4 KB pages backed by main RAM (`pbase + 4096 <= ram.len`).
     soft_tlb32: [2][soft_tlb_size]SoftTlbSlot32 = @splat(@splat(.{})),
     soft_tlb64: [2][soft_tlb_size]SoftTlbSlot64 = @splat(@splat(.{})),
-    soft_tlb32_dirty: bool = false,
-    soft_tlb64_dirty: bool = false,
+    /// 64-bit bitmaps tracking which 64-entry chunks (`0..63`) in `soft_tlb32` / `soft_tlb64` have been populated since the last `flushTlb()`.
+    soft_tlb32_dirty_chunks: u64 = 0,
+    soft_tlb64_dirty_chunks: u64 = 0,
 
     pub const tlb_bits = 12;
     pub const tlb_size = 1 << tlb_bits;
     pub const tlb_mask = tlb_size - 1;
 
-    pub const soft_tlb_bits = 10;
+    pub const soft_tlb_bits = 12;
     pub const soft_tlb_size = 1 << soft_tlb_bits;
     pub const soft_tlb_mask = soft_tlb_size - 1;
+    pub const soft_tlb_chunk_shift = 6;
+    pub const soft_tlb_chunk_size = 1 << soft_tlb_chunk_shift;
 
     pub const SoftTlbSlot32 = struct {
         r_vbase: u32 = 0xffff_ffff,
@@ -206,15 +209,27 @@ pub const Mmu = struct {
             @memset(&self.tlb, .{});
             self.tlb_gen = 1;
         }
-        if (self.soft_tlb32_dirty) {
-            @memset(&self.soft_tlb32[0], .{});
-            @memset(&self.soft_tlb32[1], .{});
-            self.soft_tlb32_dirty = false;
+        var mask32 = self.soft_tlb32_dirty_chunks;
+        if (mask32 != 0) {
+            while (mask32 != 0) {
+                const chunk: usize = @ctz(mask32);
+                mask32 &= mask32 - 1;
+                const base = chunk * soft_tlb_chunk_size;
+                @memset(self.soft_tlb32[0][base..][0..soft_tlb_chunk_size], .{});
+                @memset(self.soft_tlb32[1][base..][0..soft_tlb_chunk_size], .{});
+            }
+            self.soft_tlb32_dirty_chunks = 0;
         }
-        if (self.soft_tlb64_dirty) {
-            @memset(&self.soft_tlb64[0], .{});
-            @memset(&self.soft_tlb64[1], .{});
-            self.soft_tlb64_dirty = false;
+        var mask64 = self.soft_tlb64_dirty_chunks;
+        if (mask64 != 0) {
+            while (mask64 != 0) {
+                const chunk: usize = @ctz(mask64);
+                mask64 &= mask64 - 1;
+                const base = chunk * soft_tlb_chunk_size;
+                @memset(self.soft_tlb64[0][base..][0..soft_tlb_chunk_size], .{});
+                @memset(self.soft_tlb64[1][base..][0..soft_tlb_chunk_size], .{});
+            }
+            self.soft_tlb64_dirty_chunks = 0;
         }
     }
 
@@ -256,7 +271,8 @@ pub const Mmu = struct {
                 .x_vbase = if ((perms & perm_user_x) != 0) vbase else 0xffff_ffff,
                 .pbase = pbase,
             };
-            self.soft_tlb32_dirty = true;
+            const chunk: u6 = @intCast(s_idx >> soft_tlb_chunk_shift);
+            self.soft_tlb32_dirty_chunks |= (@as(u64, 1) << chunk);
         }
     }
 
@@ -278,7 +294,8 @@ pub const Mmu = struct {
                     .pbase = pbase,
                 };
             }
-            self.soft_tlb64_dirty = true;
+            const chunk: u6 = @intCast(s_idx >> soft_tlb_chunk_shift);
+            self.soft_tlb64_dirty_chunks |= (@as(u64, 1) << chunk);
         }
     }
 
@@ -1477,5 +1494,11 @@ test "AArch64 VMSAv8-64 4-level (48-bit VA) and 3-level (39-bit VA) page table t
     try std.testing.expectError(error.Abort, mmu.translate64(ram, 0x0000_0000_0000_4abc, .write, false));
     try std.testing.expectEqual(@as(u64, 0x0000_0000_0000_4abc), mmu.far_el1);
     try std.testing.expectEqual(@as(u32, (0b100100 << 26) | (1 << 25) | (1 << 6) | 0x0f), mmu.esr_el1);
+
+    // Verify 4096-entry SoftTLB chunk-bitmap tracking and selective flush
+    try std.testing.expect(mmu.soft_tlb64_dirty_chunks != 0);
+    mmu.flushTlb();
+    try std.testing.expectEqual(@as(u64, 0), mmu.soft_tlb64_dirty_chunks);
+    try std.testing.expectEqual(@as(u64, 0xffff_ffff_ffff_ffff), mmu.soft_tlb64[0][4].r_vbase);
 }
 
