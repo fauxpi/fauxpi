@@ -3496,12 +3496,14 @@ pub const BoardUi = struct {
 
         // 1. Micro-SD card (connected into slot or pulled out to the left)
         const sd_card_name = self.activeSdCardName();
+        const show_sd_warning = !status.sd_connected and (status.power_connected or self.hovered_target == .power);
         for (b.parts) |part| {
             if (part.kind == .micro_sd or part.kind == .sd) {
                 const hovered = (self.hovered_target == .sd_card) or (status.sd_connected and self.hovered_target == .sd_connector);
+                const slot_r = map(tr, part.rect);
                 drawSdCard(
                     c,
-                    map(tr, part.rect),
+                    slot_r,
                     tr.y + HubLayout.top_cable_min_y * s,
                     max_y,
                     s,
@@ -3512,6 +3514,9 @@ pub const BoardUi = struct {
                     hovered,
                     sd_card_name,
                 );
+                if (show_sd_warning) {
+                    drawSdSocketWarning(c, slot_r, s, part.underside);
+                }
             }
         }
 
@@ -3852,6 +3857,21 @@ pub fn drawSdCard(
         );
         _ = c.drawTextRotated90(name_sz, baseline_x, start_y, card_name, ink);
     }
+}
+
+/// Draws a red exclamation mark over the SD card socket (`slot_r`) when the SD card is
+/// disconnected and the user is hovering over the power cable or power is connected.
+/// On boards with an underside microSD slot (`underside == true`), shifts right to clear the top-side DSI connector.
+pub fn drawSdSocketWarning(c: *Canvas, slot_r: Rect, s: f32, underside: bool) void {
+    const icon_sz = 8.0 * s;
+    const dx: f32 = if (underside) 3.2 * s else 0.0;
+    c.drawIcon(
+        .priority_high,
+        slot_r.x + (slot_r.w - icon_sz) * 0.5 + dx,
+        slot_r.y + (slot_r.h - icon_sz) * 0.5,
+        icon_sz,
+        red,
+    );
 }
 
 /// Draws a bottom-facing plug and straight vertical cable (used for Mini HDMI and Power).
@@ -5173,9 +5193,52 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     // 4. Clicking the Power socket returns .toggle_power
     const pwr_x = tr.x + 54.0 * tr.scale;
     const pwr_y = tr.y + 28.1 * tr.scale;
+    const pwr_cable_y = tr.y + 40.0 * tr.scale;
+    const countRedPixelsInSdSocket = struct {
+        fn count(px_buf: []const u32, w: u32, trans: @TypeOf(tr)) usize {
+            const sx0: usize = @intFromFloat(@round(trans.x + 2.5 * trans.scale));
+            const sx1: usize = @intFromFloat(@round(trans.x + 11.0 * trans.scale));
+            const sy0: usize = @intFromFloat(@round(trans.y + 8.5 * trans.scale));
+            const sy1: usize = @intFromFloat(@round(trans.y + 18.0 * trans.scale));
+            var n: usize = 0;
+            for (sy0..sy1) |py| {
+                for (sx0..sx1) |px| {
+                    const argb = px_buf[py * w + px];
+                    const r_ch = (argb >> 16) & 0xff;
+                    const g_ch = (argb >> 8) & 0xff;
+                    const b_ch = argb & 0xff;
+                    if (r_ch > 180 and g_ch < 80 and b_ch < 80) n += 1;
+                }
+            }
+            return n;
+        }
+    }.count;
+
+    // With SD card disconnected and power off + not hovered, no red exclamation mark is shown on the SD socket
+    status.sd_connected = false;
+    status.power_connected = false;
+    ui.pointerLeave();
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testing.expectEqual(@as(usize, 0), countRedPixelsInSdSocket(pixels, win_w, tr));
+
+    // Hovering over the power cable while SD card is disconnected shows the red exclamation mark on the SD socket
+    _ = ui.pointerMotion(pwr_x, pwr_cable_y, status, &hw);
+    try testing.expectEqual(@as(?InteractiveTarget, .power), ui.hovered_target);
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testing.expect(countRedPixelsInSdSocket(pixels, win_w, tr) > 20);
+
+    // Connecting power while SD card is disconnected keeps the red exclamation mark visible even when not hovering power
     _ = ui.pointerButton(pwr_x, pwr_y, true, status, &hw);
     try testing.expectEqual(Action.toggle_power, ui.pointerButton(pwr_x, pwr_y, false, status, &hw));
     status.power_connected = true;
+    ui.pointerLeave();
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testing.expect(countRedPixelsInSdSocket(pixels, win_w, tr) > 20);
+
+    // Connecting the SD card hides the red exclamation mark
+    status.sd_connected = true;
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testing.expectEqual(@as(usize, 0), countRedPixelsInSdSocket(pixels, win_w, tr));
 
     // 5. Clicking the USB Hub body does not toggle the hub (.consumed), while clicking the USB OTG socket/plug/cable returns .toggle_usb_hub
     const hub_body_x = tr.x + 98.0 * tr.scale;

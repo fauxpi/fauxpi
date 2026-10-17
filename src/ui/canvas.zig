@@ -127,6 +127,7 @@ pub const Icon = enum(u21) {
     power = 0xe63c,
     power_settings_new = 0xe8ac,
     print = 0xe8ad,
+    priority_high = 0xe645,
     sports_esports = 0xea28,
     tv = 0xe333,
     usb = 0xe1e0,
