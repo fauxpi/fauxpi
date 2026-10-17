@@ -24,6 +24,98 @@ pub const icache_size: usize = 65536;
 pub const icache_mask: usize = icache_size - 1;
 pub const icache_pages: usize = icache_size >> 10;
 
+pub const thumb_icache_pages: usize = 16;
+pub const thumb_icache_size: usize = thumb_icache_pages * 2048;
+
+pub const ThumbOp = enum(u8) {
+    slow = 0,
+    lsl_imm,
+    lsr_imm,
+    asr_imm,
+    add_reg3,
+    sub_reg3,
+    add_imm3,
+    sub_imm3,
+    mov_imm8,
+    cmp_imm8,
+    add_imm8,
+    sub_imm8,
+    alu_and,
+    alu_eor,
+    alu_lsl,
+    alu_lsr,
+    alu_asr,
+    alu_adc,
+    alu_sbc,
+    alu_ror,
+    alu_tst,
+    alu_neg,
+    alu_cmp,
+    alu_cmn,
+    alu_orr,
+    alu_mul,
+    alu_bic,
+    alu_mvn,
+    hi_add,
+    hi_cmp,
+    hi_mov,
+    bx,
+    blx_reg,
+    ldr_lit,
+    str_reg,
+    strh_reg,
+    strb_reg,
+    ldrsb_reg,
+    ldr_reg,
+    ldrh_reg,
+    ldrb_reg,
+    ldrsh_reg,
+    str_imm,
+    ldr_imm,
+    strb_imm,
+    ldrb_imm,
+    strh_imm,
+    ldrh_imm,
+    str_sp,
+    ldr_sp,
+    add_pc,
+    add_sp_rd,
+    add_sp_imm,
+    sub_sp_imm,
+    sxth,
+    sxtb,
+    uxth,
+    uxtb,
+    rev,
+    rev16,
+    revsh,
+    push,
+    pop,
+    pop_pc,
+    stmia,
+    ldmia,
+    b_cond,
+    b_uncond,
+    bl_prefix,
+    bl_suffix,
+    blx_suffix,
+    bl_pair,
+    blx_pair,
+    b_w_pair,
+    movw_pair,
+    movt_pair,
+    nop,
+};
+
+pub const ThumbSlot = struct {
+    raw: u16 = 0xffff,
+    op: ThumbOp = .slow,
+    rd: u8 = 0,
+    rn: u8 = 0,
+    rm: u8 = 0,
+    imm: u16 = 0,
+};
+
 pub const DecodedSlot = struct {
     raw: u32 = 0xffff_ffff,
     op: u8 = 0,
@@ -1018,6 +1110,257 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
     }
 }
 
+pub fn decodeThumb16(inst: u16, next_hw: ?u16) ThumbSlot {
+    const top3: u3 = @truncate(inst >> 13);
+    switch (top3) {
+        0b000 => {
+            const op: u2 = @truncate((inst >> 11) & 3);
+            const rd: u8 = @truncate(inst & 7);
+            const rm: u8 = @truncate((inst >> 3) & 7);
+            if (op != 0b11) {
+                const imm5: u16 = (inst >> 6) & 0x1f;
+                const top: ThumbOp = switch (op) {
+                    0b00 => .lsl_imm,
+                    0b01 => .lsr_imm,
+                    0b10 => .asr_imm,
+                    else => unreachable,
+                };
+                return .{ .raw = inst, .op = top, .rd = rd, .rm = rm, .imm = imm5 };
+            } else {
+                const is_imm = (inst & (1 << 10)) != 0;
+                const is_sub = (inst & (1 << 9)) != 0;
+                const rn_or_imm: u8 = @truncate((inst >> 6) & 7);
+                if (is_imm) {
+                    return .{
+                        .raw = inst,
+                        .op = if (is_sub) .sub_imm3 else .add_imm3,
+                        .rd = rd,
+                        .rn = rm,
+                        .imm = rn_or_imm,
+                    };
+                } else {
+                    return .{
+                        .raw = inst,
+                        .op = if (is_sub) .sub_reg3 else .add_reg3,
+                        .rd = rd,
+                        .rn = rm,
+                        .rm = rn_or_imm,
+                    };
+                }
+            }
+        },
+        0b001 => {
+            const op: u2 = @truncate((inst >> 11) & 3);
+            const rd: u8 = @truncate((inst >> 8) & 7);
+            const imm8: u16 = inst & 0xff;
+            const top: ThumbOp = switch (op) {
+                0b00 => .mov_imm8,
+                0b01 => .cmp_imm8,
+                0b10 => .add_imm8,
+                0b11 => .sub_imm8,
+            };
+            return .{ .raw = inst, .op = top, .rd = rd, .imm = imm8 };
+        },
+        0b010 => {
+            if ((inst & 0xfc00) == 0x4000) {
+                const alu_op: u4 = @truncate((inst >> 6) & 0xf);
+                const rm: u8 = @truncate((inst >> 3) & 7);
+                const rd: u8 = @truncate(inst & 7);
+                const top: ThumbOp = @enumFromInt(@intFromEnum(ThumbOp.alu_and) + alu_op);
+                return .{ .raw = inst, .op = top, .rd = rd, .rm = rm };
+            } else if ((inst & 0xfc00) == 0x4400) {
+                const op: u2 = @truncate((inst >> 8) & 3);
+                const rd: u8 = @truncate(((inst >> 4) & 8) | (inst & 7));
+                const rm: u8 = @truncate((inst >> 3) & 0xf);
+                const top: ThumbOp = switch (op) {
+                    0b00 => .hi_add,
+                    0b01 => .hi_cmp,
+                    0b10 => .hi_mov,
+                    0b11 => if ((inst & (1 << 7)) != 0) .blx_reg else .bx,
+                };
+                return .{ .raw = inst, .op = top, .rd = rd, .rm = rm };
+            } else if ((inst & 0xf800) == 0x4800) {
+                const rd: u8 = @truncate((inst >> 8) & 7);
+                const imm: u16 = (inst & 0xff) * 4;
+                return .{ .raw = inst, .op = .ldr_lit, .rd = rd, .imm = imm };
+            } else {
+                const op: u3 = @truncate((inst >> 9) & 7);
+                const rm: u8 = @truncate((inst >> 6) & 7);
+                const rn: u8 = @truncate((inst >> 3) & 7);
+                const rd: u8 = @truncate(inst & 7);
+                const top: ThumbOp = @enumFromInt(@intFromEnum(ThumbOp.str_reg) + op);
+                return .{ .raw = inst, .op = top, .rd = rd, .rn = rn, .rm = rm };
+            }
+        },
+        0b011 => {
+            const b = (inst & (1 << 12)) != 0;
+            const l = (inst & (1 << 11)) != 0;
+            const imm5: u16 = (inst >> 6) & 0x1f;
+            const rn: u8 = @truncate((inst >> 3) & 7);
+            const rd: u8 = @truncate(inst & 7);
+            const top: ThumbOp = if (l) (if (b) .ldrb_imm else .ldr_imm) else (if (b) .strb_imm else .str_imm);
+            return .{ .raw = inst, .op = top, .rd = rd, .rn = rn, .imm = if (b) imm5 else imm5 * 4 };
+        },
+        0b100 => {
+            if ((inst & (1 << 12)) == 0) {
+                const l = (inst & (1 << 11)) != 0;
+                const imm5: u16 = ((inst >> 6) & 0x1f) * 2;
+                const rn: u8 = @truncate((inst >> 3) & 7);
+                const rd: u8 = @truncate(inst & 7);
+                return .{ .raw = inst, .op = if (l) .ldrh_imm else .strh_imm, .rd = rd, .rn = rn, .imm = imm5 };
+            } else {
+                const l = (inst & (1 << 11)) != 0;
+                const rd: u8 = @truncate((inst >> 8) & 7);
+                const imm: u16 = (inst & 0xff) * 4;
+                return .{ .raw = inst, .op = if (l) .ldr_sp else .str_sp, .rd = rd, .rn = 13, .imm = imm };
+            }
+        },
+        0b101 => {
+            if ((inst & (1 << 12)) == 0) {
+                const use_sp = (inst & (1 << 11)) != 0;
+                const rd: u8 = @truncate((inst >> 8) & 7);
+                const imm: u16 = (inst & 0xff) * 4;
+                return .{ .raw = inst, .op = if (use_sp) .add_sp_rd else .add_pc, .rd = rd, .imm = imm };
+            } else {
+                const sub: u4 = @truncate((inst >> 8) & 0xf);
+                switch (sub) {
+                    0b0000 => {
+                        const imm: u16 = (inst & 0x7f) * 4;
+                        return .{ .raw = inst, .op = if ((inst & 0x80) != 0) .sub_sp_imm else .add_sp_imm, .imm = imm };
+                    },
+                    0b0010 => {
+                        const op: u2 = @truncate((inst >> 6) & 3);
+                        const rm: u8 = @truncate((inst >> 3) & 7);
+                        const rd: u8 = @truncate(inst & 7);
+                        const top: ThumbOp = switch (op) {
+                            0b00 => .sxth,
+                            0b01 => .sxtb,
+                            0b10 => .uxth,
+                            0b11 => .uxtb,
+                        };
+                        return .{ .raw = inst, .op = top, .rd = rd, .rm = rm };
+                    },
+                    0b0100, 0b0101 => {
+                        const push_lr = (sub & 1) != 0;
+                        const rlist: u8 = @truncate(inst & 0xff);
+                        const reg_list: u16 = @as(u16, rlist) | (if (push_lr) @as(u16, 1 << 14) else 0);
+                        const count: u8 = @popCount(reg_list);
+                        if (count > 0) {
+                            return .{ .raw = inst, .op = .push, .rn = count * 4, .imm = reg_list };
+                        }
+                        return .{ .raw = inst, .op = .slow };
+                    },
+                    0b1010 => {
+                        const op: u2 = @truncate((inst >> 6) & 3);
+                        const rm: u8 = @truncate((inst >> 3) & 7);
+                        const rd: u8 = @truncate(inst & 7);
+                        const top: ThumbOp = switch (op) {
+                            0b00 => .rev,
+                            0b01 => .rev16,
+                            0b11 => .revsh,
+                            0b10 => .slow,
+                        };
+                        return .{ .raw = inst, .op = top, .rd = rd, .rm = rm };
+                    },
+                    0b1100, 0b1101 => {
+                        const pop_pc = (sub & 1) != 0;
+                        const rlist: u8 = @truncate(inst & 0xff);
+                        const count: u8 = @as(u8, @popCount(rlist)) + @intFromBool(pop_pc);
+                        if (count > 0) {
+                            return .{ .raw = inst, .op = if (pop_pc) .pop_pc else .pop, .rn = count * 4, .rm = rlist };
+                        }
+                        return .{ .raw = inst, .op = .slow };
+                    },
+                    0b1111 => {
+                        if (inst == 0xbf00) return .{ .raw = inst, .op = .nop };
+                        return .{ .raw = inst, .op = .slow };
+                    },
+                    else => return .{ .raw = inst, .op = .slow },
+                }
+            }
+        },
+        0b110 => {
+            if ((inst & (1 << 12)) == 0) {
+                const l = (inst & (1 << 11)) != 0;
+                const rn: u8 = @truncate((inst >> 8) & 7);
+                const rlist: u8 = @truncate(inst & 0xff);
+                const count: u8 = @popCount(rlist);
+                if (count > 0) {
+                    return .{ .raw = inst, .op = if (l) .ldmia else .stmia, .rd = count * 4, .rn = rn, .rm = rlist };
+                }
+                return .{ .raw = inst, .op = .slow };
+            } else {
+                const cond: u4 = @truncate((inst >> 8) & 0xf);
+                if (cond < 0xe) {
+                    const imm8: i8 = @bitCast(@as(u8, @truncate(inst)));
+                    const offset: i16 = @as(i16, imm8) * 2;
+                    return .{ .raw = inst, .op = .b_cond, .rd = cond, .imm = @bitCast(offset) };
+                }
+                return .{ .raw = inst, .op = .slow };
+            }
+        },
+        0b111 => {
+            const op: u2 = @truncate((inst >> 11) & 3);
+            const imm11: u16 = inst & 0x7ff;
+            switch (op) {
+                0b00 => {
+                    const s11: i11 = @bitCast(@as(u11, @truncate(imm11)));
+                    const offset: i16 = @as(i16, s11) * 2;
+                    return .{ .raw = inst, .op = .b_uncond, .imm = @bitCast(offset) };
+                },
+                0b10 => {
+                    if (next_hw) |hw2| {
+                        if ((hw2 & 0xf800) == 0xf800 or (hw2 & 0xf800) == 0xe800) {
+                            const s11: i32 = @as(i11, @bitCast(@as(u11, @truncate(imm11))));
+                            const lo11: i32 = @intCast((hw2 & 0x7ff) << 1);
+                            const off32: u32 = @bitCast((s11 << 12) +% lo11);
+                            return .{
+                                .raw = inst,
+                                .op = if ((hw2 & 0x1000) != 0) .bl_pair else .blx_pair,
+                                .rn = @truncate(off32 >> 24),
+                                .rm = @truncate(off32 >> 16),
+                                .imm = @truncate(off32),
+                            };
+                        } else if ((hw2 & 0xd000) == 0x9000) {
+                            // Thumb-2 32-bit unconditional B.W
+                            const s_bit: u32 = (inst >> 10) & 1;
+                            const j1: u32 = (hw2 >> 13) & 1;
+                            const j2: u32 = (hw2 >> 11) & 1;
+                            const i1_bit: u32 = ~(j1 ^ s_bit) & 1;
+                            const i2_bit: u32 = ~(j2 ^ s_bit) & 1;
+                            const imm25: u25 = @truncate((s_bit << 24) | (i1_bit << 23) | (i2_bit << 22) | (@as(u32, inst & 0x3ff) << 12) | (@as(u32, hw2 & 0x7ff) << 1));
+                            const off32: u32 = @bitCast(@as(i32, @as(i25, @bitCast(imm25))));
+                            return .{
+                                .raw = inst,
+                                .op = .b_w_pair,
+                                .rn = @truncate(off32 >> 24),
+                                .rm = @truncate(off32 >> 16),
+                                .imm = @truncate(off32),
+                            };
+                        } else if (((inst & 0xfbf0) == 0xf240 or (inst & 0xfbf0) == 0xf2c0) and (hw2 & 0x8000) == 0) {
+                            // Thumb-2 32-bit MOVW / MOVT Rd, #imm16
+                            const rd: u8 = @truncate((hw2 >> 8) & 0xf);
+                            if (rd < 13) {
+                                const imm16: u16 = ((inst & 0xf) << 12) | (((inst >> 10) & 1) << 11) | (((hw2 >> 12) & 7) << 8) | (hw2 & 0xff);
+                                return .{
+                                    .raw = inst,
+                                    .op = if ((inst & 0x0080) != 0) .movt_pair else .movw_pair,
+                                    .rd = rd,
+                                    .imm = imm16,
+                                };
+                            }
+                        }
+                    }
+                    const s11: i11 = @bitCast(@as(u11, @truncate(imm11)));
+                    return .{ .raw = inst, .op = .bl_prefix, .imm = @bitCast(@as(i16, s11)) };
+                },
+                0b11 => return .{ .raw = inst, .op = .bl_suffix, .imm = imm11 << 1 },
+                0b01 => return .{ .raw = inst, .op = .blx_suffix, .imm = imm11 << 1 },
+            }
+        },
+    }
+}
+
 pub const Mode = enum(u5) {
     usr = 0b10000,
     fiq = 0b10001,
@@ -1094,9 +1437,14 @@ pub fn Arm1176(comptime Bus: type) type {
         icache: [icache_size]DecodedSlot = @splat(.{}),
         /// Physical page base tags (`pbase`) for each 1024-word 4 KB page in `icache` (`0xffff_ffff` = untagged/invalid)
         icache_page_tags: [icache_pages]u32 = @splat(0xffff_ffff),
+        /// Direct-mapped pre-decoded Thumb/Thumb-2 instruction cache (`thumb_icache_size` entries)
+        thumb_icache: [thumb_icache_size]ThumbSlot = @splat(.{}),
+        /// Physical page base tags (`pbase`) for each 2048-halfword 4 KB page in `thumb_icache`
+        thumb_icache_page_tags: [thumb_icache_pages]u32 = @splat(0xffff_ffff),
 
         pub inline fn invalidateIcache(self: *Self) void {
             @memset(&self.icache_page_tags, 0xffff_ffff);
+            @memset(&self.thumb_icache_page_tags, 0xffff_ffff);
         }
 
         pub inline fn invalidateIcachePage(self: *Self, pbase: u32) void {
@@ -1104,6 +1452,11 @@ pub fn Arm1176(comptime Bus: type) type {
             const page_idx: usize = @as(usize, (pbase >> 12) ^ (pbase >> 16) ^ (pbase >> 20)) & ic_pages_mask;
             if (self.icache_page_tags[page_idx] == pbase) {
                 self.icache_page_tags[page_idx] = 0xffff_ffff;
+            }
+            const tic_pages_mask = thumb_icache_pages - 1;
+            const tpage_idx: usize = @as(usize, (pbase >> 12) ^ (pbase >> 16) ^ (pbase >> 20)) & tic_pages_mask;
+            if (self.thumb_icache_page_tags[tpage_idx] == pbase) {
+                self.thumb_icache_page_tags[tpage_idx] = 0xffff_ffff;
             }
         }
 
@@ -1541,11 +1894,16 @@ pub fn Arm1176(comptime Bus: type) type {
                 self.excl_valid = false;
             }
             const ic_pages_mask = (icache_size >> 10) - 1;
+            const tic_pages_mask = thumb_icache_pages - 1;
             var priv: u1 = @intFromBool(self.isPrivileged());
             var code_vbase: u32 = 0xffff_ffff;
             var code_pbase: u32 = 0;
             var code_page_ptr: [*]const u8 = bus.ram.ptr;
             var code_icache_ptr: [*]DecodedSlot = self.icache[0..].ptr;
+            var thumb_vbase: u32 = 0xffff_ffff;
+            var thumb_pbase: u32 = 0;
+            var thumb_page_ptr: [*]const u8 = bus.ram.ptr;
+            var thumb_icache_ptr: [*]ThumbSlot = self.thumb_icache[0..].ptr;
             var data_r_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
             var data_w_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
             var data_r_page_ptr: [2][*]const u8 = .{ bus.ram.ptr, bus.ram.ptr };
@@ -1559,6 +1917,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     // Apply TLB invalidations other cores broadcast while this slice runs
                     if (bus.smp.serviceTlb(self.mmu.core_id, &self.mmu)) {
                         code_vbase = 0xffff_ffff;
+                        thumb_vbase = 0xffff_ffff;
                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     }
@@ -1573,54 +1932,82 @@ pub fn Arm1176(comptime Bus: type) type {
                 while (executed < batch_end) {
                     if (self.isThumb()) {
                         const pc = self.r[15] & ~@as(u32, 1);
-                        const inst16: u16 = if ((pc & 0xffff_f000) == code_vbase)
-                            std.mem.readInt(u16, code_page_ptr[pc & 0xffe ..][0..2], .little)
-                        else blk: {
+                        const page_hw: usize = (pc >> 1) & 0x7ff;
+                        var td: ThumbSlot = undefined;
+                        if ((pc & 0xffff_f000) == thumb_vbase) {
+                            td = thumb_icache_ptr[page_hw];
+                            if (td.raw == 0xffff) {
+                                const inst16 = std.mem.readInt(u16, thumb_page_ptr[page_hw * 2 ..][0..2], .little);
+                                const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
+                                td = decodeThumb16(inst16, next_hw);
+                                thumb_icache_ptr[page_hw] = td;
+                            }
+                        } else {
                             const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
                             if ((pc & 0xffff_f000) == islot.x_vbase) {
-                                code_vbase = islot.x_vbase;
-                                code_pbase = islot.pbase;
-                                code_page_ptr = bus.ram.ptr + code_pbase;
-                                const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
-                                const page_slot = page_idx << 10;
-                                if (self.icache_page_tags[page_idx] != code_pbase) {
-                                    @memset(self.icache[page_slot..][0..1024], .{});
-                                    self.icache_page_tags[page_idx] = code_pbase;
+                                thumb_vbase = islot.x_vbase;
+                                thumb_pbase = islot.pbase;
+                                thumb_page_ptr = bus.ram.ptr + thumb_pbase;
+                                const tpage_idx = @as(usize, (thumb_pbase >> 12) ^ (thumb_pbase >> 16) ^ (thumb_pbase >> 20)) & tic_pages_mask;
+                                const tpage_slot = tpage_idx << 11;
+                                if (self.thumb_icache_page_tags[tpage_idx] != thumb_pbase) {
+                                    @memset(self.thumb_icache[tpage_slot..][0..2048], .{});
+                                    self.thumb_icache_page_tags[tpage_idx] = thumb_pbase;
                                 }
-                                code_icache_ptr = self.icache[page_slot..].ptr;
-                                break :blk std.mem.readInt(u16, code_page_ptr[pc & 0xffe ..][0..2], .little);
-                            }
-                            const fetched = self.fetch16(bus, pc) catch {
-                                self.enterException(.abt, 0x0c, pc +% 4, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                executed += 1;
-                                continue;
-                            };
-                            const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
-                            if ((pc & 0xffff_f000) == islot2.x_vbase) {
-                                code_vbase = islot2.x_vbase;
-                                code_pbase = islot2.pbase;
-                                code_page_ptr = bus.ram.ptr + code_pbase;
-                                const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
-                                const page_slot = page_idx << 10;
-                                if (self.icache_page_tags[page_idx] != code_pbase) {
-                                    @memset(self.icache[page_slot..][0..1024], .{});
-                                    self.icache_page_tags[page_idx] = code_pbase;
+                                thumb_icache_ptr = self.thumb_icache[tpage_slot..].ptr;
+                                td = thumb_icache_ptr[page_hw];
+                                if (td.raw == 0xffff) {
+                                    const inst16 = std.mem.readInt(u16, thumb_page_ptr[page_hw * 2 ..][0..2], .little);
+                                    const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
+                                    td = decodeThumb16(inst16, next_hw);
+                                    thumb_icache_ptr[page_hw] = td;
                                 }
-                                code_icache_ptr = self.icache[page_slot..].ptr;
+                            } else {
+                                const inst16 = self.fetch16(bus, pc) catch {
+                                    self.enterException(.abt, 0x0c, pc +% 4, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    thumb_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    executed += 1;
+                                    continue;
+                                };
+                                const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
+                                if ((pc & 0xffff_f000) == islot2.x_vbase) {
+                                    thumb_vbase = islot2.x_vbase;
+                                    thumb_pbase = islot2.pbase;
+                                    thumb_page_ptr = bus.ram.ptr + thumb_pbase;
+                                    const tpage_idx = @as(usize, (thumb_pbase >> 12) ^ (thumb_pbase >> 16) ^ (thumb_pbase >> 20)) & tic_pages_mask;
+                                    const tpage_slot = tpage_idx << 11;
+                                    if (self.thumb_icache_page_tags[tpage_idx] != thumb_pbase) {
+                                        @memset(self.thumb_icache[tpage_slot..][0..2048], .{});
+                                        self.thumb_icache_page_tags[tpage_idx] = thumb_pbase;
+                                    }
+                                    thumb_icache_ptr = self.thumb_icache[tpage_slot..].ptr;
+                                    const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
+                                    td = decodeThumb16(inst16, next_hw);
+                                    thumb_icache_ptr[page_hw] = td;
+                                } else {
+                                    const tpage_idx = @as(usize, (pc >> 12) ^ (pc >> 16)) & tic_pages_mask;
+                                    self.thumb_icache_page_tags[tpage_idx] = 0xffff_ffff;
+                                    thumb_icache_ptr = self.thumb_icache[tpage_idx << 11 ..].ptr;
+                                    td = thumb_icache_ptr[page_hw];
+                                    if (td.raw != inst16 or td.op == .bl_pair or td.op == .blx_pair or td.op == .b_w_pair or td.op == .movw_pair or td.op == .movt_pair) {
+                                        td = decodeThumb16(inst16, null);
+                                        thumb_icache_ptr[page_hw] = td;
+                                    }
+                                }
                             }
-                            break :blk fetched;
-                        };
+                        }
                         self.r[15] = pc +% 2;
                         executed += 1;
-                        if (self.executeThumb(bus, pc, inst16, priv, code_vbase, code_pbase, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
+                        if (self.executeThumbDecoded(bus, pc, td, &executed, batch_end, priv, thumb_vbase, thumb_pbase, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
                             if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
                             _ = self.checkInterrupts(bus);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
+                            thumb_vbase = 0xffff_ffff;
                             data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
@@ -4905,7 +5292,610 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        // --- 16-bit Thumb Instruction Execution ---
+        // --- 16-bit Thumb & 32-bit Thumb-2 Pre-Decoded Execution ---
+
+        fn executeThumbDecoded(
+            self: *Self,
+            bus: *Bus,
+            inst_pc: u32,
+            td: ThumbSlot,
+            executed: *usize,
+            batch_end: usize,
+            priv: u1,
+            code_vbase: u32,
+            code_pbase: u32,
+            data_r_vbase: *[2]u32,
+            data_w_vbase: *[2]u32,
+            data_r_page_ptr: *[2][*]const u8,
+            data_w_page_ptr: *[2][*]u8,
+        ) bool {
+            switch (td.op) {
+                .nop => return false,
+                .lsl_imm => {
+                    const carry_in: u1 = @truncate((self.cpsr >> 29) & 1);
+                    const sh = dec.barrelShiftImm(self.r[td.rm], 0b00, @truncate(td.imm), carry_in);
+                    self.r[td.rd] = sh.val;
+                    self.setNZC(sh.val, sh.carry);
+                    return false;
+                },
+                .lsr_imm => {
+                    const carry_in: u1 = @truncate((self.cpsr >> 29) & 1);
+                    const sh = dec.barrelShiftImm(self.r[td.rm], 0b01, @truncate(td.imm), carry_in);
+                    self.r[td.rd] = sh.val;
+                    self.setNZC(sh.val, sh.carry);
+                    return false;
+                },
+                .asr_imm => {
+                    const carry_in: u1 = @truncate((self.cpsr >> 29) & 1);
+                    const sh = dec.barrelShiftImm(self.r[td.rm], 0b10, @truncate(td.imm), carry_in);
+                    self.r[td.rd] = sh.val;
+                    self.setNZC(sh.val, sh.carry);
+                    return false;
+                },
+                .add_reg3 => {
+                    const res = dec.addWithCarry(self.r[td.rn], self.r[td.rm], 0);
+                    self.r[td.rd] = res.val;
+                    self.setNZCV(res);
+                    return false;
+                },
+                .sub_reg3 => {
+                    const res = dec.addWithCarry(self.r[td.rn], ~self.r[td.rm], 1);
+                    self.r[td.rd] = res.val;
+                    self.setNZCV(res);
+                    return false;
+                },
+                .add_imm3 => {
+                    const res = dec.addWithCarry(self.r[td.rn], td.imm, 0);
+                    self.r[td.rd] = res.val;
+                    self.setNZCV(res);
+                    return false;
+                },
+                .sub_imm3 => {
+                    const res = dec.addWithCarry(self.r[td.rn], ~@as(u32, td.imm), 1);
+                    self.r[td.rd] = res.val;
+                    self.setNZCV(res);
+                    return false;
+                },
+                .mov_imm8 => {
+                    self.r[td.rd] = td.imm;
+                    self.setNZ(td.imm);
+                    return false;
+                },
+                .cmp_imm8 => {
+                    self.setNZCV(dec.addWithCarry(self.r[td.rd], ~@as(u32, td.imm), 1));
+                    return false;
+                },
+                .add_imm8 => {
+                    const res = dec.addWithCarry(self.r[td.rd], td.imm, 0);
+                    self.r[td.rd] = res.val;
+                    self.setNZCV(res);
+                    return false;
+                },
+                .sub_imm8 => {
+                    const res = dec.addWithCarry(self.r[td.rd], ~@as(u32, td.imm), 1);
+                    self.r[td.rd] = res.val;
+                    self.setNZCV(res);
+                    return false;
+                },
+                .alu_and => {
+                    self.r[td.rd] &= self.r[td.rm];
+                    self.setNZ(self.r[td.rd]);
+                    return false;
+                },
+                .alu_eor => {
+                    self.r[td.rd] ^= self.r[td.rm];
+                    self.setNZ(self.r[td.rd]);
+                    return false;
+                },
+                .alu_lsl => {
+                    const sh = dec.barrelShiftReg(self.r[td.rd], 0b00, @truncate(self.r[td.rm]), @truncate((self.cpsr >> 29) & 1));
+                    self.r[td.rd] = sh.val;
+                    self.setNZC(sh.val, sh.carry);
+                    return false;
+                },
+                .alu_lsr => {
+                    const sh = dec.barrelShiftReg(self.r[td.rd], 0b01, @truncate(self.r[td.rm]), @truncate((self.cpsr >> 29) & 1));
+                    self.r[td.rd] = sh.val;
+                    self.setNZC(sh.val, sh.carry);
+                    return false;
+                },
+                .alu_asr => {
+                    const sh = dec.barrelShiftReg(self.r[td.rd], 0b10, @truncate(self.r[td.rm]), @truncate((self.cpsr >> 29) & 1));
+                    self.r[td.rd] = sh.val;
+                    self.setNZC(sh.val, sh.carry);
+                    return false;
+                },
+                .alu_adc => {
+                    const res = dec.addWithCarry(self.r[td.rd], self.r[td.rm], @truncate((self.cpsr >> 29) & 1));
+                    self.r[td.rd] = res.val;
+                    self.setNZCV(res);
+                    return false;
+                },
+                .alu_sbc => {
+                    const res = dec.addWithCarry(self.r[td.rd], ~self.r[td.rm], @truncate((self.cpsr >> 29) & 1));
+                    self.r[td.rd] = res.val;
+                    self.setNZCV(res);
+                    return false;
+                },
+                .alu_ror => {
+                    const sh = dec.barrelShiftReg(self.r[td.rd], 0b11, @truncate(self.r[td.rm]), @truncate((self.cpsr >> 29) & 1));
+                    self.r[td.rd] = sh.val;
+                    self.setNZC(sh.val, sh.carry);
+                    return false;
+                },
+                .alu_tst => {
+                    self.setNZ(self.r[td.rd] & self.r[td.rm]);
+                    return false;
+                },
+                .alu_neg => {
+                    const res = dec.addWithCarry(0, ~self.r[td.rm], 1);
+                    self.r[td.rd] = res.val;
+                    self.setNZCV(res);
+                    return false;
+                },
+                .alu_cmp => {
+                    self.setNZCV(dec.addWithCarry(self.r[td.rd], ~self.r[td.rm], 1));
+                    return false;
+                },
+                .alu_cmn => {
+                    self.setNZCV(dec.addWithCarry(self.r[td.rd], self.r[td.rm], 0));
+                    return false;
+                },
+                .alu_orr => {
+                    self.r[td.rd] |= self.r[td.rm];
+                    self.setNZ(self.r[td.rd]);
+                    return false;
+                },
+                .alu_mul => {
+                    self.r[td.rd] *%= self.r[td.rm];
+                    self.setNZ(self.r[td.rd]);
+                    return false;
+                },
+                .alu_bic => {
+                    self.r[td.rd] &= ~self.r[td.rm];
+                    self.setNZ(self.r[td.rd]);
+                    return false;
+                },
+                .alu_mvn => {
+                    self.r[td.rd] = ~self.r[td.rm];
+                    self.setNZ(self.r[td.rd]);
+                    return false;
+                },
+                .hi_add => {
+                    const rm_val = if (td.rm == 15) (inst_pc +% 4) else self.r[td.rm];
+                    const rd_val = if (td.rd == 15) (inst_pc +% 4) else self.r[td.rd];
+                    const sum = rd_val +% rm_val;
+                    if (td.rd == 15) self.r[15] = sum & ~@as(u32, 1) else self.r[td.rd] = sum;
+                    return false;
+                },
+                .hi_cmp => {
+                    const rm_val = if (td.rm == 15) (inst_pc +% 4) else self.r[td.rm];
+                    const rd_val = if (td.rd == 15) (inst_pc +% 4) else self.r[td.rd];
+                    self.setNZCV(dec.addWithCarry(rd_val, ~rm_val, 1));
+                    return false;
+                },
+                .hi_mov => {
+                    const rm_val = if (td.rm == 15) (inst_pc +% 4) else self.r[td.rm];
+                    if (td.rd == 15) self.r[15] = rm_val & ~@as(u32, 1) else self.r[td.rd] = rm_val;
+                    return false;
+                },
+                .bx => {
+                    const rm_val = if (td.rm == 15) (inst_pc +% 4) else self.r[td.rm];
+                    self.setPcWithInterworking(rm_val);
+                    return false;
+                },
+                .blx_reg => {
+                    const rm_val = if (td.rm == 15) (inst_pc +% 4) else self.r[td.rm];
+                    self.r[14] = (inst_pc +% 2) | 1;
+                    self.setPcWithInterworking(rm_val);
+                    return false;
+                },
+                .ldr_lit => {
+                    const addr = ((inst_pc +% 4) & ~@as(u32, 3)) +% td.imm;
+                    if ((addr & 0xffff_f000) == code_vbase) {
+                        self.r[td.rd] = std.mem.readInt(u32, bus.ram[(code_pbase | (addr & 0xffc))..][0..4], .little);
+                        return false;
+                    }
+                    if ((addr & 0xffff_f000) == data_r_vbase[0]) {
+                        self.r[td.rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & 0xffff_f000) == slot.r_vbase) {
+                        data_r_vbase[0] = slot.r_vbase;
+                        data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                        self.r[td.rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
+                        return false;
+                    }
+                    self.r[td.rd] = self.read32(bus, addr) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    return false;
+                },
+                .ldr_imm, .ldr_reg => {
+                    const addr = if (td.op == .ldr_imm) (self.r[td.rn] +% td.imm) else (self.r[td.rn] +% self.r[td.rm]);
+                    if ((addr & ~@as(u32, 0xffc)) == data_r_vbase[0]) {
+                        self.r[td.rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                        data_r_vbase[0] = slot.r_vbase;
+                        data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                        self.r[td.rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
+                        return false;
+                    }
+                    self.r[td.rd] = self.read32(bus, addr) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    return false;
+                },
+                .str_imm, .str_reg => {
+                    const addr = if (td.op == .str_imm) (self.r[td.rn] +% td.imm) else (self.r[td.rn] +% self.r[td.rm]);
+                    if ((addr & ~@as(u32, 0xffc)) == data_w_vbase[0]) {
+                        std.mem.writeInt(u32, data_w_page_ptr[0][addr & 0xffc ..][0..4], self.r[td.rd], .little);
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                        data_w_vbase[0] = slot.w_vbase;
+                        data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                        std.mem.writeInt(u32, data_w_page_ptr[0][addr & 0xffc ..][0..4], self.r[td.rd], .little);
+                        return false;
+                    }
+                    self.write32(bus, addr, self.r[td.rd]) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    return true;
+                },
+                .ldrb_imm, .ldrb_reg => {
+                    const addr = if (td.op == .ldrb_imm) (self.r[td.rn] +% td.imm) else (self.r[td.rn] +% self.r[td.rm]);
+                    if ((addr & 0xffff_f000) == data_r_vbase[0]) {
+                        self.r[td.rd] = data_r_page_ptr[0][addr & 0xfff];
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & 0xffff_f000) == slot.r_vbase) {
+                        data_r_vbase[0] = slot.r_vbase;
+                        data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                        self.r[td.rd] = data_r_page_ptr[0][addr & 0xfff];
+                        return false;
+                    }
+                    self.r[td.rd] = self.read8(bus, addr) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    return false;
+                },
+                .strb_imm, .strb_reg => {
+                    const addr = if (td.op == .strb_imm) (self.r[td.rn] +% td.imm) else (self.r[td.rn] +% self.r[td.rm]);
+                    if ((addr & 0xffff_f000) == data_w_vbase[0]) {
+                        data_w_page_ptr[0][addr & 0xfff] = @truncate(self.r[td.rd]);
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & 0xffff_f000) == slot.w_vbase) {
+                        data_w_vbase[0] = slot.w_vbase;
+                        data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                        data_w_page_ptr[0][addr & 0xfff] = @truncate(self.r[td.rd]);
+                        return false;
+                    }
+                    self.write8(bus, addr, @truncate(self.r[td.rd])) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    return true;
+                },
+                .ldrh_imm, .ldrh_reg => {
+                    const addr = if (td.op == .ldrh_imm) (self.r[td.rn] +% td.imm) else (self.r[td.rn] +% self.r[td.rm]);
+                    if ((addr & ~@as(u32, 0xffe)) == data_r_vbase[0]) {
+                        self.r[td.rd] = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                        data_r_vbase[0] = slot.r_vbase;
+                        data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                        self.r[td.rd] = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
+                        return false;
+                    }
+                    self.r[td.rd] = self.read16(bus, addr) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    return false;
+                },
+                .strh_imm, .strh_reg => {
+                    const addr = if (td.op == .strh_imm) (self.r[td.rn] +% td.imm) else (self.r[td.rn] +% self.r[td.rm]);
+                    if ((addr & ~@as(u32, 0xffe)) == data_w_vbase[0]) {
+                        std.mem.writeInt(u16, data_w_page_ptr[0][addr & 0xffe ..][0..2], @truncate(self.r[td.rd]), .little);
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & ~@as(u32, 0xffe)) == slot.w_vbase) {
+                        data_w_vbase[0] = slot.w_vbase;
+                        data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                        std.mem.writeInt(u16, data_w_page_ptr[0][addr & 0xffe ..][0..2], @truncate(self.r[td.rd]), .little);
+                        return false;
+                    }
+                    self.write16(bus, addr, @truncate(self.r[td.rd])) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    return true;
+                },
+                .ldrsb_reg => {
+                    const addr = self.r[td.rn] +% self.r[td.rm];
+                    if ((addr & 0xffff_f000) == data_r_vbase[0]) {
+                        const bval = data_r_page_ptr[0][addr & 0xfff];
+                        self.r[td.rd] = @bitCast(@as(i32, @as(i8, @bitCast(bval))));
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & 0xffff_f000) == slot.r_vbase) {
+                        data_r_vbase[0] = slot.r_vbase;
+                        data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                        const bval = data_r_page_ptr[0][addr & 0xfff];
+                        self.r[td.rd] = @bitCast(@as(i32, @as(i8, @bitCast(bval))));
+                        return false;
+                    }
+                    const bval = self.read8(bus, addr) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    self.r[td.rd] = @bitCast(@as(i32, @as(i8, @bitCast(bval))));
+                    return false;
+                },
+                .ldrsh_reg => {
+                    const addr = self.r[td.rn] +% self.r[td.rm];
+                    if ((addr & ~@as(u32, 0xffe)) == data_r_vbase[0]) {
+                        const hval = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
+                        self.r[td.rd] = @bitCast(@as(i32, @as(i16, @bitCast(hval))));
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                        data_r_vbase[0] = slot.r_vbase;
+                        data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                        const hval = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
+                        self.r[td.rd] = @bitCast(@as(i32, @as(i16, @bitCast(hval))));
+                        return false;
+                    }
+                    const hval = self.read16(bus, addr) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    self.r[td.rd] = @bitCast(@as(i32, @as(i16, @bitCast(hval))));
+                    return false;
+                },
+                .ldr_sp => {
+                    const addr = self.r[13] +% td.imm;
+                    if ((addr & ~@as(u32, 0xffc)) == data_r_vbase[1]) {
+                        self.r[td.rd] = std.mem.readInt(u32, data_r_page_ptr[1][addr & 0xffc ..][0..4], .little);
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                        data_r_vbase[1] = slot.r_vbase;
+                        data_r_page_ptr[1] = bus.ram.ptr + slot.pbase;
+                        self.r[td.rd] = std.mem.readInt(u32, data_r_page_ptr[1][addr & 0xffc ..][0..4], .little);
+                        return false;
+                    }
+                    self.r[td.rd] = self.read32(bus, addr) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    return false;
+                },
+                .str_sp => {
+                    const addr = self.r[13] +% td.imm;
+                    if ((addr & ~@as(u32, 0xffc)) == data_w_vbase[1]) {
+                        std.mem.writeInt(u32, data_w_page_ptr[1][addr & 0xffc ..][0..4], self.r[td.rd], .little);
+                        return false;
+                    }
+                    const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
+                    if ((addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                        data_w_vbase[1] = slot.w_vbase;
+                        data_w_page_ptr[1] = bus.ram.ptr + slot.pbase;
+                        std.mem.writeInt(u32, data_w_page_ptr[1][addr & 0xffc ..][0..4], self.r[td.rd], .little);
+                        return false;
+                    }
+                    self.write32(bus, addr, self.r[td.rd]) catch {
+                        self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                        return true;
+                    };
+                    return true;
+                },
+                .add_pc => {
+                    self.r[td.rd] = ((inst_pc +% 4) & ~@as(u32, 3)) +% td.imm;
+                    return false;
+                },
+                .add_sp_rd => {
+                    self.r[td.rd] = self.r[13] +% td.imm;
+                    return false;
+                },
+                .add_sp_imm => {
+                    self.r[13] +%= td.imm;
+                    return false;
+                },
+                .sub_sp_imm => {
+                    self.r[13] -%= td.imm;
+                    return false;
+                },
+                .sxth => {
+                    self.r[td.rd] = @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(self.r[td.rm]))))));
+                    return false;
+                },
+                .sxtb => {
+                    self.r[td.rd] = @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(self.r[td.rm]))))));
+                    return false;
+                },
+                .uxth => {
+                    self.r[td.rd] = @as(u16, @truncate(self.r[td.rm]));
+                    return false;
+                },
+                .uxtb => {
+                    self.r[td.rd] = @as(u8, @truncate(self.r[td.rm]));
+                    return false;
+                },
+                .rev => {
+                    self.r[td.rd] = @byteSwap(self.r[td.rm]);
+                    return false;
+                },
+                .rev16 => {
+                    const val = self.r[td.rm];
+                    self.r[td.rd] = (@as(u32, @byteSwap(@as(u16, @truncate(val >> 16)))) << 16) | @byteSwap(@as(u16, @truncate(val)));
+                    return false;
+                },
+                .revsh => {
+                    self.r[td.rd] = @bitCast(@as(i32, @as(i16, @bitCast(@byteSwap(@as(u16, @truncate(self.r[td.rm])))))));
+                    return false;
+                },
+                .b_cond => {
+                    if (dec.checkCond(@truncate(td.rd), self.cpsr)) {
+                        const off: u32 = @bitCast(@as(i32, @as(i16, @bitCast(td.imm))));
+                        self.r[15] = (inst_pc +% 4) +% off;
+                    }
+                    return false;
+                },
+                .b_uncond => {
+                    const off: u32 = @bitCast(@as(i32, @as(i16, @bitCast(td.imm))));
+                    self.r[15] = (inst_pc +% 4) +% off;
+                    return false;
+                },
+                .bl_prefix => {
+                    const s16: i16 = @bitCast(td.imm);
+                    self.r[14] = (inst_pc +% 4) +% @as(u32, @bitCast(@as(i32, s16) << 12));
+                    return false;
+                },
+                .bl_suffix => {
+                    const target = (self.r[14] +% td.imm) & ~@as(u32, 1);
+                    self.r[14] = (inst_pc +% 2) | 1;
+                    self.r[15] = target;
+                    return false;
+                },
+                .blx_suffix => {
+                    const target = (self.r[14] +% td.imm) & ~@as(u32, 3);
+                    self.r[14] = (inst_pc +% 2) | 1;
+                    self.cpsr &= ~PsrFlags.T;
+                    self.r[15] = target;
+                    return false;
+                },
+                .bl_pair => {
+                    if (executed.* < batch_end) {
+                        const off32: u32 = (@as(u32, td.rn) << 24) | (@as(u32, td.rm) << 16) | td.imm;
+                        self.r[14] = (inst_pc +% 4) | 1;
+                        self.r[15] = ((inst_pc +% 4) +% off32) & ~@as(u32, 1);
+                        executed.* += 1;
+                        return false;
+                    }
+                    const s11: i11 = @bitCast(@as(u11, @truncate(td.raw & 0x7ff)));
+                    self.r[14] = (inst_pc +% 4) +% @as(u32, @bitCast(@as(i32, s11) << 12));
+                    return false;
+                },
+                .blx_pair => {
+                    if (executed.* < batch_end) {
+                        const off32: u32 = (@as(u32, td.rn) << 24) | (@as(u32, td.rm) << 16) | td.imm;
+                        self.r[14] = (inst_pc +% 4) | 1;
+                        self.cpsr &= ~PsrFlags.T;
+                        self.r[15] = ((inst_pc +% 4) +% off32) & ~@as(u32, 3);
+                        executed.* += 1;
+                        return false;
+                    }
+                    const s11: i11 = @bitCast(@as(u11, @truncate(td.raw & 0x7ff)));
+                    self.r[14] = (inst_pc +% 4) +% @as(u32, @bitCast(@as(i32, s11) << 12));
+                    return false;
+                },
+                .b_w_pair => {
+                    const off32: u32 = (@as(u32, td.rn) << 24) | (@as(u32, td.rm) << 16) | td.imm;
+                    self.r[15] = ((inst_pc +% 4) +% off32) & ~@as(u32, 1);
+                    return false;
+                },
+                .movw_pair => {
+                    self.r[td.rd] = td.imm;
+                    self.r[15] = inst_pc +% 4;
+                    return false;
+                },
+                .movt_pair => {
+                    self.r[td.rd] = (self.r[td.rd] & 0x0000_ffff) | (@as(u32, td.imm) << 16);
+                    self.r[15] = inst_pc +% 4;
+                    return false;
+                },
+                .push => {
+                    const reg_list = td.imm;
+                    const start_sp = self.r[13] -% td.rn;
+                    const last_addr = self.r[13] -% 4;
+                    const hit_page: ?[*]u8 = if ((start_sp & ~@as(u32, 0xffc)) == data_w_vbase[1] and
+                        (last_addr & ~@as(u32, 0xffc)) == data_w_vbase[1])
+                        data_w_page_ptr[1]
+                    else blk: {
+                        const slot = self.mmu.soft_tlb32[priv][(start_sp >> 12) & Mmu.soft_tlb_mask];
+                        if ((start_sp & ~@as(u32, 0xffc)) == slot.w_vbase and
+                            (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
+                        {
+                            data_w_vbase[1] = slot.w_vbase;
+                            data_w_page_ptr[1] = bus.ram.ptr + slot.pbase;
+                            break :blk data_w_page_ptr[1];
+                        }
+                        break :blk null;
+                    };
+                    if (hit_page) |page_ptr| {
+                        var off: usize = start_sp & 0xfff;
+                        var rem = reg_list;
+                        while (rem != 0) : (rem &= rem - 1) {
+                            const i: u4 = @intCast(@ctz(rem));
+                            std.mem.writeInt(u32, page_ptr[off..][0..4], self.r[i], .little);
+                            off += 4;
+                        }
+                        self.r[13] = start_sp;
+                        return false;
+                    }
+                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr);
+                },
+                .pop, .pop_pc => {
+                    const pop_pc = td.op == .pop_pc;
+                    const rlist = td.rm;
+                    const start_sp = self.r[13];
+                    const last_addr = start_sp +% td.rn -% 4;
+                    const hit_page: ?[*]const u8 = if ((start_sp & ~@as(u32, 0xffc)) == data_r_vbase[1] and
+                        (last_addr & ~@as(u32, 0xffc)) == data_r_vbase[1])
+                        data_r_page_ptr[1]
+                    else blk: {
+                        const slot = self.mmu.soft_tlb32[priv][(start_sp >> 12) & Mmu.soft_tlb_mask];
+                        if ((start_sp & ~@as(u32, 0xffc)) == slot.r_vbase and
+                            (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
+                        {
+                            data_r_vbase[1] = slot.r_vbase;
+                            data_r_page_ptr[1] = bus.ram.ptr + slot.pbase;
+                            break :blk data_r_page_ptr[1];
+                        }
+                        break :blk null;
+                    };
+                    if (hit_page) |page_ptr| {
+                        var off: usize = start_sp & 0xfff;
+                        var rem = rlist;
+                        while (rem != 0) : (rem &= rem - 1) {
+                            const i: u4 = @intCast(@ctz(rem));
+                            self.r[i] = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
+                            off += 4;
+                        }
+                        self.r[13] = start_sp +% td.rn;
+                        if (pop_pc) {
+                            const new_pc = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
+                            self.setPcWithInterworking(new_pc);
+                        }
+                        return false;
+                    }
+                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr);
+                },
+                .stmia, .ldmia, .slow => {
+                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr);
+                },
+            }
+        }
 
         /// Executes a 16-bit Thumb instruction. Returns `true` if privilege/mode changed,
         /// `WFI`/`YIELD` was executed, or an MMIO store occurred that may have raised an IRQ.
@@ -6098,6 +7088,15 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     for (thumb_prog, 0..) |inst, i| {
         std.mem.writeInt(u16, ram[0x1800 + i * 2 ..][0..2], inst, .little);
     }
+    try std.testing.expectEqual(ThumbOp.ldr_lit, decodeThumb16(thumb_prog[0], null).op);
+    try std.testing.expectEqual(ThumbOp.str_imm, decodeThumb16(thumb_prog[1], null).op);
+    try std.testing.expectEqual(ThumbOp.ldrh_imm, decodeThumb16(thumb_prog[2], null).op);
+    try std.testing.expectEqual(ThumbOp.ldrsh_reg, decodeThumb16(thumb_prog[3], null).op);
+    try std.testing.expectEqual(ThumbOp.str_sp, decodeThumb16(thumb_prog[4], null).op);
+    try std.testing.expectEqual(ThumbOp.ldr_sp, decodeThumb16(thumb_prog[5], null).op);
+    try std.testing.expectEqual(ThumbOp.bl_pair, decodeThumb16(0xf000, 0xf810).op);
+    try std.testing.expectEqual(ThumbOp.movw_pair, decodeThumb16(0xf241, 0x0234).op);
+    try std.testing.expectEqual(ThumbOp.movt_pair, decodeThumb16(0xf2c5, 0x0267).op);
     _ = cpu.runSteps(&bus, thumb_prog.len);
     try std.testing.expectEqual(@as(u32, 0xdead_beef), cpu.r[1]);
     try std.testing.expectEqual(@as(u32, 0xdead_beef), std.mem.readInt(u32, ram[0x2404..][0..4], .little));
