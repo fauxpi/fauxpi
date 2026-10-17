@@ -19,7 +19,7 @@ pub const Vfp = vfp_mod.Vfp;
 pub const PsrFlags = dec.PsrFlags;
 pub const PstateFlags = aarch64_mod.PstateFlags;
 
-pub const icache_size: usize = 4096;
+pub const icache_size: usize = 16384;
 pub const icache_mask: usize = icache_size - 1;
 
 pub const DecodedSlot = struct {
@@ -1191,32 +1191,39 @@ pub fn Arm1176(comptime Bus: type) type {
 
             self.yield_slice = false;
             self.last_dmb_pc = 0xffff_ffff;
-            defer self.excl_valid = false;
 
             const limit = if (max_steps == 4096) max_steps + 256 else max_steps;
             var executed: usize = 0;
+            var cur_last_inst: u32 = self.last_inst;
+            defer {
+                self.cycles +%= executed;
+                self.mmu.pmccntr +%= @truncate(executed);
+                self.last_inst = cur_last_inst;
+                self.excl_valid = false;
+            }
             var priv: u1 = @intFromBool(self.isPrivileged());
             var code_vbase: u32 = 0xffff_ffff;
             var code_pbase: u32 = 0;
+            var code_page_ptr: [*]const u8 = bus.ram.ptr;
 
             while (executed < limit) {
                 if (executed >= max_steps and (self.cpsr & PsrFlags.I) == 0) break;
                 if (self.isThumb()) {
                     const pc = self.r[15] & ~@as(u32, 1);
                     const inst16: u16 = if ((pc & 0xffff_f000) == code_vbase)
-                        std.mem.readInt(u16, bus.ram[(code_pbase | (pc & 0xffe))..][0..2], .little)
+                        std.mem.readInt(u16, code_page_ptr[pc & 0xffe ..][0..2], .little)
                     else blk: {
                         const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
                         if ((pc & 0xffff_f000) == islot.x_vbase) {
                             code_vbase = islot.x_vbase;
                             code_pbase = islot.pbase;
-                            break :blk std.mem.readInt(u16, bus.ram[(islot.pbase | (pc & 0xffe))..][0..2], .little);
+                            code_page_ptr = bus.ram.ptr + code_pbase;
+                            break :blk std.mem.readInt(u16, code_page_ptr[pc & 0xffe ..][0..2], .little);
                         }
                         const fetched = self.fetch16(bus, pc) catch {
                             self.enterException(.abt, 0x0c, pc +% 4, false);
                             priv = 1;
                             code_vbase = 0xffff_ffff;
-                            self.cycles +%= 1;
                             executed += 1;
                             continue;
                         };
@@ -1224,11 +1231,11 @@ pub fn Arm1176(comptime Bus: type) type {
                         if ((pc & 0xffff_f000) == islot2.x_vbase) {
                             code_vbase = islot2.x_vbase;
                             code_pbase = islot2.pbase;
+                            code_page_ptr = bus.ram.ptr + code_pbase;
                         }
                         break :blk fetched;
                     };
                     self.r[15] = pc +% 2;
-                    self.cycles +%= 1;
                     executed += 1;
                     if (self.executeThumb(bus, pc, inst16, priv, code_vbase, code_pbase)) {
                         if (self.mmu.halted_wfi or self.yield_slice) break;
@@ -1241,19 +1248,19 @@ pub fn Arm1176(comptime Bus: type) type {
 
                 const pc = self.r[15] & ~@as(u32, 3);
                 const inst: u32 = if ((pc & 0xffff_f000) == code_vbase)
-                    std.mem.readInt(u32, bus.ram[(code_pbase | (pc & 0xfff))..][0..4], .little)
+                    std.mem.readInt(u32, code_page_ptr[pc & 0xfff ..][0..4], .little)
                 else blk: {
                     const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
                     if ((pc & 0xffff_f000) == islot.x_vbase) {
                         code_vbase = islot.x_vbase;
                         code_pbase = islot.pbase;
-                        break :blk std.mem.readInt(u32, bus.ram[(islot.pbase | (pc & 0xfff))..][0..4], .little);
+                        code_page_ptr = bus.ram.ptr + code_pbase;
+                        break :blk std.mem.readInt(u32, code_page_ptr[pc & 0xfff ..][0..4], .little);
                     }
                     const fetched = self.fetch32(bus, pc) catch {
                         self.enterException(.abt, 0x0c, pc +% 4, false);
                         priv = 1;
                         code_vbase = 0xffff_ffff;
-                        self.cycles +%= 1;
                         executed += 1;
                         continue;
                     };
@@ -1261,20 +1268,20 @@ pub fn Arm1176(comptime Bus: type) type {
                     if ((pc & 0xffff_f000) == islot2.x_vbase) {
                         code_vbase = islot2.x_vbase;
                         code_pbase = islot2.pbase;
+                        code_page_ptr = bus.ram.ptr + code_pbase;
                     }
                     break :blk fetched;
                 };
 
                 self.r[15] = pc +% 4;
-                self.last_inst = inst;
-                self.cycles +%= 1;
+                cur_last_inst = inst;
                 executed += 1;
 
                 if (inst < 0xe000_0000) {
                     if (!dec.checkCond(@truncate(inst >> 28), self.cpsr)) continue;
                 }
 
-                const ic_idx: usize = @truncate(((pc >> 2) ^ (pc >> 14)) & icache_mask);
+                const ic_idx: usize = @truncate(((pc >> 2) ^ (pc >> 16)) & icache_mask);
                 var d = self.icache[ic_idx];
                 if (d.raw != inst) {
                     d = decodeArm32(inst);

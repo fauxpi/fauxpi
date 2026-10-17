@@ -1365,10 +1365,13 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
 
             const limit = if (max_steps == 4096) max_steps + 256 else max_steps;
             const SlotType = @TypeOf(cpu.icache[0]);
+            const ic_mask = cpu.icache.len - 1;
             var executed: usize = 0;
+            var cur_last_inst: u32 = cpu.last_inst;
             var priv: u1 = @intFromBool(currentEl(cpu) != 0);
             var code_vbase: u64 = 0xffff_ffff_ffff_ffff;
             var code_pbase: u32 = 0;
+            var code_page_ptr: [*]const u8 = bus.ram.ptr;
 
             while (executed < limit) {
                 if (cpu.mmu.halted_wfi or cpu.yield_slice or !cpu.is_aarch64) break;
@@ -1376,13 +1379,14 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
 
                 const cur_pc = cpu.pc64;
                 const inst: u32 = if ((cur_pc & ~@as(u64, 0xfff)) == code_vbase)
-                    std.mem.readInt(u32, bus.ram[(code_pbase | @as(u32, @truncate(cur_pc & 0xffc)))..][0..4], .little)
+                    std.mem.readInt(u32, code_page_ptr[@as(usize, @truncate(cur_pc & 0xffc))..][0..4], .little)
                 else blk: {
                     const islot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
                     if ((cur_pc & ~@as(u64, 0xfff)) == islot.x_vbase) {
                         code_vbase = islot.x_vbase;
                         code_pbase = islot.pbase;
-                        break :blk std.mem.readInt(u32, bus.ram[(islot.pbase | @as(u32, @truncate(cur_pc & 0xffc)))..][0..4], .little);
+                        code_page_ptr = bus.ram.ptr + code_pbase;
+                        break :blk std.mem.readInt(u32, code_page_ptr[@as(usize, @truncate(cur_pc & 0xffc))..][0..4], .little);
                     }
                     const fetched = fetchInst64(cpu, bus, cur_pc) catch {
                         const target_el: u2 = @max(currentEl(cpu), 1);
@@ -1397,15 +1401,16 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     if ((cur_pc & ~@as(u64, 0xfff)) == islot2.x_vbase) {
                         code_vbase = islot2.x_vbase;
                         code_pbase = islot2.pbase;
+                        code_page_ptr = bus.ram.ptr + code_pbase;
                     }
                     break :blk fetched;
                 };
 
-                cpu.last_inst = inst;
+                cur_last_inst = inst;
                 cpu.pc64 = cur_pc +% 4;
                 executed += 1;
 
-                const idx: usize = @truncate((cur_pc >> 2) & 0xfff);
+                const idx: usize = @as(usize, @truncate((cur_pc >> 2) ^ (cur_pc >> 16))) & ic_mask;
                 var d = cpu.icache[idx];
                 if (d.raw != inst) {
                     d = decodeA64(SlotType, inst);
@@ -2829,6 +2834,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 }
             }
 
+            cpu.last_inst = cur_last_inst;
             cpu.cycles +%= executed;
             cpu.mmu.pmccntr +%= @truncate(executed);
             cpu.r[15] = @truncate(cpu.pc64);
