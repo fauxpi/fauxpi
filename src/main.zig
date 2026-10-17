@@ -23,6 +23,7 @@ pub const dma = @import("soc/dma.zig");
 pub const qcow2 = @import("soc/qcow2.zig");
 pub const sdhost = @import("soc/sdhost.zig");
 pub const cyw43430 = @import("soc/cyw43430.zig");
+pub const bluetooth = @import("soc/bluetooth.zig");
 pub const i2c = @import("soc/i2c.zig");
 pub const soc_audio = @import("soc/audio.zig");
 pub const bcm2835 = @import("soc/bcm2835.zig");
@@ -253,6 +254,12 @@ fn loadGuestBoot(
     soc.usb.hid.net.guest_mac = mac_address;
     soc.sdhci.wireless_enabled = board_model.hasWireless();
     soc.sdhci.wifi.mac_address = wifi_mac_address;
+    soc.bt.enabled = board_model.hasWireless();
+    soc.bt.chip = switch (board_model) {
+        .pi_3_a_plus, .pi_3_b_plus => .bcm4345c0,
+        else => .bcm43430a1,
+    };
+    soc.bt.bd_addr = bluetooth.hciOrder(bluetooth.addressFromWifiMac(wifi_mac_address));
 
     const boot_res = if (sd_qcow2) |disk| blk: {
         soc.sdhost.attachQcow2(disk);

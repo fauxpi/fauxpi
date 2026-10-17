@@ -6,6 +6,7 @@ const cprman_mod = @import("cprman.zig");
 const pm_mod = @import("pm.zig");
 const gpio_mod = @import("gpio.zig");
 const uart_mod = @import("uart.zig");
+const bluetooth_mod = @import("bluetooth.zig");
 const dma_mod = @import("dma.zig");
 const sdhost_mod = @import("sdhost.zig");
 const i2c_mod = @import("i2c.zig");
@@ -46,6 +47,9 @@ pub const Bcm2835 = struct {
     gpio: gpio_mod.Gpio = .{},
     uart0: uart_mod.Pl011Uart = .{},
     aux_uart: uart_mod.AuxMiniUart = .{},
+    bt: bluetooth_mod.Controller = .{},
+    /// UART whose TXD/RXD reach the Bluetooth controller through GPIO 32/33.
+    bt_uart: enum { none, pl011, mini } = .none,
     dma: dma_mod.DmaController = .{},
     sdhost: sdhost_mod.SdHost = .{},
     sdhci: sdhost_mod.ArasanSdhci = .{},
@@ -141,6 +145,35 @@ pub const Bcm2835 = struct {
         self.sdhost.pins_routed = !sd_on_arasan;
         self.sdhci.routed_to_sd_card = sd_on_arasan;
         self.sdhci.routed_to_wifi = !sd_on_arasan and self.gpio.isWifiOnArasanAlt3();
+    }
+
+    /// Connects the Bluetooth controller to the UART muxed onto GPIO 32 (TXD): PL011 on ALT3
+    /// (`uart0_pins`) or the mini UART on ALT5 (`uart1_bt_pins`, `dtoverlay=miniuart-bt`).
+    pub fn syncBtRoutingFromGpio(self: *Bcm2835) void {
+        self.bt_uart = if (!self.bt.enabled) .none else switch (self.gpio.getPinFunction(32)) {
+            .alt3 => .pl011,
+            .alt5 => .mini,
+            else => .none,
+        };
+        self.uart0.tx_capture = self.bt_uart == .pl011;
+        self.aux_uart.tx_capture = self.bt_uart == .mini;
+    }
+
+    /// Moves bytes between the Bluetooth controller and its UART.
+    fn pumpBt(self: *Bcm2835) void {
+        switch (self.bt_uart) {
+            .none => {},
+            .pl011 => {
+                for (self.uart0.tx_capture_buf[0..self.uart0.tx_capture_len]) |b| self.bt.hostWrite(b);
+                self.uart0.tx_capture_len = 0;
+                while (self.uart0.rxSpace() > 0) self.uart0.pushRx(self.bt.popOut() orelse break);
+            },
+            .mini => {
+                for (self.aux_uart.tx_capture_buf[0..self.aux_uart.tx_capture_len]) |b| self.bt.hostWrite(b);
+                self.aux_uart.tx_capture_len = 0;
+                while (self.aux_uart.rxSpace() > 0) self.aux_uart.pushRx(self.bt.popOut() orelse break);
+            },
+        }
     }
 
     fn busRead32Opaque(ctx: *anyopaque, raw_addr: u32) u32 {
@@ -608,7 +641,14 @@ pub const Bcm2835 = struct {
                 .cprman => self.cprman.read32(addr - cprman_mod.Cprman.BASE_ADDR),
                 .rng => if (addr -% pm_mod.Rng.BASE_ADDR < pm_mod.Rng.SIZE) self.rng.read32(addr - pm_mod.Rng.BASE_ADDR) else 0,
                 .gpio => if (addr -% gpio_mod.Gpio.BASE_ADDR < gpio_mod.Gpio.SIZE) self.gpio.read32(addr - gpio_mod.Gpio.BASE_ADDR) else 0,
-                .uart0 => self.uart0.read32(addr - uart_mod.Pl011Uart.BASE_ADDR),
+                .uart0 => blk: {
+                    const v = self.uart0.read32(addr - uart_mod.Pl011Uart.BASE_ADDR);
+                    if (self.bt_uart == .pl011 and addr == uart_mod.Pl011Uart.BASE_ADDR) {
+                        self.pumpBt();
+                        self.updateIrqsBank2();
+                    }
+                    break :blk v;
+                },
                 .sdhost => if (addr -% sdhost_mod.SdHost.BASE_ADDR < sdhost_mod.SdHost.SIZE) self.sdhost.read32(addr - sdhost_mod.SdHost.BASE_ADDR) else 0,
                 .i2s => if (addr -% audio_mod.I2sPcm.BASE_ADDR < audio_mod.I2sPcm.SIZE) self.i2s.read32(addr - audio_mod.I2sPcm.BASE_ADDR) else 0,
                 .spi0 => if (addr -% spi_mod.Spi0.BASE_ADDR < spi_mod.Spi0.SIZE) self.spi0.read32(addr - spi_mod.Spi0.BASE_ADDR) else 0,
@@ -617,7 +657,14 @@ pub const Bcm2835 = struct {
                 .pv1 => if (addr -% pv_mod.PixelValve.PV1_BASE < pv_mod.PixelValve.SIZE) self.pv1.read32(addr - pv_mod.PixelValve.PV1_BASE) else 0,
                 .pwm => if (addr -% audio_mod.PwmAudio.BASE_ADDR < audio_mod.PwmAudio.SIZE) self.pwm.read32(addr - audio_mod.PwmAudio.BASE_ADDR) else 0,
                 .thermal => if (addr -% pm_mod.Thermal.BASE_ADDR < pm_mod.Thermal.SIZE) self.thermal.read32(addr - pm_mod.Thermal.BASE_ADDR) else 0,
-                .aux_uart => if (addr -% uart_mod.AuxMiniUart.BASE_ADDR < uart_mod.AuxMiniUart.SIZE) self.aux_uart.read32(addr - uart_mod.AuxMiniUart.BASE_ADDR) else 0,
+                .aux_uart => if (addr -% uart_mod.AuxMiniUart.BASE_ADDR < uart_mod.AuxMiniUart.SIZE) blk: {
+                    const v = self.aux_uart.read32(addr - uart_mod.AuxMiniUart.BASE_ADDR);
+                    if (self.bt_uart == .mini and addr == uart_mod.AuxMiniUart.BASE_ADDR + 0x40) {
+                        self.pumpBt();
+                        self.updateIrqsBank1();
+                    }
+                    break :blk v;
+                } else 0,
                 .sdhci => if (addr -% sdhost_mod.ArasanSdhci.BASE_ADDR < sdhost_mod.ArasanSdhci.SIZE) self.sdhci.read32WithSd(addr - sdhost_mod.ArasanSdhci.BASE_ADDR, &self.sdhost) else 0,
                 .hvs => self.hvs.read32(addr - hvs_mod.Hvs.BASE_ADDR),
                 .bsc1 => if (addr -% i2c_mod.BscController.BSC1_BASE < i2c_mod.BscController.SIZE) self.bsc1.read32(addr - i2c_mod.BscController.BSC1_BASE) else 0,
@@ -694,10 +741,12 @@ pub const Bcm2835 = struct {
                 .gpio => if (addr -% gpio_mod.Gpio.BASE_ADDR < gpio_mod.Gpio.SIZE) {
                     self.gpio.write32(addr - gpio_mod.Gpio.BASE_ADDR, val);
                     self.syncSdRoutingFromGpio();
+                    self.syncBtRoutingFromGpio();
                     self.updateIrqsBank2();
                 },
                 .uart0 => {
                     self.uart0.write32(addr - uart_mod.Pl011Uart.BASE_ADDR, val);
+                    self.pumpBt();
                     self.updateIrqsBank2();
                 },
                 .sdhost => if (addr -% sdhost_mod.SdHost.BASE_ADDR < sdhost_mod.SdHost.SIZE) {
@@ -751,6 +800,7 @@ pub const Bcm2835 = struct {
                 },
                 .aux_uart => if (addr -% uart_mod.AuxMiniUart.BASE_ADDR < uart_mod.AuxMiniUart.SIZE) {
                     self.aux_uart.write32(addr - uart_mod.AuxMiniUart.BASE_ADDR, val);
+                    self.pumpBt();
                     self.updateIrqsBank1();
                 },
                 .sdhci => if (addr -% sdhost_mod.ArasanSdhci.BASE_ADDR < sdhost_mod.ArasanSdhci.SIZE) {

@@ -9,6 +9,7 @@
 const std = @import("std");
 const fat32 = @import("fat32.zig");
 const fdt = @import("fdt.zig");
+const bluetooth = @import("../soc/bluetooth.zig");
 const BoardModel = @import("../ui/board_sheet.zig").BoardModel;
 
 pub const kernel_load_addr: u32 = 0x0000_8000;
@@ -708,7 +709,7 @@ pub fn loadDirectWithOverlays(
     };
 }
 
-/// Updates `/model`, `/system/linux,revision`, `/system/linux,serial`, `/serial-number`, and optional wireless MAC in the in-RAM DTB at `dtb_load_addr`.
+/// Updates `/model`, `/system/linux,revision`, `/system/linux,serial`, `/serial-number`, and optional wireless MAC and Bluetooth address in the in-RAM DTB at `dtb_load_addr`.
 pub fn applyBoardConfigToRamDtb(
     allocator: std.mem.Allocator,
     ram: []u8,
@@ -728,8 +729,10 @@ pub fn applyBoardConfigToRamDtb(
     try tree.setBoardSerial(serial);
     if (wifi_mac) |wmac| {
         try tree.setWirelessMac(wmac);
+        try tree.setBluetooth(bluetooth.hciOrder(bluetooth.addressFromWifiMac(wmac)));
     } else {
         try tree.disableWireless();
+        try tree.setBluetooth(null);
     }
     const updated_dtb = try tree.serialize(alloc);
     if (dtb_load_addr + updated_dtb.len > ram.len) return error.DtbTooLarge;

@@ -28,6 +28,16 @@ pub const Pl011Uart = struct {
     tx_log: [256]u8 = [_]u8{0} ** 256,
     tx_log_len: usize = 0,
 
+    /// When set, transmitted bytes are held in `tx_capture_buf` for an attached device
+    /// (the Bluetooth controller) instead of going to the console.
+    tx_capture: bool = false,
+    tx_capture_buf: [64]u8 = undefined,
+    tx_capture_len: usize = 0,
+
+    pub fn rxSpace(self: *const Pl011Uart) usize {
+        return 64 - @as(usize, self.rx_count);
+    }
+
     pub fn pushRx(self: *Pl011Uart, byte: u8) void {
         if (self.rx_count < 64) {
             self.rx_fifo[self.rx_tail] = byte;
@@ -88,6 +98,14 @@ pub const Pl011Uart = struct {
         switch (offset) {
             0x00 => { // DR
                 const ch: u8 = @truncate(val);
+                self.ris |= INT_TX;
+                if (self.tx_capture) {
+                    if (self.tx_capture_len < self.tx_capture_buf.len) {
+                        self.tx_capture_buf[self.tx_capture_len] = ch;
+                        self.tx_capture_len += 1;
+                    }
+                    return;
+                }
                 if (self.tx_log_len < self.tx_log.len) {
                     self.tx_log[self.tx_log_len] = ch;
                     self.tx_log_len += 1;
@@ -146,6 +164,24 @@ pub const AuxMiniUart = struct {
     spi2: spi_mod.AuxSpi = .{},
 
     stdout_enabled: bool = true,
+
+    /// When set, transmitted bytes are held in `tx_capture_buf` for an attached device
+    /// (the Bluetooth controller with `dtoverlay=miniuart-bt`) instead of going to the console.
+    tx_capture: bool = false,
+    tx_capture_buf: [64]u8 = undefined,
+    tx_capture_len: usize = 0,
+
+    pub fn rxSpace(self: *const AuxMiniUart) usize {
+        return 64 - @as(usize, self.rx_count);
+    }
+
+    pub fn pushRx(self: *AuxMiniUart, byte: u8) void {
+        if (self.rx_count < 64) {
+            self.rx_fifo[self.rx_tail] = byte;
+            self.rx_tail +%= 1;
+            self.rx_count += 1;
+        }
+    }
 
     fn muIrqPending(self: *const AuxMiniUart) bool {
         if ((self.enables & AUX_ENABLE_MU) == 0) return false;
@@ -221,7 +257,12 @@ pub const AuxMiniUart = struct {
                     self.dll = val & 0xff;
                 } else {
                     const ch: u8 = @truncate(val);
-                    if (self.stdout_enabled) {
+                    if (self.tx_capture) {
+                        if (self.tx_capture_len < self.tx_capture_buf.len) {
+                            self.tx_capture_buf[self.tx_capture_len] = ch;
+                            self.tx_capture_len += 1;
+                        }
+                    } else if (self.stdout_enabled) {
                         const buf = [1]u8{ch};
                         host_posix.writeStdout(&buf);
                     }

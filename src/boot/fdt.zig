@@ -384,6 +384,24 @@ pub const Tree = struct {
         }
     }
 
+    /// Fills in `local-bd-address` (LSB first, as the firmware does) on the Bluetooth serdev
+    /// nodes (`bt` on the PL011, `minibt` on the mini UART), or disables them when the board
+    /// has no Bluetooth (`bd_addr` null).
+    pub fn setBluetooth(self: *Tree, bd_addr: ?[6]u8) !void {
+        const candidates = [_]?*Node{
+            self.findNode("bt") orelse self.findNode("/soc/serial@7e201000/bluetooth"),
+            self.findNode("minibt") orelse self.findNode("/soc/serial@7e215040/bluetooth"),
+        };
+        for (candidates) |candidate| {
+            const node = candidate orelse continue;
+            if (bd_addr) |addr| {
+                try node.setProp(self.allocator, "local-bd-address", &addr);
+            } else {
+                try node.setStringProp(self.allocator, "status", "disabled");
+            }
+        }
+    }
+
     pub fn configureSpinTable64(self: *Tree) !void {
         var has_zero_reserve = false;
         for (self.reserves.items) |r| {
@@ -485,10 +503,9 @@ pub const Tree = struct {
         try sys_node.setU32Prop(self.allocator, "linux,revision", 0x00900093);
         try self.setBoardSerial(0x00000000fa000001);
 
-        // 2c. Ensure PL011 UART0 (/soc/serial@7e201000) is enabled without Bluetooth serdev children
+        // 2c. Ensure PL011 UART0 (/soc/serial@7e201000) is enabled (its Bluetooth serdev child is set up by `setBluetooth`)
         if (self.findNode("/soc/serial@7e201000") orelse self.findNode("uart0")) |uart0| {
             try uart0.setStringProp(self.allocator, "status", "okay");
-            uart0.children.clearRetainingCapacity();
             if (!serial0_is_aux) {
                 if (self.findNode("/aliases")) |aliases| {
                     try aliases.setStringProp(self.allocator, "serial0", "/soc/serial@7e201000");
