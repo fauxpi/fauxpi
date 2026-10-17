@@ -10,16 +10,15 @@ const linux = std.os.linux;
 const host_posix = @import("../host/posix.zig");
 const client = @import("../wayland/client.zig");
 const protocol = @import("../wayland/protocol.zig");
+const portal = @import("../wayland/portal.zig");
 const UsbHidComposite = @import("../usb/hid.zig").UsbHidComposite;
 const Gpio = @import("../soc/gpio.zig").Gpio;
 const board_sheet = @import("../ui/board_sheet.zig");
 const window = @import("window.zig");
 
-extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
-extern "c" fn _exit(status: c_int) noreturn;
-
 pub const WaylandWindow = struct {
     gpa: std.mem.Allocator,
+    environ: std.process.Environ = .empty,
     display: *client.Display,
     registry: client.Proxy,
     compositor: client.Proxy,
@@ -75,7 +74,7 @@ pub const WaylandWindow = struct {
     chosen_sd_path_buf: [std.fs.max_path_bytes]u8 = undefined,
     chosen_sd_path_len: usize = 0,
 
-    picker: window.PosixFilePicker = .{},
+    picker: portal.PortalFilePicker = .{},
 
     last_mouse_x: ?f64 = null,
     last_mouse_y: ?f64 = null,
@@ -120,6 +119,7 @@ pub const WaylandWindow = struct {
 
         win.* = .{
             .gpa = gpa,
+            .environ = environ,
             .display = display,
             .registry = registry,
             .compositor = compositor,
@@ -188,8 +188,9 @@ pub const WaylandWindow = struct {
             m.string(win.ui.title).end();
         }
         {
+            const app_id = std.process.Environ.getPosix(environ, "FLATPAK_ID") orelse "fauxpi";
             var m = try win.toplevel.request(protocol.xdg_toplevel.request.set_app_id);
-            m.string("fauxpi").end();
+            m.string(app_id).end();
         }
         {
             var m = try win.surface.request(protocol.wl_surface.request.commit);
@@ -227,30 +228,7 @@ pub const WaylandWindow = struct {
     }
 
     pub fn openSdImagePicker(self: *WaylandWindow) void {
-        self.picker.spawn(execLinuxFilePickerChild);
-    }
-
-    fn execLinuxFilePickerChild() noreturn {
-        const zenity_argv = [_:null]?[*:0]const u8{
-            "zenity",
-            "--file-selection",
-            "--title=Select SD Card Image",
-            "--file-filter=Disk Images (*.img, *.img.xz, *.iso, *.bin, *.raw) | *.img *.img.xz *.xz *.iso *.bin *.raw",
-            "--file-filter=All files | *",
-        };
-        _ = execvp("zenity", &zenity_argv);
-
-        const kdialog_argv = [_:null]?[*:0]const u8{
-            "kdialog",
-            "--title",
-            "Select SD Card Image",
-            "--getopenfilename",
-            ".",
-            "*.img *.img.xz *.xz *.iso *.bin *.raw|Disk Images (*.img, *.img.xz, *.iso, *.bin, *.raw)\n*|All Files",
-        };
-        _ = execvp("kdialog", &kdialog_argv);
-
-        _exit(127);
+        self.picker.open(self.environ);
     }
 
     fn freeShmBuffers(self: *WaylandWindow) void {
@@ -1005,3 +983,8 @@ test "WaylandWindow keyboard repeat_info, serviceRepeat, keymap fd mmap, and lea
     try testing.expectEqual(@as(u32, 0), win.configured_width);
     try testing.expectEqual(@as(u32, 0), win.configured_height);
 }
+
+test {
+    _ = portal;
+}
+

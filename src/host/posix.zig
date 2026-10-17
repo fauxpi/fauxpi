@@ -269,7 +269,7 @@ pub fn openCreateTruncWrite(path: []const u8, read_write: bool) !fd_t {
 
 pub fn createTempBackingFd() !fd_t {
     if (is_linux) {
-        const tmp_dirs = [_][:0]const u8{ "/var/tmp", "/tmp" };
+        const tmp_dirs = [_][:0]const u8{ "/tmp", "/var/tmp" };
         for (tmp_dirs) |dir| {
             const rc = std.os.linux.openat(
                 std.os.linux.AT.FDCWD,

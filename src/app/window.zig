@@ -198,8 +198,7 @@ pub fn setChosenSdPath(win: anytype, path: []const u8) void {
     win.ui_dirty = true;
 }
 
-/// Non-blocking child process pipe reader used by Linux (`zenity`/`kdialog`) and macOS (`osascript`)
-/// file chooser dialogs.
+/// Non-blocking child process pipe reader used by the macOS (`osascript`) file chooser dialog.
 pub const PosixFilePicker = struct {
     fd: host_posix.fd_t = -1,
     pid: host_posix.pid_t = -1,
