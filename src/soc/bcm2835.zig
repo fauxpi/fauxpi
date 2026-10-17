@@ -275,6 +275,9 @@ pub const Bcm2835 = struct {
         return switch (normalizeAddr(raw_addr)) {
             sdhost_mod.SdHost.BASE_ADDR + 0x40 => self.sdhost.tryWriteDataBulk(src),
             sdhost_mod.ArasanSdhci.BASE_ADDR + 0x20 => self.sdhci.tryWriteDataBulk(&self.sdhost, src),
+            hdmi_mod.Hdmi.HD_BASE + hdmi_mod.Hdmi.HD_MAI_DATA => self.hdmi.writeMaiDataBulk(src, &self.audio_fifo),
+            audio_mod.PwmAudio.BASE_ADDR + audio_mod.PwmAudio.PWM_FIF1 => self.pwm.writeFif1Bulk(src, &self.audio_fifo, self.audio_connected),
+            audio_mod.I2sPcm.BASE_ADDR + audio_mod.I2sPcm.REG_FIFO_A => self.i2s.writeFifoBulk(src, &self.audio_fifo, self.audio_connected),
             else => false,
         };
     }

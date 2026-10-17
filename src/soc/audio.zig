@@ -115,17 +115,20 @@ pub const AudioFifo = struct {
     /// Returns the number of stereo frames popped.
     pub fn popFrames(self: *AudioFifo, out_interleaved: []i16) usize {
         const max_frames = out_interleaved.len / 2;
-        var r = self.read_idx.load(.monotonic);
+        const r = self.read_idx.load(.monotonic);
         const w = self.write_idx.load(.acquire);
         const avail = w -% r;
         const count: usize = @min(max_frames, avail);
-        for (0..count) |i| {
-            const slot = (r & MASK) * 2;
-            out_interleaved[i * 2] = self.samples[slot];
-            out_interleaved[i * 2 + 1] = self.samples[slot + 1];
-            r +%= 1;
+        if (count == 0) return 0;
+
+        const start_frame: usize = r & MASK;
+        const first_frames: usize = @min(count, CAPACITY - start_frame);
+        @memcpy(out_interleaved[0 .. first_frames * 2], self.samples[start_frame * 2 ..][0 .. first_frames * 2]);
+        const rem_frames = count - first_frames;
+        if (rem_frames > 0) {
+            @memcpy(out_interleaved[first_frames * 2 ..][0 .. rem_frames * 2], self.samples[0 .. rem_frames * 2]);
         }
-        self.read_idx.store(r, .release);
+        self.read_idx.store(r +% @as(u32, @intCast(count)), .release);
         return count;
     }
 };
@@ -1461,6 +1464,33 @@ pub const PwmAudio = struct {
             else => {},
         }
     }
+
+    pub fn writeFif1Bulk(
+        self: *PwmAudio,
+        src: []const u8,
+        audio_fifo: *AudioFifo,
+        audio_connected: bool,
+    ) bool {
+        const range: i32 = @intCast(@max(self.rng1, 2));
+        const half: i32 = @divTrunc(range, 2);
+        const denom: i32 = @max(half, 1);
+        var off: usize = 0;
+        while (off + 4 <= src.len) : (off += 4) {
+            const val = std.mem.readInt(u32, src[off..][0..4], .little);
+            const centered: i32 = @as(i32, @intCast(@min(val, self.rng1))) - half;
+            const pcm: i16 = @intCast(std.math.clamp(@divTrunc(centered * 32767, denom), -32768, 32767));
+            if (!self.has_pending_left) {
+                self.pending_left = pcm;
+                self.has_pending_left = true;
+            } else {
+                self.has_pending_left = false;
+                if (audio_connected) {
+                    audio_fifo.pushStereoSample(self.pending_left, pcm, 48_000);
+                }
+            }
+        }
+        return true;
+    }
 };
 
 /// BCM2835 I2S / PCM Audio Interface (`brcm,bcm2835-i2s`) at `0x20203000` (size `0x24`).
@@ -1650,6 +1680,42 @@ pub const I2sPcm = struct {
             REG_GRAY => self.gray = val,
             else => {},
         }
+    }
+
+    pub fn writeFifoBulk(
+        self: *I2sPcm,
+        src: []const u8,
+        audio_fifo: *AudioFifo,
+        audio_connected: bool,
+    ) bool {
+        const rate = self.sample_rate;
+        if ((self.mode_a & MODE_FTXP) != 0) {
+            var off: usize = 0;
+            while (off + 4 <= src.len) : (off += 4) {
+                const val = std.mem.readInt(u32, src[off..][0..4], .little);
+                if (audio_connected) {
+                    const left: i16 = @bitCast(@as(u16, @truncate(val)));
+                    const right: i16 = @bitCast(@as(u16, @truncate(val >> 16)));
+                    audio_fifo.pushStereoSample(left, right, rate);
+                }
+            }
+        } else {
+            var off: usize = 0;
+            while (off + 4 <= src.len) : (off += 4) {
+                const val = std.mem.readInt(u32, src[off..][0..4], .little);
+                const sample = self.extractUnpackedChannelSample(val);
+                if (!self.has_pending_left) {
+                    self.pending_left = sample;
+                    self.has_pending_left = true;
+                } else {
+                    self.has_pending_left = false;
+                    if (audio_connected) {
+                        audio_fifo.pushStereoSample(self.pending_left, sample, rate);
+                    }
+                }
+            }
+        }
+        return true;
     }
 };
 

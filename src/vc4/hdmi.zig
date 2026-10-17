@@ -97,6 +97,49 @@ pub const Hdmi = struct {
         return self.hd_regs[offset / 4];
     }
 
+    pub inline fn writeMaiDataWord(self: *Hdmi, val: u32, audio_fifo: ?*audio_mod.AudioFifo, rate: u32) void {
+        self.hd_regs[HD_MAI_DATA / 4] = val;
+        // Unpack 32-bit IEC958_SUBFRAME_LE word:
+        // bits [3:0] = preamble (0x8 = B/left frame 0, 0x2 = M/left, 0x4 = W/right)
+        // bits [27:12] = signed 16-bit PCM sample
+        const preamble: u4 = @truncate(val & 0xf);
+        const sample: i16 = @bitCast(@as(u16, @truncate((val >> 12) & 0xffff)));
+
+        if (preamble == 0x8 or preamble == 0x2) {
+            self.mai_pending_left = sample;
+            self.mai_has_left = true;
+        } else if (preamble == 0x4) {
+            self.mai_has_left = false;
+            if (self.connected) {
+                if (audio_fifo) |fifo| {
+                    fifo.pushStereoSample(self.mai_pending_left, sample, rate);
+                }
+            }
+        } else {
+            if (!self.mai_has_left) {
+                self.mai_pending_left = sample;
+                self.mai_has_left = true;
+            } else {
+                self.mai_has_left = false;
+                if (self.connected) {
+                    if (audio_fifo) |fifo| {
+                        fifo.pushStereoSample(self.mai_pending_left, sample, rate);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn writeMaiDataBulk(self: *Hdmi, src: []const u8, audio_fifo: ?*audio_mod.AudioFifo) bool {
+        const rate = self.maiSampleRate();
+        var off: usize = 0;
+        while (off + 4 <= src.len) : (off += 4) {
+            const val = std.mem.readInt(u32, src[off..][0..4], .little);
+            self.writeMaiDataWord(val, audio_fifo, rate);
+        }
+        return true;
+    }
+
     pub fn writeHd32(self: *Hdmi, offset: u32, val: u32, audio_fifo: ?*audio_mod.AudioFifo) void {
         if (offset >= HD_SIZE) return;
         self.hd_regs[offset / 4] = val;
@@ -106,35 +149,7 @@ pub const Hdmi = struct {
                 self.mai_has_left = false;
             }
         } else if (offset == HD_MAI_DATA) {
-            // Unpack 32-bit IEC958_SUBFRAME_LE word:
-            // bits [3:0] = preamble (0x8 = B/left frame 0, 0x2 = M/left, 0x4 = W/right)
-            // bits [27:12] = signed 16-bit PCM sample
-            const preamble: u4 = @truncate(val & 0xf);
-            const sample: i16 = @bitCast(@as(u16, @truncate((val >> 12) & 0xffff)));
-
-            if (preamble == 0x8 or preamble == 0x2) {
-                self.mai_pending_left = sample;
-                self.mai_has_left = true;
-            } else if (preamble == 0x4) {
-                self.mai_has_left = false;
-                if (self.connected) {
-                    if (audio_fifo) |fifo| {
-                        fifo.pushStereoSample(self.mai_pending_left, sample, self.maiSampleRate());
-                    }
-                }
-            } else {
-                if (!self.mai_has_left) {
-                    self.mai_pending_left = sample;
-                    self.mai_has_left = true;
-                } else {
-                    self.mai_has_left = false;
-                    if (self.connected) {
-                        if (audio_fifo) |fifo| {
-                            fifo.pushStereoSample(self.mai_pending_left, sample, self.maiSampleRate());
-                        }
-                    }
-                }
-            }
+            self.writeMaiDataWord(val, audio_fifo, self.maiSampleRate());
         }
     }
 };
