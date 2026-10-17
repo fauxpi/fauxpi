@@ -1,5 +1,5 @@
 //! Read-only MBR + FAT16/FAT32 filesystem reader for booting Raspberry Pi SD
-//! card images (such as `dazzle.img`).
+//! card images.
 //!
 //! Supports both 8.3 short names and VFAT Long File Names (LFN), nested
 //! subdirectories (e.g. `slot-a/kernel.img`, `slot-a/overlays/vc4-kms-v3d.dtbo`),

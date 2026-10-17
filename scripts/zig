@@ -34,11 +34,6 @@ Darwin) os=macos ;;
 esac
 
 ZIG_DIR=$ROOT/build/zig/zig-$arch-$os-$ZIG_VERSION
-DAZZLE_ZIG_DIR=$ROOT/../dazzle/build/zig/zig-$arch-$os-$ZIG_VERSION
-if [ ! -x "$ZIG_DIR/zig" ] && [ -x "$DAZZLE_ZIG_DIR/zig" ]; then
-	mkdir -p "$ROOT/build/zig"
-	ln -s "$DAZZLE_ZIG_DIR" "$ZIG_DIR"
-fi
 
 if [ ! -x "$ZIG_DIR/zig" ]; then
 	for tool in curl tar xz python3; do

@@ -85,7 +85,7 @@ pub fn formatByteSize(buf: []u8, bytes: u64) []const u8 {
 const red: Color = .rgb(0xe53935);
 const orange: Color = .rgb(0xfb8c00);
 
-/// Line widths from `dazzle/src/apps/settings/board_view.zig`.
+/// Board drawing line widths.
 const line_w: f32 = 1.25;
 const heavy_w: f32 = 1.75;
 
@@ -374,7 +374,7 @@ pub const BoardUi = struct {
     sd_create_task: ?*AsyncSdCreateTask = null,
     spinner_phase_rad: f32 = 0.0,
 
-    /// Material 3 Snackbar notification bar at the bottom of the window (from dazzle/src/ui/snackbar.zig).
+    /// Material 3 Snackbar notification bar at the bottom of the window.
     snackbar_buf: [256]u8 = @splat(0),
     snackbar_len: usize = 0,
     snackbar_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -3003,7 +3003,7 @@ pub const BoardUi = struct {
         }
     }
 
-    /// Renders a Material 3 Snackbar at the bottom of the window (matching `dazzle/src/ui/snackbar.zig`).
+    /// Renders a Material 3 Snackbar at the bottom of the window.
     fn paintSnackbar(self: *const BoardUi, c: *Canvas) void {
         if (!self.hasSnackbar()) return;
         const t = &self.theme;
@@ -3174,7 +3174,7 @@ pub const BoardUi = struct {
 
         @memset(c.pixels[0..total_px], t.surface_container.toArgb());
 
-        // Centered window title (22px, as in dazzle/src/ui/title_bar.zig)
+        // Centered window title (22px)
         const title_w = c.measureText(22.0, self.title);
         const style: canvas_mod.Style = .{ .font = &self.font, .size = 22.0 };
         const title_x = @round((w_f - title_w) * 0.5);
@@ -4558,7 +4558,7 @@ fn fillOverhangingPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, sur
     c.fillRoundedRect(r, rad, board_tint);
 }
 
-/// Draws a single board part, ported from `dazzle/src/apps/settings/board_view.zig`.
+/// Draws a single board part.
 pub fn drawPart(c: *Canvas, part: *const board.Part, r: Rect, s: f32, ink: Color) void {
     const radius: Radii = .all(0.6 * s);
     switch (part.kind) {

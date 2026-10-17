@@ -953,7 +953,7 @@ test "HVS DLIST plane compositing" {
 test "HVS T-tiled RGB565 plane compositing (direct scanout of maximized window)" {
     var hvs = Hvs{};
     const w: u32 = 128;
-    const h: u32 = 69; // Non-multiple-of-4 height (like 1280x669 in Dazzle)
+    const h: u32 = 69; // Non-multiple-of-4 height (e.g. 1280x669)
     var ram: [128 * 96 * 2]u8 = @splat(0);
 
     // Populate T-tiled RGB565 buffer with pure blue (0xff0000ff)

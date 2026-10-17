@@ -72,7 +72,7 @@ const CliOptions = struct {
 };
 
 fn readSdImageLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    // Ensure simulated SD card is at least 256 MiB so guest OSes (like Dazzle) have room
+    // Ensure simulated SD card is at least 256 MiB so guest OSes have room
     // to grow the boot partition and format a /data partition.
     return readFileWithMinSizeLinux(allocator, path, 256 * 1024 * 1024);
 }

@@ -513,8 +513,8 @@ test "drawing text into a canvas" {
     var pixels: [200 * 40]u32 = @splat(0xff000000);
     const canvas: Canvas = .{ .pixels = &pixels, .width = 200, .height = 40, .stride = 200 };
     const style: Style = .{ .font = &f, .size = 24 };
-    const end = try draw(canvas, &cache, style, 2, 28, "Dazzle AV");
-    try testing.expectApproxEqAbs(measure(style, "Dazzle AV") + 2, end, 0.001);
+    const end = try draw(canvas, &cache, style, 2, 28, "FauxPi AV");
+    try testing.expectApproxEqAbs(measure(style, "FauxPi AV") + 2, end, 0.001);
     // Kerning pulls "To" together (by 55/1000 em).
     try testing.expectApproxEqAbs(measure(style, "T") + measure(style, "o") - 24 * 0.055, measure(style, "To"), 0.001);
     var lit: u32 = 0;
@@ -526,14 +526,14 @@ test "drawing text into a canvas" {
     for (0..40) |y| for (end_px..200) |x| try testing.expectEqual(@as(u32, 0xff000000), pixels[y * 200 + x]);
     // Drawing again reuses the cached glyphs.
     const cached = cache.map.count();
-    _ = try draw(canvas, &cache, style, 2, 28, "Dazzle AV");
+    _ = try draw(canvas, &cache, style, 2, 28, "FauxPi AV");
     try testing.expectEqual(cached, cache.map.count());
 
     // Drawing rotated 90 degrees CCW advances upward and draws the same number of lit pixels.
     var rot_pixels: [40 * 200]u32 = @splat(0xff000000);
     const rot_canvas: Canvas = .{ .pixels = &rot_pixels, .width = 40, .height = 200, .stride = 40 };
-    const end_y = try drawRotated90Ccw(rot_canvas, &cache, style, 28, 198, "Dazzle AV");
-    try testing.expectApproxEqAbs(198 - measure(style, "Dazzle AV"), end_y, 0.001);
+    const end_y = try drawRotated90Ccw(rot_canvas, &cache, style, 28, 198, "FauxPi AV");
+    try testing.expectApproxEqAbs(198 - measure(style, "FauxPi AV"), end_y, 0.001);
     var rot_lit: u32 = 0;
     for (rot_pixels) |p| rot_lit += @intFromBool(p != 0xff000000);
     try testing.expectEqual(lit, rot_lit);

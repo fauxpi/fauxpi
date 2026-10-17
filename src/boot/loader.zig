@@ -737,7 +737,7 @@ pub fn applyBoardConfigToRamDtb(
 
 test "parse config.txt" {
     const sample =
-        \\# Dazzle config.txt
+        \\# Raspberry Pi config.txt
         \\os_prefix=slot-a/
         \\initramfs initramfs.cpio followkernel
         \\dtoverlay=vc4-kms-v3d
