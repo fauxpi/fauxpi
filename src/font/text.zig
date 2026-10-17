@@ -105,7 +105,7 @@ pub const Canvas = struct {
 
 /// `src` over `dst` with alpha `a` (0-255), per colour channel. The result
 /// is opaque.
-pub fn blend(dst: u32, src: u32, a: u32) u32 {
+pub inline fn blend(dst: u32, src: u32, a: u32) u32 {
     if (a >= 255) return src | 0xff000000;
     const ia = 255 - a;
     // Red and blue together (16 bits each, so they cannot overflow into
@@ -118,8 +118,41 @@ pub fn blend(dst: u32, src: u32, a: u32) u32 {
     return 0xff000000 | rb_out | g_out;
 }
 
+/// Blends `src` with uniform alpha `a` (0-255) across a horizontal span of pixels using 4-wide SIMD.
+pub fn blendSpan(dst_slice: []u32, src: u32, a: u32) void {
+    if (a == 0 or dst_slice.len == 0) return;
+    if (a >= 255) {
+        @memset(dst_slice, src | 0xff000000);
+        return;
+    }
+    const ia: u32 = 255 - a;
+    const src_rb: u32 = (src & 0xff00ff) * a + 0x800080;
+    const src_g: u32 = (src & 0x00ff00) * a + 0x008000;
+
+    const v_src_rb: @Vector(4, u32) = @splat(src_rb);
+    const v_src_g: @Vector(4, u32) = @splat(src_g);
+    const v_ia: @Vector(4, u32) = @splat(ia);
+    const v_mask_rb: @Vector(4, u32) = @splat(0x00ff00ff);
+    const v_mask_g: @Vector(4, u32) = @splat(0x0000ff00);
+    const v_alpha: @Vector(4, u32) = @splat(0xff000000);
+    const v_shift8: @Vector(4, u5) = @splat(8);
+
+    var i: usize = 0;
+    while (i + 4 <= dst_slice.len) : (i += 4) {
+        const v_dst: @Vector(4, u32) = dst_slice[i..][0..4].*;
+        const v_rb = v_src_rb + (v_dst & v_mask_rb) * v_ia;
+        const v_g = v_src_g + (v_dst & v_mask_g) * v_ia;
+        const v_rb_out = ((v_rb + ((v_rb >> v_shift8) & v_mask_rb)) >> v_shift8) & v_mask_rb;
+        const v_g_out = ((v_g + ((v_g >> v_shift8) & v_mask_g)) >> v_shift8) & v_mask_g;
+        dst_slice[i..][0..4].* = v_alpha | v_rb_out | v_g_out;
+    }
+    while (i < dst_slice.len) : (i += 1) {
+        dst_slice[i] = blend(dst_slice[i], src, a);
+    }
+}
+
 /// Rounds x / 255 to the nearest integer, for 0 <= x <= 255 * 255.
-fn div255(x: u32) u32 {
+inline fn div255(x: u32) u32 {
     const y = x + 128;
     return (y + (y >> 8)) >> 8;
 }

@@ -177,7 +177,7 @@ pub const Theme = struct {
 
 const fill_stroke: f32 = 1e6;
 
-fn shapeCoverage(d: f32, sx: f32, sy: f32, inset: f32) f32 {
+inline fn shapeCoverage(d: f32, sx: f32, sy: f32, inset: f32) f32 {
     const by_distance = std.math.clamp(0.5 - (d + inset), 0.0, 1.0);
     const cx = std.math.clamp(0.5 - (sx + inset), 0.0, 1.0);
     const cy = std.math.clamp(0.5 - (sy + inset), 0.0, 1.0);
@@ -364,29 +364,34 @@ pub const Canvas = struct {
         const argb = color.toArgb();
         const base_alpha: f32 = color.a * 255.0;
 
-        // Interior safe margin where SDF coverage is guaranteed 1.0 (when filled) or 0.0 (when stroked)
+        // Horizontal span `inner_x0..inner_x1` where `ax <= hw - inner_margin` (`mx == 0` and `cx == 1.0`)
         const inner_margin = @max(max_r, if (filled) 0.0 else stroke) + 1.0;
-        const has_inner_span = (hw > inner_margin) and (hh > inner_margin);
-        const inner_x0: u32 = if (has_inner_span) @intFromFloat(@max(@as(f32, @floatFromInt(x0)), @ceil(cx - (hw - inner_margin)))) else x1;
-        const inner_x1: u32 = if (has_inner_span) @intFromFloat(@min(@as(f32, @floatFromInt(x1)), @floor(cx + (hw - inner_margin)))) else x0;
+        const has_inner_x = hw > inner_margin;
+        const inner_x0: u32 = if (has_inner_x) @intFromFloat(@max(@as(f32, @floatFromInt(x0)), @ceil(cx - (hw - inner_margin)))) else x1;
+        const inner_x1: u32 = if (has_inner_x) @intFromFloat(@min(@as(f32, @floatFromInt(x1)), @floor(cx + (hw - inner_margin)))) else x0;
+        const has_mid_span = has_inner_x and (inner_x0 < inner_x1);
+        const full_a_u32: u32 = @intFromFloat(@round(base_alpha));
 
         for (y0..y1) |py| {
             const fy = @as(f32, @floatFromInt(py)) + 0.5 - cy;
             const ay = @abs(fy);
+            const sy = ay - hh;
             const row = c.pixels[py * c.stride ..];
-            const in_inner_y = has_inner_span and (ay <= hh - inner_margin) and (inner_x0 < inner_x1);
+            const in_inner_y = (hh > inner_margin) and (ay <= hh - inner_margin);
 
             var px: u32 = x0;
             while (px < x1) {
-                if (in_inner_y and px == inner_x0) {
-                    if (filled) {
-                        const a_u32: u32 = @intFromFloat(@round(base_alpha));
-                        if (a_u32 >= 255) {
-                            @memset(row[inner_x0..inner_x1], argb | 0xff000000);
-                        } else if (a_u32 > 0) {
-                            for (row[inner_x0..inner_x1]) |*dst| {
-                                dst.* = text_mod.blend(dst.*, argb, a_u32);
-                            }
+                if (has_mid_span and px == inner_x0) {
+                    if (in_inner_y) {
+                        if (filled) {
+                            text_mod.blendSpan(row[inner_x0..inner_x1], argb, full_a_u32);
+                        }
+                    } else {
+                        const span_cov = std.math.clamp(0.5 - sy, 0.0, 1.0) -
+                            (if (filled) @as(f32, 0.0) else std.math.clamp(0.5 - (sy + stroke), 0.0, 1.0));
+                        if (span_cov > 0.0) {
+                            const span_a: u32 = @intFromFloat(@round(base_alpha * span_cov));
+                            text_mod.blendSpan(row[inner_x0..inner_x1], argb, span_a);
                         }
                     }
                     px = inner_x1;
@@ -406,7 +411,6 @@ pub const Canvas = struct {
                 const my = @max(qy, 0.0);
                 const d = @sqrt(mx * mx + my * my) + @min(@max(qx, qy), 0.0) - rad;
                 const sx = ax - hw;
-                const sy = ay - hh;
 
                 const cov = shapeCoverage(d, sx, sy, 0.0) - (if (filled) 0.0 else shapeCoverage(d, sx, sy, stroke));
                 if (cov > 0.0) {
@@ -473,4 +477,11 @@ test "canvas shapes and icons draw anti-aliased pixels at 1x and 2x scale" {
     c2.fillRoundedRect(.{ .x = 10, .y = 10, .w = 40, .h = 20 }, .all(6), Theme.dark.primary);
     // Logical center (30, 20) -> physical center (60, 40)
     try testing.expectEqual(Theme.dark.primary.toArgb(), pixels_2x[40 * 200 + 60]);
+
+    // Translucent fillRoundedRect uses SIMD blendSpan and matches scalar text_mod.blend
+    const translucent = Theme.dark.primary.withAlpha(0.5);
+    c2.fillRoundedRect(.{ .x = 55, .y = 10, .w = 40, .h = 20 }, .all(6), translucent);
+    const expected_blend = text_mod.blend(0xff141218, translucent.toArgb(), @intFromFloat(@round(0.5 * 255.0)));
+    try testing.expectEqual(expected_blend, pixels_2x[40 * 200 + 150]);
+    try testing.expectEqual(expected_blend, pixels_2x[22 * 200 + 150]);
 }
