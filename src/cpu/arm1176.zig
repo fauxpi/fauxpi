@@ -211,6 +211,18 @@ pub const ArmOp = enum(u8) {
     vmov_f32_al,
     vfp_dp_al,
     vfp_ls_multi_al,
+    mrs_cpsr_al,
+    msr_cpsr_c_al,
+    mrc_tpidruro_al,
+    mrc_tpidrurw_al,
+    mrc_tpidrprw_al,
+    mcr_barrier_al,
+    nop_al,
+    yield_wfe_al,
+    clrex_al,
+    dmb_dsb_v7_al,
+    cpsid_al,
+    cpsie_al,
     // Pre-classified group fallbacks
     dp_imm_general,
     dp_reg_general,
@@ -227,6 +239,23 @@ pub const ArmOp = enum(u8) {
 pub fn decodeArm32(inst: u32) DecodedSlot {
     const cond: u4 = @truncate(inst >> 28);
     if (cond == 0xf) {
+        if ((inst & 0x0f00_0000) == 0x0500_0000 or (inst & 0x0f00_0000) == 0x0700_0000) {
+            if ((inst & 0x0fff_fff0) == 0x057f_f010) {
+                return .{ .raw = inst, .op = @intFromEnum(ArmOp.clrex_al) };
+            } else if ((inst & 0x0fff_ffe0) == 0x057f_f040) {
+                return .{ .raw = inst, .op = @intFromEnum(ArmOp.dmb_dsb_v7_al), .rd = @intFromBool((inst & 0x10) == 0) };
+            }
+            return .{ .raw = inst, .op = @intFromEnum(ArmOp.nop_al) }; // PLD / PLI / ISB
+        }
+        if ((inst & 0x0ff3_0020) == 0x0100_0000) {
+            const imod: u2 = @truncate((inst >> 18) & 3);
+            const mask_bits: u32 = inst & 0x1c0;
+            if (imod == 0b11) {
+                return .{ .raw = inst, .op = @intFromEnum(ArmOp.cpsid_al), .imm = mask_bits };
+            } else if (imod == 0b10) {
+                return .{ .raw = inst, .op = @intFromEnum(ArmOp.cpsie_al), .imm = ~mask_bits };
+            }
+        }
         return .{ .raw = inst, .op = @intFromEnum(ArmOp.unconditional) };
     }
     const top3: u3 = @truncate((inst >> 25) & 7);
@@ -361,6 +390,12 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                 if ((inst & 0x0fff_ffff) == 0x012f_ff1e) {
                     return .{ .raw = inst, .op = @intFromEnum(ArmOp.bx_lr_al) };
                 }
+                if ((inst & 0x0fff_0fff) == 0x010f_0000) {
+                    const rd: u4 = @truncate((inst >> 12) & 0xf);
+                    if (rd != 15) {
+                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.mrs_cpsr_al), .rd = rd };
+                    }
+                }
                 const rm: u4 = @truncate(inst & 0xf);
                 if (rm != 15) {
                     if ((inst & 0x0fff_fff0) == 0x012f_ff10) {
@@ -374,6 +409,9 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                         if (rd != 15) {
                             return .{ .raw = inst, .op = @intFromEnum(ArmOp.clz_al), .rd = rd, .rm = rm };
                         }
+                    }
+                    if ((inst & 0x0fff_fff0) == 0x0121_f000) {
+                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.msr_cpsr_c_al), .rm = rm };
                     }
                 }
                 return .{ .raw = inst, .op = @intFromEnum(ArmOp.misc_000) };
@@ -520,6 +558,14 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                         .rd = rd,
                         .imm = imm16,
                     };
+                }
+                if (op == 0b1001 and rn == 0) {
+                    const hint = inst & 0xff;
+                    if (hint == 0 or hint > 3) {
+                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.nop_al) };
+                    } else if (hint == 1 or hint == 2) {
+                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.yield_wfe_al) };
+                    }
                 }
                 return .{ .raw = inst, .op = @intFromEnum(ArmOp.dp_imm_general) };
             }
@@ -938,6 +984,30 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                                 }
                             }
                             return .{ .raw = inst, .op = @intFromEnum(ArmOp.vfp_dp_al) };
+                        }
+                    }
+                } else if (cp_num == 15 and top3 == 0b111 and (inst & 0x0f00_0010) == 0x0e00_0010) {
+                    const opc1: u3 = @truncate((inst >> 21) & 7);
+                    const l = (inst & (1 << 20)) != 0;
+                    const crn: u4 = @truncate((inst >> 16) & 0xf);
+                    const rt: u8 = @truncate((inst >> 12) & 0xf);
+                    const crm: u4 = @truncate(inst & 0xf);
+                    const opc2: u3 = @truncate((inst >> 5) & 7);
+                    if (opc1 == 0 and rt != 15) {
+                        if (l and crn == 13 and crm == 0) {
+                            if (opc2 == 3) {
+                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mrc_tpidruro_al), .rd = rt };
+                            } else if (opc2 == 2) {
+                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mrc_tpidrurw_al), .rd = rt };
+                            } else if (opc2 == 4) {
+                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mrc_tpidrprw_al), .rd = rt };
+                            }
+                        } else if (!l and crn == 7) {
+                            if (crm == 10 and (opc2 == 4 or opc2 == 5)) {
+                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mcr_barrier_al), .rd = @intFromBool(opc2 == 4) };
+                            } else if (crm == 5 and (opc2 == 4 or opc2 == 6)) {
+                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.nop_al) };
+                            }
                         }
                     }
                 }
@@ -2747,6 +2817,71 @@ pub fn Arm1176(comptime Bus: type) type {
                         code_vbase = 0xffff_ffff;
                         data_r_vbase = 0xffff_ffff;
                         data_w_vbase = 0xffff_ffff;
+                    },
+                    .mrs_cpsr_al => self.r[d.rd] = self.cpsr,
+                    .msr_cpsr_c_al => {
+                        if (priv != 0) {
+                            const val = self.r[d.rm];
+                            if ((val & 0x1f) == (self.cpsr & 0x1f) and (val & PsrFlags.T) == 0) {
+                                self.cpsr = (self.cpsr & 0xffff_ff00) | (val & 0xff);
+                                if (self.checkInterrupts(bus)) {
+                                    priv = @intFromBool(self.isPrivileged());
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = 0xffff_ffff;
+                                    data_w_vbase = 0xffff_ffff;
+                                }
+                            } else {
+                                self.setCpsr((self.cpsr & 0xffff_ff00) | (val & 0xff));
+                                _ = self.checkInterrupts(bus);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = 0xffff_ffff;
+                                data_w_vbase = 0xffff_ffff;
+                            }
+                        }
+                    },
+                    .mrc_tpidruro_al => self.r[d.rd] = self.mmu.tpidruro,
+                    .mrc_tpidrurw_al => self.r[d.rd] = self.mmu.tpidrurw,
+                    .mrc_tpidrprw_al => {
+                        if (priv != 0) {
+                            self.r[d.rd] = self.mmu.tpidrprw;
+                        } else {
+                            self.enterException(.und, 0x04, pc +% 4, false);
+                            priv = 1;
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = 0xffff_ffff;
+                            data_w_vbase = 0xffff_ffff;
+                        }
+                    },
+                    .mcr_barrier_al => self.memoryBarrier(bus, d.rd != 0),
+                    .nop_al => {},
+                    .yield_wfe_al => {
+                        self.yield_slice = true;
+                        break;
+                    },
+                    .clrex_al => self.excl_valid = false,
+                    .dmb_dsb_v7_al => {
+                        self.memoryBarrier(bus, d.rd != 0);
+                        if (self.last_dmb_pc == pc) {
+                            self.yield_slice = true;
+                            break;
+                        } else {
+                            self.last_dmb_pc = pc;
+                        }
+                    },
+                    .cpsid_al => {
+                        if (priv != 0) self.cpsr |= imm32;
+                    },
+                    .cpsie_al => {
+                        if (priv != 0) {
+                            self.cpsr &= imm32;
+                            if (self.checkInterrupts(bus)) {
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = 0xffff_ffff;
+                                data_w_vbase = 0xffff_ffff;
+                            }
+                        }
                     },
                     .misc_000 => {
                         self.executeMisc000(pc, inst);
