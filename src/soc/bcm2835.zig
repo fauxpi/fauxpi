@@ -724,7 +724,11 @@ pub const Bcm2835 = struct {
                 .pv2 => if (addr -% pv_mod.PixelValve.PV2_BASE < pv_mod.PixelValve.SIZE) self.pv2.read32(addr - pv_mod.PixelValve.PV2_BASE) else 0,
                 .hdmi_hd => if (addr -% hdmi_mod.Hdmi.HD_BASE < hdmi_mod.Hdmi.HD_SIZE) self.hdmi.readHd32(addr - hdmi_mod.Hdmi.HD_BASE) else 0,
                 .hdmi_core => if (addr -% hdmi_mod.Hdmi.HDMI_BASE < hdmi_mod.Hdmi.HDMI_SIZE) self.hdmi.readHdmi32(addr - hdmi_mod.Hdmi.HDMI_BASE) else 0,
-                .usb => self.usb.read32(addr - dwc2_mod.Dwc2Controller.BASE_ADDR),
+                .usb => blk: {
+                    const v = self.usb.read32(addr - dwc2_mod.Dwc2Controller.BASE_ADDR);
+                    self.updateIrqsBank1();
+                    break :blk v;
+                },
                 .v3d => self.v3d.read32(addr - v3d_mod.V3d.BASE_ADDR),
             };
         }

@@ -90,6 +90,7 @@ pub const Dwc2Controller = struct {
     pending_csplit_sof: bool = false,
     sof_wakeup_frames: u8 = 16,
     wake_attempts: u8 = 0,
+    last_mmio_offset: u32 = 0,
     haintmsk: u32 = 0,
     hprt0: u32 = HPRT0_PRTCONNSTS | HPRT0_PRTSPD_HIGH,
     pcgcctl: u32 = 0,
@@ -146,7 +147,7 @@ pub const Dwc2Controller = struct {
 
     pub fn wakeIfPending(self: *Dwc2Controller) void {
         self.syncRootPortConnection();
-        if (self.hid.hasPendingInterruptIn() or !self.hid.allConnectedDevicesConfigured() or self.pending_csplit_sof) {
+        if (self.hid.hasPendingInterruptIn() or self.hid.hasEthBulkIn() or !self.hid.allConnectedDevicesConfigured() or self.pending_csplit_sof) {
             self.sof_wakeup_frames = 8;
             if ((self.gintmsk & GINTSTS_SOF) != 0 and (self.gintsts & GINTSTS_SOF) == 0 and self.wake_attempts < 8) {
                 self.wake_attempts += 1;
@@ -166,16 +167,15 @@ pub const Dwc2Controller = struct {
         self.wake_attempts = 0;
         self.pollNetwork(ram);
 
-        const has_pending = self.hid.hasPendingInterruptIn() or !self.hid.allConnectedDevicesConfigured();
+        const has_pending = self.hid.hasPendingInterruptIn() or self.hid.hasEthBulkIn() or !self.hid.allConnectedDevicesConfigured();
         if (has_pending) {
             self.sof_wakeup_frames = 8;
         }
-        const need_sof = self.pending_csplit_sof or has_pending or (self.sof_wakeup_frames > 0);
         self.pending_csplit_sof = false;
         if (!has_pending and self.sof_wakeup_frames > 0) {
             self.sof_wakeup_frames -= 1;
         }
-        if (need_sof and (self.gintmsk & GINTSTS_SOF) != 0) {
+        if ((self.gintmsk & GINTSTS_SOF) != 0) {
             self.gintsts |= GINTSTS_SOF;
         }
     }
@@ -239,6 +239,8 @@ pub const Dwc2Controller = struct {
 
     pub fn read32(self: *Dwc2Controller, offset: u32) u32 {
         self.syncRootPortConnection();
+        const prev_offset = self.last_mmio_offset;
+        self.last_mmio_offset = offset;
         if (offset >= 0x500 and offset < 0x500 + NUM_CHANNELS * 0x20) {
             const ch_idx = (offset - 0x500) / 0x20;
             const reg = (offset - 0x500) % 0x20;
@@ -255,6 +257,10 @@ pub const Dwc2Controller = struct {
             };
         }
 
+        if (offset >= 0x104 and offset < 0x140) {
+            return (256 << 16) | 0x400; // DPTXFSIZN(1..15)
+        }
+
         return switch (offset) {
             0x000 => self.gotgctl,
             0x004 => self.gotgint,
@@ -262,7 +268,25 @@ pub const Dwc2Controller = struct {
             0x00c => self.gusbcfg,
             0x010 => 0x80000000, // GRSTCTL: AHBIDLE=1, CSFTRST=0
             0x014 => self.effectiveGintsts(),
-            0x018 => self.gintmsk,
+            0x018 => {
+                // In Linux's dwc2 driver (`dwc2_hcd_urb_enqueue`), non-periodic Control and Bulk URBs
+                // (such as Ethernet Bulk OUT TX and Bulk IN RX replenishment) are placed into
+                // `non_periodic_sched_inactive` followed only by `dwc2_readl(hsotg, GINTMSK)`. When
+                // `GINTSTS_SOF` is enabled in `GINTMSK`, `dwc2_hcd_urb_enqueue` does not start the
+                // transfer directly and instead waits for the next `GINTSTS_SOF` interrupt (`dwc2_sof_intr`).
+                const is_core_intr_or_perio = (prev_offset == 0x014) or
+                    (prev_offset == 0x410) or
+                    (prev_offset >= 0x500 and prev_offset < 0x500 + NUM_CHANNELS * 0x20);
+                if (!is_core_intr_or_perio and (self.gintmsk & GINTSTS_SOF) != 0) {
+                    self.sof_wakeup_frames = 8;
+                    if ((self.gintsts & GINTSTS_SOF) == 0 and self.wake_attempts < 32) {
+                        self.wake_attempts += 1;
+                        self.hfnum = (self.hfnum + 1) & 0x3fff;
+                        self.gintsts |= GINTSTS_SOF;
+                    }
+                }
+                return self.gintmsk;
+            },
             0x024 => self.grxfsiz,
             0x028 => self.gnptxfsiz,
             0x02c => (8 << 16) | ((self.gnptxfsiz >> 16) & 0xffff), // GNPTXSTS
@@ -287,6 +311,7 @@ pub const Dwc2Controller = struct {
 
     pub fn write32(self: *Dwc2Controller, offset: u32, val: u32, ram: []u8) void {
         self.syncRootPortConnection();
+        self.last_mmio_offset = offset;
         if (offset >= 0x500 and offset < 0x500 + NUM_CHANNELS * 0x20) {
             const ch_idx = (offset - 0x500) / 0x20;
             const reg = (offset - 0x500) % 0x20;
@@ -819,5 +844,44 @@ test "DWC2 multi-device USB Hub, Ethernet, Keyboard, and Mouse enumeration and t
     try std.testing.expect((dwc2.read32(0x568) & Dwc2Controller.HCINT_XFERCOMP) != 0);
     try std.testing.expectEqual(@as(u32, 1536 - 42), dwc2.read32(0x570) & 0x7ffff);
     try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, ram[0x800 + 20 ..][0..2], .big));
+}
+
+test "DWC2 asserts GINTSTS_SOF on dwc2_hcd_urb_enqueue GINTMSK read and tickSof to prevent Ethernet TX timeouts" {
+    var dwc2 = Dwc2Controller{};
+    defer dwc2.hid.net.deinit();
+    var ram: [256]u8 = [_]u8{0} ** 256;
+
+    // Enable global interrupts and unmask GINTSTS_SOF + GINTSTS_HCHINT (as Linux dwc2 does when periodic endpoints are active)
+    dwc2.write32(0x008, Dwc2Controller.GAHBCFG_GLBL_INTR_EN | Dwc2Controller.GAHBCFG_DMA_EN, &ram);
+    dwc2.write32(0x018, Dwc2Controller.GINTSTS_SOF | Dwc2Controller.GINTSTS_HCHINT, &ram);
+
+    // Simulate all USB devices configured and 20 idle vblanks elapsing so sof_wakeup_frames reaches 0
+    dwc2.hid.hub_configured = true;
+    dwc2.hid.eth_configured = true;
+    dwc2.hid.kbd_configured = true;
+    dwc2.hid.mouse_configured = true;
+    dwc2.hid.eth_notif_polled = true;
+    dwc2.hid.reported_link_up = true;
+
+    for (0..20) |_| {
+        dwc2.tickSof(&ram);
+        // Even after sof_wakeup_frames reaches 0, tickSof must still assert GINTSTS_SOF when unmasked
+        try std.testing.expect((dwc2.read32(0x014) & Dwc2Controller.GINTSTS_SOF) != 0);
+        // Simulate dwc2_read_core_intr: read GINTSTS (0x014) followed by GINTMSK (0x018)
+        _ = dwc2.read32(0x018);
+        // Clear GINTSTS_SOF and read HFNUM (0x408) as dwc2_sof_intr does
+        dwc2.write32(0x014, Dwc2Controller.GINTSTS_SOF, &ram);
+        _ = dwc2.read32(0x408);
+        try std.testing.expect(!dwc2.irqPending());
+    }
+    try std.testing.expectEqual(@as(u8, 0), dwc2.sof_wakeup_frames);
+
+    // Now simulate dwc2_hcd_urb_enqueue enqueuing an Ethernet Bulk OUT TX URB:
+    // When GINTSTS_SOF is set in GINTMSK, dwc2_hcd_urb_enqueue only reads GINTMSK (0x018) and returns.
+    const intr_mask = dwc2.read32(0x018);
+    try std.testing.expect((intr_mask & Dwc2Controller.GINTSTS_SOF) != 0);
+    // Dwc2Controller must immediately assert GINTSTS_SOF so dwc2_sof_intr schedules the Bulk OUT QH!
+    try std.testing.expect(dwc2.irqPending());
+    try std.testing.expect((dwc2.read32(0x014) & Dwc2Controller.GINTSTS_SOF) != 0);
 }
 

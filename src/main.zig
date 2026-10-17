@@ -694,7 +694,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     (w.pending_scale != w.scale) or
                     soc.usb.pending_csplit_sof or
                     (soc.usb.sof_wakeup_frames > 0) or
-                    soc.usb.hid.hasPendingInterruptIn();
+                    soc.usb.hid.hasPendingInterruptIn() or
+                    soc.usb.hid.hasEthBulkIn();
 
                 const sleep_start_ns = monotonicNs();
                 const sleep_us: u64 = if (guest_vblank_irq_enabled or has_activity) blk: {
@@ -751,7 +752,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 }
                 const usb_active = soc.usb.pending_csplit_sof or
                     (soc.usb.sof_wakeup_frames > 0) or
-                    soc.usb.hid.hasPendingInterruptIn();
+                    soc.usb.hid.hasPendingInterruptIn() or
+                    soc.usb.hid.hasEthBulkIn();
                 const until_vblank_us: u64 = 16_667 -| (soc.timer.counter -| last_guest_vblank_us);
                 var jump = @min(timer_wait_us, @max(until_vblank_us, 1));
                 if (usb_active) jump = @min(jump, 1000);
