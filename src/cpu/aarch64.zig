@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const mmu_mod = @import("mmu.zig");
+const atomic_ram = @import("atomic_ram.zig");
 
 pub const PstateFlags = struct {
     pub const N: u32 = 1 << 31;
@@ -1565,6 +1566,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
 
             while (executed < limit) {
                 if (cpu.mmu.halted_wfi or cpu.yield_slice or !cpu.is_aarch64) break;
+                if ((executed & 255) == 0 and atomic_ram.busParallel(bus)) {
+                    // Apply TLB invalidations other cores broadcast while this slice runs
+                    if (bus.smp.serviceTlb(cpu.mmu.core_id, &cpu.mmu)) code_vbase = 0xffff_ffff_ffff_ffff;
+                }
                 if (executed >= max_steps and (cpu.pstate & PstateFlags.I) == 0) break;
 
                 const cur_pc = cpu.pc64;
@@ -2118,9 +2123,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
                         if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
                             const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
+                            const loaded = std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
                             cpu.excl_valid = true;
                             cpu.excl_paddr = paddr & ~@as(u32, 7);
-                            setX(cpu, @truncate(d.rd), std.mem.readInt(u64, bus.ram[paddr..][0..8], .little));
+                            cpu.excl_val = loaded;
+                            setX(cpu, @truncate(d.rd), loaded);
                         } else {
                             executeLoadStoreExcl(cpu, bus, inst) catch {
                                 handleAbort64(cpu, cur_pc);
@@ -2137,9 +2144,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
                             const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
                             if (cpu.excl_valid and (paddr & ~@as(u32, 7)) == cpu.excl_paddr) {
-                                std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
+                                const stored = atomic_ram.compareAndSwap(u64, bus.ram, paddr, cpu.excl_val, val);
                                 cpu.excl_valid = false;
-                                setW(cpu, @truncate(d.rm), 0);
+                                setW(cpu, @truncate(d.rm), if (stored) 0 else 1);
                             } else {
                                 cpu.excl_valid = false;
                                 setW(cpu, @truncate(d.rm), 1);
@@ -2158,9 +2165,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
                         if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
                             const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
+                            const loaded = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
                             cpu.excl_valid = true;
                             cpu.excl_paddr = paddr & ~@as(u32, 7);
-                            setW(cpu, @truncate(d.rd), std.mem.readInt(u32, bus.ram[paddr..][0..4], .little));
+                            cpu.excl_val = loaded;
+                            setW(cpu, @truncate(d.rd), loaded);
                         } else {
                             executeLoadStoreExcl(cpu, bus, inst) catch {
                                 handleAbort64(cpu, cur_pc);
@@ -2177,9 +2186,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
                             const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
                             if (cpu.excl_valid and (paddr & ~@as(u32, 7)) == cpu.excl_paddr) {
-                                std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
+                                const stored = atomic_ram.compareAndSwap(u32, bus.ram, paddr, @truncate(cpu.excl_val), val);
                                 cpu.excl_valid = false;
-                                setW(cpu, @truncate(d.rm), 0);
+                                setW(cpu, @truncate(d.rm), if (stored) 0 else 1);
                             } else {
                                 cpu.excl_valid = false;
                                 setW(cpu, @truncate(d.rm), 1);
@@ -3502,6 +3511,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     if (op2 == 2) {
                         cpu.excl_valid = false; // CLREX
                     } else if (op2 == 4 or op2 == 5) {
+                        if (atomic_ram.busParallel(bus)) {
+                            atomic_ram.fence(&cpu.fence_word);
+                            // DSB completes this core's TLBI ...IS on every other core
+                            if (op2 == 4) bus.smp.broadcastTlb(cpu.mmu.core_id, &cpu.mmu);
+                        }
                         const pc32: u32 = @truncate(cur_pc);
                         if ((cpu.last_dmb_pc ^ pc32) < 256) {
                             cpu.yield_slice = true;
@@ -3578,8 +3592,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 setX(cpu, rt, readSysReg(cpu, op0, op1, crn, crm, op2));
             } else {
                 writeSysReg(cpu, op0, op1, crn, crm, op2, getX(cpu, rt));
-                if (crn == 14 and @hasField(Bus, "local_intc")) {
-                    bus.local_intc.core_timer_lines[cpu.mmu.core_id] = cpu.mmu.timer_irq_lines;
+                if (crn == 14) {
+                    if (@hasDecl(Bus, "setCoreTimerLines")) {
+                        bus.setCoreTimerLines(cpu.mmu.core_id, cpu.mmu.timer_irq_lines);
+                    } else if (@hasField(Bus, "local_intc")) {
+                        bus.local_intc.core_timer_lines[cpu.mmu.core_id] = cpu.mmu.timer_irq_lines;
+                    }
                 }
             }
         }
@@ -4117,28 +4135,33 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 // Exclusive Load/Store (single `o1=0` or pair `o1=1`)
                 if (is_load) {
                     const paddr = try cpu.mmu.translate64AtEl(bus.ram, addr, .read, currentEl(cpu));
-                    cpu.excl_valid = true;
-                    cpu.excl_paddr = paddr & ~@as(u32, 7);
                     if (!o1) {
-                        switch (size) {
-                            0 => setW(cpu, rt, try readData8(cpu, bus, addr)),
-                            1 => setW(cpu, rt, try readData16(cpu, bus, addr)),
-                            2 => setW(cpu, rt, try readData32(cpu, bus, addr)),
-                            3 => setX(cpu, rt, try readData64(cpu, bus, addr)),
-                        }
+                        const loaded: u64 = switch (size) {
+                            0 => try readData8(cpu, bus, addr),
+                            1 => try readData16(cpu, bus, addr),
+                            2 => try readData32(cpu, bus, addr),
+                            3 => try readData64(cpu, bus, addr),
+                        };
+                        if (size == 3) setX(cpu, rt, loaded) else setW(cpu, rt, @truncate(loaded));
+                        cpu.excl_val = loaded;
                     } else {
                         if (size == 2) {
                             const v1 = try readData32(cpu, bus, addr);
                             const v2 = try readData32(cpu, bus, addr +% 4);
                             setW(cpu, rt, v1);
                             setW(cpu, rt2, v2);
+                            cpu.excl_val = @as(u64, v1) | (@as(u64, v2) << 32);
                         } else {
                             const v1 = try readData64(cpu, bus, addr);
                             const v2 = try readData64(cpu, bus, addr +% 8);
                             setX(cpu, rt, v1);
                             setX(cpu, rt2, v2);
+                            cpu.excl_val = v1;
+                            cpu.excl_val_hi = v2;
                         }
                     }
+                    cpu.excl_valid = true;
+                    cpu.excl_paddr = paddr & ~@as(u32, 7);
                 } else {
                     const paddr = try cpu.mmu.translate64AtEl(bus.ram, addr, .write, currentEl(cpu));
                     if (!cpu.excl_valid or (paddr & ~@as(u32, 7)) != cpu.excl_paddr) {
@@ -4147,6 +4170,19 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         return;
                     }
                     cpu.excl_valid = false;
+                    if (paddr < bus.ram.len) {
+                        const stored = if (!o1) switch (size) {
+                            0 => atomic_ram.compareAndSwap(u8, bus.ram, paddr, @truncate(cpu.excl_val), @truncate(getW(cpu, rt))),
+                            1 => atomic_ram.compareAndSwap(u16, bus.ram, paddr, @truncate(cpu.excl_val), @truncate(getW(cpu, rt))),
+                            2 => atomic_ram.compareAndSwap(u32, bus.ram, paddr, @truncate(cpu.excl_val), getW(cpu, rt)),
+                            3 => atomic_ram.compareAndSwap(u64, bus.ram, paddr, cpu.excl_val, getX(cpu, rt)),
+                        } else if (size == 2)
+                            atomic_ram.compareAndSwap(u64, bus.ram, paddr, cpu.excl_val, @as(u64, getW(cpu, rt)) | (@as(u64, getW(cpu, rt2)) << 32))
+                        else
+                            atomic_ram.compareAndSwap(u128, bus.ram, paddr, @as(u128, cpu.excl_val) | (@as(u128, cpu.excl_val_hi) << 64), @as(u128, getX(cpu, rt)) | (@as(u128, getX(cpu, rt2)) << 64));
+                        setW(cpu, rs, if (stored) 0 else 1);
+                        return;
+                    }
                     if (!o1) {
                         switch (size) {
                             0 => try writeData8(cpu, bus, addr, @truncate(getW(cpu, rt))),
@@ -4167,6 +4203,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 }
             } else {
                 // Load-Acquire / Store-Release (`LDAR` / `STLR`)
+                const parallel = atomic_ram.busParallel(bus);
+                if (parallel) atomic_ram.fence(&cpu.fence_word);
+                defer if (parallel) atomic_ram.fence(&cpu.fence_word);
                 if (is_load) {
                     switch (size) {
                         0 => setW(cpu, rt, try readData8(cpu, bus, addr)),

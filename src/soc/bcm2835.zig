@@ -18,6 +18,7 @@ const hdmi_mod = @import("../vc4/hdmi.zig");
 const audio_mod = @import("audio.zig");
 const local_intc_mod = @import("local_intc.zig");
 const spi_mod = @import("spi.zig");
+const smp_mod = @import("smp.zig");
 
 /// Complete BCM2835 / BCM2837 SoC Bus & Peripherals.
 /// Directly satisfies the `Bus` concept required by `Arm1176(Bcm2835)`.
@@ -69,6 +70,7 @@ pub const Bcm2835 = struct {
     pwm: audio_mod.PwmAudio = .{},
     i2s: audio_mod.I2sPcm = .{},
     spi0: spi_mod.Spi0 = .{},
+    smp: smp_mod.Smp = .{},
 
     display_width: u16 = 1280,
     display_height: u16 = 720,
@@ -96,13 +98,23 @@ pub const Bcm2835 = struct {
     }
 
     pub inline fn hasPendingIrqForCore(self: *const Bcm2835, core_id: u2) bool {
+        if (self.smp.parallel) return ((self.smp.irq_summary.load(.monotonic) >> core_id) & 1) != 0;
+        return self.computeIrqPendingForCore(core_id);
+    }
+
+    pub inline fn hasPendingFiqForCore(self: *const Bcm2835, core_id: u2) bool {
+        if (self.smp.parallel) return ((self.smp.irq_summary.load(.monotonic) >> (@as(u5, core_id) + 4)) & 1) != 0;
+        return self.computeFiqPendingForCore(core_id);
+    }
+
+    inline fn computeIrqPendingForCore(self: *const Bcm2835, core_id: u2) bool {
         if (self.is_bcm2837) {
             return self.local_intc.irqPendingForCore(core_id, self.intc.hasPendingIrq()) != 0;
         }
         return core_id == 0 and self.intc.hasPendingIrq();
     }
 
-    pub inline fn hasPendingFiqForCore(self: *const Bcm2835, core_id: u2) bool {
+    inline fn computeFiqPendingForCore(self: *const Bcm2835, core_id: u2) bool {
         if (self.is_bcm2837) {
             return self.local_intc.fiqPendingForCore(core_id, self.intc.hasPendingFiq()) != 0;
         }
@@ -115,6 +127,46 @@ pub const Bcm2835 = struct {
 
     pub inline fn hasPendingFiq(self: *const Bcm2835) bool {
         return self.hasPendingFiqForCore(0);
+    }
+
+    /// Recomputes `smp.irq_summary` from the interrupt controllers for every core.
+    pub fn publishIrqSummary(self: *Bcm2835) void {
+        var summary: u32 = 0;
+        for (0..smp_mod.max_cores) |i| {
+            const cid: u2 = @intCast(i);
+            if (self.computeIrqPendingForCore(cid)) summary |= @as(u32, 1) << cid;
+            if (self.computeFiqPendingForCore(cid)) summary |= @as(u32, 1) << (@as(u5, cid) + 4);
+        }
+        self.smp.irq_summary.store(summary, .release);
+    }
+
+    /// Updates the generic timer interrupt lines of `core_id` after a CPU writes its timer registers.
+    pub fn setCoreTimerLines(self: *Bcm2835, core_id: u2, lines: u4) void {
+        if (!self.smp.parallel) {
+            self.local_intc.core_timer_lines[core_id] = lines;
+            return;
+        }
+        self.smp.device_lock.lock();
+        defer self.smp.device_lock.unlock();
+        self.local_intc.core_timer_lines[core_id] = lines;
+        self.publishIrqSummary();
+    }
+
+    inline fn cpuReadMmio32(self: *Bcm2835, addr: u32) u32 {
+        if (!self.smp.parallel) return self.readMmio32(addr);
+        self.smp.device_lock.lock();
+        defer self.smp.device_lock.unlock();
+        const val = self.readMmio32(addr);
+        self.publishIrqSummary();
+        return val;
+    }
+
+    inline fn cpuWriteMmio32(self: *Bcm2835, addr: u32, val: u32) void {
+        if (!self.smp.parallel) return self.writeMmio32(addr, val);
+        self.smp.device_lock.lock();
+        defer self.smp.device_lock.unlock();
+        self.writeMmio32(addr, val);
+        self.publishIrqSummary();
     }
 
     fn dmaMmio(self: *Bcm2835) dma_mod.DmaController.MmioIo {
@@ -555,7 +607,7 @@ pub const Bcm2835 = struct {
             if (ram_off < self.ram.len) return self.ram[ram_off];
             return 0;
         }
-        const word = self.readMmio32(addr & ~@as(u32, 3));
+        const word = self.cpuReadMmio32(addr & ~@as(u32, 3));
         const shift: u5 = @intCast((addr & 3) * 8);
         return @truncate(word >> shift);
     }
@@ -567,7 +619,7 @@ pub const Bcm2835 = struct {
             if (ram_off + 2 <= self.ram.len) return std.mem.readInt(u16, self.ram[ram_off..][0..2], .little);
             return 0;
         }
-        const word = self.readMmio32(addr & ~@as(u32, 3));
+        const word = self.cpuReadMmio32(addr & ~@as(u32, 3));
         const shift: u5 = @intCast((addr & 2) * 8);
         return @truncate(word >> shift);
     }
@@ -579,7 +631,7 @@ pub const Bcm2835 = struct {
             if (ram_off + 4 <= self.ram.len) return std.mem.readInt(u32, self.ram[ram_off..][0..4], .little);
             return 0;
         }
-        return self.readMmio32(addr & ~@as(u32, 3));
+        return self.cpuReadMmio32(addr & ~@as(u32, 3));
     }
 
     pub fn write8(self: *Bcm2835, raw_addr: u32, val: u8) void {
@@ -589,7 +641,7 @@ pub const Bcm2835 = struct {
             if (ram_off < self.ram.len) self.ram[ram_off] = val;
             return;
         }
-        self.writeMmio32(addr & ~@as(u32, 3), val);
+        self.cpuWriteMmio32(addr & ~@as(u32, 3), val);
     }
 
     pub fn write16(self: *Bcm2835, raw_addr: u32, val: u16) void {
@@ -599,7 +651,7 @@ pub const Bcm2835 = struct {
             if (ram_off + 2 <= self.ram.len) std.mem.writeInt(u16, self.ram[ram_off..][0..2], val, .little);
             return;
         }
-        self.writeMmio32(addr & ~@as(u32, 3), val);
+        self.cpuWriteMmio32(addr & ~@as(u32, 3), val);
     }
 
     pub fn write32(self: *Bcm2835, raw_addr: u32, val: u32) void {
@@ -609,7 +661,7 @@ pub const Bcm2835 = struct {
             if (ram_off + 4 <= self.ram.len) std.mem.writeInt(u32, self.ram[ram_off..][0..4], val, .little);
             return;
         }
-        self.writeMmio32(addr & ~@as(u32, 3), val);
+        self.cpuWriteMmio32(addr & ~@as(u32, 3), val);
     }
 
     pub fn readMmio32(self: *Bcm2835, addr: u32) u32 {

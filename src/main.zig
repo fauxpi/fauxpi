@@ -10,6 +10,7 @@ pub const mmu = @import("cpu/mmu.zig");
 pub const vfp = @import("cpu/vfp.zig");
 pub const decoder = @import("cpu/decoder.zig");
 pub const arm1176 = @import("cpu/arm1176.zig");
+pub const atomic_ram = @import("cpu/atomic_ram.zig");
 
 pub const intc = @import("soc/intc.zig");
 pub const local_intc = @import("soc/local_intc.zig");
@@ -27,6 +28,7 @@ pub const bluetooth = @import("soc/bluetooth.zig");
 pub const i2c = @import("soc/i2c.zig");
 pub const soc_audio = @import("soc/audio.zig");
 pub const bcm2835 = @import("soc/bcm2835.zig");
+pub const smp = @import("soc/smp.zig");
 
 pub const hid = @import("usb/hid.zig");
 pub const usb_net = @import("usb/net.zig");
@@ -68,6 +70,7 @@ const CliOptions = struct {
     power: bool = false,
     headless: bool = false,
     max_steps: u64 = 0,
+    sequential_cores: bool = false,
 };
 
 fn readFileLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -122,6 +125,7 @@ fn printUsage() void {
         \\  --height <px>       HDMI output height (default: 720)
         \\  --headless          Run without opening a desktop window
         \\  --max-steps <n>     Stop simulation after <n> ARM instructions
+        \\  --sequential-cores  Run all emulated cores on one host thread (deterministic)
         \\  --help              Show this help message
         \\
     ;
@@ -203,6 +207,8 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--max-steps")) {
             const s = args.next() orelse return 1;
             opts.max_steps = std.fmt.parseInt(u64, s, 10) catch return 1;
+        } else if (std.mem.eql(u8, arg, "--sequential-cores")) {
+            opts.sequential_cores = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             printUsage();
             return 0;
@@ -374,6 +380,9 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     defer soc.usb.hid.net.deinit();
     var cpus: [4]Cpu = @splat(.{});
     var num_cores: usize = 1;
+    var runner = smp.Runner(Cpu, Bcm2835).init(&cpus, &soc);
+    if (!opts.sequential_cores) runner.start();
+    defer runner.deinit();
     var guest_booted = false;
     var boot_failed = false;
 
@@ -600,31 +609,16 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         else
             @intCast(max_slice);
 
-        var max_ran: usize = 0;
+        // Cores in WFI with nothing pending would return immediately; leave them out of the slice.
+        var active: u4 = 0;
         for (0..num_cores) |i| {
             if (cpus[i].halted_spin) continue;
-            const ran = cpus[i].runSteps(&soc, batch);
-            if (ran > max_ran) max_ran = ran;
-            if (cpus[i].mmu.tlb_broadcast_full) {
-                cpus[i].mmu.tlb_broadcast_full = false;
-                cpus[i].mmu.tlb_broadcast_va_count = 0;
-                for (0..num_cores) |j| {
-                    if (j != i) {
-                        cpus[j].mmu.flushTlb();
-                    }
-                }
-            } else if (cpus[i].mmu.tlb_broadcast_va_count > 0) {
-                const count = cpus[i].mmu.tlb_broadcast_va_count;
-                cpus[i].mmu.tlb_broadcast_va_count = 0;
-                for (0..num_cores) |j| {
-                    if (j != i) {
-                        for (cpus[i].mmu.tlb_broadcast_vas[0..count]) |va_arg| {
-                            cpus[j].mmu.flushTlbVa64(va_arg);
-                        }
-                    }
-                }
+            const cid: u2 = @intCast(i);
+            if (!cpus[i].mmu.halted_wfi or soc.hasPendingIrqForCore(cid) or soc.hasPendingFiqForCore(cid)) {
+                active |= @as(u4, 1) << cid;
             }
         }
+        const max_ran = runner.runSlice(active, batch);
 
         // Advance 1 MHz system timer and ARM timer proportionally to instructions executed (~256 instructions per us)
         const timer_ticks: u64 = if (max_ran > 0) @max(max_ran / 256, 1) else 1;

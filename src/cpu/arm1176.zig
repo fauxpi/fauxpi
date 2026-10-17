@@ -13,6 +13,7 @@ const mmu_mod = @import("mmu.zig");
 const vfp_mod = @import("vfp.zig");
 const dec = @import("decoder.zig");
 const aarch64_mod = @import("aarch64.zig");
+const atomic_ram = @import("atomic_ram.zig");
 
 pub const Mmu = mmu_mod.Mmu;
 pub const Vfp = vfp_mod.Vfp;
@@ -851,6 +852,12 @@ pub fn Arm1176(comptime Bus: type) type {
         /// Exclusive monitor state (`LDREX` / `STREX` / `CLREX`)
         excl_valid: bool = false,
         excl_paddr: u32 = 0,
+        /// Value returned by the last load-exclusive (`excl_val_hi` holds the upper half of a 128-bit pair);
+        /// the store-exclusive is a compare-and-swap against it so it fails if another core wrote in between
+        excl_val: u64 = 0,
+        excl_val_hi: u64 = 0,
+        /// Private word for host memory barriers (`DMB` / `DSB` while cores run in parallel)
+        fence_word: u32 = 0,
         /// True for secondary SMP cores (`1..3`) before wakeup via Mailbox 3 or spin-table
         halted_spin: bool = false,
         /// True when `WFE` or `YIELD` executes so the SMP scheduler switches to the next core immediately
@@ -1076,6 +1083,41 @@ pub fn Arm1176(comptime Bus: type) type {
             return lo | (hi << 32);
         }
 
+        /// Completes a store-exclusive of `val` at `vaddr` and returns the `STREX` status (0 = stored).
+        /// RAM stores are a compare-and-swap against the value the load-exclusive returned.
+        fn storeExclusive(self: *Self, bus: *Bus, comptime T: type, vaddr: u32, val: T, privileged: bool) error{Abort}!u32 {
+            const paddr = try self.mmu.translate(bus.ram, vaddr, .write, privileged);
+            if (!self.excl_valid) return 1;
+            self.excl_valid = false;
+            if (paddr < bus.ram.len) {
+                return if (atomic_ram.compareAndSwap(T, bus.ram, paddr, @truncate(self.excl_val), val)) 0 else 1;
+            }
+            switch (T) {
+                u8 => try self.write8(bus, vaddr, val),
+                u16 => try self.write16(bus, vaddr, val),
+                u32 => try self.write32(bus, vaddr, val),
+                u64 => try self.write64(bus, vaddr, val),
+                else => @compileError("unsupported store-exclusive size"),
+            }
+            return 0;
+        }
+
+        /// Guest `DMB` / `DSB`: a host barrier while cores run in parallel. `DSB` also completes this
+        /// core's `TLBI*IS` invalidations on the other cores.
+        inline fn memoryBarrier(self: *Self, bus: *Bus, is_dsb: bool) void {
+            if (!atomic_ram.busParallel(bus)) return;
+            atomic_ram.fence(&self.fence_word);
+            if (is_dsb) bus.smp.broadcastTlb(self.mmu.core_id, &self.mmu);
+        }
+
+        fn syncCoreTimerLines(self: *Self, bus: *Bus) void {
+            if (@hasDecl(Bus, "setCoreTimerLines")) {
+                bus.setCoreTimerLines(self.mmu.core_id, self.mmu.timer_irq_lines);
+            } else if (@hasField(Bus, "local_intc")) {
+                bus.local_intc.core_timer_lines[self.mmu.core_id] = self.mmu.timer_irq_lines;
+            }
+        }
+
         inline fn write64(self: *Self, bus: *Bus, vaddr: u32, val: u64) error{Abort}!void {
             const priv: u1 = @intFromBool(self.isPrivileged());
             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
@@ -1268,6 +1310,10 @@ pub fn Arm1176(comptime Bus: type) type {
 
             while (executed < limit) {
                 if (executed >= max_steps and (self.cpsr & PsrFlags.I) == 0) break;
+                if ((executed & 255) == 0 and atomic_ram.busParallel(bus)) {
+                    // Apply TLB invalidations other cores broadcast while this slice runs
+                    if (bus.smp.serviceTlb(self.mmu.core_id, &self.mmu)) code_vbase = 0xffff_ffff;
+                }
                 if (self.isThumb()) {
                     const pc = self.r[15] & ~@as(u32, 1);
                     const inst16: u16 = if ((pc & 0xffff_f000) == code_vbase)
@@ -1449,6 +1495,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.r[d.rd] = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
                             self.excl_valid = true;
                             self.excl_paddr = paddr;
+                            self.excl_val = self.r[d.rd];
                         } else {
                             self.r[d.rd] = self.read32(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -1457,6 +1504,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 continue;
                             };
                             self.excl_valid = true;
+                            self.excl_val = self.r[d.rd];
                             const slot2 = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             self.excl_paddr = if ((vaddr & 0xffff_f000) == slot2.r_vbase) (slot2.pbase | (vaddr & 0xfff)) else 0;
                         }
@@ -1467,29 +1515,19 @@ pub fn Arm1176(comptime Bus: type) type {
                         const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                         if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
                             if (self.excl_valid) {
-                                std.mem.writeInt(u32, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..4], val, .little);
-                                self.r[d.rd] = 0;
+                                const stored = atomic_ram.compareAndSwap(u32, bus.ram, slot.pbase | (vaddr & 0xfff), @truncate(self.excl_val), val);
+                                self.r[d.rd] = if (stored) 0 else 1;
                                 self.excl_valid = false;
                             } else {
                                 self.r[d.rd] = 1;
                             }
-                        } else if (self.excl_valid) {
-                            self.write32(bus, vaddr, val) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                continue;
-                            };
-                            self.r[d.rd] = 0;
-                            self.excl_valid = false;
                         } else {
-                            _ = self.mmu.translate(bus.ram, vaddr, .write, priv != 0) catch {
+                            self.r[d.rd] = self.storeExclusive(bus, u32, vaddr, val, priv != 0) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff;
                                 continue;
                             };
-                            self.r[d.rd] = 1;
                         }
                     },
                     .ldrexd_al => {
@@ -1503,45 +1541,23 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.r[d.rd] = @truncate(pair);
                         self.r[d.rd + 1] = @truncate(pair >> 32);
                         self.excl_valid = true;
+                        self.excl_val = pair;
                     },
                     .strexd_al => {
                         const vaddr = self.r[d.rn];
-                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                        if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                            if (self.excl_valid) {
-                                const val: u64 = @as(u64, self.r[d.rm]) | (@as(u64, self.r[d.rm + 1]) << 32);
-                                std.mem.writeInt(u64, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..8], val, .little);
-                                self.r[d.rd] = 0;
-                                self.excl_valid = false;
-                            } else {
-                                self.r[d.rd] = 1;
-                            }
-                        } else if (self.excl_valid) {
-                            const val: u64 = @as(u64, self.r[d.rm]) | (@as(u64, self.r[d.rm + 1]) << 32);
-                            self.write64(bus, vaddr, val) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                continue;
-                            };
-                            self.r[d.rd] = 0;
-                            self.excl_valid = false;
-                        } else {
-                            _ = self.mmu.translate(bus.ram, vaddr, .write, priv != 0) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                continue;
-                            };
-                            self.r[d.rd] = 1;
-                        }
+                        const val: u64 = @as(u64, self.r[d.rm]) | (@as(u64, self.r[d.rm + 1]) << 32);
+                        self.r[d.rd] = self.storeExclusive(bus, u64, vaddr, val, priv != 0) catch {
+                            self.enterException(.abt, 0x10, pc +% 8, false);
+                            priv = 1;
+                            code_vbase = 0xffff_ffff;
+                            continue;
+                        };
                     },
                     .ldrexb_al => {
                         const vaddr = self.r[d.rn];
                         const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                         if ((vaddr & 0xffff_f000) == slot.r_vbase) {
                             self.r[d.rd] = bus.ram[slot.pbase | (vaddr & 0xfff)];
-                            self.excl_valid = true;
                         } else {
                             self.r[d.rd] = self.read8(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -1549,36 +1565,25 @@ pub fn Arm1176(comptime Bus: type) type {
                                 code_vbase = 0xffff_ffff;
                                 continue;
                             };
-                            self.excl_valid = true;
                         }
+                        self.excl_valid = true;
+                        self.excl_val = self.r[d.rd];
                     },
                     .strexb_al => {
                         const vaddr = self.r[d.rn];
                         const val: u8 = @truncate(self.r[d.rm]);
-                        if (self.excl_valid) {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xffff_f000) == slot.w_vbase) {
-                                bus.ram[slot.pbase | (vaddr & 0xfff)] = val;
-                            } else {
-                                self.write8(bus, vaddr, val) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    continue;
-                                };
-                            }
-                            self.r[d.rd] = 0;
-                            self.excl_valid = false;
-                        } else {
-                            self.r[d.rd] = 1;
-                        }
+                        self.r[d.rd] = self.storeExclusive(bus, u8, vaddr, val, priv != 0) catch {
+                            self.enterException(.abt, 0x10, pc +% 8, false);
+                            priv = 1;
+                            code_vbase = 0xffff_ffff;
+                            continue;
+                        };
                     },
                     .ldrexh_al => {
                         const vaddr = self.r[d.rn];
                         const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                         if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
                             self.r[d.rd] = std.mem.readInt(u16, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..2], .little);
-                            self.excl_valid = true;
                         } else {
                             self.r[d.rd] = self.read16(bus, vaddr) catch {
                                 self.enterException(.abt, 0x10, pc +% 8, false);
@@ -1586,29 +1591,19 @@ pub fn Arm1176(comptime Bus: type) type {
                                 code_vbase = 0xffff_ffff;
                                 continue;
                             };
-                            self.excl_valid = true;
                         }
+                        self.excl_valid = true;
+                        self.excl_val = self.r[d.rd];
                     },
                     .strexh_al => {
                         const vaddr = self.r[d.rn];
                         const val: u16 = @truncate(self.r[d.rm]);
-                        if (self.excl_valid) {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
-                                std.mem.writeInt(u16, bus.ram[(slot.pbase | (vaddr & 0xfff))..][0..2], val, .little);
-                            } else {
-                                self.write16(bus, vaddr, val) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    continue;
-                                };
-                            }
-                            self.r[d.rd] = 0;
-                            self.excl_valid = false;
-                        } else {
-                            self.r[d.rd] = 1;
-                        }
+                        self.r[d.rd] = self.storeExclusive(bus, u16, vaddr, val, priv != 0) catch {
+                            self.enterException(.abt, 0x10, pc +% 8, false);
+                            priv = 1;
+                            code_vbase = 0xffff_ffff;
+                            continue;
+                        };
                     },
                     .clz_al => self.r[d.rd] = @clz(self.r[d.rm]),
                     .uxtb_al => self.r[d.rd] = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xff,
@@ -2746,6 +2741,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     // CLREX
                     self.excl_valid = false;
                 } else if ((inst & 0x0fff_ffe0) == 0x057f_f040) {
+                    self.memoryBarrier(bus, (inst & 0x10) == 0);
                     // DSB / DMB: yield slice if repeated at the same PC within the current slice
                     if (self.last_dmb_pc == inst_pc) {
                         self.yield_slice = true;
@@ -3242,24 +3238,14 @@ pub fn Arm1176(comptime Bus: type) type {
                             };
                             self.r[rd] = val;
                             self.excl_valid = true;
+                            self.excl_val = val;
                             self.excl_paddr = self.mmu.translate(bus.ram, vaddr, .read, self.isPrivileged()) catch 0;
                         },
                         0b1000 => { // STREX Rd, Rm, [Rn]
-                            const paddr = self.mmu.translate(bus.ram, vaddr, .write, self.isPrivileged()) catch {
+                            self.r[rd] = self.storeExclusive(bus, u32, vaddr, self.r[rm], self.isPrivileged()) catch {
                                 self.enterException(.abt, 0x10, inst_pc +% 8, false);
                                 return;
                             };
-                            if (self.excl_valid) {
-                                self.write32(bus, vaddr, self.r[rm]) catch {
-                                    self.enterException(.abt, 0x10, inst_pc +% 8, false);
-                                    return;
-                                };
-                                self.r[rd] = 0;
-                                self.excl_valid = false;
-                            } else {
-                                _ = paddr;
-                                self.r[rd] = 1;
-                            }
                         },
                         0b1011 => { // LDREXD Rd, Rd+1, [Rn]
                             const lo = self.read32(bus, vaddr) catch {
@@ -3273,28 +3259,14 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.r[rd] = lo;
                             self.r[rd +% 1] = hi;
                             self.excl_valid = true;
+                            self.excl_val = @as(u64, lo) | (@as(u64, hi) << 32);
                         },
                         0b1010 => { // STREXD Rd, Rm, Rm+1, [Rn]
-                            _ = self.mmu.translate(bus.ram, vaddr, .write, self.isPrivileged()) catch {
+                            const val: u64 = @as(u64, self.r[rm]) | (@as(u64, self.r[rm +% 1]) << 32);
+                            self.r[rd] = self.storeExclusive(bus, u64, vaddr, val, self.isPrivileged()) catch {
                                 self.enterException(.abt, 0x10, inst_pc +% 8, false);
                                 return;
                             };
-                            if (self.excl_valid) {
-                                const lo = self.r[rm];
-                                const hi = self.r[rm +% 1];
-                                self.write32(bus, vaddr, lo) catch {
-                                    self.enterException(.abt, 0x10, inst_pc +% 8, false);
-                                    return;
-                                };
-                                self.write32(bus, vaddr +% 4, hi) catch {
-                                    self.enterException(.abt, 0x10, inst_pc +% 8, false);
-                                    return;
-                                };
-                                self.r[rd] = 0;
-                                self.excl_valid = false;
-                            } else {
-                                self.r[rd] = 1;
-                            }
                         },
                         0b1101 => { // LDREXB Rd, [Rn]
                             const val = self.read8(bus, vaddr) catch {
@@ -3303,18 +3275,13 @@ pub fn Arm1176(comptime Bus: type) type {
                             };
                             self.r[rd] = val;
                             self.excl_valid = true;
+                            self.excl_val = val;
                         },
                         0b1100 => { // STREXB Rd, Rm, [Rn]
-                            if (self.excl_valid) {
-                                self.write8(bus, vaddr, @truncate(self.r[rm])) catch {
-                                    self.enterException(.abt, 0x10, inst_pc +% 8, false);
-                                    return;
-                                };
-                                self.r[rd] = 0;
-                                self.excl_valid = false;
-                            } else {
-                                self.r[rd] = 1;
-                            }
+                            self.r[rd] = self.storeExclusive(bus, u8, vaddr, @truncate(self.r[rm]), self.isPrivileged()) catch {
+                                self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                                return;
+                            };
                         },
                         0b1111 => { // LDREXH Rd, [Rn]
                             const val = self.read16(bus, vaddr) catch {
@@ -3323,18 +3290,13 @@ pub fn Arm1176(comptime Bus: type) type {
                             };
                             self.r[rd] = val;
                             self.excl_valid = true;
+                            self.excl_val = val;
                         },
                         0b1110 => { // STREXH Rd, Rm, [Rn]
-                            if (self.excl_valid) {
-                                self.write16(bus, vaddr, @truncate(self.r[rm])) catch {
-                                    self.enterException(.abt, 0x10, inst_pc +% 8, false);
-                                    return;
-                                };
-                                self.r[rd] = 0;
-                                self.excl_valid = false;
-                            } else {
-                                self.r[rd] = 1;
-                            }
+                            self.r[rd] = self.storeExclusive(bus, u16, vaddr, @truncate(self.r[rm]), self.isPrivileged()) catch {
+                                self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                                return;
+                            };
                         },
                         else => {},
                     }
@@ -3793,9 +3755,10 @@ pub fn Arm1176(comptime Bus: type) type {
                         }
                     } else {
                         self.mmu.writeCp15(opc1, crn, crm, opc2, self.r[rt]);
-                        if (crn == 14 and @hasField(Bus, "local_intc")) {
-                            bus.local_intc.core_timer_lines[self.mmu.core_id] = self.mmu.timer_irq_lines;
+                        if (crn == 7 and crm == 10 and (opc2 == 4 or opc2 == 5)) {
+                            self.memoryBarrier(bus, opc2 == 4);
                         }
+                        if (crn == 14) self.syncCoreTimerLines(bus);
                     }
                     return;
                 }
@@ -3817,9 +3780,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     } else {
                         const val64: u64 = (@as(u64, self.r[rt2]) << 32) | self.r[rt];
                         self.mmu.writeCp15_64(opc1_64, crm, val64);
-                        if (crm == 14 and @hasField(Bus, "local_intc")) {
-                            bus.local_intc.core_timer_lines[self.mmu.core_id] = self.mmu.timer_irq_lines;
-                        }
+                        if (crm == 14) self.syncCoreTimerLines(bus);
                     }
                     return;
                 }
