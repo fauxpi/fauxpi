@@ -34,6 +34,7 @@ pub const Env = struct {
     texture_memory1: []const u8 = &.{},
     textures: []const []const u8 = &.{},
     tlb_color_in: Vec = splat(0),
+    tex_cache: ?*[2]TexCache = null,
 };
 
 pub const max_vpm_out = 32;
@@ -97,6 +98,7 @@ const State = struct {
         fifo: [4]Vec = undefined,
         fifo_head: u2 = 0,
         fifo_len: u3 = 0,
+        cached: TexCache = .{},
     };
 };
 
@@ -680,32 +682,71 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
                 }
             }
             const write_idx: u2 = t.fifo_head +% @as(u2, @truncate(t.fifo_len));
-            const cfg = texture.decodeConfig(p0, t.params[1]);
-            const pt = PrecomputedTex.init(cfg) catch {
+            const p1 = t.params[1];
+            const cache_slot: *TexCache = if (env.tex_cache) |tc| &tc[unit] else &t.cached;
+            if (cache_slot.p0 != p0 or cache_slot.p1 != p1) {
+                cache_slot.p0 = p0;
+                cache_slot.p1 = p1;
+                if (PrecomputedTex.init(texture.decodeConfig(p0, p1))) |inited| {
+                    cache_slot.pt = inited;
+                    cache_slot.valid = true;
+                } else |_| {
+                    cache_slot.valid = false;
+                }
+            }
+            if (!cache_slot.valid) {
                 t.fifo[write_idx] = splat(0xff000000);
                 t.fifo_len += 1;
                 t.param_count = 0;
                 t.has_coord_t = false;
                 if (@hasField(RType, "texture_samples")) r.texture_samples += 1;
                 return;
-            };
+            }
+            const pt = &cache_slot.pt;
             var texel: Vec = undefined;
-            var prev_sc: u32 = 0;
-            var prev_tc: u32 = 0;
-            var prev_out: u32 = 0;
             const has_t = t.has_coord_t;
-            for (0..lanes) |lane| {
-                const sc = value[lane];
-                const tc = if (has_t) t.coord_t[lane] else 0;
-                if (lane > 0 and sc == prev_sc and tc == prev_tc) {
-                    texel[lane] = prev_out;
-                    continue;
+            if (pt.cfg.mag_filter == .nearest) {
+                const p = pt.cfg;
+                var prev_wx: u32 = 0xffff_ffff;
+                var prev_wy: u32 = 0xffff_ffff;
+                var prev_out: u32 = 0;
+                const zero_wy: u32 = if (!has_t) (if (0.0 < pt.fh) 0 else wrap(0.0, p.height, p.wrap_t)) else 0;
+                for (0..lanes) |lane| {
+                    const s_coord = f(value[lane]);
+                    const fx = @floor(s_coord * pt.fw);
+                    const wx: u32 = if (fx >= 0.0 and fx < pt.fw) @intFromFloat(fx) else wrap(fx, p.width, p.wrap_s);
+                    const wy: u32 = if (has_t) blk: {
+                        const t_coord = f(t.coord_t[lane]);
+                        const fy = @floor(t_coord * pt.fh);
+                        break :blk if (fy >= 0.0 and fy < pt.fh) @intFromFloat(fy) else wrap(fy, p.height, p.wrap_t);
+                    } else zero_wy;
+                    if (wx == prev_wx and wy == prev_wy) {
+                        texel[lane] = prev_out;
+                        continue;
+                    }
+                    const sampled = pt.fetchAt(memory, wx, wy) catch 0xff000000;
+                    texel[lane] = sampled;
+                    prev_wx = wx;
+                    prev_wy = wy;
+                    prev_out = sampled;
                 }
-                const sampled = pt.sample(memory, f(sc), f(tc)) catch 0xff000000;
-                texel[lane] = sampled;
-                prev_sc = sc;
-                prev_tc = tc;
-                prev_out = sampled;
+            } else {
+                var prev_sc: u32 = 0;
+                var prev_tc: u32 = 0;
+                var prev_out: u32 = 0;
+                for (0..lanes) |lane| {
+                    const sc = value[lane];
+                    const tc = if (has_t) t.coord_t[lane] else 0;
+                    if (lane > 0 and sc == prev_sc and tc == prev_tc) {
+                        texel[lane] = prev_out;
+                        continue;
+                    }
+                    const sampled = pt.sample(memory, f(sc), f(tc)) catch 0xff000000;
+                    texel[lane] = sampled;
+                    prev_sc = sc;
+                    prev_tc = tc;
+                    prev_out = sampled;
+                }
             }
             t.fifo[write_idx] = texel;
             t.fifo_len += 1;
@@ -718,6 +759,13 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
 }
 
 pub const texture_base: u32 = 1 << 28;
+
+pub const TexCache = struct {
+    p0: u32 = 0xffff_ffff,
+    p1: u32 = 0xffff_ffff,
+    valid: bool = false,
+    pt: PrecomputedTex = undefined,
+};
 
 const PrecomputedTex = struct {
     cfg: texture.Config,
@@ -871,6 +919,12 @@ const PrecomputedTex = struct {
             wy1 = wrap(y0 + 1.0, p.height, p.wrap_t);
         }
 
+        const fx_frac: u32 = @intFromFloat(@round((fx - x0) * 256.0));
+        const fy_frac: u32 = @intFromFloat(@round((fy - y0) * 256.0));
+        if (fx_frac == 0 and fy_frac == 0) {
+            return pt.fetchAt(memory, wx0, wy0);
+        }
+
         const same_utile_x = (wx1 == wx0 + 1) and (p.type == .rgba32r or (wx0 & pt.uw_mask) != pt.uw_mask);
         const same_utile_y = (wy1 == wy0 + 1) and (p.type == .rgba32r or (wy0 & pt.uh_mask) != pt.uh_mask);
 
@@ -915,25 +969,24 @@ const PrecomputedTex = struct {
         }
 
         if (c00 == c10 and c00 == c01 and c00 == c11) return c00;
-        const ax = fx - x0;
-        const ay = fy - y0;
-        const w00 = (1.0 - ax) * (1.0 - ay);
-        const w10 = ax * (1.0 - ay);
-        const w01 = (1.0 - ax) * ay;
-        const w11 = ax * ay;
+        const ix: u32 = 256 - fx_frac;
+        const iy: u32 = 256 - fy_frac;
+        const w00: u16 = @intCast((ix * iy + 128) >> 8);
+        const w10: u16 = @intCast((fx_frac * iy + 128) >> 8);
+        const w01: u16 = @intCast((ix * fy_frac + 128) >> 8);
+        const w11: u16 = @intCast(256 -| (@as(u32, w00) + w10 + w01));
         const V4U8 = @Vector(4, u8);
-        const V4F = @Vector(4, f32);
-        const v00: V4F = @floatFromInt(@as(V4U8, @bitCast(c00)));
-        const v10: V4F = @floatFromInt(@as(V4U8, @bitCast(c10)));
-        const v01: V4F = @floatFromInt(@as(V4U8, @bitCast(c01)));
-        const v11: V4F = @floatFromInt(@as(V4U8, @bitCast(c11)));
-        const blended = @round(
-            v00 * @as(V4F, @splat(w00)) +
-                v10 * @as(V4F, @splat(w10)) +
-                v01 * @as(V4F, @splat(w01)) +
-                v11 * @as(V4F, @splat(w11)),
-        );
-        const out_bytes: V4U8 = @intFromFloat(blended);
+        const V4U16 = @Vector(4, u16);
+        const v00: V4U16 = @as(V4U8, @bitCast(c00));
+        const v10: V4U16 = @as(V4U8, @bitCast(c10));
+        const v01: V4U16 = @as(V4U8, @bitCast(c01));
+        const v11: V4U16 = @as(V4U8, @bitCast(c11));
+        const sum: V4U16 = v00 * @as(V4U16, @splat(w00)) +
+            v10 * @as(V4U16, @splat(w10)) +
+            v01 * @as(V4U16, @splat(w01)) +
+            v11 * @as(V4U16, @splat(w11)) +
+            @as(V4U16, @splat(128));
+        const out_bytes: V4U8 = @truncate(sum >> @as(@Vector(4, u4), @splat(8)));
         return @bitCast(out_bytes);
     }
 };
@@ -1128,5 +1181,69 @@ test "QPU vectorized ftoi, predicated writes, and TMU FIFO ring wrap-around" {
     for (0..4) |lane| try std.testing.expectEqual(@as(u32, 3), out[lane]); // elem < 4 -> .ns
     try std.testing.expectEqual(@as(u32, 2), out[4]); // elem == 4 -> .zs
     for (5..16) |lane| try std.testing.expectEqual(@as(u32, 0x1111_1111), out[lane]); // elem > 4 -> untouched
+}
+
+test "QPU TexCache memoization, nearest coordinate deduplication, and exact texel-center fast path" {
+    var mem: [256]u8 = @splat(0);
+
+    const cfg_linear: texture.Config = .{
+        .offset = 0,
+        .width = 2,
+        .height = 2,
+        .type = .rgba8888,
+        .mag_filter = .linear,
+        .min_filter = .linear,
+        .wrap_s = .clamp,
+        .wrap_t = .clamp,
+    };
+    const cfg_nearest: texture.Config = .{
+        .offset = 0,
+        .width = 2,
+        .height = 2,
+        .type = .rgba8888,
+        .mag_filter = .nearest,
+        .min_filter = .nearest,
+        .wrap_s = .clamp,
+        .wrap_t = .clamp,
+    };
+    const p0 = texture.p0(cfg_linear);
+    const p1_nearest = texture.p1(cfg_nearest);
+
+    // Exact texel center at (0.5/2.0, 0.5/2.0) -> (0.25, 0.25) hits texel (0,0) with fx_frac == 0, fy_frac == 0
+    const pt_lin = try PrecomputedTex.init(cfg_linear);
+    std.mem.writeInt(u32, mem[pt_lin.texelOffset(0, 0)..][0..4], 0xff102030, .little);
+    std.mem.writeInt(u32, mem[pt_lin.texelOffset(1, 0)..][0..4], 0xff304050, .little);
+    std.mem.writeInt(u32, mem[pt_lin.texelOffset(0, 1)..][0..4], 0xff506070, .little);
+    std.mem.writeInt(u32, mem[pt_lin.texelOffset(1, 1)..][0..4], 0xff708090, .little);
+    try std.testing.expectEqual(@as(u32, 0xff102030), try pt_lin.sample(&mem, 0.25, 0.25));
+    try std.testing.expectEqual(@as(u32, 0xff708090), try pt_lin.sample(&mem, 0.75, 0.75));
+    // Quarter-way interpolation between (0,0) and (1,0): (3 * 0x10 + 1 * 0x30) / 4 = 0x18, etc.
+    try std.testing.expectEqual(@as(u32, 0xff182838), try pt_lin.sample(&mem, 0.375, 0.25));
+
+    // Verify Env.tex_cache is populated and reused across QPU invocations
+    var p: qpu.Program(16) = .{};
+    p.emit(try qpu.loadImm(.{ .add_dst = .{ .periph = qpu.W.tmu0_t }, .value = u(0.25) }));
+    p.emit(try qpu.loadImm(.{ .add_dst = .{ .periph = qpu.W.tmu0_s }, .value = u(0.75) }));
+    p.emit(qpu.nop(.load_tmu0));
+    p.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(4)));
+    p.end(.fragment);
+
+    var decoded_buf: [16]DecodedInst = undefined;
+    const decoded = decodeProgram(p.code(), &decoded_buf);
+    var shared_cache: [2]TexCache = .{ .{}, .{} };
+    const unifs = [_]u32{ p0, p1_nearest };
+    const env: Env = .{
+        .uniforms = &unifs,
+        .texture_memory = &mem,
+        .tex_cache = &shared_cache,
+    };
+    const r1 = try runFragmentDecoded(decoded, &env);
+    try std.testing.expect(shared_cache[0].valid);
+    try std.testing.expectEqual(p0, shared_cache[0].p0);
+    try std.testing.expectEqual(p1_nearest, shared_cache[0].p1);
+    for (0..lanes) |l| try std.testing.expectEqual(@as(u32, 0xff304050), r1.tlb_color.?[l]);
+
+    const r2 = try runFragmentDecoded(decoded, &env);
+    for (0..lanes) |l| try std.testing.expectEqual(@as(u32, 0xff304050), r2.tlb_color.?[l]);
 }
 
