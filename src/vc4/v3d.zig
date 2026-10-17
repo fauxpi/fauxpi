@@ -1883,7 +1883,27 @@ pub const V3d = struct {
                 };
                 const res = qpu_sim.runFragmentDecoded(fcode, &env) catch return;
                 if (res.tlb_color) |colors| {
-                    for (0..count) |i| {
+                    var i: usize = 0;
+                    while (i + 4 <= count) {
+                        const idx0 = b_idx[i];
+                        if (b_idx[i + 3] == idx0 + 3) {
+                            v3d_self.tile_color[idx0..][0..4].* = colors[i..][0..4].*;
+                            if (z_upd) {
+                                v3d_self.tile_depth[idx0..][0..4].* = bz[i..][0..4].*;
+                            }
+                            i += 4;
+                            continue;
+                        }
+                        inline for (0..4) |k| {
+                            const idx = b_idx[i + k];
+                            v3d_self.tile_color[idx] = colors[i + k];
+                            if (z_upd) {
+                                v3d_self.tile_depth[idx] = bz[i + k];
+                            }
+                        }
+                        i += 4;
+                    }
+                    while (i < count) : (i += 1) {
                         const idx = b_idx[i];
                         v3d_self.tile_color[idx] = colors[i];
                         if (z_upd) {
@@ -1895,6 +1915,7 @@ pub const V3d = struct {
         }.f;
 
         const lane4_f_offsets = @Vector(4, f32){ 0.0, 1.0, 2.0, 3.0 };
+        const lane4_u_offsets = @Vector(4, u32){ 0, 1, 2, 3 };
         const lane_f_offsets = @Vector(16, f32){ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         const lane_u_offsets = @Vector(16, u32){ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         const fx_min_tile = @as(f32, @floatFromInt(x_start)) + 0.5;
@@ -2090,7 +2111,7 @@ pub const V3d = struct {
                         }
                     }
 
-                    const w_val_4: [4]f32 = if (all_unit_w)
+                    const w_vec_4: @Vector(4, f32) = if (all_unit_w)
                         @splat(1.0)
                     else blk: {
                         const interp_inv_w = @as(@Vector(4, f32), @splat(invw2)) +
@@ -2099,6 +2120,48 @@ pub const V3d = struct {
                         const valid_mask = @abs(interp_inv_w) > @as(@Vector(4, f32), @splat(1e-12));
                         break :blk @select(f32, valid_mask, @as(@Vector(4, f32), @splat(1.0)) / interp_inv_w, @as(@Vector(4, f32), @splat(1.0)));
                     };
+
+                    if (mask4 == 0xf and batch_len <= 12) {
+                        batch_idx[batch_len..][0..4].* = @as(@Vector(4, u32), @splat(base_tile_idx)) + lane4_u_offsets;
+                        batch_z[batch_len..][0..4].* = z_4;
+                        frag_w[batch_len..][0..4].* = @bitCast(w_vec_4);
+                        frag_z[batch_len..][0..4].* = @bitCast(z_4);
+                        frag_x_vec[batch_len..][0..4].* = @as(@Vector(4, u32), @splat(px)) + lane4_u_offsets;
+                        frag_y_vec[batch_len..][0..4].* = @splat(py);
+                        tlb_in[batch_len..][0..4].* = self.tile_color[base_tile_idx..][0..4].*;
+
+                        for (0..n_var) |vi| {
+                            const p_4 = (@as(@Vector(4, f32), @splat(var2[vi])) +
+                                w0_4 * @as(@Vector(4, f32), @splat(dvar0[vi])) +
+                                w1_4 * @as(@Vector(4, f32), @splat(dvar1[vi]))) * w_vec_4;
+                            vary_vecs[vi][batch_len..][0..4].* = @bitCast(p_4);
+                        }
+
+                        batch_len += 4;
+                        if (batch_len == 16) {
+                            flushBatch(
+                                self,
+                                batch_len,
+                                &batch_idx,
+                                &batch_z,
+                                &frag_w,
+                                &frag_z,
+                                &frag_x_vec,
+                                &frag_y_vec,
+                                &tlb_in,
+                                vary_vecs[0..n_var],
+                                fs_decoded,
+                                fs_unifs,
+                                ram,
+                                z_updates,
+                            );
+                            batch_len = 0;
+                        }
+                        px += 4;
+                        continue;
+                    }
+
+                    const w_val_4: [4]f32 = w_vec_4;
                     const w0_arr: [4]f32 = w0_4;
                     const w1_arr: [4]f32 = w1_4;
                     const z_arr: [4]f32 = z_4;
