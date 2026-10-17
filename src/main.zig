@@ -574,12 +574,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             }
         }
 
-        const max_slice: u64 = if (num_cores > 1) 4096 else 65536;
-        const batch: usize = if (opts.max_steps != 0)
-            @intCast(@min(max_slice, opts.max_steps - cpus[0].cycles))
-        else
-            @intCast(max_slice);
-
         // Cores in WFI with nothing pending would return immediately; leave them out of the slice.
         var active: u4 = 0;
         for (0..num_cores) |i| {
@@ -589,6 +583,11 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 active |= @as(u4, 1) << cid;
             }
         }
+        const max_slice: u64 = if (@popCount(active) > 1) 16384 else 65536;
+        const batch: usize = if (opts.max_steps != 0)
+            @intCast(@min(max_slice, opts.max_steps -| cpus[0].cycles))
+        else
+            @intCast(max_slice);
         const max_ran = runner.runSlice(active, batch);
 
         // Advance 1 MHz system timer and ARM timer proportionally to instructions executed (~256 instructions per us).
