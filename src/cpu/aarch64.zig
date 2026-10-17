@@ -661,6 +661,13 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             br_reg,
             blr_reg,
             ret,
+            bfm_r,
+            bfm_l,
+            adc_sbc,
+            mrs_tpidr_el0,
+            mrs_sys,
+            msr_safe,
+            dc_zva,
             dp_imm_other,
             dp_reg_other,
             load_store_other,
@@ -751,15 +758,38 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     const wmask: u64 = if (width >= 64) 0xffff_ffff_ffff_ffff else ((@as(u64, 1) << @intCast(width)) - 1);
                                     return .{ .raw = inst, .op = @intFromEnum(A64Op.ubfm_l), .rd = rd, .rn = rn, .rm = lshift, .imm = (wmask << lshift) & reg_mask };
                                 }
-                            } else if (opc == 0b00 and imms >= immr) {
-                                if (sf == 1) {
-                                    const lsh: u8 = @intCast(63 - imms);
-                                    const rsh: u64 = @intCast(63 - (imms - immr));
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.sbfm64_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
-                                } else if (imms < 32) {
-                                    const lsh: u8 = @intCast(31 - imms);
-                                    const rsh: u64 = @intCast(31 - (imms - immr));
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.sbfm32_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
+                            } else if (opc == 0b01) {
+                                if (imms >= immr) {
+                                    const width: u7 = @as(u7, imms - immr) + 1;
+                                    const wmask: u64 = if (width >= 64) 0xffff_ffff_ffff_ffff else ((@as(u64, 1) << @intCast(width)) - 1);
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.bfm_r), .rd = rd, .rn = rn, .rm = immr | (@as(u8, sf) << 6), .imm = wmask & reg_mask };
+                                } else {
+                                    const width: u7 = @as(u7, imms) + 1;
+                                    const lshift: u6 = @intCast(reg_bits - @as(u7, immr));
+                                    const wmask: u64 = if (width >= 64) 0xffff_ffff_ffff_ffff else ((@as(u64, 1) << @intCast(width)) - 1);
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.bfm_l), .rd = rd, .rn = rn, .rm = @as(u8, lshift) | (@as(u8, sf) << 6), .imm = (wmask << lshift) & reg_mask };
+                                }
+                            } else if (opc == 0b00) {
+                                if (imms >= immr) {
+                                    if (sf == 1) {
+                                        const lsh: u8 = @intCast(63 - imms);
+                                        const rsh: u64 = @intCast(63 - (imms - immr));
+                                        return .{ .raw = inst, .op = @intFromEnum(A64Op.sbfm64_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
+                                    } else if (imms < 32) {
+                                        const lsh: u8 = @intCast(31 - imms);
+                                        const rsh: u64 = @intCast(31 - (imms - immr));
+                                        return .{ .raw = inst, .op = @intFromEnum(A64Op.sbfm32_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
+                                    }
+                                } else {
+                                    if (sf == 1) {
+                                        const lsh: u8 = @intCast(63 - imms);
+                                        const rsh: u64 = @intCast(immr - imms - 1);
+                                        return .{ .raw = inst, .op = @intFromEnum(A64Op.sbfm64_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
+                                    } else if (immr < 32) {
+                                        const lsh: u8 = @intCast(31 - imms);
+                                        const rsh: u64 = @intCast(immr - imms - 1);
+                                        return .{ .raw = inst, .op = @intFromEnum(A64Op.sbfm32_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
+                                    }
                                 }
                             }
                         },
@@ -867,6 +897,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const shift_type: u2 = @truncate(inst >> 22);
                         const packed_shift: u64 = @as(u64, imm6) | (@as(u64, shift_type) << 6) | (@as(u64, op2) << 8) | (@as(u64, s) << 12) | (@as(u64, op0) << 13) | (@as(u64, sf) << 14);
                         return .{ .raw = inst, .op = @intFromEnum(A64Op.dp_shift_reg), .rd = rd, .rn = rn, .rm = rm, .imm = packed_shift };
+                    } else if (op2 == 0b0000) {
+                        // Add/subtract (with carry): ADC, ADCS, SBC, SBCS
+                        const packed_adc: u64 = (@as(u64, sf) << 2) | (@as(u64, op0) << 1) | s;
+                        return .{ .raw = inst, .op = @intFromEnum(A64Op.adc_sbc), .rd = rd, .rn = rn, .rm = rm, .imm = packed_adc };
                     } else if (s == 1 and op2 == 0b0010) {
                         // Conditional compare (register / immediate): CCMP, CCMN
                         const cond: u64 = (inst >> 12) & 0xf;
@@ -1329,8 +1363,66 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             .rn = @truncate((inst >> 5) & 0x1f),
                         };
                     }
-                    if (inst == 0xd503_201f) {
-                        return .{ .raw = inst, .op = @intFromEnum(A64Op.nop) };
+                    if ((inst & 0xffc0_0000) == 0xd500_0000) {
+                        const l = ((inst >> 21) & 1) != 0;
+                        const op0_sys: u2 = @truncate(inst >> 19);
+                        const op1_sys: u3 = @truncate(inst >> 16);
+                        const crn: u4 = @truncate(inst >> 12);
+                        const crm: u4 = @truncate(inst >> 8);
+                        const op2_sys: u3 = @truncate(inst >> 5);
+                        const rt: u8 = @truncate(inst & 0x1f);
+                        if (op0_sys == 0) {
+                            if (crn == 2) {
+                                const hint = (@as(u8, crm) << 3) | op2_sys;
+                                if (hint == 0 or hint > 3) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.nop) };
+                                } else if (hint == 1 or hint == 2) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 1 };
+                                }
+                            } else if (crn == 3) {
+                                if (op2_sys == 2) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 0 }; // CLREX
+                                } else if (op2_sys == 4 or op2_sys == 5) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 2, .imm = op2_sys }; // DSB / DMB
+                                } else if (op2_sys == 6) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.nop) }; // ISB
+                                }
+                            } else if (crn == 4 and op1_sys == 3) {
+                                if (op2_sys == 6) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 3, .imm = @as(u64, crm) << 6 }; // MSR DAIFSet
+                                } else if (op2_sys == 7) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 4, .imm = ~(@as(u64, crm) << 6) }; // MSR DAIFClr
+                                }
+                            }
+                        } else if (op0_sys == 1) {
+                            if (!l and op1_sys == 3 and crn == 7 and crm == 4 and op2_sys == 1) {
+                                return .{ .raw = inst, .op = @intFromEnum(A64Op.dc_zva), .rd = rt };
+                            }
+                        } else if (l) {
+                            const id = sysRegId(op0_sys, op1_sys, crn, crm, op2_sys);
+                            if (id == sysRegId(3, 3, 13, 0, 2)) {
+                                return .{ .raw = inst, .op = @intFromEnum(A64Op.mrs_tpidr_el0), .rd = rt };
+                            }
+                            return .{
+                                .raw = inst,
+                                .op = @intFromEnum(A64Op.mrs_sys),
+                                .rd = rt,
+                                .rn = (@as(u8, op0_sys) << 3) | op1_sys,
+                                .rm = (@as(u8, crn) << 4) | crm,
+                                .imm = op2_sys,
+                            };
+                        } else {
+                            switch (sysRegId(op0_sys, op1_sys, crn, crm, op2_sys)) {
+                                sysRegId(3, 3, 4, 2, 1) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 5 }, // DAIF
+                                sysRegId(3, 3, 4, 2, 0) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 6 }, // NZCV
+                                sysRegId(3, 3, 13, 0, 2) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 7 }, // TPIDR_EL0
+                                sysRegId(3, 0, 13, 0, 4) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 8 }, // TPIDR_EL1
+                                sysRegId(3, 0, 4, 1, 0) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 9 }, // SP_EL0
+                                sysRegId(3, 3, 4, 4, 0) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 10, .imm = 0 }, // FPCR
+                                sysRegId(3, 3, 4, 4, 1) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 10, .imm = 1 }, // FPSR
+                                else => {},
+                            }
+                        }
                     }
                     return .{ .raw = inst, .op = @intFromEnum(A64Op.branch_sys_other) };
                 },
@@ -1737,6 +1829,18 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     },
                     .ubfm_r => setX(cpu, @truncate(d.rd), (getX(cpu, @truncate(d.rn)) >> @intCast(d.rm)) & d.imm),
                     .ubfm_l => setX(cpu, @truncate(d.rd), (getX(cpu, @truncate(d.rn)) << @intCast(d.rm)) & d.imm),
+                    .bfm_r => {
+                        const rmask: u64 = if ((d.rm & 64) != 0) 0xffff_ffff_ffff_ffff else 0xffff_ffff;
+                        const dst = getX(cpu, @truncate(d.rd)) & ~d.imm;
+                        const ext = (getX(cpu, @truncate(d.rn)) >> @intCast(d.rm & 63)) & d.imm;
+                        setX(cpu, @truncate(d.rd), (dst | ext) & rmask);
+                    },
+                    .bfm_l => {
+                        const rmask: u64 = if ((d.rm & 64) != 0) 0xffff_ffff_ffff_ffff else 0xffff_ffff;
+                        const dst = getX(cpu, @truncate(d.rd)) & ~d.imm;
+                        const ins = (getX(cpu, @truncate(d.rn)) << @intCast(d.rm & 63)) & d.imm;
+                        setX(cpu, @truncate(d.rd), (dst | ins) & rmask);
+                    },
                     .sbfm64_r => {
                         const sval: i64 = @bitCast(getX(cpu, @truncate(d.rn)));
                         setX(cpu, @truncate(d.rd), @bitCast((sval << @as(u6, @truncate(d.rm))) >> @as(u6, @truncate(d.imm))));
@@ -1886,6 +1990,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         };
                         if (!sf) res &= 0xffff_ffff;
                         setX(cpu, @truncate(d.rd), res);
+                    },
+                    .adc_sbc => {
+                        const c_in: u1 = if ((cpu.pstate & PstateFlags.C) != 0) 1 else 0;
+                        addSub(cpu, @truncate(d.imm >> 2), ((d.imm >> 1) & 1) != 0, (d.imm & 1) != 0, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), c_in, false);
                     },
                     .ccmp => {
                         const cond: u4 = @truncate(d.imm);
@@ -3724,6 +3832,94 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             data_r_vbase = 0xffff_ffff_ffff_ffff;
                             data_w_vbase = 0xffff_ffff_ffff_ffff;
                             continue;
+                        }
+                    },
+                    .mrs_tpidr_el0 => setX(cpu, @truncate(d.rd), cpu.mmu.tpidr_el0),
+                    .mrs_sys => setX(
+                        cpu,
+                        @truncate(d.rd),
+                        readSysReg(cpu, @truncate(d.rn >> 3), @truncate(d.rn), @truncate(d.rm >> 4), @truncate(d.rm), @truncate(d.imm)),
+                    ),
+                    .msr_safe => {
+                        switch (d.rn) {
+                            0 => cpu.excl_valid = false,
+                            1 => cpu.yield_slice = true,
+                            2 => {
+                                if (atomic_ram.busParallel(bus)) {
+                                    atomic_ram.fence(&cpu.fence_word);
+                                    if (d.imm == 4) bus.smp.broadcastTlb(cpu.mmu.core_id, &cpu.mmu);
+                                }
+                                const pc32: u32 = @truncate(cur_pc);
+                                if ((cpu.last_dmb_pc ^ pc32) < 256) {
+                                    cpu.yield_slice = true;
+                                }
+                                cpu.last_dmb_pc = pc32;
+                            },
+                            3 => cpu.pstate |= @truncate(d.imm),
+                            4 => {
+                                cpu.pstate &= @truncate(d.imm);
+                                if (checkInterrupts64(cpu, bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                }
+                            },
+                            5 => {
+                                cpu.pstate = (cpu.pstate & ~@as(u32, 0x3c0)) | (@as(u32, @truncate(getX(cpu, @truncate(d.rd)))) & 0x3c0);
+                                if (checkInterrupts64(cpu, bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                }
+                            },
+                            6 => cpu.pstate = (cpu.pstate & 0x0fff_ffff) | (@as(u32, @truncate(getX(cpu, @truncate(d.rd)))) & 0xf000_0000),
+                            7 => cpu.mmu.tpidr_el0 = getX(cpu, @truncate(d.rd)),
+                            8 => cpu.mmu.tpidr_el1 = getX(cpu, @truncate(d.rd)),
+                            9 => cpu.sp_el[0] = getX(cpu, @truncate(d.rd)),
+                            else => {
+                                if (d.imm == 0) cpu.vfp.fpcr64 = getX(cpu, @truncate(d.rd)) else cpu.vfp.fpsr64 = getX(cpu, @truncate(d.rd));
+                            },
+                        }
+                    },
+                    .dc_zva => {
+                        const base_va = getX(cpu, @truncate(d.rd)) & ~@as(u64, 63);
+                        const vbase = base_va & ~@as(u64, 0xfff);
+                        if (vbase == data_w_vbase) {
+                            @memset(data_page_ptr[@as(usize, @truncate(base_va & 0xfff))..][0..64], 0);
+                        } else {
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((base_va >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if (vbase == dslot.w_vbase) {
+                                data_r_vbase = dslot.r_vbase;
+                                data_w_vbase = dslot.w_vbase;
+                                data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                @memset(data_page_ptr[@as(usize, @truncate(base_va & 0xfff))..][0..64], 0);
+                            } else {
+                                var aborted = false;
+                                var off: u64 = 0;
+                                while (off < 64) : (off += 8) {
+                                    writeData64(cpu, bus, base_va +% off, 0) catch {
+                                        aborted = true;
+                                        break;
+                                    };
+                                }
+                                if (aborted) {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_w_vbase = 0xffff_ffff_ffff_ffff;
+                                    continue;
+                                }
+                                if (vbase == dslot.w_vbase) {
+                                    data_r_vbase = dslot.r_vbase;
+                                    data_w_vbase = dslot.w_vbase;
+                                    data_page_ptr = bus.ram.ptr + dslot.pbase;
+                                }
+                            }
                         }
                     },
                     .branch_sys_other => {
