@@ -102,6 +102,7 @@ pub const Icon = enum(u21) {
     monitor = 0xef5b,
     mouse = 0xe323,
     priority_high = 0xe645,
+    thermostat = 0xe1ff,
     usb = 0xe1e0,
 
     pub fn text(icon: Icon, buf: *[4]u8) []const u8 {
@@ -463,6 +464,7 @@ test "canvas shapes and icons draw anti-aliased pixels at 1x and 2x scale" {
     try testing.expect(ic.glyphIndex(@intFromEnum(Icon.check)) != 0);
     try testing.expect(ic.glyphIndex(@intFromEnum(Icon.edit)) != 0);
     try testing.expect(ic.glyphIndex(@intFromEnum(Icon.monitor)) != 0);
+    try testing.expect(ic.glyphIndex(@intFromEnum(Icon.thermostat)) != 0);
 
     c.drawIcon(.developer_board, 10, 34, 20, Theme.dark.on_surface);
     var icon_lit: usize = 0;

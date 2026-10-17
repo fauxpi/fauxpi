@@ -112,6 +112,7 @@ pub const SystemStatus = struct {
     ethernet_connected: bool = true,
     act_led_on: bool = false,
     pwr_led_on: bool = false,
+    cpu_temperature_c: u8 = 42,
 };
 
 pub const Action = enum {
@@ -155,6 +156,7 @@ pub const InteractiveTarget = enum {
     usb_keyboard,
     usb_mouse,
     ethernet,
+    cpu,
 };
 
 /// Geometry of the 3-port USB Hub with Ethernet and external cables in board millimetres (`mm`).
@@ -255,6 +257,8 @@ pub const BoardUi = struct {
         ethernet_connected: bool = false,
         act_led_on: bool = false,
         pwr_led_on: bool = false,
+        cpu_temperature_c: u8 = 42,
+        cpu_temp_popup_open: bool = false,
     };
 
     pub const GpioCacheKey = struct {
@@ -331,6 +335,11 @@ pub const BoardUi = struct {
     hovered_sd_menu_idx: ?usize = null,
     sd_manage_open: bool = false,
     sd_create_open: bool = false,
+    cpu_temperature_c: u8 = 42,
+    cpu_temp_modified: bool = false,
+    cpu_temp_popup_open: bool = false,
+    cpu_temp_slider_hovered: bool = false,
+    cpu_temp_slider_dragging: bool = false,
     new_card_name_buf: [64]u8 = @splat(0),
     new_card_name_len: usize = 0,
     sd_name_field_hovered: bool = false,
@@ -399,6 +408,8 @@ pub const BoardUi = struct {
     sd_size_btn_rects: [SdCardSize.all.len]Rect = @splat(.{ .x = 0, .y = 0, .w = 0, .h = 0 }),
     sd_browse_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_add_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    cpu_temp_popup_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    cpu_temp_slider_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
 
     /// Bottom GPIO Outputs (LEDs) & Inputs (Switches) box state (shown when `status.gpio_connected` is true).
     gpio_box_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -439,6 +450,7 @@ pub const BoardUi = struct {
         sd_browse_btn_hovered: bool,
         sd_add_btn_hovered: bool,
         sd_manage_close_hovered: bool,
+        cpu_temp_slider_hovered: bool,
         hovered_gpio_input_idx: ?usize,
         snackbar_dismiss_hovered: bool,
     };
@@ -466,6 +478,7 @@ pub const BoardUi = struct {
             .sd_browse_btn_hovered = self.sd_browse_btn_hovered,
             .sd_add_btn_hovered = self.sd_add_btn_hovered,
             .sd_manage_close_hovered = self.sd_manage_close_hovered,
+            .cpu_temp_slider_hovered = self.cpu_temp_slider_hovered,
             .hovered_gpio_input_idx = self.hovered_gpio_input_idx,
             .snackbar_dismiss_hovered = self.snackbar_dismiss_hovered,
         };
@@ -679,6 +692,7 @@ pub const BoardUi = struct {
         usb_keyboard_connected: ?bool = null,
         usb_mouse_connected: ?bool = null,
         ethernet_connected: ?bool = null,
+        cpu_temperature_c: ?u8 = null,
     };
 
     /// Writes the current board settings to `$XDG_DATA_HOME/fauxpi/settings.json`.
@@ -723,7 +737,8 @@ pub const BoardUi = struct {
             \\  "usb_hub_connected": {},
             \\  "usb_keyboard_connected": {},
             \\  "usb_mouse_connected": {},
-            \\  "ethernet_connected": {}
+            \\  "ethernet_connected": {},
+            \\  "cpu_temperature_c": {d}
             \\}}
             \\
         ,
@@ -742,6 +757,7 @@ pub const BoardUi = struct {
                 status.usb_keyboard_connected,
                 status.usb_mouse_connected,
                 status.ethernet_connected,
+                self.effectiveCpuTemperature(status),
             },
         );
 
@@ -805,6 +821,12 @@ pub const BoardUi = struct {
         if (cfg.usb_keyboard_connected) |v| status.usb_keyboard_connected = v;
         if (cfg.usb_mouse_connected) |v| status.usb_mouse_connected = v;
         if (cfg.ethernet_connected) |v| status.ethernet_connected = v;
+        if (cfg.cpu_temperature_c) |temp_c| {
+            const clamped = std.math.clamp(temp_c, 0, 100);
+            self.cpu_temperature_c = clamped;
+            self.cpu_temp_modified = true;
+            status.cpu_temperature_c = clamped;
+        }
         if (!status.board_model.usesExternalUsbHub()) {
             status.usb_hub_connected = true;
         }
@@ -1589,10 +1611,32 @@ pub const BoardUi = struct {
                         if (rectContainsMm(eth_hit, pt)) return .ethernet;
                     }
                 },
+                .soc, .soc_with_ram => {
+                    if (!p.underside and rectContainsMm(p.rect, pt)) return .cpu;
+                },
                 else => {},
             }
         }
         return null;
+    }
+
+    pub fn effectiveCpuTemperature(self: *const BoardUi, status: SystemStatus) u8 {
+        if (self.cpu_temp_modified) return self.cpu_temperature_c;
+        if (status.cpu_temperature_c != 42) return std.math.clamp(status.cpu_temperature_c, 0, 100);
+        return self.cpu_temperature_c;
+    }
+
+    pub fn setCpuTemperature(self: *BoardUi, temp_c: u8) void {
+        self.cpu_temperature_c = std.math.clamp(temp_c, 0, 100);
+        self.cpu_temp_modified = true;
+    }
+
+    pub fn setCpuTempFromSliderX(self: *BoardUi, x: f32) void {
+        const sr = self.cpu_temp_slider_rect;
+        const track_x0 = sr.x + 8.0;
+        const track_w = @max(1.0, sr.w - 16.0);
+        const frac = std.math.clamp((x - track_x0) / track_w, 0.0, 1.0);
+        self.setCpuTemperature(@intFromFloat(@round(frac * 100.0)));
     }
 
     pub fn parsedSerial(self: *const BoardUi) u64 {
@@ -1975,6 +2019,38 @@ pub const BoardUi = struct {
             .h = sd_menu_h,
         };
 
+        // CPU temperature slider popup (anchored below the CPU chip on the board)
+        const tr = boardTransform(drawing, self.board_rect);
+        var cpu_cx: f32 = self.board_rect.x + self.board_rect.w * 0.35;
+        var cpu_bottom_y: f32 = self.board_rect.y + self.board_rect.h * 0.65;
+        for (drawing.parts) |p| {
+            if (!p.underside and (p.kind == .soc or p.kind == .soc_with_ram)) {
+                cpu_cx = tr.x + (p.rect.x + p.rect.w * 0.5) * tr.scale;
+                cpu_bottom_y = tr.y + (p.rect.y + p.rect.h) * tr.scale;
+                break;
+            }
+        }
+        const cpu_popup_w: f32 = 236.0;
+        const cpu_popup_h: f32 = 68.0;
+        const cpu_popup_x: f32 = @round(std.math.clamp(
+            cpu_cx - cpu_popup_w * 0.5,
+            sheet_x + 12.0,
+            sheet_x + sheet_w - cpu_popup_w - 12.0,
+        ));
+        const cpu_popup_y: f32 = @round(cpu_bottom_y + 6.0);
+        self.cpu_temp_popup_rect = .{
+            .x = cpu_popup_x,
+            .y = cpu_popup_y,
+            .w = cpu_popup_w,
+            .h = cpu_popup_h,
+        };
+        self.cpu_temp_slider_rect = .{
+            .x = cpu_popup_x + 38.0,
+            .y = cpu_popup_y + 34.0,
+            .w = cpu_popup_w - 84.0,
+            .h = 24.0,
+        };
+
         // Manage SD Cards modal popup (centered in the sheet)
         const mg_w: f32 = @min(520.0, sheet_w - 32.0);
         const mg_x: f32 = @round(sheet_x + (sheet_w - mg_w) * 0.5);
@@ -2058,11 +2134,12 @@ pub const BoardUi = struct {
         const menu_bottom: f32 = if (self.board_menu_open) (self.board_menu_rect.y + self.board_menu_rect.h + 16.0) else 0.0;
         const sd_menu_bottom: f32 = if (self.sd_card_menu_open) (self.sd_card_menu_rect.y + self.sd_card_menu_rect.h + 16.0) else 0.0;
         const sd_manage_bottom: f32 = if (self.sd_manage_open) (self.sd_manage_rect.y + self.sd_manage_rect.h + 18.0) else 0.0;
+        const cpu_temp_bottom: f32 = if (self.cpu_temp_popup_open) (self.cpu_temp_popup_rect.y + self.cpu_temp_popup_rect.h + 16.0) else 0.0;
         const base_bottom: f32 = if (self.settings_open)
             @max(panel_y + panel_h + 16.0, menu_bottom)
         else
             collapsed_bottom;
-        const total_h: f32 = @max(base_bottom, @max(sd_menu_bottom, sd_manage_bottom)) - sheet_y;
+        const total_h: f32 = @max(@max(base_bottom, cpu_temp_bottom), @max(sd_menu_bottom, sd_manage_bottom)) - sheet_y;
 
         self.sheet_rect = .{
             .x = sheet_x,
@@ -2200,6 +2277,7 @@ pub const BoardUi = struct {
             if (self.sheet_rect.contains(pt)) return true;
             if (self.sd_manage_open and self.sd_manage_rect.contains(pt)) return true;
             if (self.sd_card_menu_open and self.sd_card_menu_rect.contains(pt)) return true;
+            if (self.cpu_temp_popup_open and self.cpu_temp_popup_rect.contains(pt)) return true;
             if (self.settings_open and self.board_menu_open and self.board_menu_rect.contains(pt)) return true;
         }
         if (!self.display_rect.contains(pt)) return true;
@@ -2302,7 +2380,20 @@ pub const BoardUi = struct {
             self.sd_browse_btn_hovered = false;
             self.sd_add_btn_hovered = false;
             self.sd_manage_close_hovered = false;
+            self.cpu_temp_slider_hovered = false;
+            self.cpu_temp_slider_dragging = false;
             return self.isPointInUi(x, y, status);
+        }
+
+        if (self.cpu_temp_slider_dragging) {
+            const prev_t = self.cpu_temperature_c;
+            self.setCpuTempFromSliderX(x);
+            if (self.cpu_temperature_c != prev_t) {
+                self.hover_dirty = true;
+            }
+            self.cpu_temp_slider_hovered = true;
+            self.hovered_target = null;
+            return true;
         }
 
         if (self.sd_manage_open) {
@@ -2391,6 +2482,16 @@ pub const BoardUi = struct {
             self.hovered_sd_menu_idx = null;
         }
 
+        if (self.cpu_temp_popup_open) {
+            self.cpu_temp_slider_hovered = self.cpu_temp_slider_rect.contains(pt);
+            if (self.cpu_temp_popup_rect.contains(pt)) {
+                self.hovered_target = null;
+                return true;
+            }
+        } else {
+            self.cpu_temp_slider_hovered = false;
+        }
+
         self.settings_btn_hovered = self.settings_btn_rect.contains(pt);
         if (self.settings_open) {
             const boot_editable = !status.power_connected;
@@ -2433,7 +2534,7 @@ pub const BoardUi = struct {
 
     pub fn pointerLeave(self: *BoardUi) void {
         const prev_hover = self.snapshotHoverState();
-        const had_pressed = self.board_btn_pressed or self.max_btn_pressed or self.close_btn_pressed or self.settings_btn_pressed or self.snackbar_dismiss_pressed;
+        const had_pressed = self.board_btn_pressed or self.max_btn_pressed or self.close_btn_pressed or self.settings_btn_pressed or self.snackbar_dismiss_pressed or self.cpu_temp_slider_dragging;
         self.board_btn_hovered = false;
         self.board_btn_pressed = false;
         self.max_btn_hovered = false;
@@ -2458,6 +2559,8 @@ pub const BoardUi = struct {
         self.sd_browse_btn_hovered = false;
         self.sd_add_btn_hovered = false;
         self.sd_manage_close_hovered = false;
+        self.cpu_temp_slider_hovered = false;
+        self.cpu_temp_slider_dragging = false;
         self.hovered_gpio_input_idx = null;
         self.snackbar_dismiss_hovered = false;
         self.snackbar_dismiss_pressed = false;
@@ -2478,6 +2581,12 @@ pub const BoardUi = struct {
     ) Action {
         self.updateLayout(self.last_win_w, self.last_win_h, status, gpio_hw);
         const pt: Point = .{ x, y };
+
+        if (!pressed and self.cpu_temp_slider_dragging) {
+            self.cpu_temp_slider_dragging = false;
+            self.setCpuTempFromSliderX(x);
+            return .consumed;
+        }
 
         // Top bar (y < 44)
         if (y < @as(f32, @floatFromInt(title_bar_height))) {
@@ -2511,6 +2620,8 @@ pub const BoardUi = struct {
                         self.sd_card_menu_open = false;
                         self.sd_manage_open = false;
                         self.sd_create_open = false;
+                        self.cpu_temp_popup_open = false;
+                        self.cpu_temp_slider_dragging = false;
                     }
                     return .consumed;
                 }
@@ -2561,10 +2672,20 @@ pub const BoardUi = struct {
         }
 
         if (pressed) {
-            if (!self.sd_manage_open and !self.sd_card_menu_open and self.settings_btn_rect.contains(pt)) {
+            if (self.cpu_temp_popup_open and !self.sd_manage_open and !self.sd_card_menu_open) {
+                if (self.cpu_temp_slider_rect.contains(pt)) {
+                    self.cpu_temp_slider_dragging = true;
+                    self.setCpuTempFromSliderX(x);
+                    return .consumed;
+                }
+                if (self.cpu_temp_popup_rect.contains(pt)) {
+                    return .consumed;
+                }
+            }
+            if (!self.sd_manage_open and !self.sd_card_menu_open and !self.cpu_temp_popup_open and self.settings_btn_rect.contains(pt)) {
                 self.settings_btn_pressed = true;
             }
-            if (self.sheet_docked_above and !self.sd_manage_open and !self.sd_card_menu_open and
+            if (self.sheet_docked_above and !self.sd_manage_open and !self.sd_card_menu_open and !self.cpu_temp_popup_open and
                 !(self.settings_open and self.board_menu_open) and !self.sheet_rect.contains(pt))
             {
                 self.focused_field = .none;
@@ -2680,6 +2801,19 @@ pub const BoardUi = struct {
                 return .consumed;
             }
 
+            // 3. CPU temperature slider popup handling
+            if (self.cpu_temp_popup_open) {
+                if (self.cpu_temp_popup_rect.contains(pt)) {
+                    if (self.cpu_temp_slider_rect.contains(pt)) {
+                        self.setCpuTempFromSliderX(x);
+                    }
+                    return .consumed;
+                }
+                self.cpu_temp_popup_open = false;
+                self.cpu_temp_slider_hovered = false;
+                return .consumed;
+            }
+
             if (self.settings_btn_rect.contains(pt)) {
                 self.settings_open = !self.settings_open;
                 if (!self.settings_open) {
@@ -2777,6 +2911,12 @@ pub const BoardUi = struct {
                         .usb_mouse => .toggle_usb_mouse,
                         .ethernet => .toggle_ethernet,
                         .gpio => .toggle_gpio,
+                        .cpu => blk: {
+                            self.sd_card_menu_open = false;
+                            self.board_menu_open = false;
+                            self.cpu_temp_popup_open = !self.cpu_temp_popup_open;
+                            break :blk .consumed;
+                        },
                     };
                 }
             }
@@ -3385,6 +3525,8 @@ pub const BoardUi = struct {
                 .gpio_connected = status.gpio_connected,
                 .act_led_on = status.act_led_on,
                 .pwr_led_on = status.pwr_led_on,
+                .cpu_temperature_c = self.effectiveCpuTemperature(status),
+                .cpu_temp_popup_open = self.cpu_temp_popup_open,
             };
 
             if (self.board_cache.len != total_board_px or !std.meta.eql(self.board_cache_key, bkey)) {
@@ -3419,6 +3561,7 @@ pub const BoardUi = struct {
                 }
                 self.paintSettingsSection(c, status);
                 self.paintSdPopups(c);
+                self.paintCpuTempPopup(c, status);
                 return;
             }
         }
@@ -3430,6 +3573,7 @@ pub const BoardUi = struct {
         self.paintBoardDrawing(c, drawing, self.board_rect, status);
         self.paintSettingsSection(c, status);
         self.paintSdPopups(c);
+        self.paintCpuTempPopup(c, status);
     }
 
     /// Renders the GPIO box below the display when the GPIO ribbon cable is connected.
@@ -4000,6 +4144,60 @@ pub const BoardUi = struct {
         }
     }
 
+    fn paintCpuTempPopup(self: *const BoardUi, c: *Canvas, status: SystemStatus) void {
+        if (!self.cpu_temp_popup_open) return;
+        const t = &self.theme;
+        const pr = self.cpu_temp_popup_rect;
+        const sr = self.cpu_temp_slider_rect;
+        const temp_c = self.effectiveCpuTemperature(status);
+
+        c.fillRoundedRect(pr, .all(10.0), t.surface_container_highest);
+        c.strokeRoundedRect(pr, .all(10.0), 1.2, t.primary);
+
+        const icon_s: f32 = 16.0;
+        c.drawIcon(.thermostat, @round(pr.x + 12.0), @round(pr.y + 10.0), icon_s, t.primary);
+        _ = c.drawText(13.0, @round(pr.x + 32.0), @round(pr.y + 23.0), "CPU Temperature", t.on_surface);
+
+        var val_buf: [16]u8 = undefined;
+        const val_str = std.fmt.bufPrint(&val_buf, "{d}°C", .{temp_c}) catch "42°C";
+        const val_w = c.measureText(13.5, val_str);
+        _ = c.drawText(13.5, @round(pr.x + pr.w - 14.0 - val_w), @round(pr.y + 23.0), val_str, t.primary);
+
+        const min_lbl = "0°C";
+        const max_lbl = "100°C";
+        const lbl_st: canvas_mod.Style = .{ .font = &self.font, .size = 11.0 };
+        const lbl_base = @round(sr.y + (sr.h - lbl_st.lineHeight()) * 0.5 + lbl_st.ascent());
+        _ = c.drawText(11.0, @round(pr.x + 12.0), lbl_base, min_lbl, t.on_surface_variant);
+        const max_w = c.measureText(11.0, max_lbl);
+        _ = c.drawText(11.0, @round(pr.x + pr.w - 12.0 - max_w), lbl_base, max_lbl, t.on_surface_variant);
+
+        const track_x0 = sr.x + 8.0;
+        const track_w = @max(1.0, sr.w - 16.0);
+        const track_h: f32 = 6.0;
+        const track_y = @round(sr.y + (sr.h - track_h) * 0.5);
+        const track_r: Rect = .{ .x = track_x0, .y = track_y, .w = track_w, .h = track_h };
+        c.fillRoundedRect(track_r, .all(track_h * 0.5), t.surface);
+        c.strokeRoundedRect(track_r, .all(track_h * 0.5), 1.0, t.outline_variant);
+
+        const frac = std.math.clamp(@as(f32, @floatFromInt(temp_c)) / 100.0, 0.0, 1.0);
+        const fill_w = frac * track_w;
+        if (fill_w > 0.5) {
+            c.fillRoundedRect(
+                .{ .x = track_x0, .y = track_y, .w = @max(track_h, fill_w), .h = track_h },
+                .all(track_h * 0.5),
+                t.primary,
+            );
+        }
+
+        const thumb_cx = @round(track_x0 + fill_w);
+        const thumb_cy = @round(sr.y + sr.h * 0.5);
+        if (self.cpu_temp_slider_hovered or self.cpu_temp_slider_dragging) {
+            c.fillCircle(.{ thumb_cx, thumb_cy }, 12.0, t.primary.withAlpha(0.22));
+        }
+        c.fillCircle(.{ thumb_cx, thumb_cy }, 7.5, t.primary);
+        c.strokeCircle(.{ thumb_cx, thumb_cy }, 7.5, 1.5, t.surface_container_highest);
+    }
+
     fn paintSpinner(c: *Canvas, center: Point, radius: f32, phase_rad: f32, fg: Color, track: Color) void {
         c.strokeCircle(center, radius, 1.5, track.withAlpha(0.28));
         const num_dots: usize = 12;
@@ -4140,6 +4338,7 @@ pub const BoardUi = struct {
                 },
                 .ethernet => !hl.has_external_hub and self.hovered_target == .ethernet,
                 .gpio, .gpio_holes => self.hovered_target == .gpio,
+                .soc, .soc_with_ram => !part.underside and (self.hovered_target == .cpu or self.cpu_temp_popup_open),
                 else => false,
             };
             const pr = map(tr, part.rect);
@@ -4156,7 +4355,40 @@ pub const BoardUi = struct {
                     c.fillRoundedRect(pr.outset(1.0 * s), .all(0.9 * s), led_col.withAlpha(0.36));
                     c.fillRoundedRect(pr, .all(0.25 * s), led_col);
                 }
-                drawPart(c, &part, pr, s, if (part_hovered) t.primary else ink);
+                const fg = if (part_hovered) t.primary else ink;
+                drawPart(c, &part, pr, s, fg);
+                if (part.kind == .soc or part.kind == .soc_with_ram) {
+                    const temp_c = self.effectiveCpuTemperature(status);
+                    var temp_buf: [16]u8 = undefined;
+                    const temp_str = std.fmt.bufPrint(&temp_buf, "{d}°C", .{temp_c}) catch "42°C";
+                    const icon_sz = 4.2 * s;
+                    var font_sz = 2.5 * s;
+                    const max_tw = @max(4.0 * s, pr.w - (if (part.lidded) 3.2 * s else 2.0 * s));
+                    var tw = c.measureText(font_sz, temp_str);
+                    if (tw > max_tw and tw > 0) {
+                        font_sz *= max_tw / tw;
+                        tw = c.measureText(font_sz, temp_str);
+                    }
+                    const style: canvas_mod.Style = .{ .font = &self.font, .size = font_sz };
+                    const text_h = style.ascent();
+                    const gap = 0.6 * s;
+                    const group_h = icon_sz + gap + text_h;
+                    const top_y = pr.y + (pr.h - group_h) * 0.5;
+                    c.drawIcon(
+                        .thermostat,
+                        @round(pr.x + (pr.w - icon_sz) * 0.5),
+                        @round(top_y),
+                        icon_sz,
+                        fg,
+                    );
+                    _ = c.drawText(
+                        font_sz,
+                        @round(pr.x + (pr.w - tw) * 0.5),
+                        @round(top_y + icon_sz + gap + text_h),
+                        temp_str,
+                        fg,
+                    );
+                }
             }
             if (part_hovered) {
                 c.fillRoundedRect(pr, partRadius(&part, s), t.primary.withAlpha(0.22));
@@ -6848,5 +7080,104 @@ test "BoardUi renames SD cards via UI and updates persistent .qcow2 files" {
         try testing.expectEqual(@as(u8, 0xAB), ui2.sd_cards.items[1].disk.readByte(0));
     }
 }
+
+test "BoardUi renders thermometer and temperature on CPU and opens temperature slider on click" {
+    var ui = try BoardUi.init(testing.allocator);
+    defer ui.deinit();
+
+    var hw: Gpio = .{};
+    var status = SystemStatus{};
+    const win_w: u32 = 800;
+    const win_h: u32 = 524;
+    ui.sheet_open = true;
+    ui.updateLayout(win_w, win_h, status, &hw);
+
+    // Find the CPU rect in window coordinates
+    const drawing = status.board_model.drawing();
+    const tr = BoardUi.boardTransform(drawing, ui.board_rect);
+    var cpu_win_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    for (drawing.parts) |p| {
+        if (!p.underside and (p.kind == .soc or p.kind == .soc_with_ram)) {
+            cpu_win_rect = .{
+                .x = tr.x + p.rect.x * tr.scale,
+                .y = tr.y + p.rect.y * tr.scale,
+                .w = p.rect.w * tr.scale,
+                .h = p.rect.h * tr.scale,
+            };
+            break;
+        }
+    }
+    try testing.expect(cpu_win_rect.w > 0);
+    const cpu_cx = cpu_win_rect.x + cpu_win_rect.w * 0.5;
+    const cpu_cy = cpu_win_rect.y + cpu_win_rect.h * 0.5;
+
+    // Hovering over the CPU targets .cpu
+    _ = ui.pointerMotion(cpu_cx, cpu_cy, status, &hw);
+    try testing.expectEqual(@as(?InteractiveTarget, .cpu), ui.hovered_target);
+
+    // Paint at default 42°C and verify interior of CPU has lit pixels from thermometer icon and temperature text
+    const pixels_42 = try testing.allocator.alloc(u32, win_w * win_h);
+    defer testing.allocator.free(pixels_42);
+    @memset(pixels_42, 0xFF000000);
+    ui.paint(pixels_42, win_w, win_h, 1, status, &hw);
+
+    const surface_argb = ui.theme.surface.toArgb();
+    var cpu_interior_lit: usize = 0;
+    const ix0: usize = @intFromFloat(@ceil(cpu_win_rect.x + 6.0));
+    const ix1: usize = @intFromFloat(@floor(cpu_win_rect.x + cpu_win_rect.w - 6.0));
+    const iy0: usize = @intFromFloat(@ceil(cpu_win_rect.y + 6.0));
+    const iy1: usize = @intFromFloat(@floor(cpu_win_rect.y + cpu_win_rect.h - 6.0));
+    for (iy0..iy1) |py| {
+        for (ix0..ix1) |px| {
+            if (pixels_42[py * win_w + px] != surface_argb) cpu_interior_lit += 1;
+        }
+    }
+    try testing.expect(cpu_interior_lit > 20);
+
+    // Clicking on the CPU opens the temperature slider popup
+    try testing.expect(!ui.cpu_temp_popup_open);
+    _ = ui.pointerButton(cpu_cx, cpu_cy, true, status, &hw);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(cpu_cx, cpu_cy, false, status, &hw));
+    try testing.expect(ui.cpu_temp_popup_open);
+
+    // Dragging the slider changes the CPU temperature
+    ui.updateLayout(win_w, win_h, status, &hw);
+    const sr = ui.cpu_temp_slider_rect;
+    const track_x0 = sr.x + 8.0;
+    const track_w = sr.w - 16.0;
+    const slider_y = sr.y + sr.h * 0.5;
+
+    // Press at 75% of the slider track -> 75°C
+    try testing.expectEqual(Action.consumed, ui.pointerButton(track_x0 + track_w * 0.75, slider_y, true, status, &hw));
+    try testing.expect(ui.cpu_temp_slider_dragging);
+    try testing.expectEqual(@as(u8, 75), ui.cpu_temperature_c);
+
+    // Drag to 0% -> 0°C
+    _ = ui.pointerMotion(track_x0 - 10.0, slider_y, status, &hw);
+    try testing.expectEqual(@as(u8, 0), ui.cpu_temperature_c);
+
+    // Drag to 100% -> 100°C and release
+    _ = ui.pointerMotion(track_x0 + track_w + 10.0, slider_y, status, &hw);
+    try testing.expectEqual(@as(u8, 100), ui.cpu_temperature_c);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(track_x0 + track_w * 0.65, slider_y, false, status, &hw));
+    try testing.expect(!ui.cpu_temp_slider_dragging);
+    try testing.expectEqual(@as(u8, 65), ui.cpu_temperature_c);
+
+    // Verify rendering at 65°C differs inside the CPU chip from 42°C
+    ui.cpu_temp_popup_open = false;
+    const pixels_65 = try testing.allocator.alloc(u32, win_w * win_h);
+    defer testing.allocator.free(pixels_65);
+    @memset(pixels_65, 0xFF000000);
+    ui.paint(pixels_65, win_w, win_h, 1, status, &hw);
+
+    var diff_count: usize = 0;
+    for (iy0..iy1) |py| {
+        for (ix0..ix1) |px| {
+            if (pixels_42[py * win_w + px] != pixels_65[py * win_w + px]) diff_count += 1;
+        }
+    }
+    try testing.expect(diff_count > 10);
+}
+
 
 

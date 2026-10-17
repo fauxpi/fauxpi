@@ -308,6 +308,7 @@ fn resetCpusForBoard(
 fn syncWindowPeripheralsToSoc(w: *const window.Window, soc: *Bcm2835) void {
     soc.setHdmiConnected(w.status.hdmi_connected);
     soc.setAudioConnected(w.status.audio_connected);
+    soc.setCpuTemperatureCelsius(w.status.cpu_temperature_c);
     soc.usb.hid.setHubKind(w.status.board_model.hubKind());
     soc.usb.hid.hub_connected = w.status.usb_hub_connected;
     soc.usb.hid.keyboard_connected = w.status.usb_keyboard_connected;
@@ -496,6 +497,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             }
 
             soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
+            soc.setCpuTemperatureCelsius(w.status.cpu_temperature_c);
 
             if (!w.status.power_connected or !guest_booted) {
                 if (host_audio) |ha| ha.setPaused(true);
@@ -796,6 +798,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 try w.pollEvents();
                 soc.setHdmiConnected(w.status.hdmi_connected);
                 soc.setAudioConnected(w.status.audio_connected);
+                soc.setCpuTemperatureCelsius(w.status.cpu_temperature_c);
                 soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
                 soc.usb.wakeIfPending();
                 soc.updateIrqs();

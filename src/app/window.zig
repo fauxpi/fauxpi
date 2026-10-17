@@ -282,7 +282,7 @@ pub fn compositeToBuffer(win: anytype, full: []u32, buf_state: *BufferState) boo
     const top_phys_rows: usize = @as(usize, disp_y) * @as(usize, sc);
 
     const has_overlay = win.ui.sheet_open or win.ui.hasSnackbar();
-    const has_popup = win.ui.sd_manage_open or win.ui.sd_card_menu_open or win.ui.board_menu_open;
+    const has_popup = win.ui.sd_manage_open or win.ui.sd_card_menu_open or win.ui.board_menu_open or win.ui.cpu_temp_popup_open;
     const can_reuse_sheet_backdrop = win.ui.sheet_open and !win.ui.hasSnackbar() and !has_popup;
     const hdmi_state: u2 = (@as(u2, @intFromBool(win.status.hdmi_connected)) |
         (@as(u2, @intFromBool(win.status.hdmi_active)) << 1));
@@ -381,7 +381,12 @@ pub fn updateGuestMouseTarget(win: anytype, sx: f64, sy: f64) void {
 }
 
 pub fn handlePointerMotion(win: anytype, sx: f64, sy: f64) void {
+    const prev_temp = win.ui.cpu_temperature_c;
     const in_ui = win.ui.pointerMotion(@floatCast(sx), @floatCast(sy), win.status, win.gpio);
+    if (win.ui.cpu_temperature_c != prev_temp) {
+        win.status.cpu_temperature_c = win.ui.cpu_temperature_c;
+        win.ui_dirty = true;
+    }
     win.updateCursorShape(in_ui);
     if (!in_ui) {
         updateGuestMouseTarget(win, sx, sy);
@@ -535,6 +540,7 @@ pub fn handlePointerButton(win: anytype, button_bit: u8, pressed: bool, sx_f64: 
                 win.status.serial_u64 = win.ui.parsedSerial();
                 win.status.mac_address = win.ui.parsedMac();
                 win.status.wifi_mac_address = win.ui.parsedWifiMac();
+                win.status.cpu_temperature_c = win.ui.cpu_temperature_c;
                 win.ui.saveSettings(win.status) catch {};
                 return;
             },
@@ -641,6 +647,11 @@ pub fn dispatchKey(win: anytype, key: u32, pressed: bool, is_repeat: bool) void 
                 win.ui.sd_card_menu_open = false;
                 return;
             }
+            if (win.ui.cpu_temp_popup_open) {
+                win.ui.cpu_temp_popup_open = false;
+                win.ui.cpu_temp_slider_dragging = false;
+                return;
+            }
             if (!win.ui.sheet_docked_above) {
                 win.ui.sheet_open = false;
                 const sx: f32 = @floatCast(win.last_mouse_x orelse 0.0);
@@ -649,7 +660,7 @@ pub fn dispatchKey(win: anytype, key: u32, pressed: bool, is_repeat: bool) void 
                 return;
             }
         }
-        if (!win.ui.sheet_docked_above or win.ui.focused_field != .none or win.ui.sd_manage_open or win.ui.sd_card_menu_open) {
+        if (!win.ui.sheet_docked_above or win.ui.focused_field != .none or win.ui.sd_manage_open or win.ui.sd_card_menu_open or win.ui.cpu_temp_popup_open) {
             return;
         }
     }

@@ -195,11 +195,16 @@ pub const Thermal = struct {
     pub const SIZE: u32 = 0x08;
 
     ctl: u32 = 0,
+    temperature_mc: i32 = 42_000,
 
     pub fn read32(self: *const Thermal, offset: u32) u32 {
         return switch (offset) {
             0x00 => self.ctl,
-            0x04 => (1 << 10) | 682, // TS_TSENSSTAT_VALID | raw ADC (407000 - 538*682 = 40.08 C)
+            0x04 => blk: {
+                // Linux bcm2835_thermal formula: T(m°C) = 407000 - 538 * raw_adc
+                const adc: u32 = @intCast(std.math.clamp(@divTrunc(407_000 - self.temperature_mc, 538), 0, 1023));
+                break :blk (1 << 10) | adc; // TS_TSENSSTAT_VALID | raw ADC
+            },
             else => 0,
         };
     }

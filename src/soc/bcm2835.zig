@@ -432,6 +432,14 @@ pub const Bcm2835 = struct {
         self.audio_connected = connected;
     }
 
+    /// Sets the simulated SoC temperature in degrees Celsius (`0..100` °C) for both the
+    /// VideoCore property mailbox (`0x00030006`) and the `bcm2835-thermal` MMIO sensor.
+    pub fn setCpuTemperatureCelsius(self: *Bcm2835, temp_c: u8) void {
+        const temp_mc: u32 = @as(u32, temp_c) * 1000;
+        self.mailbox.temperature_mc = temp_mc;
+        self.thermal.temperature_mc = @intCast(temp_mc);
+    }
+
     /// Advances paced audio DMA channels (`vc4-hdmi` MAI and `bcm2835-pwm`) and VCHIQ `AUDS` completions.
     pub fn advanceAudio(self: *Bcm2835, elapsed_us: u64) void {
         if (elapsed_us == 0) return;

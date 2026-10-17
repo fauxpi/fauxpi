@@ -62,6 +62,7 @@ pub const Mailbox = struct {
     board_revision: u32 = 0x00900093,
     board_serial: u64 = 0x00000000fa000001,
     mac_address: [6]u8 = .{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 },
+    temperature_mc: u32 = 42_000,
 
     /// Firmware GPIO expander state (pins 128..135; 128 = ACT LED, 130 = active-low PWR LED on Pi 3 B+, 135 = PWR LED)
     exp_gpio_state: [8]u1 = .{ 0, 1, 0, 1, 1, 1, 1, 1 },
@@ -362,7 +363,7 @@ pub const Mailbox = struct {
                 0x00030006 => { // Get temperature
                     const id = readU32(ram, payload, 0, buf_size);
                     writeU32(ram, payload, 0, buf_size, id);
-                    writeU32(ram, payload, 4, buf_size, 42000);
+                    writeU32(ram, payload, 4, buf_size, self.temperature_mc);
                     resp_len = 8;
                 },
                 0x0003000a => { // Get max temperature
