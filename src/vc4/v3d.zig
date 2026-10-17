@@ -1005,14 +1005,82 @@ pub const V3d = struct {
         }
     }
 
+    pub const TileBuffer = struct {
+        color: *[64 * 64]u32,
+        depth: *[64 * 64]f32,
+        color_solid: ?u32 = null,
+        depth_valid: bool = false,
+        clear_zs: f32 = 1.0,
+        lazy_load: ?LazyTileLoad = null,
+        loaded_from: ?LazyTileLoad = null,
+        modified: bool = false,
+    };
+
+    pub const TileJob = struct {
+        tile_x: u32,
+        tile_y: u32,
+        clear_color0: u32,
+        clear_zs: f32,
+        lazy_load: ?LazyTileLoad = null,
+        has_render: bool = false,
+        dst_addr: u32 = 0,
+        fb_w: u32 = 0,
+        fb_h: u32 = 0,
+        tiling: u2 = 0,
+        ls_format: u2 = 0,
+    };
+
+    const WorkerCtx = struct {
+        v3d: *const V3d,
+        ram: []u8,
+        jobs: []const TileJob,
+        next_idx: *std.atomic.Value(usize),
+
+        fn run(ctx: *const WorkerCtx) void {
+            var color_buf: [64 * 64]u32 = undefined;
+            var depth_buf: [64 * 64]f32 = undefined;
+            var tb = TileBuffer{
+                .color = &color_buf,
+                .depth = &depth_buf,
+            };
+            while (true) {
+                const idx = ctx.next_idx.fetchAdd(1, .monotonic);
+                if (idx >= ctx.jobs.len) break;
+                ctx.v3d.executeTileJob(&tb, ctx.ram, ctx.jobs[idx]);
+            }
+        }
+    };
+
     const PendingTileLoad = struct {
         addr: u32,
         tiling: u2,
         format: u2,
     };
 
-    inline fn canSkipUnmodifiedStore(
-        self: *const V3d,
+    inline fn tileBuf(self: *V3d) TileBuffer {
+        return .{
+            .color = &self.tile_color,
+            .depth = &self.tile_depth,
+            .color_solid = self.tile_color_solid,
+            .depth_valid = self.tile_depth_valid,
+            .clear_zs = self.tile_clear_zs,
+            .lazy_load = self.lazy_load,
+            .loaded_from = self.loaded_from,
+            .modified = self.tile_modified,
+        };
+    }
+
+    inline fn syncFromTileBuf(self: *V3d, tb: *const TileBuffer) void {
+        self.tile_color_solid = tb.color_solid;
+        self.tile_depth_valid = tb.depth_valid;
+        self.tile_clear_zs = tb.clear_zs;
+        self.lazy_load = tb.lazy_load;
+        self.loaded_from = tb.loaded_from;
+        self.tile_modified = tb.modified;
+    }
+
+    inline fn canSkipUnmodifiedStoreBuf(
+        tb: *const TileBuffer,
         dst_addr: u32,
         fb_w: u32,
         fb_h: u32,
@@ -1022,8 +1090,8 @@ pub const V3d = struct {
         tiling: u2,
         format: u2,
     ) bool {
-        if (self.tile_modified) return false;
-        const lf = self.loaded_from orelse return false;
+        if (tb.modified) return false;
+        const lf = tb.loaded_from orelse return false;
         const dst_is_565 = (format == 1 or format == 2);
         const src_is_565 = (lf.format == 1 or lf.format == 2);
         return (lf.addr & 0x1FFFFFFF) == (dst_addr & 0x1FFFFFFF) and
@@ -1034,6 +1102,78 @@ pub const V3d = struct {
             lf.tile_size == tile_size and
             lf.tiling == tiling and
             dst_is_565 == src_is_565;
+    }
+
+    fn executeTileJob(self: *const V3d, tb: *TileBuffer, ram: []u8, job: TileJob) void {
+        const tile_size: u32 = 64;
+        if (job.lazy_load) |ll| {
+            tb.lazy_load = ll;
+            tb.loaded_from = ll;
+            tb.color_solid = null;
+        } else {
+            tb.lazy_load = null;
+            tb.loaded_from = null;
+            tb.color_solid = job.clear_color0;
+        }
+        tb.depth_valid = false;
+        tb.clear_zs = job.clear_zs;
+        tb.modified = false;
+
+        if (job.has_render) {
+            self.renderDrawsIntoTileBuf(tb, ram, job.tile_x * tile_size, job.tile_y * tile_size, tile_size);
+        }
+
+        if (!canSkipUnmodifiedStoreBuf(tb, job.dst_addr, job.fb_w, job.fb_h, job.tile_x, job.tile_y, tile_size, job.tiling, job.ls_format)) {
+            if (tb.lazy_load) |ll| {
+                tb.lazy_load = null;
+                loadTileIntoBuf(tb, ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
+                tb.color_solid = null;
+            }
+            storeTileFromBuf(tb, ram, job.dst_addr, job.fb_w, job.fb_h, job.tile_x, job.tile_y, tile_size, job.tiling, job.ls_format);
+        }
+    }
+
+    fn flushTileJobs(self: *V3d, ram: []u8, jobs: []const TileJob) void {
+        if (jobs.len == 0) return;
+        if (jobs.len < 4) {
+            var tb = self.tileBuf();
+            defer self.syncFromTileBuf(&tb);
+            for (jobs) |job| {
+                self.executeTileJob(&tb, ram, job);
+            }
+            return;
+        }
+
+        var next_idx = std.atomic.Value(usize).init(0);
+        const ctx = WorkerCtx{
+            .v3d = self,
+            .ram = ram,
+            .jobs = jobs,
+            .next_idx = &next_idx,
+        };
+
+        const max_helper_threads = 3;
+        const desired_helpers = @min(max_helper_threads, (jobs.len / 2) - 1);
+        var threads: [max_helper_threads]std.Thread = undefined;
+        var spawned: usize = 0;
+        for (0..desired_helpers) |_| {
+            threads[spawned] = std.Thread.spawn(.{}, WorkerCtx.run, .{&ctx}) catch break;
+            spawned += 1;
+        }
+
+        {
+            var tb = self.tileBuf();
+            defer self.syncFromTileBuf(&tb);
+            while (true) {
+                const idx = next_idx.fetchAdd(1, .monotonic);
+                if (idx >= jobs.len) break;
+                self.executeTileJob(&tb, ram, jobs[idx]);
+            }
+        }
+
+        for (threads[0..spawned]) |t| {
+            t.join();
+        }
     }
 
     fn executeRcl(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) void {
@@ -1054,10 +1194,42 @@ pub const V3d = struct {
         var cur_tile_y: u32 = 0;
         var has_tile_coords: bool = false;
         var pending_load: ?PendingTileLoad = null;
+        var cur_lazy_load: ?LazyTileLoad = null;
+        var cur_has_render: bool = false;
         var tile_loaded: bool = false;
-        self.lazy_load = null;
-        self.loaded_from = null;
-        self.tile_modified = false;
+
+        var tile_jobs: [1024]TileJob = undefined;
+        var tile_jobs_len: usize = 0;
+        var queued_tile_mask: [32]u32 = @splat(0);
+
+        const queueOrRunJob = struct {
+            fn f(
+                v3d_self: *V3d,
+                mem: []u8,
+                jobs: *[1024]TileJob,
+                jobs_len: *usize,
+                q_mask: *[32]u32,
+                job: TileJob,
+            ) void {
+                if (job.tile_x < 32 and job.tile_y < 32) {
+                    const bit = @as(u32, 1) << @intCast(job.tile_x);
+                    if ((q_mask[job.tile_y] & bit) != 0 or jobs_len.* >= jobs.len) {
+                        v3d_self.flushTileJobs(mem, jobs[0..jobs_len.*]);
+                        jobs_len.* = 0;
+                        q_mask.* = @splat(0);
+                    }
+                    q_mask[job.tile_y] |= bit;
+                    jobs[jobs_len.*] = job;
+                    jobs_len.* += 1;
+                } else {
+                    v3d_self.flushTileJobs(mem, jobs[0..jobs_len.*]);
+                    jobs_len.* = 0;
+                    q_mask.* = @splat(0);
+                    const single = [1]TileJob{job};
+                    v3d_self.flushTileJobs(mem, &single);
+                }
+            }
+        }.f;
 
         while (pc < end) {
             const op = ram[pc];
@@ -1070,47 +1242,39 @@ pub const V3d = struct {
                 },
                 17 => { // BRANCH_TO_SUB_LIST (executes binned primitives for the current tile)
                     if (pc + 5 > end) break;
-                    const tile_size: u32 = 64;
                     if (!tile_loaded) {
-                        self.lazy_load = null;
-                        self.loaded_from = null;
-                        self.tile_color_solid = clear_color0;
-                        self.tile_depth_valid = false;
-                        self.tile_clear_zs = clear_zs;
-                        self.tile_modified = false;
+                        cur_lazy_load = null;
                         tile_loaded = true;
                     }
-                    self.renderDrawsIntoTile(ram, cur_tile_x * tile_size, cur_tile_y * tile_size, tile_size);
+                    cur_has_render = true;
                     pc += 5;
                 },
                 24, 25 => { // STORE_MS_TILE_BUFFER / STORE_MS_TILE_BUFFER_AND_EOF (1 byte)
-                    const tile_size: u32 = 64;
                     if (!tile_loaded) {
-                        self.lazy_load = null;
-                        self.loaded_from = null;
-                        self.tile_color_solid = clear_color0;
-                        self.tile_depth_valid = false;
-                        self.tile_clear_zs = clear_zs;
-                        self.tile_modified = false;
+                        cur_lazy_load = null;
                         tile_loaded = true;
                     }
                     const r_format: u2 = @truncate((fb_flags >> 2) & 3);
                     const r_tiling: u2 = @truncate((fb_flags >> 6) & 3);
                     const ls_format: u2 = if (r_format == 1) 0 else 2;
-                    if (!self.canSkipUnmodifiedStore(fb_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, r_tiling, ls_format)) {
-                        if (self.lazy_load) |ll| {
-                            self.lazy_load = null;
-                            self.loadTileFromRam(ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
-                            self.tile_color_solid = null;
-                        }
-                        self.storeTileToRam(ram, fb_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, r_tiling, ls_format);
-                    }
+                    queueOrRunJob(self, ram, &tile_jobs, &tile_jobs_len, &queued_tile_mask, .{
+                        .tile_x = cur_tile_x,
+                        .tile_y = cur_tile_y,
+                        .clear_color0 = clear_color0,
+                        .clear_zs = clear_zs,
+                        .lazy_load = cur_lazy_load,
+                        .has_render = cur_has_render,
+                        .dst_addr = fb_addr,
+                        .fb_w = fb_width,
+                        .fb_h = fb_height,
+                        .tiling = r_tiling,
+                        .ls_format = ls_format,
+                    });
                     tile_loaded = false;
                     has_tile_coords = false;
                     pending_load = null;
-                    self.lazy_load = null;
-                    self.loaded_from = null;
-                    self.tile_modified = false;
+                    cur_lazy_load = null;
+                    cur_has_render = false;
                     pc += 1;
                 },
                 28 => { // STORE_TILE_BUFFER_GENERAL (7 bytes)
@@ -1119,34 +1283,34 @@ pub const V3d = struct {
                     const addr_word = std.mem.readInt(u32, ram[pc + 3 ..][0..4], .little);
                     const buf_kind = bits & 7;
                     if (buf_kind == 1) { // Color buffer store
-                        const tile_size: u32 = 64;
                         if (!tile_loaded) {
-                            self.lazy_load = null;
-                            self.loaded_from = null;
-                            self.tile_color_solid = clear_color0;
-                            self.tile_modified = false;
+                            cur_lazy_load = null;
                             tile_loaded = true;
                         }
                         const ls_tiling: u2 = @truncate((bits >> 4) & 3);
                         const ls_format: u2 = @truncate((bits >> 8) & 3);
                         const dst_addr = if ((addr_word & ~@as(u32, 0xf)) != 0) (addr_word & ~@as(u32, 0xf)) else fb_addr;
-                        if (!self.canSkipUnmodifiedStore(dst_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, ls_tiling, ls_format)) {
-                            if (self.lazy_load) |ll| {
-                                self.lazy_load = null;
-                                self.loadTileFromRam(ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
-                                self.tile_color_solid = null;
-                            }
-                            self.storeTileToRam(ram, dst_addr, fb_width, fb_height, cur_tile_x, cur_tile_y, tile_size, ls_tiling, ls_format);
-                        }
+                        queueOrRunJob(self, ram, &tile_jobs, &tile_jobs_len, &queued_tile_mask, .{
+                            .tile_x = cur_tile_x,
+                            .tile_y = cur_tile_y,
+                            .clear_color0 = clear_color0,
+                            .clear_zs = clear_zs,
+                            .lazy_load = cur_lazy_load,
+                            .has_render = cur_has_render,
+                            .dst_addr = dst_addr,
+                            .fb_w = fb_width,
+                            .fb_h = fb_height,
+                            .tiling = ls_tiling,
+                            .ls_format = ls_format,
+                        });
                     }
                     if ((bits & (1 << 15)) == 0) {
                         // Last store for tile
                         tile_loaded = false;
                         has_tile_coords = false;
                         pending_load = null;
-                        self.lazy_load = null;
-                        self.loaded_from = null;
-                        self.tile_modified = false;
+                        cur_lazy_load = null;
+                        cur_has_render = false;
                     }
                     pc += 7;
                 },
@@ -1160,7 +1324,7 @@ pub const V3d = struct {
                         const ls_format: u2 = @truncate((bits >> 8) & 3);
                         const load_addr = addr_word & ~@as(u32, 0xf);
                         if (has_tile_coords) {
-                            const ll = LazyTileLoad{
+                            cur_lazy_load = .{
                                 .addr = load_addr,
                                 .fb_w = fb_width,
                                 .fb_h = fb_height,
@@ -1170,12 +1334,7 @@ pub const V3d = struct {
                                 .tiling = ls_tiling,
                                 .format = ls_format,
                             };
-                            self.lazy_load = ll;
-                            self.loaded_from = ll;
-                            self.tile_color_solid = null;
-                            self.tile_depth_valid = false;
-                            self.tile_clear_zs = clear_zs;
-                            self.tile_modified = false;
+                            cur_has_render = false;
                             tile_loaded = true;
                         } else {
                             pending_load = .{
@@ -1214,8 +1373,9 @@ pub const V3d = struct {
                     cur_tile_x = ram[pc + 1];
                     cur_tile_y = ram[pc + 2];
                     has_tile_coords = true;
+                    cur_has_render = false;
                     if (pending_load) |pl| {
-                        const ll = LazyTileLoad{
+                        cur_lazy_load = .{
                             .addr = pl.addr,
                             .fb_w = fb_width,
                             .fb_h = fb_height,
@@ -1225,21 +1385,10 @@ pub const V3d = struct {
                             .tiling = pl.tiling,
                             .format = pl.format,
                         };
-                        self.lazy_load = ll;
-                        self.loaded_from = ll;
-                        self.tile_color_solid = null;
-                        self.tile_depth_valid = false;
-                        self.tile_clear_zs = clear_zs;
-                        self.tile_modified = false;
                         tile_loaded = true;
                         pending_load = null;
                     } else if (!tile_loaded) {
-                        self.lazy_load = null;
-                        self.loaded_from = null;
-                        self.tile_color_solid = clear_color0;
-                        self.tile_depth_valid = false;
-                        self.tile_clear_zs = clear_zs;
-                        self.tile_modified = false;
+                        cur_lazy_load = null;
                         tile_loaded = true;
                     }
                     pc += 3;
@@ -1247,10 +1396,29 @@ pub const V3d = struct {
                 else => break,
             }
         }
+
+        self.flushTileJobs(ram, tile_jobs[0..tile_jobs_len]);
     }
 
     fn loadTileFromRam(
         self: *V3d,
+        ram: []const u8,
+        base_bus: u32,
+        fb_w: u32,
+        fb_h: u32,
+        tile_x: u32,
+        tile_y: u32,
+        tile_size: u32,
+        tiling: u2,
+        ls_format: u2,
+    ) void {
+        var tb = self.tileBuf();
+        defer self.syncFromTileBuf(&tb);
+        loadTileIntoBuf(&tb, ram, base_bus, fb_w, fb_h, tile_x, tile_y, tile_size, tiling, ls_format);
+    }
+
+    fn loadTileIntoBuf(
+        tb: *TileBuffer,
         ram: []const u8,
         base_bus: u32,
         fb_w: u32,
@@ -1277,7 +1445,7 @@ pub const V3d = struct {
                     const py = y0 + @as(u32, @intCast(ty));
                     const off = base + (py * fb_w + x0) * 4;
                     if (off + 256 <= ram.len) {
-                        @memcpy(std.mem.sliceAsBytes(self.tile_color[ty * 64 ..][0..64]), ram[off..][0..256]);
+                        @memcpy(std.mem.sliceAsBytes(tb.color[ty * 64 ..][0..64]), ram[off..][0..256]);
                     }
                 }
                 return;
@@ -1302,7 +1470,7 @@ pub const V3d = struct {
                             inline for (0..4) |ry| {
                                 const dst_idx = (uy * 4 + ry) * 64 + ux * 4;
                                 @memcpy(
-                                    std.mem.sliceAsBytes(self.tile_color[dst_idx..][0..4]),
+                                    std.mem.sliceAsBytes(tb.color[dst_idx..][0..4]),
                                     ram[utile_off + ry * 16 ..][0..16],
                                 );
                             }
@@ -1330,7 +1498,7 @@ pub const V3d = struct {
                     const utile_off = group_base + ((abs_ux & 3) << 6);
                     if (utile_off + 64 <= ram.len) {
                         inline for (0..4) |ry| {
-                            const dst_row = self.tile_color[(uy * 4 + ry) * 64 + ux * 8 ..][0..8];
+                            const dst_row = tb.color[(uy * 4 + ry) * 64 + ux * 8 ..][0..8];
                             const p16_vec: @Vector(8, u16) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
                             dst_row.* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
                         }
@@ -1354,7 +1522,7 @@ pub const V3d = struct {
                 else
                     texture.texelOffsetOf(fmt, fb_w, fb_h, px, py);
                 if (off + cpp <= ram.len) {
-                    self.tile_color[ty * tile_size + tx] = if (is_565)
+                    tb.color[ty * tile_size + tx] = if (is_565)
                         format_mod.fromRgb565(std.mem.readInt(u16, ram[off..][0..2], .little))
                     else
                         std.mem.readInt(u32, ram[off..][0..4], .little);
@@ -1365,6 +1533,31 @@ pub const V3d = struct {
 
     fn storeTileToRam(
         self: *const V3d,
+        ram: []u8,
+        base_bus: u32,
+        fb_w: u32,
+        fb_h: u32,
+        tile_x: u32,
+        tile_y: u32,
+        tile_size: u32,
+        tiling: u2,
+        ls_format: u2,
+    ) void {
+        const tb = TileBuffer{
+            .color = @constCast(&self.tile_color),
+            .depth = @constCast(&self.tile_depth),
+            .color_solid = self.tile_color_solid,
+            .depth_valid = self.tile_depth_valid,
+            .clear_zs = self.tile_clear_zs,
+            .lazy_load = self.lazy_load,
+            .loaded_from = self.loaded_from,
+            .modified = self.tile_modified,
+        };
+        storeTileFromBuf(&tb, ram, base_bus, fb_w, fb_h, tile_x, tile_y, tile_size, tiling, ls_format);
+    }
+
+    fn storeTileFromBuf(
+        tb: *const TileBuffer,
         ram: []u8,
         base_bus: u32,
         fb_w: u32,
@@ -1387,7 +1580,7 @@ pub const V3d = struct {
 
         if (!is_565 and tile_size == 64) {
             if (tiling == 0 and valid_w == 64) {
-                if (self.tile_color_solid) |solid_c| {
+                if (tb.color_solid) |solid_c| {
                     var solid_row: [64]u32 = @splat(solid_c);
                     const row_bytes = std.mem.asBytes(&solid_row);
                     for (0..valid_h) |ty| {
@@ -1402,7 +1595,7 @@ pub const V3d = struct {
                         const py = y0 + @as(u32, @intCast(ty));
                         const off = base + (py * fb_w + x0) * 4;
                         if (off + 256 <= ram.len) {
-                            @memcpy(ram[off..][0..256], std.mem.sliceAsBytes(self.tile_color[ty * 64 ..][0..64]));
+                            @memcpy(ram[off..][0..256], std.mem.sliceAsBytes(tb.color[ty * 64 ..][0..64]));
                         }
                     }
                 }
@@ -1415,7 +1608,7 @@ pub const V3d = struct {
                 const base_uy = y0 >> 2;
                 const utiles_x = valid_w >> 2;
                 const utiles_y = valid_h >> 2;
-                if (self.tile_color_solid) |solid_c| {
+                if (tb.color_solid) |solid_c| {
                     var solid_utile: [16]u32 = @splat(solid_c);
                     const utile_bytes = std.mem.asBytes(&solid_utile);
                     for (0..utiles_y) |uy| {
@@ -1447,7 +1640,7 @@ pub const V3d = struct {
                                     const src_idx = (uy * 4 + ry) * 64 + ux * 4;
                                     @memcpy(
                                         ram[utile_off + ry * 16 ..][0..16],
-                                        std.mem.sliceAsBytes(self.tile_color[src_idx..][0..4]),
+                                        std.mem.sliceAsBytes(tb.color[src_idx..][0..4]),
                                     );
                                 }
                             }
@@ -1458,7 +1651,7 @@ pub const V3d = struct {
             }
         }
 
-        const solid_565 = if (self.tile_color_solid) |sc| format_mod.toRgb565(sc) else 0;
+        const solid_565 = if (tb.color_solid) |sc| format_mod.toRgb565(sc) else 0;
         if (is_565 and tile_size == 64 and tiling != 0 and (valid_w & 7) == 0) {
             const is_lt = (fb_w <= 32 or fb_h <= 16);
             const lt_row_stride = ((fb_w + 7) & ~@as(u32, 7)) << 1;
@@ -1467,7 +1660,7 @@ pub const V3d = struct {
             const base_uy = y0 >> 2;
             const utiles_x = valid_w >> 3;
             const utiles_y = valid_h >> 2;
-            if (self.tile_color_solid != null) {
+            if (tb.color_solid != null) {
                 var solid_utile: [32]u16 = @splat(solid_565);
                 const utile_bytes = std.mem.asBytes(&solid_utile);
                 for (0..utiles_y) |uy| {
@@ -1496,7 +1689,7 @@ pub const V3d = struct {
                         const utile_off = group_base + ((abs_ux & 3) << 6);
                         if (utile_off + 64 <= ram.len) {
                             inline for (0..4) |ry| {
-                                const src_row: @Vector(8, u32) = self.tile_color[(uy * 4 + ry) * 64 + ux * 8 ..][0..8].*;
+                                const src_row: @Vector(8, u32) = tb.color[(uy * 4 + ry) * 64 + ux * 8 ..][0..8].*;
                                 const dst_bytes = ram[utile_off + ry * 16 ..][0..16];
                                 dst_bytes.* = @bitCast(format_mod.toRgb565Vec8(src_row));
                             }
@@ -1520,10 +1713,10 @@ pub const V3d = struct {
                     (py * fb_w + px) * cpp
                 else
                     texture.texelOffsetOf(fmt, fb_w, fb_h, px, py);
-                const c = self.tile_color_solid orelse self.tile_color[ty * tile_size + tx];
+                const c = tb.color_solid orelse tb.color[ty * tile_size + tx];
                 if (off + cpp <= ram.len) {
                     if (is_565) {
-                        const c565 = if (self.tile_color_solid != null) solid_565 else format_mod.toRgb565(c);
+                        const c565 = if (tb.color_solid != null) solid_565 else format_mod.toRgb565(c);
                         std.mem.writeInt(u16, ram[off..][0..2], c565, .little);
                     } else {
                         std.mem.writeInt(u32, ram[off..][0..4], c, .little);
@@ -1533,23 +1726,30 @@ pub const V3d = struct {
         }
     }
 
-    fn ensureTileMaterialized(self: *V3d, ram: []const u8, need_depth: bool) void {
-        self.tile_modified = true;
-        if (self.lazy_load) |ll| {
-            self.lazy_load = null;
-            self.loadTileFromRam(ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
-            self.tile_color_solid = null;
-        } else if (self.tile_color_solid) |c| {
-            @memset(&self.tile_color, c);
-            self.tile_color_solid = null;
+    fn ensureTileMaterializedBuf(tb: *TileBuffer, ram: []const u8, need_depth: bool) void {
+        tb.modified = true;
+        if (tb.lazy_load) |ll| {
+            tb.lazy_load = null;
+            loadTileIntoBuf(tb, ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
+            tb.color_solid = null;
+        } else if (tb.color_solid) |c| {
+            @memset(tb.color, c);
+            tb.color_solid = null;
         }
-        if (need_depth and !self.tile_depth_valid) {
-            @memset(&self.tile_depth, self.tile_clear_zs);
-            self.tile_depth_valid = true;
+        if (need_depth and !tb.depth_valid) {
+            @memset(tb.depth, tb.clear_zs);
+            tb.depth_valid = true;
         }
     }
 
-    fn renderDrawsIntoTile(self: *V3d, ram: []const u8, tile_px_x: u32, tile_px_y: u32, tile_size: u32) void {
+    fn renderDrawsIntoTileBuf(
+        self: *const V3d,
+        tb: *TileBuffer,
+        ram: []const u8,
+        tile_px_x: u32,
+        tile_px_y: u32,
+        tile_size: u32,
+    ) void {
         const tile_end_x = tile_px_x + tile_size;
         const tile_end_y = tile_px_y + tile_size;
 
@@ -1604,7 +1804,8 @@ pub const V3d = struct {
                         }
 
                         const draw = self.draws[tri.draw_idx];
-                        self.rasterizeShadedTriangleDecodedInTile(
+                        rasterizeShadedTriangleDecodedInTileBuf(
+                            tb,
                             ram,
                             draw,
                             tri,
@@ -1649,7 +1850,8 @@ pub const V3d = struct {
                 }
 
                 const draw = self.draws[tri.draw_idx];
-                self.rasterizeShadedTriangleDecodedInTile(
+                rasterizeShadedTriangleDecodedInTileBuf(
+                    tb,
                     ram,
                     draw,
                     tri,
@@ -1666,12 +1868,12 @@ pub const V3d = struct {
 
         if (self.overflow_draw_start < self.draws_len) {
             for (self.draws[self.overflow_draw_start..self.draws_len]) |draw| {
-                self.renderDrawIntoTile(ram, draw, tile_px_x, tile_px_y, tile_size);
+                renderDrawIntoTileBuf(tb, ram, draw, tile_px_x, tile_px_y, tile_size);
             }
         }
     }
 
-    fn renderDrawIntoTile(self: *V3d, ram: []const u8, draw: DrawCall, tile_px_x: u32, tile_px_y: u32, tile_size: u32) void {
+    fn renderDrawIntoTileBuf(tb: *TileBuffer, ram: []const u8, draw: DrawCall, tile_px_x: u32, tile_px_y: u32, tile_size: u32) void {
         if (draw.count < 3) return;
         const rec_phys = draw.shader_rec_addr & 0x1FFFFFFF;
         if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) return;
@@ -1826,7 +2028,7 @@ pub const V3d = struct {
                     verts,
                     n_var,
                 );
-                self.rasterizeShadedTriangleDecodedInTile(ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
+                rasterizeShadedTriangleDecodedInTileBuf(tb, ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
             }
         }
     }
@@ -1863,11 +2065,13 @@ pub const V3d = struct {
         var fs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
         const fs_decoded = qpu_sim.decodeProgram(fs_code, &fs_decoded_buf);
         const fast_frag = qpu_sim.analyzeFragmentShader(fs_decoded, fs_unifs);
-        self.rasterizeShadedTriangleDecodedInTile(ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
+        var tb = self.tileBuf();
+        defer self.syncFromTileBuf(&tb);
+        rasterizeShadedTriangleDecodedInTileBuf(&tb, ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
     }
 
-    fn rasterizeShadedTriangleDecodedInTile(
-        self: *V3d,
+    fn rasterizeShadedTriangleDecodedInTileBuf(
+        tb: *TileBuffer,
         ram: []const u8,
         draw: DrawCall,
         tri: *const ShadedTriangle,
@@ -1934,7 +2138,7 @@ pub const V3d = struct {
 
         const flushBatch = struct {
             fn f(
-                v3d_self: *V3d,
+                tbuf: *TileBuffer,
                 count: usize,
                 b_idx: *const [16]u32,
                 bz: *const [16]f32,
@@ -1981,27 +2185,27 @@ pub const V3d = struct {
                     while (i + 4 <= count) {
                         const idx0 = b_idx[i];
                         if (b_idx[i + 3] == idx0 + 3) {
-                            v3d_self.tile_color[idx0..][0..4].* = colors[i..][0..4].*;
+                            tbuf.color[idx0..][0..4].* = colors[i..][0..4].*;
                             if (z_upd) {
-                                v3d_self.tile_depth[idx0..][0..4].* = bz[i..][0..4].*;
+                                tbuf.depth[idx0..][0..4].* = bz[i..][0..4].*;
                             }
                             i += 4;
                             continue;
                         }
                         inline for (0..4) |k| {
                             const idx = b_idx[i + k];
-                            v3d_self.tile_color[idx] = colors[i + k];
+                            tbuf.color[idx] = colors[i + k];
                             if (z_upd) {
-                                v3d_self.tile_depth[idx] = bz[i + k];
+                                tbuf.depth[idx] = bz[i + k];
                             }
                         }
                         i += 4;
                     }
                     while (i < count) : (i += 1) {
                         const idx = b_idx[i];
-                        v3d_self.tile_color[idx] = colors[i];
+                        tbuf.color[idx] = colors[i];
                         if (z_upd) {
-                            v3d_self.tile_depth[idx] = bz[i];
+                            tbuf.depth[idx] = bz[i];
                         }
                     }
                 }
@@ -2099,7 +2303,7 @@ pub const V3d = struct {
                         edge2.passes(cur_e2 + step_x2 * 15.0))
                     {
                         if (!tile_materialized) {
-                            self.ensureTileMaterialized(ram, need_depth);
+                            ensureTileMaterializedBuf(tb, ram, need_depth);
                             tile_materialized = true;
                         }
                         const tile_idx = row_base + (px - tile_px_x);
@@ -2109,7 +2313,7 @@ pub const V3d = struct {
                         const z_vec = @as(@Vector(16, f32), @splat(z_base)) + step16_z;
 
                         const depth_all_pass: bool = if (depth_func == 7) true else blk: {
-                            const cur_z_vec: @Vector(16, f32) = self.tile_depth[tile_idx..][0..16].*;
+                            const cur_z_vec: @Vector(16, f32) = tb.depth[tile_idx..][0..16].*;
                             break :blk switch (depth_func) {
                                 0 => false,
                                 1 => @reduce(.And, z_vec < cur_z_vec),
@@ -2124,9 +2328,9 @@ pub const V3d = struct {
 
                         if (depth_all_pass) {
                             if (fast_frag.kind == .constant_color) {
-                                self.tile_color[tile_idx..][0..16].* = @splat(fast_frag.color);
+                                tb.color[tile_idx..][0..16].* = @splat(fast_frag.color);
                                 if (z_updates) {
-                                    self.tile_depth[tile_idx..][0..16].* = z_vec;
+                                    tb.depth[tile_idx..][0..16].* = z_vec;
                                 }
                                 px += 16;
                                 cur_e0 += step_x0 * 16.0;
@@ -2158,16 +2362,16 @@ pub const V3d = struct {
                                 .frag_x = @as(qpu_sim.Vec, @splat(px)) + lane_u_offsets,
                                 .frag_y = @splat(py),
                                 .texture_memory = ram,
-                                .tlb_color_in = self.tile_color[tile_idx..][0..16].*,
+                                .tlb_color_in = tb.color[tile_idx..][0..16].*,
                                 .tex_cache = &tex_cache,
                             };
                             const span_res = qpu_sim.runFragmentFast(fast_frag, fs_decoded, &span_env) catch null;
 
                             if (span_res) |res| {
                                 if (res.tlb_color) |colors| {
-                                    self.tile_color[tile_idx..][0..16].* = colors;
+                                    tb.color[tile_idx..][0..16].* = colors;
                                     if (z_updates) {
-                                        self.tile_depth[tile_idx..][0..16].* = z_vec;
+                                        tb.depth[tile_idx..][0..16].* = z_vec;
                                     }
                                 }
                             }
@@ -2211,7 +2415,7 @@ pub const V3d = struct {
                     }
 
                     if (!tile_materialized) {
-                        self.ensureTileMaterialized(ram, need_depth);
+                        ensureTileMaterializedBuf(tb, ram, need_depth);
                         tile_materialized = true;
                     }
 
@@ -2222,7 +2426,7 @@ pub const V3d = struct {
                     const base_tile_idx = row_base + (px - tile_px_x);
 
                     if (depth_func != 7) {
-                        const cur_z_4: @Vector(4, f32) = self.tile_depth[base_tile_idx..][0..4].*;
+                        const cur_z_4: @Vector(4, f32) = tb.depth[base_tile_idx..][0..4].*;
                         const dmask: u4 = switch (depth_func) {
                             0 => 0,
                             1 => @bitCast(z_4 < cur_z_4),
@@ -2245,9 +2449,9 @@ pub const V3d = struct {
 
                     if (fast_frag.kind == .constant_color) {
                         if (mask4 == 0xf) {
-                            self.tile_color[base_tile_idx..][0..4].* = @splat(fast_frag.color);
+                            tb.color[base_tile_idx..][0..4].* = @splat(fast_frag.color);
                             if (z_updates) {
-                                self.tile_depth[base_tile_idx..][0..4].* = z_4;
+                                tb.depth[base_tile_idx..][0..4].* = z_4;
                             }
                         } else {
                             const z_arr_c: [4]f32 = z_4;
@@ -2255,9 +2459,9 @@ pub const V3d = struct {
                                 const k: usize = @ctz(mask4);
                                 mask4 &= mask4 - 1;
                                 const t_idx = base_tile_idx + @as(u32, @intCast(k));
-                                self.tile_color[t_idx] = fast_frag.color;
+                                tb.color[t_idx] = fast_frag.color;
                                 if (z_updates) {
-                                    self.tile_depth[t_idx] = z_arr_c[k];
+                                    tb.depth[t_idx] = z_arr_c[k];
                                 }
                             }
                         }
@@ -2284,7 +2488,7 @@ pub const V3d = struct {
                         frag_z[batch_len..][0..4].* = @bitCast(z_4);
                         frag_x_vec[batch_len..][0..4].* = @as(@Vector(4, u32), @splat(px)) + lane4_u_offsets;
                         frag_y_vec[batch_len..][0..4].* = @splat(py);
-                        tlb_in[batch_len..][0..4].* = self.tile_color[base_tile_idx..][0..4].*;
+                        tlb_in[batch_len..][0..4].* = tb.color[base_tile_idx..][0..4].*;
 
                         for (0..n_var) |vi| {
                             const var_base = var2[vi] + w0_base * dvar0[vi] + w1_base * dvar1[vi];
@@ -2295,7 +2499,7 @@ pub const V3d = struct {
                         batch_len += 4;
                         if (batch_len == 16) {
                             flushBatch(
-                                self,
+                                tb,
                                 batch_len,
                                 &batch_idx,
                                 &batch_z,
@@ -2341,7 +2545,7 @@ pub const V3d = struct {
                         frag_z[lane] = @bitCast(z);
                         frag_x_vec[lane] = px + @as(u32, @intCast(k));
                         frag_y_vec[lane] = py;
-                        tlb_in[lane] = self.tile_color[tile_idx];
+                        tlb_in[lane] = tb.color[tile_idx];
 
                         for (0..n_var) |vi| {
                             const p_val = (var2[vi] + w0 * dvar0[vi] + w1 * dvar1[vi]) * w_val;
@@ -2351,7 +2555,7 @@ pub const V3d = struct {
                         batch_len += 1;
                         if (batch_len == 16) {
                             flushBatch(
-                                self,
+                                tb,
                                 batch_len,
                                 &batch_idx,
                                 &batch_z,
@@ -2390,7 +2594,7 @@ pub const V3d = struct {
                 if (!edge2.passes(e2)) continue;
 
                 if (!tile_materialized) {
-                    self.ensureTileMaterialized(ram, need_depth);
+                    ensureTileMaterializedBuf(tb, ram, need_depth);
                     tile_materialized = true;
                 }
 
@@ -2401,7 +2605,7 @@ pub const V3d = struct {
                 const tile_idx = row_base + (px - 1 - tile_px_x);
 
                 if (depth_func != 7) {
-                    const cur_z = self.tile_depth[tile_idx];
+                    const cur_z = tb.depth[tile_idx];
                     const depth_pass = switch (depth_func) {
                         0 => false, // never
                         1 => z < cur_z, // less
@@ -2416,9 +2620,9 @@ pub const V3d = struct {
                 }
 
                 if (fast_frag.kind == .constant_color) {
-                    self.tile_color[tile_idx] = fast_frag.color;
+                    tb.color[tile_idx] = fast_frag.color;
                     if (z_updates) {
-                        self.tile_depth[tile_idx] = z;
+                        tb.depth[tile_idx] = z;
                     }
                     continue;
                 }
@@ -2435,7 +2639,7 @@ pub const V3d = struct {
                 frag_z[lane] = @bitCast(z);
                 frag_x_vec[lane] = px - 1;
                 frag_y_vec[lane] = py;
-                tlb_in[lane] = self.tile_color[tile_idx];
+                tlb_in[lane] = tb.color[tile_idx];
 
                 for (0..n_var) |vi| {
                     const p_val = (var2[vi] + w0 * dvar0[vi] + w1 * dvar1[vi]) * w_val;
@@ -2445,7 +2649,7 @@ pub const V3d = struct {
                 batch_len += 1;
                 if (batch_len == 16) {
                     flushBatch(
-                        self,
+                        tb,
                         batch_len,
                         &batch_idx,
                         &batch_z,
@@ -2469,7 +2673,7 @@ pub const V3d = struct {
 
         if (batch_len > 0) {
             flushBatch(
-                self,
+                tb,
                 batch_len,
                 &batch_idx,
                 &batch_z,
@@ -2733,4 +2937,128 @@ test "V3D populateBatchVpmIn multi-word attribute gather and padding" {
     }
 }
 
+test "V3D multi-tile RCL parallel rasterization across 16 tiles" {
+    var v3d = V3d{};
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 512 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
 
+    // Build VS and FS programs in guest RAM at 0x1000 and 0x1400
+    var vs: qpu.Program(32) = .{};
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_write_setup, .value = 0x00001a00 }));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_read_setup, .value = 0x00501a00 }));
+    vs.emit(try qpu.mov(qpu.wr(0), qpu.vpm_read)); // x
+    vs.emit(try qpu.mov(qpu.wr(1), qpu.vpm_read)); // y
+    vs.emit(try qpu.mov(qpu.wa(0), qpu.vpm_read)); // r
+    vs.emit(try qpu.mov(qpu.wr(3), qpu.vpm_read)); // g
+    vs.emit(try qpu.mov(qpu.wa(2), qpu.vpm_read)); // b
+    vs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(0), .a = qpu.r(0), .b = qpu.unif } }));
+    vs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(1), .a = qpu.r(1), .b = qpu.unif } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .ftoi, .dst = qpu.wa(1), .a = qpu.r(0), .b = qpu.r(0) }, .pack = .{ .regfile_a = .@"16a" } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .ftoi, .dst = qpu.wa(1), .a = qpu.r(1), .b = qpu.r(1) }, .pack = .{ .regfile_a = .@"16b" } }));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.wr(2), .value = @bitCast(@as(f32, 0.5)) }));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(1)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(2)));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_write, .value = @bitCast(@as(f32, 1.0)) }));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(0)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(3)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(2)));
+    vs.end(.vertex);
+
+    var fs: qpu.Program(16) = .{};
+    fs.emit(try qpu.loadImm(.{ .add_dst = qpu.tlb_color_all, .value = 0xff00ff00 }));
+    fs.end(.fragment);
+
+    @memcpy(ram[0x1000 .. 0x1000 + vs.code().len * 8], std.mem.sliceAsBytes(vs.code()));
+    @memcpy(ram[0x1400 .. 0x1400 + fs.code().len * 8], std.mem.sliceAsBytes(fs.code()));
+
+    // VS uniforms at 0x1800: x_scale = 128.0 * 16.0, y_scale = 128.0 * 16.0 (for 256x256 viewport)
+    std.mem.writeInt(u32, ram[0x1800..0x1804], @bitCast(@as(f32, 128.0 * 16.0)), .little);
+    std.mem.writeInt(u32, ram[0x1804..0x1808], @bitCast(@as(f32, 128.0 * 16.0)), .little);
+
+    // 2 triangles forming a full-screen quad [-1, 1] x [-1, 1] covering all 16 tiles
+    const verts = [_]f32{
+        -1.0, -1.0, 0.0, 1.0, 0.0,
+        1.0,  -1.0, 0.0, 1.0, 0.0,
+        1.0,  1.0,  0.0, 1.0, 0.0,
+        -1.0, -1.0, 0.0, 1.0, 0.0,
+        1.0,  1.0,  0.0, 1.0, 0.0,
+        -1.0, 1.0,  0.0, 1.0, 0.0,
+    };
+    @memcpy(ram[0x2000 .. 0x2000 + @sizeOf(@TypeOf(verts))], std.mem.sliceAsBytes(&verts));
+
+    ram[0x3003] = 3; // fs_num_varyings = 3
+    std.mem.writeInt(u32, ram[0x3004..0x3008], 0x1400, .little); // FS code
+    std.mem.writeInt(u32, ram[0x3008..0x300c], 0x1900, .little); // FS unifs
+    ram[0x300e] = 1; // vs_attr_mask = 1
+    std.mem.writeInt(u32, ram[0x3010..0x3014], 0x1000, .little); // VS code
+    std.mem.writeInt(u32, ram[0x3014..0x3018], 0x1800, .little); // VS unifs
+    std.mem.writeInt(u32, ram[0x3024..0x3028], 0x2000, .little);
+    ram[0x3028] = 19;
+    ram[0x3029] = 20;
+
+    var bcl: usize = 0x4000;
+    ram[bcl] = 6; // START_TILE_BINNING
+    bcl += 1;
+    ram[bcl] = 103; // VIEWPORT_OFFSET (128.0, 128.0)
+    std.mem.writeInt(u16, ram[bcl + 1 ..][0..2], 128 * 16, .little);
+    std.mem.writeInt(u16, ram[bcl + 3 ..][0..2], 128 * 16, .little);
+    bcl += 5;
+    ram[bcl] = 64; // GL_SHADER_STATE (0x3000 | 1 attr)
+    std.mem.writeInt(u32, ram[bcl + 1 ..][0..4], 0x3001, .little);
+    bcl += 5;
+    ram[bcl] = 33; // GL_ARRAY_PRIMITIVE (triangles=4, count=6, first=0)
+    ram[bcl + 1] = 4;
+    std.mem.writeInt(u32, ram[bcl + 2 ..][0..4], 6, .little);
+    std.mem.writeInt(u32, ram[bcl + 6 ..][0..4], 0, .little);
+    bcl += 10;
+    ram[bcl] = 4; // FLUSH
+    bcl += 1;
+
+    v3d.write32(0x034, V3d.INT_FLDONE | V3d.INT_FRDONE, ram);
+    v3d.write32(0x110, 0x4000, ram);
+    v3d.write32(0x108, @intCast(bcl), ram);
+    try std.testing.expect((v3d.read32(0x030) & V3d.INT_FLDONE) != 0);
+
+    // Build RCL at 0x5000 rendering 16 tiles (4x4 = 256x256) to Linear RGBA8888 framebuffer at 0x20000
+    var rcl: usize = 0x5000;
+    ram[rcl] = 113; // TILE_RENDERING_MODE_CONFIG
+    std.mem.writeInt(u32, ram[rcl + 1 ..][0..4], 0x20000, .little);
+    std.mem.writeInt(u16, ram[rcl + 5 ..][0..2], 256, .little);
+    std.mem.writeInt(u16, ram[rcl + 7 ..][0..2], 256, .little);
+    std.mem.writeInt(u16, ram[rcl + 9 ..][0..2], 1 << 2, .little); // format=1 (RGBA8888), tiling=0 (Linear)
+    rcl += 11;
+    ram[rcl] = 114; // CLEAR_COLORS (black 0xff000000)
+    std.mem.writeInt(u32, ram[rcl + 1 ..][0..4], 0xff000000, .little);
+    std.mem.writeInt(u32, ram[rcl + 9 ..][0..4], 0x00ffffff, .little);
+    rcl += 14;
+
+    for (0..4) |ty| {
+        for (0..4) |tx| {
+            ram[rcl] = 115; // TILE_COORDINATES
+            ram[rcl + 1] = @intCast(tx);
+            ram[rcl + 2] = @intCast(ty);
+            rcl += 3;
+            ram[rcl] = 17; // BRANCH_TO_SUB_LIST
+            std.mem.writeInt(u32, ram[rcl + 1 ..][0..4], 0, .little);
+            rcl += 5;
+            ram[rcl] = if (tx == 3 and ty == 3) 25 else 24; // STORE_MS_TILE_BUFFER(_AND_EOF)
+            rcl += 1;
+        }
+    }
+
+    v3d.write32(0x114, 0x5000, ram);
+    v3d.write32(0x10c, @intCast(rcl), ram);
+    try std.testing.expect((v3d.read32(0x030) & V3d.INT_FRDONE) != 0);
+
+    // Check center of each of the 16 64x64 tiles is green (0xff00ff00)
+    for (0..4) |ty| {
+        for (0..4) |tx| {
+            const px = tx * 64 + 32;
+            const py = ty * 64 + 32;
+            const off = 0x20000 + (py * 256 + px) * 4;
+            try std.testing.expectEqual(@as(u32, 0xff00ff00), std.mem.readInt(u32, ram[off..][0..4], .little));
+        }
+    }
+}
