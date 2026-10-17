@@ -57,7 +57,7 @@ pub const V3d = struct {
         y: f32 = 0,
         z: f32 = 0.5,
         inv_w: f32 = 1.0,
-        persp_varyings: [16]f32 = [_]f32{0} ** 16,
+        persp_varyings: [16]f32 = @splat(0),
     };
 
     pub const ShadedTriangle = struct {
@@ -127,8 +127,8 @@ pub const V3d = struct {
     multisample_bin: bool = false,
 
     // Tile buffer (64x64 pixels max per tile)
-    tile_color: [64 * 64]u32 = [_]u32{0} ** (64 * 64),
-    tile_depth: [64 * 64]f32 = [_]f32{1.0} ** (64 * 64),
+    tile_color: [64 * 64]u32 = @splat(0),
+    tile_depth: [64 * 64]f32 = @splat(1.0),
     tile_color_solid: ?u32 = null,
     tile_depth_valid: bool = false,
     tile_clear_zs: f32 = 1.0,
@@ -145,7 +145,7 @@ pub const V3d = struct {
     shaded_tris: [MAX_PREBINNED_TRIS]ShadedTriangle = undefined,
     shaded_tris_len: usize = 0,
     overflow_draw_start: usize = 0,
-    tile_nonempty: [32]u32 = [_]u32{0} ** 32,
+    tile_nonempty: [32]u32 = @splat(0),
     tile_tri_mask: [32 * 32][MAX_PREBINNED_TRIS / 64]u64 = undefined,
 
     gl: GlRenderer = .{},
@@ -438,7 +438,7 @@ pub const V3d = struct {
         self.prep_fs_insts_len = 0;
         self.prep_fs_unifs_len = 0;
         self.overflow_draw_start = self.draws_len;
-        self.tile_nonempty = [_]u32{0} ** 32;
+        self.tile_nonempty = @splat(0);
 
         var vs_buf: [512]qpu.Inst = undefined;
         var fs_buf: [512]qpu.Inst = undefined;
@@ -1837,7 +1837,7 @@ pub const V3d = struct {
         var frag_x_vec: qpu_sim.Vec = qpu_sim.splat(0);
         var frag_y_vec: qpu_sim.Vec = qpu_sim.splat(0);
         var tlb_in: qpu_sim.Vec = qpu_sim.splat(0);
-        var vary_vecs: [16]qpu_sim.Vec = [_]qpu_sim.Vec{qpu_sim.splat(0)} ** 16;
+        var vary_vecs: [16]qpu_sim.Vec = @splat(qpu_sim.splat(0));
         var span_vary_vecs: [16]qpu_sim.Vec = undefined;
         var batch_len: usize = 0;
 
@@ -2436,7 +2436,7 @@ test "V3D RGB565 8x4 utile storeTileToRam and loadTileFromRam round-trip" {
     var v3d = V3d{};
     const fb_w: u32 = 128;
     const fb_h: u32 = 93; // tile_y=0 has full 64 rows, tile_y=1 has 29 rows (7 full utile rows + 1 remainder row)
-    var ram: [128 * 96 * 2]u8 = [_]u8{0} ** (128 * 96 * 2);
+    var ram: [128 * 96 * 2]u8 = @splat(0);
 
     // 1. Solid clear store on tile (0, 0) and partial-height tile (1, 1)
     v3d.tile_color_solid = 0xff00ff00;
@@ -2464,7 +2464,7 @@ test "V3D RGB565 8x4 utile storeTileToRam and loadTileFromRam round-trip" {
 }
 
 test "V3D populateBatchVpmIn multi-word attribute gather and padding" {
-    var ram: [256]u8 = [_]u8{0} ** 256;
+    var ram: [256]u8 = @splat(0);
     // 3 vertices, each 24 bytes (vec4 + vec2 interleaved, stride = 24)
     for (0..3) |vi| {
         for (0..6) |wi| {

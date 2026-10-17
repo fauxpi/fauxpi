@@ -29,13 +29,13 @@ pub const Hdmi = struct {
 
     connected: bool = true,
     hdmi_regs: [HDMI_SIZE / 4]u32 = initHdmiRegs(),
-    hd_regs: [HD_SIZE / 4]u32 = [_]u32{0} ** (HD_SIZE / 4),
+    hd_regs: [HD_SIZE / 4]u32 = @splat(0),
 
     mai_pending_left: i16 = 0,
     mai_has_left: bool = false,
 
     fn initHdmiRegs() [HDMI_SIZE / 4]u32 {
-        var r: [HDMI_SIZE / 4]u32 = [_]u32{0} ** (HDMI_SIZE / 4);
+        var r: [HDMI_SIZE / 4]u32 = @splat(0);
         r[HDMI_CORE_REV / 4] = 0x00000105;
         r[HDMI_HOTPLUG / 4] = 0x00000001; // Connected
         r[HDMI_FIFO_CTL / 4] = (1 << 14) | 1; // VC4_HDMI_FIFO_CTL_RECENTER_DONE | MASTER_SLAVE_N
@@ -144,7 +144,7 @@ pub const Txp = struct {
     pub const BASE_ADDR: u32 = 0x20004000;
     pub const SIZE: u32 = 0x20;
 
-    regs: [8]u32 = [_]u32{0} ** 8,
+    regs: [8]u32 = @splat(0),
     irq_pending: bool = false,
 
     pub fn read32(self: *const Txp, offset: u32) u32 {

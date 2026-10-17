@@ -71,8 +71,8 @@ pub const Smp = struct {
     /// Bits `0..3`: IRQ pending for core `n`; bits `4..7`: FIQ pending for core `n`.
     irq_summary: std.atomic.Value(u32) = .init(0),
     /// True while core `n` is executing its slice.
-    running: [max_cores]std.atomic.Value(bool) = [_]std.atomic.Value(bool){.init(false)} ** max_cores,
-    tlb: [max_cores]TlbInbox = [_]TlbInbox{.{}} ** max_cores,
+    running: [max_cores]std.atomic.Value(bool) = @splat(.init(false)),
+    tlb: [max_cores]TlbInbox = @splat(.{}),
 
     /// Posts the TLB invalidations `mmu` (core `from`) queued with `TLBI ...IS`
     /// to every other core, then waits until each core still running its slice
@@ -143,7 +143,7 @@ pub fn Runner(comptime Cpu: type, comptime Bus: type) type {
 
         cpus: *[max_cores]Cpu,
         bus: *Bus,
-        workers: [max_cores]Worker = [_]Worker{.{}} ** max_cores,
+        workers: [max_cores]Worker = @splat(.{}),
         /// Workers that finished the current slice (futex word for the main thread).
         done: std.atomic.Value(u32) = .init(0),
         main_sleeping: std.atomic.Value(u32) = .init(0),

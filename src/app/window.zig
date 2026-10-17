@@ -139,7 +139,7 @@ pub const WaylandWindow = struct {
     repeat_rate: u32 = 25,
     repeat_delay_ms: u32 = 600,
     repeat: ?struct { key: u32, next_ns: u64 } = null,
-    keys_down: std.StaticBitSet(256) = .initEmpty(),
+    keys_down: std.StaticBitSet(256) = .empty,
 
     hid: ?*UsbHidComposite = null,
     gpio: *Gpio,
@@ -364,7 +364,7 @@ pub const WaylandWindow = struct {
             if (err != .SUCCESS) break;
             if (rc == 0) {
                 // EOF: dialog closed
-                var wstatus: u32 = 0;
+                var wstatus: i32 = 0;
                 if (self.picker_pid > 0) {
                     _ = linux.waitpid(self.picker_pid, &wstatus, 0);
                 }
@@ -1224,7 +1224,7 @@ pub const WaylandWindow = struct {
                 _ = r.uint() catch return; // surface
                 const keys = r.array() catch return;
                 self.repeat = null;
-                self.keys_down = .initEmpty();
+                self.keys_down = .empty;
                 self.ui.clearModifiers();
                 var i: usize = 0;
                 while (i + 4 <= keys.len) : (i += 4) {
@@ -1242,7 +1242,7 @@ pub const WaylandWindow = struct {
                 _ = r.uint() catch return; // serial
                 _ = r.uint() catch return; // surface
                 self.repeat = null;
-                self.keys_down = .initEmpty();
+                self.keys_down = .empty;
                 self.ui.clearModifiers();
                 if (self.hid) |hid| {
                     hid.releaseAllKeys();

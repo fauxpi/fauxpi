@@ -38,7 +38,7 @@ pub const DmaController = struct {
         audio_byte_rem_fp: u64 = 0,
     };
 
-    channels: [NUM_CHANNELS]Channel = [_]Channel{.{}} ** NUM_CHANNELS,
+    channels: [NUM_CHANNELS]Channel = @splat(.{}),
     int_status: u32 = 0,
     cs_int_mask: u16 = 0,
     active_mask: u16 = 0,
@@ -466,7 +466,7 @@ pub const DmaController = struct {
 
 test "DMA 1D memory-to-memory copy" {
     var dma = DmaController{};
-    var ram: [1024]u8 = [_]u8{0} ** 1024;
+    var ram: [1024]u8 = @splat(0);
 
     // Source data at 0x100
     std.mem.writeInt(u32, ram[0x100..0x104], 0xCAFEBABE, .little);
@@ -491,7 +491,7 @@ test "DMA 1D memory-to-memory copy" {
 
 test "DMA zero-fill and constant-word fill fast paths" {
     var dma = DmaController{};
-    var ram: [1024]u8 = [_]u8{0xAA} ** 1024;
+    var ram: [1024]u8 = @splat(0xAA);
 
     // 1. TI_S_IGNORE zero-fill 64 bytes at 0x200
     const cb1: u32 = 0x20;

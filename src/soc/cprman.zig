@@ -11,7 +11,7 @@ pub const Cprman = struct {
     regs: [SIZE / 4]u32 = initDefaultRegs(),
 
     fn initDefaultRegs() [SIZE / 4]u32 {
-        var r: [SIZE / 4]u32 = [_]u32{0} ** (SIZE / 4);
+        var r: [SIZE / 4]u32 = @splat(0);
 
         // CM_LOCK: all PLLs locked
         r[CM_LOCK / 4] = 0x0000FFFF;

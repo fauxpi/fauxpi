@@ -12,7 +12,7 @@
 #               (must serve download/index.json and the release tarballs)
 set -eu
 
-ZIG_VERSION=0.16.0
+ZIG_VERSION=0.17.0
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 MIRROR=${ZIG_MIRROR:-https://ziglang.org}
 

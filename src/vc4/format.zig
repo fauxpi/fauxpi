@@ -37,8 +37,7 @@ pub const Format = enum {
     }
 
     pub fn fromFourcc(c: u32) ?Format {
-        inline for (@typeInfo(Format).@"enum".fields) |field| {
-            const f: Format = @enumFromInt(field.value);
+        inline for (comptime std.enums.values(Format)) |f| {
             if (f.fourcc() == c) return f;
         }
         return null;

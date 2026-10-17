@@ -161,7 +161,7 @@ pub const BscController = struct {
     /// Generates a 256-byte EDID (Block 0: EDID 1.3 + Detailed Timing Descriptor for `width`x`height`@60Hz,
     /// Block 1: CTA-861 Extension Block with HDMI VSDB `00-0C-03`).
     pub fn buildHdmiEdid(width: u16, height: u16) [256]u8 {
-        var b: [256]u8 = [_]u8{0} ** 256;
+        var b: [256]u8 = @splat(0);
 
         // 0x00..0x07: EDID Header
         const header = [_]u8{ 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00 };

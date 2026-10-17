@@ -701,7 +701,7 @@ pub fn dup2Stdout(fd: fd_t) void {
 pub fn waitpidBlocking(pid: pid_t) void {
     if (pid <= 0) return;
     if (is_linux) {
-        var wstatus: u32 = 0;
+        var wstatus: i32 = 0;
         _ = std.os.linux.waitpid(pid, &wstatus, 0);
     } else if (!is_windows) {
         var wstatus: c_int = 0;

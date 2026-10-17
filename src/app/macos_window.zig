@@ -326,7 +326,7 @@ pub const MacosWindow = struct {
     repeat_rate: u32 = 25,
     repeat_delay_ms: u32 = 500,
     repeat: ?struct { key: u32, next_ns: u64 } = null,
-    keys_down: std.StaticBitSet(256) = .initEmpty(),
+    keys_down: std.StaticBitSet(256) = .empty,
 
     hid: ?*UsbHidComposite = null,
     gpio: *Gpio,
@@ -803,7 +803,7 @@ pub const MacosWindow = struct {
             const is_key = msgSend0(bool, w, sel("isKeyWindow"));
             if (self.was_key_window and !is_key) {
                 self.repeat = null;
-                self.keys_down = .initEmpty();
+                self.keys_down = .empty;
                 self.ui.clearModifiers();
                 if (self.hid) |h| {
                     h.releaseAllKeys();

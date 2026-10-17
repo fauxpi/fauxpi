@@ -76,7 +76,7 @@ pub const GlRenderer = struct {
     glGetProgramiv: ?*const fn (GLuint, GLenum, *GLint) callconv(.c) void = null,
     glUseProgram: ?*const fn (GLuint) callconv(.c) void = null,
 
-    program_cache: [16]CachedProgram = [_]CachedProgram{.{}} ** 16,
+    program_cache: [16]CachedProgram = @splat(.{}),
     cache_next: usize = 0,
 
     pub fn init() GlRenderer {

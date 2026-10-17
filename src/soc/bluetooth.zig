@@ -46,7 +46,7 @@ pub const Controller = struct {
     out_head: usize = 0,
     out_len: usize = 0,
 
-    local_name: [248]u8 = [_]u8{0} ** 248,
+    local_name: [248]u8 = @splat(0),
     class_of_device: [3]u8 = .{ 0, 0, 0 },
     scan_enable: u8 = 0,
     page_scan_type: u8 = 0,
@@ -69,7 +69,7 @@ pub const Controller = struct {
 
     /// Restores the controller to its power-on state (`HCI_Reset` / power cycle).
     pub fn reset(self: *Controller) void {
-        self.local_name = [_]u8{0} ** 248;
+        self.local_name = @splat(0);
         self.class_of_device = .{ 0, 0, 0 };
         self.scan_enable = 0;
         self.page_scan_type = 0;
@@ -184,7 +184,7 @@ pub const Controller = struct {
     }
 
     fn handleCommand(self: *Controller, opcode: u16, params: []const u8) void {
-        var ret: [252]u8 = [_]u8{0} ** 252;
+        var ret: [252]u8 = @splat(0);
         const len: usize = switch (opcode) {
             // Link Control
             0x0401 => { // Inquiry: no devices in range
@@ -195,7 +195,7 @@ pub const Controller = struct {
             0x0402 => 0, // Inquiry Cancel
             0x0405 => { // Create Connection: nothing answers the page
                 self.sendCommandStatus(opcode, STATUS_SUCCESS);
-                var evt: [11]u8 = [_]u8{0} ** 11;
+                var evt: [11]u8 = @splat(0);
                 evt[0] = STATUS_PAGE_TIMEOUT;
                 if (params.len >= 6) @memcpy(evt[3..9], params[0..6]);
                 evt[9] = 0x01; // ACL
@@ -227,7 +227,7 @@ pub const Controller = struct {
             0x0c12 => 2, // Delete Stored Link Key: Num_Keys_Deleted = 0
             0x0c13 => blk: { // Write Local Name
                 const n = @min(params.len, self.local_name.len);
-                self.local_name = [_]u8{0} ** 248;
+                self.local_name = @splat(0);
                 @memcpy(self.local_name[0..n], params[0..n]);
                 break :blk 0;
             },

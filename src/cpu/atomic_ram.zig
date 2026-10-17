@@ -6,13 +6,7 @@
 //! LL/SC on hosts (it cannot detect an A-B-A change, which guest locks do not depend on).
 
 const std = @import("std");
-const builtin = @import("builtin");
-const native_endian = builtin.cpu.arch.endian();
-
-/// Zig's self-hosted x86-64 backend (Debug builds) crashes compiling a 128-bit `cmpxchg`,
-/// so Debug builds serialise 128-bit pair stores through this lock instead.
-const lock_u128 = builtin.mode == .Debug;
-var u128_lock: std.atomic.Value(u32) = .init(0);
+const native_endian = @import("builtin").cpu.arch.endian();
 
 /// Atomically replaces the little-endian `T` at `ram[paddr..]` with `desired` if it
 /// still holds `expected`. Returns false if the location changed or is out of range.
@@ -21,13 +15,6 @@ pub inline fn compareAndSwap(comptime T: type, ram: []u8, paddr: u32, expected: 
     if (@as(usize, paddr) + size > ram.len) return false;
     if (paddr % size != 0) {
         // Misaligned exclusives fault on hardware; fall back to a plain check-and-store.
-        if (std.mem.readInt(T, ram[paddr..][0..size], .little) != expected) return false;
-        std.mem.writeInt(T, ram[paddr..][0..size], desired, .little);
-        return true;
-    }
-    if (T == u128 and lock_u128) {
-        while (u128_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
-        defer u128_lock.store(0, .release);
         if (std.mem.readInt(T, ram[paddr..][0..size], .little) != expected) return false;
         std.mem.writeInt(T, ram[paddr..][0..size], desired, .little);
         return true;

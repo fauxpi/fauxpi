@@ -55,7 +55,7 @@ pub const Spi0 = struct {
     dc: u32 = 0x30201020,
 
     /// Internal RX FIFO ring buffer (sized to 64 KiB so full DMA TX bursts complete before RX DMA is armed)
-    rx_fifo: [RX_BUF_CAPACITY]u8 = [_]u8{0} ** RX_BUF_CAPACITY,
+    rx_fifo: [RX_BUF_CAPACITY]u8 = @splat(0),
     rx_head: u16 = 0,
     rx_tail: u16 = 0,
     rx_count: usize = 0,
@@ -216,7 +216,7 @@ pub const AuxSpi = struct {
 
     cntl0: u32 = 0,
     cntl1: u32 = 0,
-    rx_fifo: [16]u32 = [_]u32{0} ** 16,
+    rx_fifo: [16]u32 = @splat(0),
     rx_head: u4 = 0,
     rx_tail: u4 = 0,
     rx_count: u5 = 0,

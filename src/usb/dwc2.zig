@@ -95,7 +95,7 @@ pub const Dwc2Controller = struct {
     hprt0: u32 = HPRT0_PRTCONNSTS | HPRT0_PRTSPD_HIGH,
     pcgcctl: u32 = 0,
 
-    channels: [NUM_CHANNELS]HostChannel = [_]HostChannel{.{}} ** NUM_CHANNELS,
+    channels: [NUM_CHANNELS]HostChannel = @splat(.{}),
     hid: UsbHidComposite = .{},
 
     pub fn syncRootPortConnection(self: *Dwc2Controller) void {
@@ -715,7 +715,7 @@ fn testReadControlData(dwc2: *Dwc2Controller, ram: []u8, devaddr: u7, dest_off: 
 test "DWC2 multi-device USB Hub, Ethernet, Keyboard, and Mouse enumeration and transfers" {
     var dwc2 = Dwc2Controller{};
     defer dwc2.hid.net.deinit();
-    var ram: [4096]u8 = [_]u8{0} ** 4096;
+    var ram: [4096]u8 = @splat(0);
 
     // Verify Synopsis ID
     try std.testing.expectEqual(@as(u32, 0x4f54280a), dwc2.read32(0x040));
@@ -849,7 +849,7 @@ test "DWC2 multi-device USB Hub, Ethernet, Keyboard, and Mouse enumeration and t
 test "DWC2 asserts GINTSTS_SOF on dwc2_hcd_urb_enqueue GINTMSK read and tickSof to prevent Ethernet TX timeouts" {
     var dwc2 = Dwc2Controller{};
     defer dwc2.hid.net.deinit();
-    var ram: [256]u8 = [_]u8{0} ** 256;
+    var ram: [256]u8 = @splat(0);
 
     // Enable global interrupts and unmask GINTSTS_SOF + GINTSTS_HCHINT (as Linux dwc2 does when periodic endpoints are active)
     dwc2.write32(0x008, Dwc2Controller.GAHBCFG_GLBL_INTR_EN | Dwc2Controller.GAHBCFG_DMA_EN, &ram);

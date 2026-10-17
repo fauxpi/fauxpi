@@ -128,7 +128,7 @@ pub const UsbHidComposite = struct {
     };
 
     pub const ControlState = struct {
-        buf: [256]u8 = [_]u8{0} ** 256,
+        buf: [256]u8 = @splat(0),
         len: usize = 0,
         pos: usize = 0,
         last_setup_ok: bool = true,
@@ -139,9 +139,9 @@ pub const UsbHidComposite = struct {
     // Per-device USB addresses and configuration states
     hub_addr: u7 = 0,
     hub_configured: bool = false,
-    port_status: [MAX_PORTS]u16 = [_]u16{0} ** MAX_PORTS,
-    port_change: [MAX_PORTS]u16 = [_]u16{0} ** MAX_PORTS,
-    latched_port_conn: [MAX_PORTS]bool = [_]bool{false} ** MAX_PORTS,
+    port_status: [MAX_PORTS]u16 = @splat(0),
+    port_change: [MAX_PORTS]u16 = @splat(0),
+    latched_port_conn: [MAX_PORTS]bool = @splat(false),
 
     eth_addr: u7 = 0,
     eth_configured: bool = false,
@@ -162,10 +162,10 @@ pub const UsbHidComposite = struct {
     active_zero_target: TargetDevice = .hub,
 
     // Per-device control transfer buffers (prevents hub GetPortStatus polling from clobbering child enumeration)
-    ctrl: [4]ControlState = [_]ControlState{.{}} ** 4,
+    ctrl: [4]ControlState = @splat(.{}),
 
     // Current Keyboard state: [modifier, reserved, key0, key1, key2, key3, key4, key5]
-    kbd_state: [8]u8 = [_]u8{0} ** 8,
+    kbd_state: [8]u8 = @splat(0),
     // Queued 8-byte keyboard reports
     kbd_queue: [16][8]u8 = undefined,
     kbd_head: u4 = 0,
@@ -200,7 +200,7 @@ pub const UsbHidComposite = struct {
     eth_notif_polled: bool = false,
     reported_link_up: ?bool = null,
     cdc_notif_queue: [8][16]u8 = undefined,
-    cdc_notif_lens: [8]u8 = [_]u8{0} ** 8,
+    cdc_notif_lens: [8]u8 = @splat(0),
     cdc_notif_head: u3 = 0,
     cdc_notif_tail: u3 = 0,
     cdc_notif_count: u4 = 0,
@@ -230,9 +230,9 @@ pub const UsbHidComposite = struct {
     pub fn resetHubDevice(self: *UsbHidComposite) void {
         self.hub_addr = 0;
         self.hub_configured = false;
-        self.port_status = [_]u16{0} ** MAX_PORTS;
-        self.port_change = [_]u16{0} ** MAX_PORTS;
-        self.latched_port_conn = [_]bool{false} ** MAX_PORTS;
+        self.port_status = @splat(0);
+        self.port_change = @splat(0);
+        self.latched_port_conn = @splat(false);
         self.ctrl[@intFromEnum(TargetDevice.hub)] = .{};
     }
 

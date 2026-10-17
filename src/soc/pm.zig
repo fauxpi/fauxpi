@@ -34,7 +34,7 @@ pub const PowerManager = struct {
     reboot_requested: bool = false,
 
     fn initRegs() [SIZE / 4]u32 {
-        var r: [SIZE / 4]u32 = [_]u32{0} ** (SIZE / 4);
+        var r: [SIZE / 4]u32 = @splat(0);
         const default_domain = PM_POWUP | PM_POWOK | PM_ISPOW | PM_MRDONE | PM_ISFUNC | PM_V3DRSTN | PM_PERIRSTN;
         r[PM_RSTC / 4] = PM_RSTC_RESET;
         r[PM_IMAGE / 4] = default_domain;
@@ -137,7 +137,7 @@ pub const AsbBridge = struct {
     regs: [SIZE / 4]u32 = initRegs(),
 
     fn initRegs() [SIZE / 4]u32 {
-        var r: [SIZE / 4]u32 = [_]u32{0} ** (SIZE / 4);
+        var r: [SIZE / 4]u32 = @splat(0);
         r[ASB_AXI_BRDG_ID / 4] = BRDG_ID_VAL;
         return r;
     }

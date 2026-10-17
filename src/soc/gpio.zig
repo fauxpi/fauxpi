@@ -54,7 +54,7 @@ pub const Gpio = struct {
     pub const DEFAULT_PULL_DOWN_MASK: u64 = ((@as(u64, 1) << 54) - 1) & ~(DEFAULT_PULL_UP_MASK | DEFAULT_NO_PULL_MASK);
 
     /// Function select registers GPFSEL0..5
-    gpfsel: [6]u32 = [_]u32{0} ** 6,
+    gpfsel: [6]u32 = @splat(0),
     /// Output levels driven by GPSET / GPCLR
     out_level: u64 = 0,
     /// Pull-up and pull-down masks (initialized to BCM2835 power-on defaults)
@@ -98,7 +98,7 @@ pub const Gpio = struct {
     /// Resets volatile SoC GPIO register state (GPFSEL, GPSET/GPCLR, GPPUD/GPPUDCLK, event enables)
     /// to BCM283x power-on hardware defaults while preserving external hardware connections.
     pub fn resetSocState(self: *Gpio) void {
-        self.gpfsel = [_]u32{0} ** 6;
+        self.gpfsel = @splat(0);
         self.out_level = 0;
         self.pull_up_mask = DEFAULT_PULL_UP_MASK;
         self.pull_down_mask = DEFAULT_PULL_DOWN_MASK;

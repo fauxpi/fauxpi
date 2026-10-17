@@ -289,7 +289,7 @@ pub const Bcm2835 = struct {
     };
 
     const MMIO_PAGE_TABLE: [4096]MmioPage = blk: {
-        var table = [_]MmioPage{.none} ** 4096;
+        var table: [4096]MmioPage = @splat(.none);
         const Entry = struct { base: u32, size: u32, tag: MmioPage };
         const entries = [_]Entry{
             .{ .base = TIMER_BASE, .size = TIMER_SIZE, .tag = .timer },
@@ -915,7 +915,7 @@ test "Bcm2835 DMA block write to SDHOST (CMD24) completes without recursion" {
     defer gpa.free(ram);
     @memset(ram, 0);
 
-    var disk: [1024]u8 = [_]u8{0} ** 1024;
+    var disk: [1024]u8 = @splat(0);
     var soc = Bcm2835.init(ram, 1280, 720);
     soc.sdhost.attachMutableSlice(&disk);
 
@@ -1004,7 +1004,7 @@ test "Bcm2835 GPIO 48..53 ALT3 routes SD card to Arasan SDHCI with DMA PERMAP 11
     defer gpa.free(ram);
     @memset(ram, 0);
 
-    var disk: [1024]u8 = [_]u8{0} ** 1024;
+    var disk: [1024]u8 = @splat(0);
     var soc = Bcm2835.init(ram, 1280, 720);
     soc.sdhost.attachMutableSlice(&disk);
     soc.sdhci.wireless_enabled = true;
@@ -1193,7 +1193,7 @@ test "Bcm2835 renderDisplayFrameIfChanged dirty-frame detection and SIMD Mailbox
     const w: u16 = 16;
     const h: u16 = 8;
     var soc = Bcm2835.init(ram, w, h);
-    var out: [16 * 8]u32 = [_]u32{0} ** (16 * 8);
+    var out: [16 * 8]u32 = @splat(0);
 
     // 1. Before FB allocation or HVS setup: inactive and unchanged
     const r0 = soc.renderDisplayFrameIfChanged(&out, w, h, true, true);

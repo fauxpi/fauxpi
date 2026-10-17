@@ -164,20 +164,20 @@ pub const Cyw43430 = struct {
     // SDPCM sequence numbers and Function 2 frame queue
     rx_seq: u8 = 0,
     host_tx_seq: u8 = 0,
-    event_msgs: [32]u8 = [_]u8{0} ** 32,
+    event_msgs: [32]u8 = @splat(0),
     country_abrev: [4]u8 = .{ '0', '0', 0, 0 },
     country_rev: i32 = 0,
     country_ccode: [4]u8 = .{ '0', '0', 0, 0 },
 
     rx_frames: [MAX_RX_FRAMES][MAX_FRAME_LEN]u8 = undefined,
-    rx_frame_lens: [MAX_RX_FRAMES]usize = [_]usize{0} ** MAX_RX_FRAMES,
+    rx_frame_lens: [MAX_RX_FRAMES]usize = @splat(0),
     rx_head: usize = 0,
     rx_tail: usize = 0,
     rx_count: usize = 0,
     rx_frame_offset: usize = 0,
 
     // 512 KiB chip RAM for firmware & NVRAM upload/verification
-    chip_ram: [RAM_SIZE]u8 = [_]u8{0} ** RAM_SIZE,
+    chip_ram: [RAM_SIZE]u8 = @splat(0),
 
     pub fn reset(self: *Cyw43430) void {
         const mac = self.mac_address;
@@ -712,7 +712,7 @@ pub const Cyw43430 = struct {
         const is_set = (flags & BCDC_DCMD_SET) != 0;
         const body = dcmd[16..];
 
-        var resp_buf: [1536]u8 = [_]u8{0} ** 1536;
+        var resp_buf: [1536]u8 = @splat(0);
         const max_body = @min(@as(usize, len & 0xffff), resp_buf.len - 16);
         const copy_in = @min(body.len, max_body);
         @memcpy(resp_buf[16 .. 16 + copy_in], body[0..copy_in]);
@@ -888,7 +888,7 @@ pub const Cyw43430 = struct {
     fn queueEscanCompleteEvent(self: *Cyw43430) void {
         // BCDC header (4 bytes) + struct brcmf_event (14 + 10 + 48 = 72 bytes) = 76 bytes
         // Total SDPCM frame = 12 + 76 = 88 bytes (> BRCMF_FIRSTREAD = 64 bytes)
-        var evt: [76]u8 = [_]u8{0} ** 76;
+        var evt: [76]u8 = @splat(0);
 
         // 1. struct brcmf_proto_bcdc_header (4 bytes)
         evt[0] = 0x20; // BCDC_PROTO_VER (2) << BCDC_FLAG_VER_SHIFT (4)
@@ -953,7 +953,7 @@ test "Cyw43430 CIS tuples, backplane ChipCommon/EROM, and BCDC cur_etheraddr" {
     chip.writeByte(0, 0x04, 0x07); // CCCR IENx
     chip.writeBackplane32(0x18002024, 0x000000ff); // hostintmask
 
-    var tx_pkt: [64]u8 = [_]u8{0} ** 64;
+    var tx_pkt: [64]u8 = @splat(0);
     const total_len: u16 = 12 + 16 + 14;
     std.mem.writeInt(u16, tx_pkt[0..2], total_len, .little);
     std.mem.writeInt(u16, tx_pkt[2..4], ~total_len, .little);

@@ -38,7 +38,7 @@ pub const Hvs = struct {
     frame_count: u6 = 0,
 
     fn initDlist() [DLIST_WORDS]u32 {
-        var d: [DLIST_WORDS]u32 = [_]u32{0} ** DLIST_WORDS;
+        var d: [DLIST_WORDS]u32 = @splat(0);
         d[0] = SCALER_CTL0_END;
         return d;
     }
@@ -833,7 +833,7 @@ pub const Hvs = struct {
 
 test "HVS DLIST plane compositing" {
     var hvs = Hvs{};
-    var ram: [1024]u8 = [_]u8{0} ** 1024;
+    var ram: [1024]u8 = @splat(0);
 
     // 2x2 Linear XRGB8888 plane at 0x100 with green pixels
     for (0..4) |i| {
@@ -861,7 +861,7 @@ test "HVS DLIST plane compositing" {
     // Point DISPLIST1 to slot 16
     hvs.write32(0x0024, 16);
 
-    var out: [4]u32 = [_]u32{0} ** 4;
+    var out: [4]u32 = @splat(0);
     try std.testing.expect(hvs.compositeFrame(&ram, &out, 2, 2));
     try std.testing.expectEqual(@as(u32, 0xff00ff00), out[0]);
     try std.testing.expectEqual(@as(u32, 0xff00ff00), out[3]);
@@ -871,7 +871,7 @@ test "HVS T-tiled RGB565 plane compositing (direct scanout of maximized window)"
     var hvs = Hvs{};
     const w: u32 = 128;
     const h: u32 = 69; // Non-multiple-of-4 height (like 1280x669 in Dazzle)
-    var ram: [128 * 96 * 2]u8 = [_]u8{0} ** (128 * 96 * 2);
+    var ram: [128 * 96 * 2]u8 = @splat(0);
 
     // Populate T-tiled RGB565 buffer with pure blue (0xff0000ff)
     const blue565 = format_mod.toRgb565(0xff0000ff);
@@ -894,7 +894,7 @@ test "HVS T-tiled RGB565 plane compositing (direct scanout of maximized window)"
     hvs.write32(Hvs.DLIST_OFFSET + 23 * 4, Hvs.SCALER_CTL0_END);
     hvs.write32(0x0024, 16);
 
-    var out: [128 * 69]u32 = [_]u32{0} ** (128 * 69);
+    var out: [128 * 69]u32 = @splat(0);
     try std.testing.expect(hvs.compositeFrame(&ram, &out, w, h));
     for (out) |px| {
         try std.testing.expectEqual(@as(u32, 0xff0000ff), px);
@@ -903,7 +903,7 @@ test "HVS T-tiled RGB565 plane compositing (direct scanout of maximized window)"
 
 test "HVS cursor hotspot detection" {
     var hvs = Hvs{};
-    var ram: [8192]u8 = [_]u8{0} ** 8192;
+    var ram: [8192]u8 = @splat(0);
 
     // Simulate arrow cursor buffer at page-aligned 0x1000 (pixel (1,2) opaque)
     std.mem.writeInt(u32, ram[0x1000 + (2 * 32 + 1) * 4 ..][0..4], 0xffffffff, .little);
@@ -954,7 +954,7 @@ test "HVS Linear RGB565 SIMD scanline and offset T-tiled ARGB8888 overlay compos
     var hvs = Hvs{};
     const out_w: u32 = 40;
     const out_h: u32 = 24;
-    var ram: [65536]u8 = [_]u8{0} ** 65536;
+    var ram: [65536]u8 = @splat(0);
 
     // Plane 0: 40x24 Linear RGB565 background at 0x0000 with pure red (0xffff0000)
     const red565 = format_mod.toRgb565(0xffff0000);
@@ -994,7 +994,7 @@ test "HVS Linear RGB565 SIMD scanline and offset T-tiled ARGB8888 overlay compos
     hvs.write32(Hvs.DLIST_OFFSET + 30 * 4, Hvs.SCALER_CTL0_END);
     hvs.write32(0x0024, 16);
 
-    var out: [40 * 24]u32 = [_]u32{0} ** (40 * 24);
+    var out: [40 * 24]u32 = @splat(0);
     try std.testing.expect(hvs.compositeFrame(&ram, &out, out_w, out_h));
     for (0..out_h) |y| {
         for (0..out_w) |x| {

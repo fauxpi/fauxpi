@@ -59,13 +59,13 @@ pub const VirtualNetwork = struct {
     host_dns_ip: [4]u8 = .{ 1, 1, 1, 1 },
 
     rx_frames: [RX_QUEUE_CAP][MAX_FRAME_LEN]u8 = undefined,
-    rx_lens: [RX_QUEUE_CAP]u16 = [_]u16{0} ** RX_QUEUE_CAP,
+    rx_lens: [RX_QUEUE_CAP]u16 = @splat(0),
     rx_head: u5 = 0,
     rx_tail: u5 = 0,
     rx_count: u6 = 0,
 
-    udp_sessions: [MAX_UDP_SESSIONS]UdpSession = [_]UdpSession{.{}} ** MAX_UDP_SESSIONS,
-    tcp_conns: [MAX_TCP_CONNS]TcpConn = [_]TcpConn{.{}} ** MAX_TCP_CONNS,
+    udp_sessions: [MAX_UDP_SESSIONS]UdpSession = @splat(.{}),
+    tcp_conns: [MAX_TCP_CONNS]TcpConn = @splat(.{}),
 
     pub fn deinit(self: *VirtualNetwork) void {
         for (&self.udp_sessions) |*s| {
@@ -142,7 +142,7 @@ pub const VirtualNetwork = struct {
             if (!std.mem.eql(u8, tpa, &GATEWAY_IP)) return;
         }
 
-        var reply: [42]u8 = [_]u8{0} ** 42;
+        var reply: [42]u8 = @splat(0);
         @memcpy(reply[0..6], sha);
         @memcpy(reply[6..12], &GATEWAY_MAC);
         std.mem.writeInt(u16, reply[12..14], 0x0806, .big);
@@ -262,7 +262,7 @@ pub const VirtualNetwork = struct {
 
         self.guest_ip = DEFAULT_GUEST_IP;
 
-        var bootp: [300]u8 = [_]u8{0} ** 300;
+        var bootp: [300]u8 = @splat(0);
         bootp[0] = 2; // BOOTREPLY
         bootp[1] = 1; // Ethernet
         bootp[2] = 6; // hlen
@@ -332,7 +332,7 @@ pub const VirtualNetwork = struct {
     }
 
     fn handleSntp(self: *VirtualNetwork, src_ip: [4]u8, src_port: u16, dst_ip: [4]u8, req: []const u8) void {
-        var rep: [48]u8 = [_]u8{0} ** 48;
+        var rep: [48]u8 = @splat(0);
         const vn = (req[0] >> 3) & 0x7;
         rep[0] = ((if (vn == 0) @as(u8, 4) else vn) << 3) | 4; // LI=0, VN, Mode=4 (Server)
         rep[1] = 2; // Stratum 2
@@ -676,7 +676,7 @@ pub const VirtualNetwork = struct {
         data: []const u8,
     ) void {
         if (20 + data.len > 1480) return;
-        var tcp: [1480]u8 = [_]u8{0} ** 1480;
+        var tcp: [1480]u8 = @splat(0);
         const tcp_len: usize = 20 + data.len;
         std.mem.writeInt(u16, tcp[0..2], src_port, .big);
         std.mem.writeInt(u16, tcp[2..4], dst_port, .big);
@@ -786,7 +786,7 @@ test "VirtualNetwork ARP, DHCP, ICMP Echo, and SNTP" {
     defer net.deinit();
 
     // 1. Test ARP request for 10.0.2.2
-    var arp_req: [42]u8 = [_]u8{0} ** 42;
+    var arp_req: [42]u8 = @splat(0);
     @memset(arp_req[0..6], 0xff);
     @memcpy(arp_req[6..12], &VirtualNetwork.DEFAULT_GUEST_MAC);
     std.mem.writeInt(u16, arp_req[12..14], 0x0806, .big);
@@ -809,7 +809,7 @@ test "VirtualNetwork ARP, DHCP, ICMP Echo, and SNTP" {
     try std.testing.expectEqualSlices(u8, &VirtualNetwork.GATEWAY_MAC, rx_buf[22..28]);
 
     // 2. Test DHCP DISCOVER -> OFFER
-    var dhcp_disc: [34 + 8 + 244]u8 = [_]u8{0} ** (34 + 8 + 244);
+    var dhcp_disc: [34 + 8 + 244]u8 = @splat(0);
     @memset(dhcp_disc[0..6], 0xff);
     @memcpy(dhcp_disc[6..12], &VirtualNetwork.DEFAULT_GUEST_MAC);
     std.mem.writeInt(u16, dhcp_disc[12..14], 0x0800, .big);
@@ -838,7 +838,7 @@ test "VirtualNetwork ARP, DHCP, ICMP Echo, and SNTP" {
     try std.testing.expectEqualSlices(u8, &VirtualNetwork.DEFAULT_GUEST_IP, rx_buf[58..62]);
 
     // 3. Test SNTP request on UDP port 123
-    var sntp_pkt: [34 + 8 + 48]u8 = [_]u8{0} ** (34 + 8 + 48);
+    var sntp_pkt: [34 + 8 + 48]u8 = @splat(0);
     @memcpy(sntp_pkt[0..6], &VirtualNetwork.GATEWAY_MAC);
     @memcpy(sntp_pkt[6..12], &VirtualNetwork.DEFAULT_GUEST_MAC);
     std.mem.writeInt(u16, sntp_pkt[12..14], 0x0800, .big);

@@ -10,7 +10,7 @@ pub const AudioFifo = struct {
     pub const MASK: u32 = CAPACITY - 1;
 
     /// Interleaved stereo samples (`samples[idx * 2 + 0]` = left, `samples[idx * 2 + 1]` = right)
-    samples: [CAPACITY * 2]i16 = [_]i16{0} ** (CAPACITY * 2),
+    samples: [CAPACITY * 2]i16 = @splat(0),
     write_idx: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     read_idx: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     consumer_sleeping: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -238,14 +238,14 @@ pub const Vchiq = struct {
         is_enabled: u32 = 0,
         buffer_num: u32 = 1,
         buffer_size: u32 = 4096,
-        format: [32]u8 = [_]u8{0} ** 32,
-        es: [44]u8 = [_]u8{0} ** 44,
+        format: [32]u8 = @splat(0),
+        es: [44]u8 = @splat(0),
     };
 
     pub const MmalComponent = struct {
         active: bool = false,
         kind: MmalCompKind = .generic,
-        ports: [8]MmalPortState = [_]MmalPortState{.{}} ** 8,
+        ports: [8]MmalPortState = @splat(.{}),
     };
 
     // Layout offsets within vchiq_slot_zero (sizeof(vchiq_shared_state) == 372 with DEBUG_MAX == 11)
@@ -307,11 +307,11 @@ pub const Vchiq = struct {
     auds_write_total: u32 = 0,
     auds_cookie1: u32 = 0,
     auds_cookie2: u32 = 0,
-    pcm_carry_buf: [4]u8 = [_]u8{0} ** 4,
+    pcm_carry_buf: [4]u8 = @splat(0),
     pcm_carry_len: u8 = 0,
 
     // Paced completion queue so ALSA ring buffer advances at real sample rate
-    pending_completes: [32]PendingComplete = [_]PendingComplete{.{}} ** 32,
+    pending_completes: [32]PendingComplete = @splat(.{}),
     pending_head: usize = 0,
     pending_tail: usize = 0,
     pending_count: usize = 0,
@@ -321,12 +321,12 @@ pub const Vchiq = struct {
     smem_client_version: u32 = 0,
     smem_next_handle: u32 = 1,
     smem_next_alloc_addr: u32 = 0xdf00_0000,
-    smem_resources: [64]SmemResource = [_]SmemResource{.{}} ** 64,
+    smem_resources: [64]SmemResource = @splat(.{}),
 
     // MMAL service state (vc_port = 4)
     mmal_arm_port: u12 = 0,
     mmal_next_comp_handle: u32 = 1,
-    mmal_components: [32]MmalComponent = [_]MmalComponent{.{}} ** 32,
+    mmal_components: [32]MmalComponent = @splat(.{}),
 
     pub fn irqPending(self: *const Vchiq) bool {
         return self.bell0_active;
@@ -393,10 +393,10 @@ pub const Vchiq = struct {
         self.smem_client_version = 0;
         self.smem_next_handle = 1;
         self.smem_next_alloc_addr = 0xdf00_0000;
-        self.smem_resources = [_]SmemResource{.{}} ** 64;
+        self.smem_resources = @splat(.{});
         self.mmal_arm_port = 0;
         self.mmal_next_comp_handle = 1;
-        self.mmal_components = [_]MmalComponent{.{}} ** 32;
+        self.mmal_components = @splat(.{});
 
         // Mark master as initialised
         std.mem.writeInt(u32, ram[master + STATE_INITIALISED ..][0..4], 1, .little);
@@ -449,7 +449,7 @@ pub const Vchiq = struct {
                 self.pending_head = (self.pending_head + 1) % self.pending_completes.len;
                 self.pending_count -= 1;
 
-                var resp: [20]u8 = [_]u8{0} ** 20;
+                var resp: [20]u8 = @splat(0);
                 std.mem.writeInt(u32, resp[0..4], VC_AUDIO_MSG_TYPE_COMPLETE, .little);
                 std.mem.writeInt(u32, resp[4..8], count, .little);
                 std.mem.writeInt(u32, resp[8..12], cookie1, .little);
@@ -717,7 +717,7 @@ pub const Vchiq = struct {
     }
 
     fn sendAudsResult(self: *Vchiq, ram: []u8, success: i32) void {
-        var resp: [20]u8 = [_]u8{0} ** 20;
+        var resp: [20]u8 = @splat(0);
         std.mem.writeInt(u32, resp[0..4], VC_AUDIO_MSG_TYPE_RESULT, .little);
         std.mem.writeInt(i32, resp[4..8], success, .little);
         self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 1, self.auds_arm_port), &resp);
@@ -792,7 +792,7 @@ pub const Vchiq = struct {
                     self.smem_client_version = std.mem.readInt(u32, body[0..4], .little);
                 }
                 // Acknowledge client version support via VPU event callback (top bit of trans_id set)
-                var resp: [8]u8 = [_]u8{0} ** 8;
+                var resp: [8]u8 = @splat(0);
                 std.mem.writeInt(u32, resp[0..4], VC_SM_MSG_TYPE_CLIENT_VERSION | 0x8000_0000, .little);
                 std.mem.writeInt(i32, resp[4..8], 0, .little);
                 self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
@@ -805,7 +805,7 @@ pub const Vchiq = struct {
                 self.recordSmemResource(res_handle, addr, size, kernel_id);
 
                 // struct vc_sm_import_result { u32 trans_id; u32 res_handle; }
-                var resp: [8]u8 = [_]u8{0} ** 8;
+                var resp: [8]u8 = @splat(0);
                 std.mem.writeInt(u32, resp[0..4], trans_id, .little);
                 std.mem.writeInt(u32, resp[4..8], res_handle, .little);
                 self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
@@ -820,7 +820,7 @@ pub const Vchiq = struct {
                 self.recordSmemResource(res_handle, res_mem, total_size, 0);
 
                 // struct vc_sm_alloc_result_t { u32 trans_id; u32 res_handle; u32 res_mem; u32 res_base_size; u32 res_num; }
-                var resp: [20]u8 = [_]u8{0} ** 20;
+                var resp: [20]u8 = @splat(0);
                 std.mem.writeInt(u32, resp[0..4], trans_id, .little);
                 std.mem.writeInt(u32, resp[4..8], res_handle, .little);
                 std.mem.writeInt(u32, resp[8..12], res_mem, .little);
@@ -839,7 +839,7 @@ pub const Vchiq = struct {
                     0xdf00_0000;
 
                 // struct vc_sm_lock_result_t { u32 trans_id; u32 res_handle; u32 res_mem; u32 res_old_mem; }
-                var resp: [16]u8 = [_]u8{0} ** 16;
+                var resp: [16]u8 = @splat(0);
                 std.mem.writeInt(u32, resp[0..4], trans_id, .little);
                 std.mem.writeInt(u32, resp[4..8], res_handle, .little);
                 std.mem.writeInt(u32, resp[8..12], res_mem, .little);
@@ -852,7 +852,7 @@ pub const Vchiq = struct {
                 if (self.smem_client_version >= 2) {
                     // Protocol >= 2 uses async VC_SM_MSG_TYPE_RELEASED callback (wait_reply == 0 on FREE)
                     const r = freed orelse SmemResource{ .vc_handle = res_handle };
-                    var resp: [20]u8 = [_]u8{0} ** 20;
+                    var resp: [20]u8 = @splat(0);
                     std.mem.writeInt(u32, resp[0..4], VC_SM_MSG_TYPE_RELEASED | 0x8000_0000, .little);
                     std.mem.writeInt(u32, resp[4..8], r.addr, .little);
                     std.mem.writeInt(u32, resp[8..12], r.size, .little);
@@ -860,7 +860,7 @@ pub const Vchiq = struct {
                     std.mem.writeInt(u32, resp[16..20], res_handle, .little);
                     self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
                 } else {
-                    var resp: [8]u8 = [_]u8{0} ** 8;
+                    var resp: [8]u8 = @splat(0);
                     std.mem.writeInt(u32, resp[0..4], trans_id, .little);
                     std.mem.writeInt(i32, resp[4..8], 0, .little);
                     self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
@@ -869,7 +869,7 @@ pub const Vchiq = struct {
             VC_SM_MSG_TYPE_UNLOCK_NOANS, VC_SM_MSG_TYPE_VC_MEM_REQUEST_REPLY => {},
             else => {
                 // Generic struct vc_sm_result_t { u32 trans_id; s32 success; }
-                var resp: [8]u8 = [_]u8{0} ** 8;
+                var resp: [8]u8 = @splat(0);
                 std.mem.writeInt(u32, resp[0..4], trans_id, .little);
                 std.mem.writeInt(i32, resp[4..8], 0, .little);
                 self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 3, srcport), &resp);
@@ -999,7 +999,7 @@ pub const Vchiq = struct {
 
         switch (msg_type) {
             MMAL_MSG_TYPE_GET_VERSION => {
-                var resp: [40]u8 = [_]u8{0} ** 40;
+                var resp: [40]u8 = @splat(0);
                 writeMmalHeader(resp[0..24], msg_type, control_service, context);
                 std.mem.writeInt(u32, resp[24..28], 0, .little); // flags
                 std.mem.writeInt(u32, resp[28..32], 16, .little); // major
@@ -1060,7 +1060,7 @@ pub const Vchiq = struct {
                 }
                 self.mmal_components[comp_handle - 1] = comp;
 
-                var resp: [44]u8 = [_]u8{0} ** 44;
+                var resp: [44]u8 = @splat(0);
                 writeMmalHeader(resp[0..24], msg_type, control_service, context);
                 std.mem.writeInt(u32, resp[24..28], 0, .little); // status = MMAL_MSG_STATUS_SUCCESS
                 std.mem.writeInt(u32, resp[28..32], comp_handle, .little);
@@ -1121,7 +1121,7 @@ pub const Vchiq = struct {
                         self.mmal_components[comp_idx].ports[pslot].is_enabled = 0;
                     }
                 }
-                var resp: [28]u8 = [_]u8{0} ** 28;
+                var resp: [28]u8 = @splat(0);
                 writeMmalHeader(resp[0..24], msg_type, control_service, context);
                 std.mem.writeInt(u32, resp[24..28], 0, .little); // status = MMAL_MSG_STATUS_SUCCESS
                 self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 4, srcport), &resp);
@@ -1132,7 +1132,7 @@ pub const Vchiq = struct {
                 const param_id: u32 = if (payload.len >= 36) std.mem.readInt(u32, payload[32..36], .little) else 0;
                 const req_size: u32 = if (payload.len >= 40) std.mem.readInt(u32, payload[36..40], .little) else 8;
 
-                var resp: [420]u8 = [_]u8{0} ** 420;
+                var resp: [420]u8 = @splat(0);
                 writeMmalHeader(resp[0..24], msg_type, control_service, context);
                 std.mem.writeInt(u32, resp[24..28], 0, .little); // status = MMAL_MSG_STATUS_SUCCESS
                 std.mem.writeInt(u32, resp[28..32], param_id, .little);
@@ -1207,7 +1207,7 @@ pub const Vchiq = struct {
             MMAL_MSG_TYPE_BUFFER_FROM_HOST, MMAL_MSG_TYPE_BUFFER_FROM_HOST_ZEROLEN => {},
             else => {
                 // COMPONENT_DESTROY, COMPONENT_ENABLE, COMPONENT_DISABLE, PORT_PARAMETER_SET, PORT_FLUSH, etc.
-                var resp: [28]u8 = [_]u8{0} ** 28;
+                var resp: [28]u8 = @splat(0);
                 writeMmalHeader(resp[0..24], msg_type, control_service, context);
                 std.mem.writeInt(u32, resp[24..28], 0, .little); // status = MMAL_MSG_STATUS_SUCCESS
                 self.sendVcMessage(ram, makeMsgid(VCHIQ_MSG_DATA, 4, srcport), &resp);
@@ -1221,7 +1221,7 @@ pub const Vchiq = struct {
         const duration_us: u64 = (@as(u64, self.auds_write_total) * 1_000_000) / bytes_per_sec;
 
         if (duration_us == 0 or self.pending_count >= self.pending_completes.len) {
-            var resp: [20]u8 = [_]u8{0} ** 20;
+            var resp: [20]u8 = @splat(0);
             std.mem.writeInt(u32, resp[0..4], VC_AUDIO_MSG_TYPE_COMPLETE, .little);
             std.mem.writeInt(u32, resp[4..8], self.auds_write_total, .little);
             std.mem.writeInt(u32, resp[8..12], self.auds_cookie1, .little);
@@ -1526,7 +1526,7 @@ pub const I2sPcm = struct {
     pending_left: i16 = 0,
     has_pending_left: bool = false,
 
-    rx_fifo: [64]u32 = [_]u32{0} ** 64,
+    rx_fifo: [64]u32 = @splat(0),
     rx_head: u6 = 0,
     rx_tail: u6 = 0,
     rx_count: u7 = 0,
@@ -1679,7 +1679,7 @@ test "AudioFifo push and pop stereo samples with 44.1kHz to 48kHz resampling" {
 }
 
 test "Vchiq AUDS service opens, configures, streams PCM, and respects audio_connected" {
-    var ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024);
+    var ram: [64 * 1024]u8 = @splat(0);
     var vchiq = Vchiq{};
     var fifo = AudioFifo{};
 
@@ -1748,7 +1748,7 @@ test "Vchiq AUDS service opens, configures, streams PCM, and respects audio_conn
 }
 
 test "Vchiq SMEM service opens and handles client_version, import, and free" {
-    var ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024);
+    var ram: [64 * 1024]u8 = @splat(0);
     var vchiq = Vchiq{};
     var fifo = AudioFifo{};
 
@@ -1827,7 +1827,7 @@ test "Vchiq SMEM service opens and handles client_version, import, and free" {
 }
 
 test "Vchiq MMAL service opens and handles component creation, port info, and parameters" {
-    var ram: [64 * 1024]u8 = [_]u8{0} ** (64 * 1024);
+    var ram: [64 * 1024]u8 = @splat(0);
     var vchiq = Vchiq{};
     var fifo = AudioFifo{};
 

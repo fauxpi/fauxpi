@@ -12,7 +12,7 @@ pub const Mailbox = struct {
     pub const MBOX_IHAVEDATAIRQEN: u32 = 0x00000001;
 
     /// Response FIFO (up to 16 entries)
-    fifo: [16]u32 = [_]u32{0} ** 16,
+    fifo: [16]u32 = @splat(0),
     fifo_head: u4 = 0,
     fifo_tail: u4 = 0,
     fifo_count: u5 = 0,
@@ -485,7 +485,7 @@ pub const Mailbox = struct {
 
 test "Mailbox property tags: board revision and clock rate" {
     var mbox = Mailbox{};
-    var ram: [1024]u8 = [_]u8{0} ** 1024;
+    var ram: [1024]u8 = @splat(0);
 
     // Build a property buffer at phys 0x100 with:
     // Tag 1: 0x00010002 (Board revision, 4 bytes)

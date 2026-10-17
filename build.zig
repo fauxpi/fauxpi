@@ -12,9 +12,12 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // Debug builds use LLVM too: Zig's self-hosted x86-64 backend crashes compiling the
+    // 128-bit `cmpxchg` that emulates `STXP` (src/cpu/atomic_ram.zig).
     const exe = b.addExecutable(.{
         .name = "fauxpi",
         .root_module = root_mod,
+        .use_llvm = true,
     });
     b.installArtifact(exe);
 
@@ -38,6 +41,7 @@ pub fn build(b: *std.Build) void {
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
+        .use_llvm = true,
     });
     const run_unit_tests = b.addRunArtifact(unit_tests);
 

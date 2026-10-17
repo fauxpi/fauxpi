@@ -11,7 +11,7 @@ pub const Pl011Uart = struct {
     pub const INT_TX: u32 = 1 << 5;
     pub const INT_RT: u32 = 1 << 6;
 
-    rx_fifo: [64]u8 = [_]u8{0} ** 64,
+    rx_fifo: [64]u8 = @splat(0),
     rx_head: u6 = 0,
     rx_tail: u6 = 0,
     rx_count: u7 = 0,
@@ -25,7 +25,7 @@ pub const Pl011Uart = struct {
     ris: u32 = INT_TX, // TX is always ready
 
     stdout_enabled: bool = true,
-    tx_log: [256]u8 = [_]u8{0} ** 256,
+    tx_log: [256]u8 = @splat(0),
     tx_log_len: usize = 0,
 
     /// When set, transmitted bytes are held in `tx_capture_buf` for an attached device
@@ -155,7 +155,7 @@ pub const AuxMiniUart = struct {
     dlm: u32 = 0,
     tx_irq_pending: bool = false,
 
-    rx_fifo: [64]u8 = [_]u8{0} ** 64,
+    rx_fifo: [64]u8 = @splat(0),
     rx_head: u6 = 0,
     rx_tail: u6 = 0,
     rx_count: u7 = 0,

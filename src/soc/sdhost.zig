@@ -39,7 +39,7 @@ pub const SdHost = struct {
     sdarg: u32 = 0,
     sdtout: u32 = 0x00f00000,
     sdcdiv: u32 = 0,
-    sdrsp: [4]u32 = [_]u32{0} ** 4,
+    sdrsp: [4]u32 = @splat(0),
     sdhsts: u32 = 0,
     sdvdd: u32 = 1,
     sdedm: u32 = 0x00001f01, // FSM = DATAMODE (1), threshold = 4
@@ -62,9 +62,9 @@ pub const SdHost = struct {
     transfer_mode: enum { none, read_image, write_image, read_aux } = .none,
     transfer_offset: u64 = 0,
     data_remaining: u32 = 0,
-    aux_buf: [64]u8 = [_]u8{0} ** 64,
+    aux_buf: [64]u8 = @splat(0),
     aux_pos: u32 = 0,
-    sector_cache: [512]u8 = [_]u8{0} ** 512,
+    sector_cache: [512]u8 = @splat(0),
     sector_cache_lba: u64 = std.math.maxInt(u64),
     activity_latch: bool = false,
     /// True when GPIO 48..53 are routed to SDHOST (ALT0, or default before pinctrl switches to ALT3)
@@ -567,7 +567,7 @@ pub const SdHost = struct {
             self.transfer_offset += 4;
             self.data_remaining -= 4;
         } else {
-            var bytes: [4]u8 = [_]u8{0} ** 4;
+            var bytes: [4]u8 = @splat(0);
             for (0..4) |i| {
                 if (self.data_remaining > 0) {
                     switch (self.transfer_mode) {
@@ -685,7 +685,7 @@ pub const ArasanSdhci = struct {
 
     // Active PIO / DMA transfer state
     pio_mode: enum { none, read_wifi, write_wifi, read_sd_image, write_sd_image, read_sd_aux } = .none,
-    pio_buf: [PIO_BUF_SIZE]u8 = [_]u8{0} ** PIO_BUF_SIZE,
+    pio_buf: [PIO_BUF_SIZE]u8 = @splat(0),
     pio_blksz: usize = 0,
     pio_blocks_rem: usize = 0,
     pio_block_pos: usize = 0,
@@ -697,7 +697,7 @@ pub const ArasanSdhci = struct {
     sd_transfer_offset: u64 = 0,
 
     fn initRegs() [SIZE / 4]u32 {
-        var r: [SIZE / 4]u32 = [_]u32{0} ** (SIZE / 4);
+        var r: [SIZE / 4]u32 = @splat(0);
         r[0x24 / 4] = SDHCI_CARD_PRESENT | SDHCI_CARD_STATE_STABLE | SDHCI_CD_LVL | SDHCI_WRITE_PROTECT | SDHCI_DATA_0_LVL_MASK;
         r[0x2c / 4] = 0x00000002; // CLOCK_CONTROL: SDHCI_CLOCK_INT_STABLE
         r[0x30 / 4] = 0x00000000; // INT_STATUS
@@ -1171,7 +1171,7 @@ pub const ArasanSdhci = struct {
             word = std.mem.readInt(u32, self.pio_buf[self.pio_total_pos..][0..4], .little);
             self.pio_total_pos += 4;
         } else {
-            var bytes: [4]u8 = [_]u8{0} ** 4;
+            var bytes: [4]u8 = @splat(0);
             for (0..chunk) |i| {
                 switch (self.pio_mode) {
                     .read_wifi => {
@@ -1282,7 +1282,7 @@ pub const ArasanSdhci = struct {
 
 test "SdHost identification and CMD17 block read" {
     var sd = SdHost{};
-    var disk: [1024]u8 = [_]u8{0} ** 1024;
+    var disk: [1024]u8 = @splat(0);
     std.mem.writeInt(u32, disk[512..516], 0xDEADBEEF, .little);
     sd.attachSlice(&disk);
 
@@ -1330,7 +1330,7 @@ test "ArasanSdhci SDIO CMD5, CMD52, and CMD53 PIO transfer" {
 
 test "ArasanSdhci secondary SD card routing (GPIO 48..53 ALT3) supports SDHC identification, R2 CSD, and block read/write" {
     var sd = SdHost{ .pins_routed = false };
-    var disk: [1024]u8 = [_]u8{0} ** 1024;
+    var disk: [1024]u8 = @splat(0);
     std.mem.writeInt(u32, disk[512..516], 0xCAFEBABE, .little);
     sd.attachMutableSlice(&disk);
 
