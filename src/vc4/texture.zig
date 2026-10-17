@@ -197,6 +197,42 @@ pub fn uploadRectOf(format: Format, dst: []u8, width: u32, height: u32, rect: Re
     const cpp = format.bytesPerPixel();
     const x_end = rect.x + rect.width;
     const y_end = rect.y + rect.height;
+
+    if (uh == 4) {
+        const uw_mask = uw - 1;
+        const cpp_shift: u5 = if (cpp == 4) 2 else 1;
+        const uw_shift: u5 = if (cpp == 4) 2 else 3;
+        const is_lt = isLtOf(format, width, height);
+        const lt_row_stride = ((width + uw_mask) & ~uw_mask) << cpp_shift;
+        const tile_w = uw << 3;
+        const utile_stride = ((width + tile_w - 1) & ~(tile_w - 1)) >> uw_shift;
+
+        var uy = rect.y >> 2;
+        while ((uy << 2) < y_end) : (uy += 1) {
+            var ux = rect.x >> uw_shift;
+            var group_base: u32 = 0;
+            var group_valid = false;
+            while ((ux << uw_shift) < x_end) : (ux += 1) {
+                if (!group_valid or (ux & 3) == 0) {
+                    group_base = utileGroupOffset(is_lt, lt_row_stride, utile_stride, ux & ~@as(u32, 3), uy);
+                    group_valid = true;
+                }
+                const base = group_base + ((ux & 3) << 6);
+                const x0 = @max(ux << uw_shift, rect.x);
+                const x1 = @min((ux << uw_shift) + uw, x_end);
+                const y0 = @max(uy << 2, rect.y);
+                const y1 = @min((uy << 2) + 4, y_end);
+                const n = (x1 - x0) << cpp_shift;
+                for (y0..y1) |y| {
+                    const d = base + (((@as(u32, @intCast(y)) & 3) << uw_shift) + (x0 & uw_mask)) * cpp;
+                    const sidx = (@as(u32, @intCast(y)) - rect.y) * stride + ((x0 - rect.x) << cpp_shift);
+                    @memcpy(dst[d..][0..n], src[sidx..][0..n]);
+                }
+            }
+        }
+        return;
+    }
+
     var uy = rect.y / uh;
     while (uy * uh < y_end) : (uy += 1) {
         var ux = rect.x / uw;
@@ -221,40 +257,229 @@ pub fn uploadRectOf(format: Format, dst: []u8, width: u32, height: u32, rect: Re
 pub fn detileTextureToBgra(ram: []const u8, cfg: Config, out_bgra: []u32) void {
     const w = cfg.width;
     const h = cfg.height;
-    if (out_bgra.len < w * h) return;
+    const total_px = @as(usize, w) * @as(usize, h);
+    if (w == 0 or h == 0 or out_bgra.len < total_px) return;
+
+    const base = cfg.offset & 0x1FFFFFFF;
+
+    // Fast path 1: Linear 32-bit RGBA32R
+    if (cfg.type == .rgba32r) {
+        const total_bytes = total_px * 4;
+        if (@as(usize, base) + total_bytes <= ram.len) {
+            @memcpy(std.mem.sliceAsBytes(out_bgra[0..total_px]), ram[base..][0..total_bytes]);
+        } else {
+            for (0..total_px) |i| {
+                const off = @as(usize, base) + i * 4;
+                out_bgra[i] = if (off + 4 <= ram.len)
+                    std.mem.readInt(u32, ram[off..][0..4], .little)
+                else
+                    0xff000000;
+            }
+        }
+        return;
+    }
 
     const fmt: Format = switch (cfg.type) {
-        .rgba8888, .rgbx8888, .rgba32r => .argb8888,
+        .rgba8888, .rgbx8888 => .argb8888,
         .rgb565 => .rgb565,
         .alpha, .luminance => .a8,
         else => .argb8888,
     };
     const cpp = fmt.bytesPerPixel();
-    const base = cfg.offset & 0x1FFFFFFF;
 
-    for (0..h) |y| {
-        for (0..w) |x| {
-            const off = base + if (cfg.type == .rgba32r)
-                (@as(u32, @intCast(y)) * w + @as(u32, @intCast(x))) * 4
-            else
-                texelOffsetOf(fmt, w, h, @intCast(x), @intCast(y));
+    // Fast path 2: T-tiled / LT-tiled 32-bit (4x4 utiles, hoisted utileGroupOffset + 4-wide SIMD)
+    if (cpp == 4) {
+        const is_lt = (w <= 16 or h <= 16);
+        const lt_row_stride = ((w + 3) & ~@as(u32, 3)) << 2;
+        const utile_stride = ((w + 31) & ~@as(u32, 31)) >> 2;
+        const utiles_x = w >> 2;
+        const utiles_y = h >> 2;
+        const rem_x = w & 3;
+        const rem_y = h & 3;
+        const total_uy = utiles_y + @intFromBool(rem_y != 0);
+        const alpha_or: u32 = if (cfg.type == .rgbx8888) 0xff000000 else 0;
+        const alpha_or_v: @Vector(4, u32) = @splat(alpha_or);
 
-            var pixel: u32 = 0xff000000;
-            if (off + cpp <= ram.len) {
-                pixel = switch (cpp) {
-                    4 => blk: {
-                        const raw = std.mem.readInt(u32, ram[off..][0..4], .little);
-                        break :blk if (cfg.type == .rgbx8888) (raw | 0xff000000) else raw;
-                    },
-                    2 => format_mod.fromRgb565(std.mem.readInt(u16, ram[off..][0..2], .little)),
-                    1 => if (cfg.type == .luminance) blk: {
-                        const l: u32 = ram[off];
-                        break :blk 0xff000000 | (l << 16) | (l << 8) | l;
-                    } else (@as(u32, ram[off]) << 24),
-                    else => 0xff000000,
-                };
+        var uy: u32 = 0;
+        while (uy < total_uy) : (uy += 1) {
+            const y0 = uy << 2;
+            const rows: u32 = if (uy < utiles_y) 4 else rem_y;
+            var ux: u32 = 0;
+            var group_base: u32 = 0;
+            while (ux < utiles_x) : (ux += 1) {
+                if ((ux & 3) == 0) {
+                    group_base = base + utileGroupOffset(is_lt, lt_row_stride, utile_stride, ux, uy);
+                }
+                const utile_off = group_base + ((ux & 3) << 6);
+                const x0 = ux << 2;
+                if (@as(usize, utile_off) + 64 <= ram.len) {
+                    if (rows == 4) {
+                        inline for (0..4) |ry| {
+                            const src_v: @Vector(4, u32) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
+                            out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..4].* = @bitCast(src_v | alpha_or_v);
+                        }
+                    } else {
+                        for (0..rows) |ry| {
+                            const src_v: @Vector(4, u32) = @bitCast(ram[utile_off + @as(u32, @intCast(ry)) * 16 ..][0..16].*);
+                            out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..4].* = @bitCast(src_v | alpha_or_v);
+                        }
+                    }
+                } else {
+                    for (0..rows) |ry| {
+                        const dst_row = out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..4];
+                        for (0..4) |rx| {
+                            const off = @as(usize, utile_off) + ry * 16 + rx * 4;
+                            dst_row[rx] = if (off + 4 <= ram.len)
+                                (std.mem.readInt(u32, ram[off..][0..4], .little) | alpha_or)
+                            else
+                                0xff000000;
+                        }
+                    }
+                }
             }
-            out_bgra[y * w + x] = pixel;
+            if (rem_x != 0) {
+                if ((utiles_x & 3) == 0) {
+                    group_base = base + utileGroupOffset(is_lt, lt_row_stride, utile_stride, utiles_x, uy);
+                }
+                const utile_off = group_base + ((utiles_x & 3) << 6);
+                const x0 = utiles_x << 2;
+                for (0..rows) |ry| {
+                    const dst_row = out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..rem_x];
+                    for (0..rem_x) |rx| {
+                        const off = @as(usize, utile_off) + ry * 16 + rx * 4;
+                        dst_row[rx] = if (off + 4 <= ram.len)
+                            (std.mem.readInt(u32, ram[off..][0..4], .little) | alpha_or)
+                        else
+                            0xff000000;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Fast path 3: T-tiled / LT-tiled 16-bit RGB565 (8x4 utiles, hoisted utileGroupOffset + 8-wide SIMD)
+    if (cpp == 2) {
+        const is_lt = (w <= 32 or h <= 16);
+        const lt_row_stride = ((w + 7) & ~@as(u32, 7)) << 1;
+        const utile_stride = ((w + 63) & ~@as(u32, 63)) >> 3;
+        const utiles_x = w >> 3;
+        const utiles_y = h >> 2;
+        const rem_x = w & 7;
+        const rem_y = h & 3;
+        const total_uy = utiles_y + @intFromBool(rem_y != 0);
+
+        var uy: u32 = 0;
+        while (uy < total_uy) : (uy += 1) {
+            const y0 = uy << 2;
+            const rows: u32 = if (uy < utiles_y) 4 else rem_y;
+            var ux: u32 = 0;
+            var group_base: u32 = 0;
+            while (ux < utiles_x) : (ux += 1) {
+                if ((ux & 3) == 0) {
+                    group_base = base + utileGroupOffset(is_lt, lt_row_stride, utile_stride, ux, uy);
+                }
+                const utile_off = group_base + ((ux & 3) << 6);
+                const x0 = ux << 3;
+                if (@as(usize, utile_off) + 64 <= ram.len) {
+                    if (rows == 4) {
+                        inline for (0..4) |ry| {
+                            const p16_vec: @Vector(8, u16) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
+                            out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..8].* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
+                        }
+                    } else {
+                        for (0..rows) |ry| {
+                            const p16_vec: @Vector(8, u16) = @bitCast(ram[utile_off + @as(u32, @intCast(ry)) * 16 ..][0..16].*);
+                            out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..8].* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
+                        }
+                    }
+                } else {
+                    for (0..rows) |ry| {
+                        const dst_row = out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..8];
+                        for (0..8) |rx| {
+                            const off = @as(usize, utile_off) + ry * 16 + rx * 2;
+                            dst_row[rx] = if (off + 2 <= ram.len)
+                                format_mod.fromRgb565(std.mem.readInt(u16, ram[off..][0..2], .little))
+                            else
+                                0xff000000;
+                        }
+                    }
+                }
+            }
+            if (rem_x != 0) {
+                if ((utiles_x & 3) == 0) {
+                    group_base = base + utileGroupOffset(is_lt, lt_row_stride, utile_stride, utiles_x, uy);
+                }
+                const utile_off = group_base + ((utiles_x & 3) << 6);
+                const x0 = utiles_x << 3;
+                for (0..rows) |ry| {
+                    const dst_row = out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..rem_x];
+                    for (0..rem_x) |rx| {
+                        const off = @as(usize, utile_off) + ry * 16 + rx * 2;
+                        dst_row[rx] = if (off + 2 <= ram.len)
+                            format_mod.fromRgb565(std.mem.readInt(u16, ram[off..][0..2], .little))
+                        else
+                            0xff000000;
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Fast path 4: T-tiled / LT-tiled 8-bit Alpha / Luminance (8x8 utiles, 8-wide SIMD expansion)
+    const utiles_x = w >> 3;
+    const utiles_y = h >> 3;
+    const rem_x = w & 7;
+    const rem_y = h & 7;
+    const total_uy = utiles_y + @intFromBool(rem_y != 0);
+    const is_lum = (cfg.type == .luminance);
+    const opaque_v: @Vector(8, u32) = @splat(0xff000000);
+
+    var uy: u32 = 0;
+    while (uy < total_uy) : (uy += 1) {
+        const y0 = uy << 3;
+        const rows: u32 = if (uy < utiles_y) 8 else rem_y;
+        var ux: u32 = 0;
+        while (ux < utiles_x) : (ux += 1) {
+            const x0 = ux << 3;
+            const utile_off = base + texelOffsetOf(.a8, w, h, x0, y0);
+            if (@as(usize, utile_off) + 64 <= ram.len) {
+                for (0..rows) |ry| {
+                    const b_vec: @Vector(8, u8) = ram[utile_off + @as(u32, @intCast(ry)) * 8 ..][0..8].*;
+                    const v32: @Vector(8, u32) = b_vec;
+                    const out_v: @Vector(8, u32) = if (is_lum)
+                        opaque_v | (v32 << @splat(16)) | (v32 << @splat(8)) | v32
+                    else
+                        v32 << @splat(24);
+                    out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..8].* = @bitCast(out_v);
+                }
+            } else {
+                for (0..rows) |ry| {
+                    const dst_row = out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..8];
+                    for (0..8) |rx| {
+                        const off = @as(usize, utile_off) + ry * 8 + rx;
+                        dst_row[rx] = if (off < ram.len) blk: {
+                            const b: u32 = ram[off];
+                            break :blk if (is_lum) (0xff000000 | (b << 16) | (b << 8) | b) else (b << 24);
+                        } else 0xff000000;
+                    }
+                }
+            }
+        }
+        if (rem_x != 0) {
+            const x0 = utiles_x << 3;
+            const utile_off = base + texelOffsetOf(.a8, w, h, x0, y0);
+            for (0..rows) |ry| {
+                const dst_row = out_bgra[(y0 + @as(u32, @intCast(ry))) * w + x0 ..][0..rem_x];
+                for (0..rem_x) |rx| {
+                    const off = @as(usize, utile_off) + ry * 8 + rx;
+                    dst_row[rx] = if (off < ram.len) blk: {
+                        const b: u32 = ram[off];
+                        break :blk if (is_lum) (0xff000000 | (b << 16) | (b << 8) | b) else (b << 24);
+                    } else 0xff000000;
+                }
+            }
         }
     }
 }
@@ -267,3 +492,62 @@ test "config round trip and uploadRect" {
     try std.testing.expectEqual(c.width, d.width);
     try std.testing.expectEqual(c.height, d.height);
 }
+
+test "detileTextureToBgra matches per-texel reference across T-tiled, LT-tiled, and unaligned sizes" {
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 128 * 1024);
+    defer allocator.free(ram);
+    for (ram, 0..) |*b, i| {
+        b.* = @truncate((i *% 73) ^ (i >> 5) ^ 0x5a);
+    }
+
+    const cases = [_]Config{
+        .{ .offset = 0x1000, .type = .rgba8888, .width = 67, .height = 37 },
+        .{ .offset = 0x1000, .type = .rgbx8888, .width = 13, .height = 19 },
+        .{ .offset = 0x1000, .type = .rgb565, .width = 131, .height = 35 },
+        .{ .offset = 0x1000, .type = .rgb565, .width = 21, .height = 11 },
+        .{ .offset = 0x1000, .type = .luminance, .width = 75, .height = 43 },
+        .{ .offset = 0x1000, .type = .alpha, .width = 19, .height = 13 },
+        .{ .offset = 0x1000, .type = .rgba32r, .width = 33, .height = 17 },
+    };
+
+    var out_fast: [131 * 43]u32 = undefined;
+    for (cases) |cfg| {
+        const w = cfg.width;
+        const h = cfg.height;
+        detileTextureToBgra(ram, cfg, out_fast[0 .. w * h]);
+
+        const fmt: Format = switch (cfg.type) {
+            .rgba8888, .rgbx8888, .rgba32r => .argb8888,
+            .rgb565 => .rgb565,
+            .alpha, .luminance => .a8,
+            else => .argb8888,
+        };
+        const cpp = fmt.bytesPerPixel();
+        const base = cfg.offset & 0x1FFFFFFF;
+
+        for (0..h) |y| {
+            for (0..w) |x| {
+                const off = base + if (cfg.type == .rgba32r)
+                    (@as(u32, @intCast(y)) * w + @as(u32, @intCast(x))) * 4
+                else
+                    texelOffsetOf(fmt, w, h, @intCast(x), @intCast(y));
+
+                const expected: u32 = switch (cpp) {
+                    4 => blk: {
+                        const raw = std.mem.readInt(u32, ram[off..][0..4], .little);
+                        break :blk if (cfg.type == .rgbx8888) (raw | 0xff000000) else raw;
+                    },
+                    2 => format_mod.fromRgb565(std.mem.readInt(u16, ram[off..][0..2], .little)),
+                    1 => if (cfg.type == .luminance) blk: {
+                        const l: u32 = ram[off];
+                        break :blk 0xff000000 | (l << 16) | (l << 8) | l;
+                    } else (@as(u32, ram[off]) << 24),
+                    else => 0xff000000,
+                };
+                try std.testing.expectEqual(expected, out_fast[y * w + x]);
+            }
+        }
+    }
+}
+

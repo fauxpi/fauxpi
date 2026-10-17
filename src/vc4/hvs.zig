@@ -502,7 +502,6 @@ pub const Hvs = struct {
         const raw_pitch: u32 = pitch0 & 0xffff;
         // HVS_PIXEL_FORMAT_RGB565 is 4 (some legacy bare-metal tests also used 0 for 565)
         const is_565 = (pix_fmt == 0) or (pix_fmt == 4);
-        const fmt: format_mod.Format = if (is_565) .rgb565 else .argb8888;
         const cpp: u32 = if (is_565) 2 else 4;
         const linear_pitch: u32 = if (raw_pitch != 0) raw_pitch else (src_w * cpp);
         // For T-tiled planes (SCALER_CTL0_TILING_256B_OR_T = 3), pitch0[6:0] is SCALER_TILE_WIDTH_T
@@ -591,8 +590,6 @@ pub const Hvs = struct {
             return;
         }
 
-        var start_py: u32 = dst_y;
-
         // Fast path 2: Unity 32-bit T-tiled / LT-tiled plane (4x4 utiles, hoisted group address)
         if (unity and tiling != 0 and !is_565) {
             const is_lt = (tiled_w <= 16 or src_h <= 16);
@@ -601,11 +598,14 @@ pub const Hvs = struct {
             const utiles_x = span_w >> 2;
             const utiles_y = span_h >> 2;
             const rem_x = span_w & 3;
+            const rem_y = span_h & 3;
+            const total_uy = utiles_y + @intFromBool(rem_y != 0);
             const opaque_mask: @Vector(4, u32) = @splat(0xFF000000);
 
             var uy: u32 = 0;
-            while (uy < utiles_y) : (uy += 1) {
+            while (uy < total_uy) : (uy += 1) {
                 const dy0 = dst_y + (uy << 2);
+                const rows: u32 = if (uy < utiles_y) 4 else rem_y;
                 var ux: u32 = 0;
                 var group_base: u32 = 0;
                 while (ux < utiles_x) : (ux += 1) {
@@ -615,18 +615,36 @@ pub const Hvs = struct {
                     const utile_off = group_base + ((ux & 3) << 6);
                     if (utile_off + 64 > ram.len) continue;
                     const dx0 = dst_x + (ux << 2);
-                    inline for (0..4) |ry| {
-                        const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..4];
-                        const src_v: @Vector(4, u32) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
-                        if (alpha_mode == 1) {
-                            dst_row.* = @bitCast(src_v | opaque_mask);
-                        } else {
-                            const alphas = src_v >> @splat(24);
-                            if (@reduce(.And, alphas) == 0xff) {
-                                dst_row.* = @bitCast(src_v);
-                            } else if (@reduce(.Or, alphas) != 0) {
-                                const dst_v: @Vector(4, u32) = dst_row.*;
-                                dst_row.* = blendPixels4(dst_v, src_v, premult);
+                    if (rows == 4) {
+                        inline for (0..4) |ry| {
+                            const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..4];
+                            const src_v: @Vector(4, u32) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
+                            if (alpha_mode == 1) {
+                                dst_row.* = @bitCast(src_v | opaque_mask);
+                            } else {
+                                const alphas = src_v >> @splat(24);
+                                if (@reduce(.And, alphas) == 0xff) {
+                                    dst_row.* = @bitCast(src_v);
+                                } else if (@reduce(.Or, alphas) != 0) {
+                                    const dst_v: @Vector(4, u32) = dst_row.*;
+                                    dst_row.* = blendPixels4(dst_v, src_v, premult);
+                                }
+                            }
+                        }
+                    } else {
+                        for (0..rows) |ry| {
+                            const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..4];
+                            const src_v: @Vector(4, u32) = @bitCast(ram[utile_off + @as(u32, @intCast(ry)) * 16 ..][0..16].*);
+                            if (alpha_mode == 1) {
+                                dst_row.* = @bitCast(src_v | opaque_mask);
+                            } else {
+                                const alphas = src_v >> @splat(24);
+                                if (@reduce(.And, alphas) == 0xff) {
+                                    dst_row.* = @bitCast(src_v);
+                                } else if (@reduce(.Or, alphas) != 0) {
+                                    const dst_v: @Vector(4, u32) = dst_row.*;
+                                    dst_row.* = blendPixels4(dst_v, src_v, premult);
+                                }
                             }
                         }
                     }
@@ -638,9 +656,9 @@ pub const Hvs = struct {
                     const utile_off = group_base + ((utiles_x & 3) << 6);
                     if (utile_off + 64 <= ram.len) {
                         const dx0 = dst_x + (utiles_x << 2);
-                        inline for (0..4) |ry| {
+                        for (0..rows) |ry| {
                             const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..rem_x];
-                            const src_row_bytes = ram[utile_off + ry * 16 ..][0..16];
+                            const src_row_bytes = ram[utile_off + @as(u32, @intCast(ry)) * 16 ..][0..16];
                             for (0..rem_x) |rx| {
                                 const src_color = std.mem.readInt(u32, src_row_bytes[rx * 4 ..][0..4], .little);
                                 if (alpha_mode == 1) {
@@ -658,8 +676,7 @@ pub const Hvs = struct {
                     }
                 }
             }
-            if ((span_h & 3) == 0) return;
-            start_py = dst_y + (utiles_y << 2);
+            return;
         }
 
         // Fast path 3: Unity 16-bit RGB565 T-tiled / LT-tiled plane (8x4 utiles, hoisted group address + SIMD)
@@ -670,10 +687,13 @@ pub const Hvs = struct {
             const utiles_x = span_w >> 3;
             const utiles_y = span_h >> 2;
             const rem_x = span_w & 7;
+            const rem_y = span_h & 3;
+            const total_uy = utiles_y + @intFromBool(rem_y != 0);
 
             var uy: u32 = 0;
-            while (uy < utiles_y) : (uy += 1) {
+            while (uy < total_uy) : (uy += 1) {
                 const dy0 = dst_y + (uy << 2);
+                const rows: u32 = if (uy < utiles_y) 4 else rem_y;
                 var ux: u32 = 0;
                 var group_base: u32 = 0;
                 while (ux < utiles_x) : (ux += 1) {
@@ -683,10 +703,18 @@ pub const Hvs = struct {
                     const utile_off = group_base + ((ux & 3) << 6);
                     if (utile_off + 64 > ram.len) continue;
                     const dx0 = dst_x + (ux << 3);
-                    inline for (0..4) |ry| {
-                        const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..8];
-                        const p16_vec: @Vector(8, u16) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
-                        dst_row.* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
+                    if (rows == 4) {
+                        inline for (0..4) |ry| {
+                            const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..8];
+                            const p16_vec: @Vector(8, u16) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
+                            dst_row.* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
+                        }
+                    } else {
+                        for (0..rows) |ry| {
+                            const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..8];
+                            const p16_vec: @Vector(8, u16) = @bitCast(ram[utile_off + @as(u32, @intCast(ry)) * 16 ..][0..16].*);
+                            dst_row.* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
+                        }
                     }
                 }
                 if (rem_x != 0) {
@@ -696,9 +724,9 @@ pub const Hvs = struct {
                     const utile_off = group_base + ((utiles_x & 3) << 6);
                     if (utile_off + 64 <= ram.len) {
                         const dx0 = dst_x + (utiles_x << 3);
-                        inline for (0..4) |ry| {
+                        for (0..rows) |ry| {
                             const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..rem_x];
-                            const src_row_bytes = ram[utile_off + ry * 16 ..][0..16];
+                            const src_row_bytes = ram[utile_off + @as(u32, @intCast(ry)) * 16 ..][0..16];
                             for (0..rem_x) |rx| {
                                 const p16 = std.mem.readInt(u16, src_row_bytes[rx * 2 ..][0..2], .little);
                                 dst_row[rx] = format_mod.fromRgb565(p16);
@@ -707,24 +735,80 @@ pub const Hvs = struct {
                     }
                 }
             }
-            if ((span_h & 3) == 0) return;
-            start_py = dst_y + (utiles_y << 2);
+            return;
         }
 
-        // General / scaled / bottom-remainder fallback with hoisted row invariants
-        var py: u32 = start_py;
-        while (py < max_dy) : (py += 1) {
-            const sy: u32 = if (unity) (py - dst_y) else ((py - dst_y) * src_h) / dst_h;
-            const linear_row_off = ptr0 + sy * linear_pitch;
-            const out_row_base = py * out_w;
-            var px: u32 = dst_x;
-            while (px < max_dx) : (px += 1) {
-                const sx: u32 = if (unity) (px - dst_x) else ((px - dst_x) * src_w) / dst_w;
-                const off = if (tiling == 0)
-                    (linear_row_off + sx * cpp)
-                else
-                    (ptr0 + texture.texelOffsetOf(fmt, tiled_w, src_h, sx, sy));
+        // Scaled plane path (!unity): 32.32 fixed-point reciprocal stepping
+        const step_x_fp: u64 = ((@as(u64, src_w) << 32) + dst_w - 1) / dst_w;
+        const step_y_fp: u64 = ((@as(u64, src_h) << 32) + dst_h - 1) / dst_h;
+        var acc_y: u64 = 0;
 
+        if (tiling == 0) {
+            var py: u32 = dst_y;
+            while (py < max_dy) : ({
+                py += 1;
+                acc_y += step_y_fp;
+            }) {
+                const sy: u32 = @intCast(acc_y >> 32);
+                const linear_row_off = ptr0 + sy * linear_pitch;
+                const dst_row = out_argb[py * out_w + dst_x ..][0..span_w];
+                var acc_x: u64 = 0;
+                for (0..span_w) |x| {
+                    const sx: u32 = @intCast(acc_x >> 32);
+                    acc_x += step_x_fp;
+                    const off = linear_row_off + sx * cpp;
+                    if (off + cpp > ram.len) continue;
+                    const src_color: u32 = if (is_565)
+                        format_mod.fromRgb565(std.mem.readInt(u16, ram[off..][0..2], .little))
+                    else
+                        std.mem.readInt(u32, ram[off..][0..4], .little);
+                    if (alpha_mode == 1 or is_565) {
+                        dst_row[x] = src_color | 0xFF000000;
+                    } else {
+                        const a: u32 = (src_color >> 24) & 0xff;
+                        if (a == 255) {
+                            dst_row[x] = src_color;
+                        } else if (a > 0) {
+                            dst_row[x] = blendPixel(dst_row[x], src_color, a, premult);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Scaled T-tiled / LT-tiled plane with per-scanline cached utile row base
+        const uw_shift: u5 = if (is_565) 3 else 2;
+        const uw_mask: u32 = (@as(u32, 1) << uw_shift) - 1;
+        const cpp_shift: u5 = if (is_565) 1 else 2;
+        const is_lt = (tiled_w <= (@as(u32, 4) << uw_shift) or src_h <= 16);
+        const lt_row_stride = ((tiled_w + uw_mask) & ~uw_mask) << cpp_shift;
+        const tile_w = @as(u32, 8) << uw_shift;
+        const utile_stride = ((tiled_w + tile_w - 1) & ~(tile_w - 1)) >> uw_shift;
+
+        var py: u32 = dst_y;
+        while (py < max_dy) : ({
+            py += 1;
+            acc_y += step_y_fp;
+        }) {
+            const sy: u32 = @intCast(acc_y >> 32);
+            const uy = sy >> 2;
+            const in_utile_y = (sy & 3) << 4;
+            const dst_row = out_argb[py * out_w + dst_x ..][0..span_w];
+            var cached_ux: u32 = 0xffff_ffff;
+            var cached_utile_row_off: u32 = 0;
+            var acc_x: u64 = 0;
+
+            for (0..span_w) |x| {
+                const sx: u32 = @intCast(acc_x >> 32);
+                acc_x += step_x_fp;
+                const ux = sx >> uw_shift;
+                if (ux != cached_ux) {
+                    cached_ux = ux;
+                    const group_off = texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, ux & ~@as(u32, 3), uy);
+                    cached_utile_row_off = ptr0 + group_off + ((ux & 3) << 6) + in_utile_y;
+                }
+                const off = cached_utile_row_off + ((sx & uw_mask) << cpp_shift);
                 if (off + cpp > ram.len) continue;
 
                 const src_color: u32 = if (is_565)
@@ -732,15 +816,14 @@ pub const Hvs = struct {
                 else
                     std.mem.readInt(u32, ram[off..][0..4], .little);
 
-                const out_idx = out_row_base + px;
                 if (alpha_mode == 1 or is_565) {
-                    out_argb[out_idx] = src_color | 0xFF000000;
+                    dst_row[x] = src_color | 0xFF000000;
                 } else {
                     const a: u32 = (src_color >> 24) & 0xff;
                     if (a == 255) {
-                        out_argb[out_idx] = src_color;
+                        dst_row[x] = src_color;
                     } else if (a > 0) {
-                        out_argb[out_idx] = blendPixel(out_argb[out_idx], src_color, a, premult);
+                        dst_row[x] = blendPixel(dst_row[x], src_color, a, premult);
                     }
                 }
             }
@@ -1026,4 +1109,46 @@ test "HVS 4-wide SIMD blendPixels4 matches scalar division by 255" {
         }
     }
 }
+
+test "HVS scaled T-tiled plane compositing matches exact integer division" {
+    var hvs = Hvs{};
+    const src_w: u32 = 37;
+    const src_h: u32 = 23;
+    const dst_w: u32 = 59;
+    const dst_h: u32 = 41;
+    var ram: [65536]u8 = @splat(0);
+
+    for (0..src_h) |y| {
+        for (0..src_w) |x| {
+            const off = texture.texelOffsetOf(.argb8888, 64, src_h, @intCast(x), @intCast(y));
+            const color: u32 = 0xff000000 | (@as(u32, @intCast(y)) << 16) | (@as(u32, @intCast(x)) << 8) | 0x55;
+            std.mem.writeInt(u32, ram[off..][0..4], color, .little);
+        }
+    }
+
+    // Non-unity DLIST entry at slot 16 (8 words: ctl0, pos0, pos1 (dst_w/dst_h), pos2 (src_w/src_h), pos3, ptr0, ptr_ctx0, pitch0)
+    hvs.write32(Hvs.DLIST_OFFSET + 16 * 4, Hvs.SCALER_CTL0_VALID | (8 << 24) | (3 << 20) | 7);
+    hvs.write32(Hvs.DLIST_OFFSET + 17 * 4, 0);
+    hvs.write32(Hvs.DLIST_OFFSET + 18 * 4, (dst_h << 16) | dst_w);
+    hvs.write32(Hvs.DLIST_OFFSET + 19 * 4, (1 << 30) | (src_h << 16) | src_w);
+    hvs.write32(Hvs.DLIST_OFFSET + 20 * 4, 0);
+    hvs.write32(Hvs.DLIST_OFFSET + 21 * 4, 0x80000000);
+    hvs.write32(Hvs.DLIST_OFFSET + 22 * 4, 0);
+    hvs.write32(Hvs.DLIST_OFFSET + 23 * 4, 2); // 2 T-tiles wide (64px)
+    hvs.write32(Hvs.DLIST_OFFSET + 24 * 4, Hvs.SCALER_CTL0_END);
+    hvs.write32(0x0024, 16);
+
+    var out: [59 * 41]u32 = @splat(0);
+    try std.testing.expect(hvs.compositeFrame(&ram, &out, dst_w, dst_h));
+
+    for (0..dst_h) |py| {
+        const sy = (@as(u32, @intCast(py)) * src_h) / dst_h;
+        for (0..dst_w) |px| {
+            const sx = (@as(u32, @intCast(px)) * src_w) / dst_w;
+            const expected: u32 = 0xff000000 | (sy << 16) | (sx << 8) | 0x55;
+            try std.testing.expectEqual(expected, out[py * dst_w + px]);
+        }
+    }
+}
+
 
