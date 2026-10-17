@@ -323,6 +323,8 @@ pub const WindowsWindow = struct {
     hdmi_gen: u64 = 1,
     backbuf_hdmi_gen: u64 = 0,
     backbuf_had_sheet: bool = false,
+    backbuf_hdmi_state: u2 = 0,
+    backbuf_sheet_rect: board_sheet.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
 
     closed: bool = false,
     ui_dirty: bool = true,
@@ -549,6 +551,8 @@ pub const WindowsWindow = struct {
         @memset(self.backbuffer, 0xFF101418);
         self.backbuf_hdmi_gen = 0;
         self.backbuf_had_sheet = false;
+        self.backbuf_hdmi_state = 0;
+        self.backbuf_sheet_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         self.cursor_mode = .unknown;
         self.ui_dirty = true;
     }
@@ -606,21 +610,43 @@ pub const WindowsWindow = struct {
         const dw: usize = self.display_width;
         const dh: usize = self.display_height;
 
+        self.ui.updateLayout(self.width, self.height, self.status, self.gpio);
         const has_overlay = self.ui.sheet_open or self.ui.hasSnackbar();
+        const hdmi_state: u2 = (@as(u2, @intFromBool(self.status.hdmi_connected)) |
+            (@as(u2, @intFromBool(self.status.hdmi_active)) << 1));
+        const same_sheet_backdrop = self.ui.sheet_open and !self.ui.hasSnackbar() and
+            self.backbuf_had_sheet and
+            self.backbuf_hdmi_state == hdmi_state and
+            std.meta.eql(self.backbuf_sheet_rect, self.ui.sheet_rect);
+
+        var reuse_dimmed_backdrop = false;
         if (self.status.hdmi_connected and self.status.hdmi_active) {
-            const need_hdmi_blit = (self.backbuf_hdmi_gen != self.hdmi_gen) or
-                has_overlay or
-                self.backbuf_had_sheet;
-            if (need_hdmi_blit) {
-                board_sheet.BoardUi.blitHdmiToBackbuffer(full, buf_w, top_phys_rows, self.hdmi_fb, dw, dh, sc);
-                self.backbuf_hdmi_gen = self.hdmi_gen;
+            if (same_sheet_backdrop and self.backbuf_hdmi_gen == self.hdmi_gen) {
+                reuse_dimmed_backdrop = true;
+            } else {
+                const need_hdmi_blit = (self.backbuf_hdmi_gen != self.hdmi_gen) or
+                    has_overlay or
+                    self.backbuf_had_sheet or
+                    (self.backbuf_hdmi_state != hdmi_state);
+                if (need_hdmi_blit) {
+                    board_sheet.BoardUi.blitHdmiToBackbuffer(full, buf_w, top_phys_rows, self.hdmi_fb, dw, dh, sc);
+                    self.backbuf_hdmi_gen = self.hdmi_gen;
+                }
             }
         } else {
             self.backbuf_hdmi_gen = 0;
+            if (same_sheet_backdrop) {
+                reuse_dimmed_backdrop = true;
+            }
         }
         self.backbuf_had_sheet = has_overlay;
+        self.backbuf_hdmi_state = hdmi_state;
+        self.backbuf_sheet_rect = if (self.ui.sheet_open and !self.ui.hasSnackbar())
+            self.ui.sheet_rect
+        else
+            .{ .x = 0, .y = 0, .w = 0, .h = 0 };
 
-        self.ui.paint(full, self.width, self.height, sc, self.status, self.gpio);
+        self.ui.paintWithBackdrop(full, self.width, self.height, sc, self.status, self.gpio, reuse_dimmed_backdrop);
     }
 
     pub fn present(self: *WindowsWindow) !void {

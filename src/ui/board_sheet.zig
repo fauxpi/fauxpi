@@ -2487,6 +2487,21 @@ pub const BoardUi = struct {
         status: SystemStatus,
         gpio_hw: *const Gpio,
     ) void {
+        self.paintWithBackdrop(pixels, win_w, win_h, scale, status, gpio_hw, false);
+    }
+
+    /// Renders `BoardUi` over `pixels`, skipping redundant full-screen HDMI backdrop dimming and
+    /// outer sheet border rasterization when `backdrop_already_dimmed` is true for the same `sheet_rect`.
+    pub fn paintWithBackdrop(
+        self: *BoardUi,
+        pixels: []u32,
+        win_w: u32,
+        win_h: u32,
+        scale: u32,
+        status: SystemStatus,
+        gpio_hw: *const Gpio,
+        backdrop_already_dimmed: bool,
+    ) void {
         const sc = @max(scale, 1);
         self.updateLayout(win_w, win_h, status, gpio_hw);
 
@@ -2509,14 +2524,16 @@ pub const BoardUi = struct {
             win_h;
 
         if (!status.hdmi_connected or !status.hdmi_active) {
-            self.paintNoSignal(&c, win_w, disp_bottom_h, status.hdmi_connected);
+            if (!backdrop_already_dimmed) {
+                self.paintNoSignal(&c, win_w, disp_bottom_h, status.hdmi_connected);
+            }
         }
         if (status.gpio_connected and win_h > gpio_panel_height) {
             self.paintGpioBox(&c, win_w, status, gpio_hw);
         }
         self.paintTitleBar(&c, win_w);
         if (self.sheet_open) {
-            self.paintSheet(&c, win_w, disp_bottom_h, status);
+            self.paintSheet(&c, win_w, disp_bottom_h, status, backdrop_already_dimmed);
         }
         if (self.hasSnackbar()) {
             self.paintSnackbar(&c);
@@ -2871,6 +2888,7 @@ pub const BoardUi = struct {
         _: u32,
         disp_bottom_h: u32,
         status: SystemStatus,
+        backdrop_already_dimmed: bool,
     ) void {
         const t = &self.theme;
         const sc_f = @max(c.scale, 1.0);
@@ -2879,36 +2897,55 @@ pub const BoardUi = struct {
         const top_y: f32 = @floatFromInt(title_bar_height);
 
         const sr = self.sheet_rect;
-        // Dim the HDMI display behind the drop-down sheet using SWAR (skipping the opaque upper body of sheet_rect)
-        if (h_f > top_y) {
-            const py_start: u32 = title_bar_height * sc;
-            const py_end: u32 = @min(c.height, disp_bottom_h * sc);
-            const sr_x0: u32 = @intFromFloat(@max(0.0, @ceil((sr.x + 2.0) * sc_f)));
-            const sr_x1: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(c.width)), @floor((sr.x + sr.w - 2.0) * sc_f)));
-            const sr_opaque_y1: u32 = @intFromFloat(@max(@as(f32, @floatFromInt(py_start)), @floor((sr.y + sr.h - 17.0) * sc_f)));
-
-            for (py_start..py_end) |py| {
-                const row = c.pixels[py * c.stride ..][0..c.width];
-                if (py < sr_opaque_y1 and sr_x0 < sr_x1) {
-                    dimSpanSwar(row[0..sr_x0]);
-                    dimSpanSwar(row[sr_x1..c.width]);
-                } else {
-                    dimSpanSwar(row);
-                }
-            }
-        }
-
-        // Drop-down sheet container (anchored to the bottom of the TitleBar)
-        const sheet_radii: Radii = .{ .tl = 0, .tr = 0, .br = 16, .bl = 16 };
-        c.fillRoundedRect(sr, sheet_radii, t.surface);
-        c.strokeRoundedRect(sr, sheet_radii, 1.0, t.outline_variant);
-
         // Cache the interior board diagram region (padded by 16px inside sheet_rect)
         const pad_in: f32 = 16.0;
         const cache_box_x = @max(@round(sr.x + 8.0), @round(self.board_rect.x - pad_in));
         const cache_box_y = @max(@round(sr.y + 4.0), @round(self.board_rect.y - pad_in));
         const cache_box_x1 = @min(@round(sr.x + sr.w - 8.0), @round(self.board_rect.x + self.board_rect.w + pad_in));
         const cache_box_y1 = @min(@round(sr.y + sr.h - 16.0), @round(self.board_rect.y + self.board_rect.h + pad_in));
+
+        if (!backdrop_already_dimmed) {
+            // Dim the HDMI display behind the drop-down sheet using SWAR (skipping the opaque upper body of sheet_rect)
+            if (h_f > top_y) {
+                const py_start: u32 = title_bar_height * sc;
+                const py_end: u32 = @min(c.height, disp_bottom_h * sc);
+                const sr_x0: u32 = @intFromFloat(@max(0.0, @ceil((sr.x + 2.0) * sc_f)));
+                const sr_x1: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(c.width)), @floor((sr.x + sr.w - 2.0) * sc_f)));
+                const sr_opaque_y1: u32 = @intFromFloat(@max(@as(f32, @floatFromInt(py_start)), @floor((sr.y + sr.h - 17.0) * sc_f)));
+
+                for (py_start..py_end) |py| {
+                    const row = c.pixels[py * c.stride ..][0..c.width];
+                    if (py < sr_opaque_y1 and sr_x0 < sr_x1) {
+                        dimSpanSwar(row[0..sr_x0]);
+                        dimSpanSwar(row[sr_x1..c.width]);
+                    } else {
+                        dimSpanSwar(row);
+                    }
+                }
+            }
+
+            // Drop-down sheet container (anchored to the bottom of the TitleBar)
+            const sheet_radii: Radii = .{ .tl = 0, .tr = 0, .br = 16, .bl = 16 };
+            c.fillRoundedRect(sr, sheet_radii, t.surface);
+            c.strokeRoundedRect(sr, sheet_radii, 1.0, t.outline_variant);
+        } else {
+            // Dimmed HDMI backdrop and outer rounded border of `sr` are already in `c.pixels` at identical `sr` geometry;
+            // clear only the lower interior below `cache_box_y1` (since `board_cache` overwrites `cache_box` directly).
+            if (sr.y + sr.h - 16.0 > cache_box_y1) {
+                c.fillRect(.{
+                    .x = sr.x + 2.0,
+                    .y = cache_box_y1,
+                    .w = sr.w - 4.0,
+                    .h = (sr.y + sr.h - 16.0) - cache_box_y1,
+                }, t.surface);
+            }
+            c.fillRect(.{
+                .x = sr.x + 16.0,
+                .y = sr.y + sr.h - 16.0,
+                .w = sr.w - 32.0,
+                .h = 14.0,
+            }, t.surface);
+        }
 
         if (cache_box_x1 > cache_box_x and cache_box_y1 > cache_box_y) {
             const box_x_px: u32 = @intFromFloat(cache_box_x * sc_f);
@@ -2973,6 +3010,9 @@ pub const BoardUi = struct {
             }
         }
 
+        if (backdrop_already_dimmed) {
+            c.fillRect(.{ .x = sr.x + 2.0, .y = sr.y + 2.0, .w = sr.w - 4.0, .h = sr.h - 18.0 }, t.surface);
+        }
         const drawing = board.forModel(status.model) orelse &board.pi_zero;
         self.paintBoardDrawing(c, drawing, self.board_rect, status);
         self.paintSettingsSection(c, status);
@@ -6082,5 +6122,39 @@ test "BoardUi.blitHdmiToBackbuffer SIMD pixel scaling for sc = 1, 2, 3, 4" {
             }
         }
     }
+}
+
+test "BoardUi.paintWithBackdrop reuses dimmed HDMI backdrop bit-identically on sheet hover" {
+    var ui = try BoardUi.init(testing.allocator);
+    defer ui.deinit();
+
+    var hw: Gpio = .{};
+    const status: SystemStatus = .{ .hdmi_connected = true, .hdmi_active = true };
+    const win_w: u32 = 800;
+    const win_h: u32 = 524;
+    const pixels_ref = try testing.allocator.alloc(u32, win_w * win_h);
+    defer testing.allocator.free(pixels_ref);
+    const pixels_fast = try testing.allocator.alloc(u32, win_w * win_h);
+    defer testing.allocator.free(pixels_fast);
+
+    @memset(pixels_ref, 0xFF336699);
+    @memset(pixels_fast, 0xFF336699);
+
+    ui.sheet_open = true;
+    // Initial paint dims the backdrop in pixels_fast
+    ui.paintWithBackdrop(pixels_fast, win_w, win_h, 1, status, &hw, false);
+
+    // Now change hover state and settings button hover
+    ui.hovered_target = .hdmi;
+    ui.settings_btn_hovered = true;
+
+    // Fast path: reuse already-dimmed backdrop without re-blitting or re-dimming HDMI
+    ui.paintWithBackdrop(pixels_fast, win_w, win_h, 1, status, &hw, true);
+
+    // Reference path: fresh HDMI blit + full paint
+    @memset(pixels_ref, 0xFF336699);
+    ui.paintWithBackdrop(pixels_ref, win_w, win_h, 1, status, &hw, false);
+
+    try testing.expectEqualSlices(u32, pixels_ref, pixels_fast);
 }
 
