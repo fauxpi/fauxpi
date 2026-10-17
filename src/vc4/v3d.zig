@@ -427,10 +427,8 @@ pub const V3d = struct {
     fn extractUniforms(ram: []const u8, phys: u32, out_buf: *[128]u32) []const u32 {
         if (phys >= ram.len) return &.{};
         const max_bytes = ram.len - phys;
-        const max_words = @min(max_bytes / 4, out_buf.len);
-        for (0..max_words) |i| {
-            out_buf[i] = std.mem.readInt(u32, ram[phys + i * 4 ..][0..4], .little);
-        }
+        const max_words: usize = @min(max_bytes / 4, out_buf.len);
+        @memcpy(std.mem.sliceAsBytes(out_buf[0..max_words]), ram[phys..][0 .. max_words * 4]);
         return out_buf[0..max_words];
     }
 
@@ -479,10 +477,12 @@ pub const V3d = struct {
                 self.prep_fs_insts_len += fs_code.len;
 
                 fs_unif_start = @intCast(self.prep_fs_unifs_len);
-                for (0..max_unif_words) |i| {
-                    self.prep_fs_unifs[self.prep_fs_unifs_len + i] = std.mem.readInt(u32, ram[fs_unif_phys + i * 4 ..][0..4], .little);
-                }
-                self.prep_fs_unifs_len += max_unif_words;
+                const unif_words: usize = max_unif_words;
+                @memcpy(
+                    std.mem.sliceAsBytes(self.prep_fs_unifs[self.prep_fs_unifs_len..][0..unif_words]),
+                    ram[fs_unif_phys..][0 .. unif_words * 4],
+                );
+                self.prep_fs_unifs_len += unif_words;
                 fs_cached = true;
             }
 
@@ -525,56 +525,89 @@ pub const V3d = struct {
                 const batch_verts: usize = batch_tris * 3;
                 var v_indices: [15]u32 = undefined;
 
-                for (0..batch_tris) |t_i| {
-                    const cur_tri = tri_idx + @as(u32, @intCast(t_i));
-                    const base_l = t_i * 3;
-                    switch (draw.mode) {
-                        4 => {
-                            v_indices[base_l + 0] = cur_tri * 3 + 0;
-                            v_indices[base_l + 1] = cur_tri * 3 + 1;
-                            v_indices[base_l + 2] = cur_tri * 3 + 2;
-                        },
-                        5 => {
-                            if ((cur_tri & 1) == 0) {
-                                v_indices[base_l + 0] = cur_tri + 0;
-                                v_indices[base_l + 1] = cur_tri + 1;
-                                v_indices[base_l + 2] = cur_tri + 2;
+                if (draw.mode == 4) {
+                    const base_v = tri_idx * 3;
+                    if (draw.indexed) {
+                        const idx_base: usize = draw.index_buffer_addr & 0x1FFFFFFF;
+                        if (draw.u16_indices) {
+                            const start_off = idx_base + @as(usize, base_v) * 2;
+                            if (start_off + batch_verts * 2 <= ram.len) {
+                                for (0..batch_verts) |k| {
+                                    v_indices[k] = std.mem.readInt(u16, ram[start_off + k * 2 ..][0..2], .little);
+                                }
                             } else {
-                                v_indices[base_l + 0] = cur_tri + 1;
-                                v_indices[base_l + 1] = cur_tri + 0;
-                                v_indices[base_l + 2] = cur_tri + 2;
+                                for (0..batch_verts) |k| {
+                                    const off = start_off + k * 2;
+                                    v_indices[k] = if (off + 2 <= ram.len) std.mem.readInt(u16, ram[off..][0..2], .little) else 0;
+                                }
                             }
-                        },
-                        6 => {
-                            v_indices[base_l + 0] = 0;
-                            v_indices[base_l + 1] = cur_tri + 1;
-                            v_indices[base_l + 2] = cur_tri + 2;
-                        },
-                        else => {
-                            v_indices[base_l + 0] = 0;
-                            v_indices[base_l + 1] = 0;
-                            v_indices[base_l + 2] = 0;
-                        },
-                    }
-                }
-                tri_idx += @intCast(batch_tris);
-
-                if (draw.indexed) {
-                    const idx_base = draw.index_buffer_addr & 0x1FFFFFFF;
-                    if (draw.u16_indices) {
-                        for (v_indices[0..batch_verts]) |*vi| {
-                            const off = idx_base + vi.* * 2;
-                            vi.* = if (off + 2 <= ram.len) std.mem.readInt(u16, ram[off..][0..2], .little) else 0;
+                        } else {
+                            const start_off = idx_base + @as(usize, base_v);
+                            if (start_off + batch_verts <= ram.len) {
+                                for (0..batch_verts) |k| {
+                                    v_indices[k] = ram[start_off + k];
+                                }
+                            } else {
+                                for (0..batch_verts) |k| {
+                                    const off = start_off + k;
+                                    v_indices[k] = if (off < ram.len) ram[off] else 0;
+                                }
+                            }
                         }
                     } else {
-                        for (v_indices[0..batch_verts]) |*vi| {
-                            const off = idx_base + vi.*;
-                            vi.* = if (off < ram.len) ram[off] else 0;
+                        const start_v = base_v + draw.first_or_offset;
+                        for (0..batch_verts) |k| {
+                            v_indices[k] = start_v + @as(u32, @intCast(k));
                         }
                     }
-                } else if (draw.first_or_offset != 0) {
-                    for (v_indices[0..batch_verts]) |*vi| {
-                        vi.* += draw.first_or_offset;
+                    tri_idx += @intCast(batch_tris);
+                } else {
+                    for (0..batch_tris) |t_i| {
+                        const cur_tri = tri_idx + @as(u32, @intCast(t_i));
+                        const base_l = t_i * 3;
+                        switch (draw.mode) {
+                            5 => {
+                                if ((cur_tri & 1) == 0) {
+                                    v_indices[base_l + 0] = cur_tri + 0;
+                                    v_indices[base_l + 1] = cur_tri + 1;
+                                    v_indices[base_l + 2] = cur_tri + 2;
+                                } else {
+                                    v_indices[base_l + 0] = cur_tri + 1;
+                                    v_indices[base_l + 1] = cur_tri + 0;
+                                    v_indices[base_l + 2] = cur_tri + 2;
+                                }
+                            },
+                            6 => {
+                                v_indices[base_l + 0] = 0;
+                                v_indices[base_l + 1] = cur_tri + 1;
+                                v_indices[base_l + 2] = cur_tri + 2;
+                            },
+                            else => {
+                                v_indices[base_l + 0] = 0;
+                                v_indices[base_l + 1] = 0;
+                                v_indices[base_l + 2] = 0;
+                            },
+                        }
+                    }
+                    tri_idx += @intCast(batch_tris);
+
+                    if (draw.indexed) {
+                        const idx_base = draw.index_buffer_addr & 0x1FFFFFFF;
+                        if (draw.u16_indices) {
+                            for (v_indices[0..batch_verts]) |*vi| {
+                                const off = idx_base + vi.* * 2;
+                                vi.* = if (off + 2 <= ram.len) std.mem.readInt(u16, ram[off..][0..2], .little) else 0;
+                            }
+                        } else {
+                            for (v_indices[0..batch_verts]) |*vi| {
+                                const off = idx_base + vi.*;
+                                vi.* = if (off < ram.len) ram[off] else 0;
+                            }
+                        }
+                    } else if (draw.first_or_offset != 0) {
+                        for (v_indices[0..batch_verts]) |*vi| {
+                            vi.* += draw.first_or_offset;
+                        }
                     }
                 }
 
@@ -586,11 +619,12 @@ pub const V3d = struct {
                     .vpm_in = vpm_in[0..vpm_words],
                 }) catch continue;
                 if (vs_res.vpm_out_len < 3) continue;
+                const valid_vars = @min(n_var, vs_res.vpm_out_len - 3);
 
                 for (0..batch_tris) |t_i| {
                     const base_l = t_i * 3;
                     var verts: [3]ShadedVertex = .{ .{}, .{}, .{} };
-                    for (0..3) |corner| {
+                    inline for (0..3) |corner| {
                         const lane = base_l + corner;
                         const xy_packed = vs_res.vpm_out[0][lane];
                         const xs: i16 = @bitCast(@as(u16, @truncate(xy_packed)));
@@ -601,11 +635,9 @@ pub const V3d = struct {
                         const raw_inv_w: f32 = @bitCast(vs_res.vpm_out[2][lane]);
                         const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
                         verts[corner].inv_w = inv_w;
-                        for (0..n_var) |vi| {
-                            if (3 + vi < vs_res.vpm_out_len) {
-                                const raw_v: f32 = @bitCast(vs_res.vpm_out[3 + vi][lane]);
-                                verts[corner].persp_varyings[vi] = raw_v * inv_w;
-                            }
+                        for (0..valid_vars) |vi| {
+                            const raw_v: f32 = @bitCast(vs_res.vpm_out[3 + vi][lane]);
+                            verts[corner].persp_varyings[vi] = raw_v * inv_w;
                         }
                     }
 
@@ -636,23 +668,36 @@ pub const V3d = struct {
                     self.shaded_tris_len = tri_slot + 1;
 
                     // Spatially bin this triangle into overlapping 64x64 tiles
-                    const tx0 = @min(min_ux >> 6, 31);
-                    const ty0 = @min(min_uy >> 6, 31);
-                    const tx1 = @min((max_ux - 1) >> 6, 31);
-                    const ty1 = @min((max_uy - 1) >> 6, 31);
+                    const tx0: u32 = @min(min_ux >> 6, 31);
+                    const ty0: u32 = @min(min_uy >> 6, 31);
+                    const tx1: u32 = @min((max_ux - 1) >> 6, 31);
+                    const ty1: u32 = @min((max_uy - 1) >> 6, 31);
                     const word_idx = tri_slot >> 6;
                     const bit_mask = @as(u64, 1) << @intCast(tri_slot & 63);
-                    var ty: u32 = ty0;
-                    while (ty <= ty1) : (ty += 1) {
-                        var tx: u32 = tx0;
-                        while (tx <= tx1) : (tx += 1) {
-                            const tx_bit = @as(u32, 1) << @intCast(tx);
-                            const t_idx = ty * 32 + tx;
-                            if ((self.tile_nonempty[ty] & tx_bit) == 0) {
-                                @memset(&self.tile_tri_mask[t_idx], 0);
-                                self.tile_nonempty[ty] |= tx_bit;
+                    if (tx0 == tx1 and ty0 == ty1) {
+                        const tx_bit = @as(u32, 1) << @intCast(tx0);
+                        const t_idx = (ty0 << 5) + tx0;
+                        if ((self.tile_nonempty[ty0] & tx_bit) == 0) {
+                            @memset(&self.tile_tri_mask[t_idx], 0);
+                            self.tile_nonempty[ty0] |= tx_bit;
+                        }
+                        self.tile_tri_mask[t_idx][word_idx] |= bit_mask;
+                    } else {
+                        var ty: u32 = ty0;
+                        while (ty <= ty1) : (ty += 1) {
+                            const row_base = ty << 5;
+                            var row_nonempty = self.tile_nonempty[ty];
+                            var tx: u32 = tx0;
+                            while (tx <= tx1) : (tx += 1) {
+                                const tx_bit = @as(u32, 1) << @intCast(tx);
+                                const t_idx = row_base + tx;
+                                if ((row_nonempty & tx_bit) == 0) {
+                                    @memset(&self.tile_tri_mask[t_idx], 0);
+                                    row_nonempty |= tx_bit;
+                                }
+                                self.tile_tri_mask[t_idx][word_idx] |= bit_mask;
                             }
-                            self.tile_tri_mask[t_idx][word_idx] |= bit_mask;
+                            self.tile_nonempty[ty] = row_nonempty;
                         }
                     }
                 }
@@ -695,7 +740,7 @@ pub const V3d = struct {
         return .{ .count = count, .vpm_words = vpm_words };
     }
 
-    inline fn populateBatchVpmIn(
+    pub inline fn populateBatchVpmIn(
         ram: []const u8,
         attrs: []const AttrStream,
         v_indices: []const u32,
@@ -704,7 +749,113 @@ pub const V3d = struct {
         var vpm_word: usize = 0;
         const batch_verts = v_indices.len;
         for (attrs) |attr| {
-            for (0..attr.words) |w_i| {
+            const words: usize = attr.words;
+            if (words == 0 or vpm_word >= 32) break;
+            if (vpm_word + words <= 32 and words <= 4) {
+                switch (words) {
+                    1 => {
+                        var v0: qpu_sim.Vec = undefined;
+                        for (v_indices, 0..) |vi, lane| {
+                            const v_addr: usize = @as(usize, attr.base) + @as(usize, vi) * @as(usize, attr.stride);
+                            v0[lane] = if (v_addr + 4 <= ram.len) std.mem.readInt(u32, ram[v_addr..][0..4], .little) else 0;
+                        }
+                        const pad0 = if (batch_verts > 0) v0[batch_verts - 1] else 0;
+                        for (batch_verts..16) |lane| v0[lane] = pad0;
+                        vpm_in[vpm_word] = v0;
+                    },
+                    2 => {
+                        var v0: qpu_sim.Vec = undefined;
+                        var v1: qpu_sim.Vec = undefined;
+                        for (v_indices, 0..) |vi, lane| {
+                            const v_addr: usize = @as(usize, attr.base) + @as(usize, vi) * @as(usize, attr.stride);
+                            if (v_addr + 8 <= ram.len) {
+                                const w2: [2]u32 = @bitCast(ram[v_addr..][0..8].*);
+                                v0[lane] = w2[0];
+                                v1[lane] = w2[1];
+                            } else {
+                                v0[lane] = if (v_addr + 4 <= ram.len) std.mem.readInt(u32, ram[v_addr..][0..4], .little) else 0;
+                                v1[lane] = 0;
+                            }
+                        }
+                        const pad0 = if (batch_verts > 0) v0[batch_verts - 1] else 0;
+                        const pad1 = if (batch_verts > 0) v1[batch_verts - 1] else 0;
+                        for (batch_verts..16) |lane| {
+                            v0[lane] = pad0;
+                            v1[lane] = pad1;
+                        }
+                        vpm_in[vpm_word + 0] = v0;
+                        vpm_in[vpm_word + 1] = v1;
+                    },
+                    3 => {
+                        var v0: qpu_sim.Vec = undefined;
+                        var v1: qpu_sim.Vec = undefined;
+                        var v2: qpu_sim.Vec = undefined;
+                        for (v_indices, 0..) |vi, lane| {
+                            const v_addr: usize = @as(usize, attr.base) + @as(usize, vi) * @as(usize, attr.stride);
+                            if (v_addr + 12 <= ram.len) {
+                                const w3: [3]u32 = @bitCast(ram[v_addr..][0..12].*);
+                                v0[lane] = w3[0];
+                                v1[lane] = w3[1];
+                                v2[lane] = w3[2];
+                            } else {
+                                v0[lane] = if (v_addr + 4 <= ram.len) std.mem.readInt(u32, ram[v_addr..][0..4], .little) else 0;
+                                v1[lane] = if (v_addr + 8 <= ram.len) std.mem.readInt(u32, ram[v_addr + 4 ..][0..4], .little) else 0;
+                                v2[lane] = 0;
+                            }
+                        }
+                        const pad0 = if (batch_verts > 0) v0[batch_verts - 1] else 0;
+                        const pad1 = if (batch_verts > 0) v1[batch_verts - 1] else 0;
+                        const pad2 = if (batch_verts > 0) v2[batch_verts - 1] else 0;
+                        for (batch_verts..16) |lane| {
+                            v0[lane] = pad0;
+                            v1[lane] = pad1;
+                            v2[lane] = pad2;
+                        }
+                        vpm_in[vpm_word + 0] = v0;
+                        vpm_in[vpm_word + 1] = v1;
+                        vpm_in[vpm_word + 2] = v2;
+                    },
+                    4 => {
+                        var v0: qpu_sim.Vec = undefined;
+                        var v1: qpu_sim.Vec = undefined;
+                        var v2: qpu_sim.Vec = undefined;
+                        var v3: qpu_sim.Vec = undefined;
+                        for (v_indices, 0..) |vi, lane| {
+                            const v_addr: usize = @as(usize, attr.base) + @as(usize, vi) * @as(usize, attr.stride);
+                            if (v_addr + 16 <= ram.len) {
+                                const w4: [4]u32 = @bitCast(ram[v_addr..][0..16].*);
+                                v0[lane] = w4[0];
+                                v1[lane] = w4[1];
+                                v2[lane] = w4[2];
+                                v3[lane] = w4[3];
+                            } else {
+                                v0[lane] = if (v_addr + 4 <= ram.len) std.mem.readInt(u32, ram[v_addr..][0..4], .little) else 0;
+                                v1[lane] = if (v_addr + 8 <= ram.len) std.mem.readInt(u32, ram[v_addr + 4 ..][0..4], .little) else 0;
+                                v2[lane] = if (v_addr + 12 <= ram.len) std.mem.readInt(u32, ram[v_addr + 8 ..][0..4], .little) else 0;
+                                v3[lane] = 0;
+                            }
+                        }
+                        const pad0 = if (batch_verts > 0) v0[batch_verts - 1] else 0;
+                        const pad1 = if (batch_verts > 0) v1[batch_verts - 1] else 0;
+                        const pad2 = if (batch_verts > 0) v2[batch_verts - 1] else 0;
+                        const pad3 = if (batch_verts > 0) v3[batch_verts - 1] else 0;
+                        for (batch_verts..16) |lane| {
+                            v0[lane] = pad0;
+                            v1[lane] = pad1;
+                            v2[lane] = pad2;
+                            v3[lane] = pad3;
+                        }
+                        vpm_in[vpm_word + 0] = v0;
+                        vpm_in[vpm_word + 1] = v1;
+                        vpm_in[vpm_word + 2] = v2;
+                        vpm_in[vpm_word + 3] = v3;
+                    },
+                    else => unreachable,
+                }
+                vpm_word += words;
+                continue;
+            }
+            for (0..words) |w_i| {
                 if (vpm_word >= 32) return;
                 const word_off: u32 = @intCast(w_i * 4);
                 var vec: qpu_sim.Vec = undefined;
@@ -2311,4 +2462,34 @@ test "V3D RGB565 8x4 utile storeTileToRam and loadTileFromRam round-trip" {
         }
     }
 }
+
+test "V3D populateBatchVpmIn multi-word attribute gather and padding" {
+    var ram: [256]u8 = [_]u8{0} ** 256;
+    // 3 vertices, each 24 bytes (vec4 + vec2 interleaved, stride = 24)
+    for (0..3) |vi| {
+        for (0..6) |wi| {
+            const val: u32 = @intCast((vi + 1) * 100 + wi);
+            std.mem.writeInt(u32, ram[vi * 24 + wi * 4 ..][0..4], val, .little);
+        }
+    }
+
+    const attrs = [_]V3d.AttrStream{
+        .{ .base = 0, .stride = 24, .words = 4 },
+        .{ .base = 16, .stride = 24, .words = 2 },
+    };
+    const v_indices = [_]u32{ 2, 0, 1 };
+    var vpm_in: [32]qpu_sim.Vec = undefined;
+    V3d.populateBatchVpmIn(&ram, &attrs, &v_indices, &vpm_in);
+
+    for (0..6) |wi| {
+        try std.testing.expectEqual(@as(u32, @intCast(300 + wi)), vpm_in[wi][0]); // vi = 2
+        try std.testing.expectEqual(@as(u32, @intCast(100 + wi)), vpm_in[wi][1]); // vi = 0
+        try std.testing.expectEqual(@as(u32, @intCast(200 + wi)), vpm_in[wi][2]); // vi = 1
+        // Lanes 3..15 should pad with lane 2 (vi = 1)
+        for (3..16) |lane| {
+            try std.testing.expectEqual(@as(u32, @intCast(200 + wi)), vpm_in[wi][lane]);
+        }
+    }
+}
+
 
