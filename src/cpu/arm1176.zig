@@ -152,6 +152,14 @@ pub const ArmOp = enum(u8) {
     // MOVW / MOVT (rd != 15)
     movw_al,
     movt_al,
+    // Fused 2-instruction superinstructions (unconditional first instruction + branch / movt)
+    cmp_imm_bcond_al,
+    cmp_reg_bcond_al,
+    tst_imm_bcond_al,
+    tst_reg_bcond_al,
+    subs_imm_bcond_al,
+    adds_imm_bcond_al,
+    movw_movt_al,
     // Unshifted Register Data Processing (S == 0, shift == 0, rd != 15, rn != 15, rm != 15)
     add_reg_al,
     sub_reg_al,
@@ -1110,6 +1118,60 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
     }
 }
 
+pub inline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_word: usize) DecodedSlot {
+    const d = decodeArm32(inst);
+    if (inst < 0xe000_0000 or page_word >= 1022) return d;
+    const op: ArmOp = @enumFromInt(d.op);
+    switch (op) {
+        .cmp_imm_al, .cmp_reg_al, .tst_imm_al, .tst_reg_al, .subs_imm_al, .adds_imm_al => {
+            const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
+            if ((next_inst & 0x0f00_0000) == 0x0a00_0000 and next_inst < 0xf000_0000) {
+                const after_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 2) * 4 ..][0..4], .little);
+                if ((after_inst & 0x0fff_ffe0) != 0x057f_f040) {
+                    const b_cond: u8 = @truncate(next_inst >> 28);
+                    const imm24: i24 = @bitCast(@as(u24, @truncate(next_inst)));
+                    const shift_imm: i32 = @as(i32, imm24) << 2;
+                    const target_off: u32 = @bitCast(@as(i32, 12) +% shift_imm);
+                    const fused_op: ArmOp = switch (op) {
+                        .cmp_imm_al => .cmp_imm_bcond_al,
+                        .cmp_reg_al => .cmp_reg_bcond_al,
+                        .tst_imm_al => .tst_imm_bcond_al,
+                        .tst_reg_al => .tst_reg_bcond_al,
+                        .subs_imm_al => .subs_imm_bcond_al,
+                        .adds_imm_al => .adds_imm_bcond_al,
+                        else => unreachable,
+                    };
+                    return .{
+                        .raw = inst,
+                        .op = @intFromEnum(fused_op),
+                        .rd = if (op == .subs_imm_al or op == .adds_imm_al) d.rd else b_cond,
+                        .rn = d.rn,
+                        .rm = if (op == .subs_imm_al or op == .adds_imm_al) b_cond else d.rm,
+                        .imm = (@as(u64, target_off) << 32) | (d.imm & 0xffff_ffff),
+                    };
+                }
+            }
+        },
+        .movw_al => {
+            const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
+            if ((next_inst & 0xfff0_0000) == 0xe340_0000) {
+                const rd2: u8 = @truncate((next_inst >> 12) & 0xf);
+                if (rd2 == d.rd) {
+                    const imm16_hi: u32 = (((next_inst >> 16) & 0xf) << 12) | (next_inst & 0xfff);
+                    return .{
+                        .raw = inst,
+                        .op = @intFromEnum(ArmOp.movw_movt_al),
+                        .rd = d.rd,
+                        .imm = (@as(u32, @truncate(d.imm)) & 0xffff) | (imm16_hi << 16),
+                    };
+                }
+            }
+        },
+        else => {},
+    }
+    return d;
+}
+
 pub fn decodeThumb16(inst: u16, next_hw: ?u16) ThumbSlot {
     const top3: u3 = @truncate(inst >> 13);
     switch (top3) {
@@ -2057,7 +2119,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             inst = d.raw;
                         } else {
                             inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
-                            d = decodeArm32(inst);
+                            d = decodeAndFuseArm32(inst, code_page_ptr, page_word);
                             code_icache_ptr[page_word] = d;
                         }
                     } else {
@@ -2078,7 +2140,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 inst = d.raw;
                             } else {
                                 inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
-                                d = decodeArm32(inst);
+                                d = decodeAndFuseArm32(inst, code_page_ptr, page_word);
                                 code_icache_ptr[page_word] = d;
                             }
                         } else {
@@ -2103,15 +2165,17 @@ pub fn Arm1176(comptime Bus: type) type {
                                     self.icache_page_tags[page_idx] = code_pbase;
                                 }
                                 code_icache_ptr = self.icache[page_slot..].ptr;
+                                d = decodeAndFuseArm32(inst, code_page_ptr, page_word);
+                                code_icache_ptr[page_word] = d;
                             } else {
                                 const page_idx = @as(usize, (pc >> 12) ^ (pc >> 16)) & ic_pages_mask;
                                 self.icache_page_tags[page_idx] = 0xffff_ffff;
                                 code_icache_ptr = self.icache[page_idx << 10 ..].ptr;
-                            }
-                            d = code_icache_ptr[page_word];
-                            if (d.raw != inst) {
-                                d = decodeArm32(inst);
-                                code_icache_ptr[page_word] = d;
+                                d = code_icache_ptr[page_word];
+                                if (d.raw != inst) {
+                                    d = decodeArm32(inst);
+                                    code_icache_ptr[page_word] = d;
+                                }
                             }
                         }
                     }
@@ -2166,6 +2230,51 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .movw_al => self.r[d.rd] = imm32,
                     .movt_al => self.r[d.rd] = (self.r[d.rd] & 0x0000_ffff) | (imm32 << 16),
+                    .cmp_imm_bcond_al => {
+                        self.setNZCV(dec.addWithCarry(self.r[d.rn], ~imm32, 1));
+                        executed += 1;
+                        const target_off: u32 = @truncate(d.imm >> 32);
+                        self.r[15] = if (dec.checkCond(@truncate(d.rd), self.cpsr)) (pc +% target_off) else (pc +% 8);
+                    },
+                    .cmp_reg_bcond_al => {
+                        self.setNZCV(dec.addWithCarry(self.r[d.rn], ~self.r[d.rm], 1));
+                        executed += 1;
+                        const target_off: u32 = @truncate(d.imm >> 32);
+                        self.r[15] = if (dec.checkCond(@truncate(d.rd), self.cpsr)) (pc +% target_off) else (pc +% 8);
+                    },
+                    .tst_imm_bcond_al => {
+                        self.setNZ(self.r[d.rn] & imm32);
+                        executed += 1;
+                        const target_off: u32 = @truncate(d.imm >> 32);
+                        self.r[15] = if (dec.checkCond(@truncate(d.rd), self.cpsr)) (pc +% target_off) else (pc +% 8);
+                    },
+                    .tst_reg_bcond_al => {
+                        self.setNZ(self.r[d.rn] & self.r[d.rm]);
+                        executed += 1;
+                        const target_off: u32 = @truncate(d.imm >> 32);
+                        self.r[15] = if (dec.checkCond(@truncate(d.rd), self.cpsr)) (pc +% target_off) else (pc +% 8);
+                    },
+                    .subs_imm_bcond_al => {
+                        const res = dec.addWithCarry(self.r[d.rn], ~imm32, 1);
+                        self.r[d.rd] = res.val;
+                        self.setNZCV(res);
+                        executed += 1;
+                        const target_off: u32 = @truncate(d.imm >> 32);
+                        self.r[15] = if (dec.checkCond(@truncate(d.rm), self.cpsr)) (pc +% target_off) else (pc +% 8);
+                    },
+                    .adds_imm_bcond_al => {
+                        const res = dec.addWithCarry(self.r[d.rn], imm32, 0);
+                        self.r[d.rd] = res.val;
+                        self.setNZCV(res);
+                        executed += 1;
+                        const target_off: u32 = @truncate(d.imm >> 32);
+                        self.r[15] = if (dec.checkCond(@truncate(d.rm), self.cpsr)) (pc +% target_off) else (pc +% 8);
+                    },
+                    .movw_movt_al => {
+                        self.r[d.rd] = imm32;
+                        self.r[15] = pc +% 8;
+                        executed += 1;
+                    },
                     .add_reg_al => self.r[d.rd] = self.r[d.rn] +% self.r[d.rm],
                     .sub_reg_al => self.r[d.rd] = self.r[d.rn] -% self.r[d.rm],
                     .rsb_reg_al => self.r[d.rd] = self.r[d.rm] -% self.r[d.rn],
@@ -7243,4 +7352,53 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     try std.testing.expectEqual(@as(u32, 138), cpu.r[9]);
     try std.testing.expectEqual(@as(u32, 4), cpu.r[10]);
     try std.testing.expectEqual(@as(u32, 138), cpu.r[11]);
+
+    // Verify 32-bit ARM superinstruction fusion (movw_movt_al, subs_imm_bcond_al, cmp_imm_bcond_al, tst_imm_bcond_al)
+    cpu.r[15] = 0x1b00;
+    cpu.r[0] = 5;
+    cpu.r[1] = 0;
+    // 0x1b00: movw r2, #0x5678          (0xe3052678)
+    // 0x1b04: movt r2, #0x1234          (0xe3412234) -> fused movw_movt_al: r2 = 0x12345678
+    // 0x1b08: add r1, r1, #10           (0xe281100a) -> loop body: r1 += 10
+    // 0x1b0c: subs r0, r0, #1           (0xe2500001)
+    // 0x1b10: bne 0x1b08                (0x1afffffc) -> fused subs_imm_bcond_al
+    // 0x1b14: cmp r1, #50               (0xe3510032)
+    // 0x1b18: beq 0x1b24                (0x0a000001) -> fused cmp_imm_bcond_al (skips 0x1b1c and 0x1b20)
+    // 0x1b1c: mov r2, #0                (0xe3a02000) -> skipped
+    // 0x1b20: mov r2, #0                (0xe3a02000) -> skipped
+    // 0x1b24: tst r2, #0x08             (0xe3120008)
+    // 0x1b28: bne 0x1b30                (0x1a000000) -> fused tst_imm_bcond_al (skips 0x1b2c)
+    // 0x1b2c: mov r1, #0                (0xe3a01000) -> skipped
+    // 0x1b30: add r3, r1, #1            (0xe2813001) -> r3 = 51
+    const fuse_prog = [_]u32{
+        0xe3052678,
+        0xe3412234,
+        0xe281100a,
+        0xe2500001,
+        0x1afffffc,
+        0xe3510032,
+        0x0a000001,
+        0xe3a02000,
+        0xe3a02000,
+        0xe3120008,
+        0x1a000000,
+        0xe3a01000,
+        0xe2813001,
+    };
+    for (fuse_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1b00 + i * 4 ..][0..4], inst, .little);
+    }
+    try std.testing.expectEqual(ArmOp.movw_movt_al, @as(ArmOp, @enumFromInt(decodeAndFuseArm32(fuse_prog[0], ram[0x1000..].ptr, (0x1b00 & 0xfff) >> 2).op)));
+    try std.testing.expectEqual(ArmOp.subs_imm_bcond_al, @as(ArmOp, @enumFromInt(decodeAndFuseArm32(fuse_prog[3], ram[0x1000..].ptr, (0x1b0c & 0xfff) >> 2).op)));
+    try std.testing.expectEqual(ArmOp.cmp_imm_bcond_al, @as(ArmOp, @enumFromInt(decodeAndFuseArm32(fuse_prog[5], ram[0x1000..].ptr, (0x1b14 & 0xfff) >> 2).op)));
+    try std.testing.expectEqual(ArmOp.tst_imm_bcond_al, @as(ArmOp, @enumFromInt(decodeAndFuseArm32(fuse_prog[9], ram[0x1000..].ptr, (0x1b24 & 0xfff) >> 2).op)));
+
+    // Total dynamic instructions executed: 2 (movw+movt) + 5*3 (loop) + 2 (cmp+beq) + 2 (tst+bne) + 1 (add) = 22
+    const fuse_ran = cpu.runSteps(&bus, 22);
+    try std.testing.expectEqual(@as(usize, 22), fuse_ran);
+    try std.testing.expectEqual(@as(u32, 0), cpu.r[0]);
+    try std.testing.expectEqual(@as(u32, 50), cpu.r[1]);
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), cpu.r[2]);
+    try std.testing.expectEqual(@as(u32, 51), cpu.r[3]);
 }
+

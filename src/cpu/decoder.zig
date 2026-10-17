@@ -17,31 +17,43 @@ pub const PsrFlags = struct {
     pub const MODE_MASK: u32 = 0x1f;
 };
 
+const cond_lut: [16]u16 = blk: {
+    var lut: [16]u16 = @splat(0);
+    for (0..16) |c_idx| {
+        var mask: u16 = 0;
+        for (0..16) |nzcv| {
+            const n = (nzcv >> 3) & 1;
+            const z = (nzcv >> 2) & 1;
+            const c = (nzcv >> 1) & 1;
+            const v = nzcv & 1;
+            const ok = switch (@as(u4, @intCast(c_idx))) {
+                0x0 => z == 1, // EQ
+                0x1 => z == 0, // NE
+                0x2 => c == 1, // CS / HS
+                0x3 => c == 0, // CC / LO
+                0x4 => n == 1, // MI
+                0x5 => n == 0, // PL
+                0x6 => v == 1, // VS
+                0x7 => v == 0, // VC
+                0x8 => c == 1 and z == 0, // HI
+                0x9 => c == 0 or z == 1, // LS
+                0xa => n == v, // GE
+                0xb => n != v, // LT
+                0xc => z == 0 and n == v, // GT
+                0xd => z == 1 or n != v, // LE
+                0xe, 0xf => true, // AL / Unconditional
+            };
+            if (ok) mask |= (@as(u16, 1) << @intCast(nzcv));
+        }
+        lut[c_idx] = mask;
+    }
+    break :blk lut;
+};
+
 /// Evaluates the 4-bit ARM condition code `cond` against `cpsr`.
 pub inline fn checkCond(cond: u4, cpsr: u32) bool {
-    if (cond == 0xe) return true; // AL (fast path)
-    const n = (cpsr >> 31) & 1;
-    const z = (cpsr >> 30) & 1;
-    const c = (cpsr >> 29) & 1;
-    const v = (cpsr >> 28) & 1;
-    return switch (cond) {
-        0x0 => z == 1, // EQ
-        0x1 => z == 0, // NE
-        0x2 => c == 1, // CS / HS
-        0x3 => c == 0, // CC / LO
-        0x4 => n == 1, // MI
-        0x5 => n == 0, // PL
-        0x6 => v == 1, // VS
-        0x7 => v == 0, // VC
-        0x8 => c == 1 and z == 0, // HI
-        0x9 => c == 0 or z == 1, // LS
-        0xa => n == v, // GE
-        0xb => n != v, // LT
-        0xc => z == 0 and n == v, // GT
-        0xd => z == 1 or n != v, // LE
-        0xe => true, // AL
-        0xf => true, // Unconditional space
-    };
+    const nzcv: u4 = @truncate(cpsr >> 28);
+    return ((cond_lut[cond] >> nzcv) & 1) != 0;
 }
 
 pub const ShiftResult = struct {
