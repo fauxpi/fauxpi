@@ -555,13 +555,15 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                         }
                     }
                 }
+                if (!cpus[i].halted_spin) {
+                    soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+                }
             }
         }
 
         var runnable_cores: usize = 0;
         for (0..num_cores) |i| {
             if (cpus[i].halted_spin) continue;
-            soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
             const cid: u2 = @intCast(i);
             if (!cpus[i].mmu.halted_wfi or soc.hasPendingIrqForCore(cid) or soc.hasPendingFiqForCore(cid)) {
                 runnable_cores += 1;
@@ -577,10 +579,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         var max_ran: usize = 0;
         for (0..num_cores) |i| {
             if (cpus[i].halted_spin) continue;
-            soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
             const ran = cpus[i].runSteps(&soc, batch);
             if (ran > max_ran) max_ran = ran;
-            soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
         }
 
         // Advance 1 MHz system timer and ARM timer proportionally to instructions executed (~256 instructions per us)
@@ -590,9 +590,10 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         soc.arm_timer.advance(timer_ticks, &soc.intc);
         soc.pm.advance(timer_ticks);
         soc.advanceAudio(timer_ticks);
+        const next_cntpct = (soc.timer.counter * 96) / 5;
         for (0..num_cores) |i| {
             if (!cpus[i].halted_spin) {
-                soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+                soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimerWithCntpct(next_cntpct);
             }
         }
         soc.updateIrqs();

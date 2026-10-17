@@ -997,26 +997,31 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         pub inline fn checkInterrupts(self: *Self, bus: *const Bus) bool {
-            const pending_fiq = if (@hasDecl(Bus, "hasPendingFiqForCore"))
-                bus.hasPendingFiqForCore(self.mmu.core_id)
-            else
-                bus.hasPendingFiq();
-            if (pending_fiq) {
-                self.mmu.halted_wfi = false;
-                if ((self.cpsr & PsrFlags.F) == 0) {
-                    self.enterException(.fiq, 0x1c, self.r[15] +% 4, true);
-                    return true;
+            const halted = self.mmu.halted_wfi;
+            if (halted or (self.cpsr & PsrFlags.F) == 0) {
+                const pending_fiq = if (@hasDecl(Bus, "hasPendingFiqForCore"))
+                    bus.hasPendingFiqForCore(self.mmu.core_id)
+                else
+                    bus.hasPendingFiq();
+                if (pending_fiq) {
+                    self.mmu.halted_wfi = false;
+                    if ((self.cpsr & PsrFlags.F) == 0) {
+                        self.enterException(.fiq, 0x1c, self.r[15] +% 4, true);
+                        return true;
+                    }
                 }
             }
-            const pending_irq = if (@hasDecl(Bus, "hasPendingIrqForCore"))
-                bus.hasPendingIrqForCore(self.mmu.core_id)
-            else
-                bus.hasPendingIrq();
-            if (pending_irq) {
-                self.mmu.halted_wfi = false;
-                if ((self.cpsr & PsrFlags.I) == 0) {
-                    self.enterException(.irq, 0x18, self.r[15] +% 4, false);
-                    return true;
+            if (halted or (self.cpsr & PsrFlags.I) == 0) {
+                const pending_irq = if (@hasDecl(Bus, "hasPendingIrqForCore"))
+                    bus.hasPendingIrqForCore(self.mmu.core_id)
+                else
+                    bus.hasPendingIrq();
+                if (pending_irq) {
+                    self.mmu.halted_wfi = false;
+                    if ((self.cpsr & PsrFlags.I) == 0) {
+                        self.enterException(.irq, 0x18, self.r[15] +% 4, false);
+                        return true;
+                    }
                 }
             }
             return false;
@@ -3573,6 +3578,9 @@ pub fn Arm1176(comptime Bus: type) type {
                         }
                     } else {
                         self.mmu.writeCp15(opc1, crn, crm, opc2, self.r[rt]);
+                        if (crn == 14 and @hasField(Bus, "local_intc")) {
+                            bus.local_intc.core_timer_lines[self.mmu.core_id] = self.mmu.timer_irq_lines;
+                        }
                     }
                     return;
                 }
@@ -3594,6 +3602,9 @@ pub fn Arm1176(comptime Bus: type) type {
                     } else {
                         const val64: u64 = (@as(u64, self.r[rt2]) << 32) | self.r[rt];
                         self.mmu.writeCp15_64(opc1_64, crm, val64);
+                        if (crm == 14 and @hasField(Bus, "local_intc")) {
+                            bus.local_intc.core_timer_lines[self.mmu.core_id] = self.mmu.timer_irq_lines;
+                        }
                     }
                     return;
                 }

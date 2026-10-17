@@ -89,6 +89,7 @@ pub const Mmu = struct {
     cntps_ctl: u32 = 0,
     cnthp_cval: u64 = 0,
     cnthp_ctl: u32 = 0,
+    timer_irq_lines: u4 = 0,
 
     /// CP15 c15: Performance monitor control / cycle counter & Cortex-A53 CPUECTLR
     pmcr: u32 = 0,
@@ -283,18 +284,32 @@ pub const Mmu = struct {
 
     /// Updates `cntpct` from the 1 MHz system timer counter (`sys_timer_us * 19.2`)
     /// and returns the 4 active Generic Timer interrupt lines (`[0]=CNTPS`, `[1]=CNTPNS`, `[2]=CNTHP`, `[3]=CNTV`).
-    pub fn syncGenericTimer(self: *Mmu, sys_timer_us: u64) u4 {
-        self.cntpct = (sys_timer_us * 96) / 5;
+    pub inline fn syncGenericTimer(self: *Mmu, sys_timer_us: u64) u4 {
+        return self.syncGenericTimerWithCntpct((sys_timer_us * 96) / 5);
+    }
+
+    /// Updates `cntpct` from a precomputed 19.2 MHz counter value and evaluates timer interrupt lines.
+    pub inline fn syncGenericTimerWithCntpct(self: *Mmu, next_cntpct: u64) u4 {
+        self.cntpct = next_cntpct;
         return self.timerIrqLines();
     }
 
     pub fn timerIrqLines(self: *Mmu) u4 {
+        if (((self.cntps_ctl | self.cntp_ctl | self.cnthp_ctl | self.cntv_ctl) & 1) == 0) {
+            self.cntps_ctl &= ~@as(u32, 4);
+            self.cntp_ctl &= ~@as(u32, 4);
+            self.cnthp_ctl &= ~@as(u32, 4);
+            self.cntv_ctl &= ~@as(u32, 4);
+            self.timer_irq_lines = 0;
+            return 0;
+        }
         var lines: u4 = 0;
         if (evalTimer(&self.cntps_ctl, self.cntpct, self.cntps_cval)) lines |= (1 << 0);
         if (evalTimer(&self.cntp_ctl, self.cntpct, self.cntp_cval)) lines |= (1 << 1);
         if (evalTimer(&self.cnthp_ctl, self.cntpct, self.cnthp_cval)) lines |= (1 << 2);
         const cntvct = self.cntpct -% self.cntvoff;
         if (evalTimer(&self.cntv_ctl, cntvct, self.cntv_cval)) lines |= (1 << 3);
+        self.timer_irq_lines = lines;
         return lines;
     }
 
@@ -1421,6 +1436,10 @@ test "Cortex-A53 LPAE 3-level MMU translation (T1SZ=2 TTBR1_OFFSET, 2MB block, 4
     mmu.writeCp15(0, 14, 2, 1, 1); // CNTP_CTL = ENABLE
     try std.testing.expectEqual(@as(u4, 0), mmu.syncGenericTimer(105));
     try std.testing.expectEqual(@as(u4, 0b0010), mmu.syncGenericTimer(110));
+    try std.testing.expectEqual(@as(u4, 0b0010), mmu.timer_irq_lines);
+    // Re-arming CNTP_TVAL immediately clears cached timer_irq_lines
+    mmu.writeCp15(0, 14, 2, 0, 192);
+    try std.testing.expectEqual(@as(u4, 0), mmu.timer_irq_lines);
 }
 
 test "AArch64 VMSAv8-64 4-level (48-bit VA) and 3-level (39-bit VA) page table translation" {

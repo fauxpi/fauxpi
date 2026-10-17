@@ -356,30 +356,35 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return bus.read32(paddr);
         }
 
-        pub fn checkInterrupts64(cpu: *CpuType, bus: *const Bus) bool {
+        pub inline fn checkInterrupts64(cpu: *CpuType, bus: *const Bus) bool {
+            const halted = cpu.mmu.halted_wfi;
             const cid = cpu.mmu.core_id;
-            const pending_fiq = if (@hasDecl(Bus, "hasPendingFiqForCore"))
-                bus.hasPendingFiqForCore(cid)
-            else
-                bus.hasPendingFiq();
-            if (pending_fiq) {
-                cpu.mmu.halted_wfi = false;
-                if ((cpu.pstate & PstateFlags.F) == 0) {
-                    const target_el: u2 = @max(currentEl(cpu), 1);
-                    takeException64(cpu, target_el, 0x100, null, null, cpu.pc64);
-                    return true;
+            if (halted or (cpu.pstate & PstateFlags.F) == 0) {
+                const pending_fiq = if (@hasDecl(Bus, "hasPendingFiqForCore"))
+                    bus.hasPendingFiqForCore(cid)
+                else
+                    bus.hasPendingFiq();
+                if (pending_fiq) {
+                    cpu.mmu.halted_wfi = false;
+                    if ((cpu.pstate & PstateFlags.F) == 0) {
+                        const target_el: u2 = @max(currentEl(cpu), 1);
+                        takeException64(cpu, target_el, 0x100, null, null, cpu.pc64);
+                        return true;
+                    }
                 }
             }
-            const pending_irq = if (@hasDecl(Bus, "hasPendingIrqForCore"))
-                bus.hasPendingIrqForCore(cid)
-            else
-                bus.hasPendingIrq();
-            if (pending_irq) {
-                cpu.mmu.halted_wfi = false;
-                if ((cpu.pstate & PstateFlags.I) == 0) {
-                    const target_el: u2 = @max(currentEl(cpu), 1);
-                    takeException64(cpu, target_el, 0x080, null, null, cpu.pc64);
-                    return true;
+            if (halted or (cpu.pstate & PstateFlags.I) == 0) {
+                const pending_irq = if (@hasDecl(Bus, "hasPendingIrqForCore"))
+                    bus.hasPendingIrqForCore(cid)
+                else
+                    bus.hasPendingIrq();
+                if (pending_irq) {
+                    cpu.mmu.halted_wfi = false;
+                    if ((cpu.pstate & PstateFlags.I) == 0) {
+                        const target_el: u2 = @max(currentEl(cpu), 1);
+                        takeException64(cpu, target_el, 0x080, null, null, cpu.pc64);
+                        return true;
+                    }
                 }
             }
             return false;
@@ -3203,6 +3208,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 setX(cpu, rt, readSysReg(cpu, op0, op1, crn, crm, op2));
             } else {
                 writeSysReg(cpu, op0, op1, crn, crm, op2, getX(cpu, rt));
+                if (crn == 14 and @hasField(Bus, "local_intc")) {
+                    bus.local_intc.core_timer_lines[cpu.mmu.core_id] = cpu.mmu.timer_irq_lines;
+                }
             }
         }
 
