@@ -587,8 +587,33 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         }
         const max_ran = runner.runSlice(active, batch);
 
-        // Advance 1 MHz system timer and ARM timer proportionally to instructions executed (~256 instructions per us)
-        const timer_ticks: u64 = if (max_ran > 0) @max(max_ran / 256, 1) else 1;
+        // Advance 1 MHz system timer and ARM timer proportionally to instructions executed (~256 instructions per us).
+        // When all active cores yield early (WFE / YIELD / timer poll loop), fast-forward up to 16 us (clamped to next IRQ).
+        var all_yielded = (active != 0) and (max_ran < 64);
+        if (all_yielded) {
+            for (0..num_cores) |i| {
+                if ((active >> @intCast(i)) & 1 == 0) continue;
+                if (!cpus[i].yield_slice and !cpus[i].mmu.halted_wfi) {
+                    all_yielded = false;
+                    break;
+                }
+            }
+        }
+        const timer_ticks: u64 = if (all_yielded) blk: {
+            var wait_us = @min(
+                soc.timer.usUntilNextMatch(16),
+                @min(
+                    soc.arm_timer.usUntilNextMatch(16),
+                    soc.pm.usUntilWatchdogExpire(16),
+                ),
+            );
+            for (0..num_cores) |i| {
+                if (!cpus[i].halted_spin) {
+                    wait_us = @min(wait_us, cpus[i].mmu.usUntilNextGenericTimer(16));
+                }
+            }
+            break :blk @max(wait_us, 1);
+        } else if (max_ran > 0) @max(max_ran / 256, 1) else 1;
         active_us_accum += timer_ticks;
         soc.timer.advance(timer_ticks, &soc.intc);
         soc.arm_timer.advance(timer_ticks, &soc.intc);

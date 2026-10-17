@@ -4649,6 +4649,9 @@ pub fn Arm1176(comptime Bus: type) type {
                         const val64 = self.mmu.readCp15_64(opc1_64, crm);
                         self.r[rt] = @truncate(val64);
                         self.r[rt2] = @truncate(val64 >> 32);
+                        if (crm == 14 and (opc1_64 == 0 or opc1_64 == 1)) {
+                            if (self.mmu.noteTimerCounterRead()) self.yield_slice = true;
+                        }
                     } else {
                         const val64: u64 = (@as(u64, self.r[rt2]) << 32) | self.r[rt];
                         self.mmu.writeCp15_64(opc1_64, crm, val64);

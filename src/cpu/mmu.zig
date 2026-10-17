@@ -80,6 +80,8 @@ pub const Mmu = struct {
     cntfrq: u32 = 19_200_000,
     cntkctl: u32 = 0,
     cntpct: u64 = 0,
+    last_cntpct_read: u64 = 0xffff_ffff_ffff_ffff,
+    cntpct_same_reads: u8 = 0,
     cntvoff: u64 = 0,
     cntp_cval: u64 = 0,
     cntp_ctl: u32 = 0,
@@ -310,8 +312,23 @@ pub const Mmu = struct {
 
     /// Updates `cntpct` from a precomputed 19.2 MHz counter value and evaluates timer interrupt lines.
     pub inline fn syncGenericTimerWithCntpct(self: *Mmu, next_cntpct: u64) u4 {
-        self.cntpct = next_cntpct;
+        if (self.cntpct != next_cntpct) {
+            self.cntpct = next_cntpct;
+            self.cntpct_same_reads = 0;
+        }
         return self.timerIrqLines();
+    }
+
+    /// Records a guest read of `CNTPCT` / `CNTVCT` and returns `true` when the core is polling
+    /// a stationary counter value so the current slice can yield and advance guest time.
+    pub inline fn noteTimerCounterRead(self: *Mmu) bool {
+        if (self.cntpct == self.last_cntpct_read) {
+            self.cntpct_same_reads +|= 1;
+            return self.cntpct_same_reads >= 2;
+        }
+        self.last_cntpct_read = self.cntpct;
+        self.cntpct_same_reads = 0;
+        return false;
     }
 
     pub fn timerIrqLines(self: *Mmu) u4 {

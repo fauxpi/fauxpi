@@ -3926,11 +3926,14 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         }
                     },
                     .mrs_tpidr_el0 => setX(cpu, @truncate(d.rd), cpu.mmu.tpidr_el0),
-                    .mrs_sys => setX(
-                        cpu,
-                        @truncate(d.rd),
-                        readSysReg(cpu, @truncate(d.rn >> 3), @truncate(d.rn), @truncate(d.rm >> 4), @truncate(d.rm), @truncate(d.imm)),
-                    ),
+                    .mrs_sys => {
+                        setX(
+                            cpu,
+                            @truncate(d.rd),
+                            readSysReg(cpu, @truncate(d.rn >> 3), @truncate(d.rn), @truncate(d.rm >> 4), @truncate(d.rm), @truncate(d.imm)),
+                        );
+                        if (cpu.yield_slice) break :step_loop;
+                    },
                     .msr_safe => {
                         switch (d.rn) {
                             0 => cpu.excl_valid = false,
@@ -5000,8 +5003,14 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
 
                 // Generic Timer Registers
                 sysRegId(3, 3, 14, 0, 0) => cpu.mmu.cntfrq, // CNTFRQ_EL0
-                sysRegId(3, 3, 14, 0, 1) => cpu.mmu.cntpct, // CNTPCT_EL0
-                sysRegId(3, 3, 14, 0, 2) => cpu.mmu.cntpct -% cpu.mmu.cntvoff, // CNTVCT_EL0
+                sysRegId(3, 3, 14, 0, 1) => blk: { // CNTPCT_EL0
+                    if (cpu.mmu.noteTimerCounterRead()) cpu.yield_slice = true;
+                    break :blk cpu.mmu.cntpct;
+                },
+                sysRegId(3, 3, 14, 0, 2) => blk: { // CNTVCT_EL0
+                    if (cpu.mmu.noteTimerCounterRead()) cpu.yield_slice = true;
+                    break :blk cpu.mmu.cntpct -% cpu.mmu.cntvoff;
+                },
                 sysRegId(3, 0, 14, 1, 0) => cpu.mmu.cntkctl, // CNTKCTL_EL1
                 sysRegId(3, 4, 14, 1, 0) => cpu.mmu.cnthctl_el2, // CNTHCTL_EL2
                 sysRegId(3, 4, 14, 0, 3) => cpu.mmu.cntvoff, // CNTVOFF_EL2
