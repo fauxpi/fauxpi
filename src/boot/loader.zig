@@ -1,7 +1,8 @@
 //! Raspberry Pi Zero bootloader & VideoCore `start.elf` firmware stub.
 //!
 //! Parses `config.txt` and `cmdline.txt` from a FAT16/FAT32 boot partition
-//! (or direct file arguments), patches the Flattened Device Tree (`.dtb`),
+//! (or direct file arguments), applies `dtoverlay=` / `dtparam=` settings and
+//! patches the Flattened Device Tree (`.dtb`),
 //! loads `kernel.img` (`zImage`), the `.dtb`, and optional `initramfs.cpio`
 //! into guest SDRAM, and returns the initial ARM CPU register state.
 
@@ -30,8 +31,31 @@ pub fn arm64KernelLoadOffset(kernel_bytes: []const u8) u32 {
     return kernel64_load_addr;
 }
 
+/// A device-tree parameter (`dtparam=name=value`, or `dtoverlay=overlay,name=value`).
+pub const DtParam = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+/// A `dtoverlay=` line and the parameters that apply to it. An empty `name` applies `params` to
+/// the base device tree (`dtparam=` lines before any overlay, or after an empty `dtoverlay=`).
+pub const DtOverlay = struct {
+    name: []const u8 = "",
+    dtbo: ?[]const u8 = null,
+    params: []const DtParam = &.{},
+};
+
+pub const DtDirective = struct {
+    kind: enum { overlay, param },
+    /// Raw value, e.g. `"i2c-rtc,ds3231"` or `"i2c_arm=on,spi=on"`.
+    text: []const u8,
+};
+
+pub const max_dt_directives = 64;
+
 pub const BootConfig = struct {
     os_prefix: []const u8 = "",
+    overlay_prefix: []const u8 = "overlays/",
     kernel: []const u8 = "kernel.img",
     kernel_explicit: bool = false,
     arm_64bit: ?bool = null,
@@ -39,6 +63,8 @@ pub const BootConfig = struct {
     initramfs: ?[]const u8 = null,
     auto_initramfs: bool = false,
     vc4_kms_v3d: bool = false,
+    dt_directives: [max_dt_directives]DtDirective = undefined,
+    dt_directive_count: usize = 0,
 
     pub fn parse(text: []const u8) BootConfig {
         return parseForModel(text, .pi_zero);
@@ -106,15 +132,90 @@ pub const BootConfig = struct {
                 cfg.auto_initramfs = std.mem.eql(u8, val, "1") or std.ascii.eqlIgnoreCase(val, "true");
             } else if (std.mem.eql(u8, key, "device_tree")) {
                 cfg.device_tree = val;
-            } else if (std.mem.eql(u8, key, "dtoverlay")) {
-                if (std.mem.startsWith(u8, val, "vc4-kms-v3d")) {
+            } else if (std.mem.eql(u8, key, "overlay_prefix")) {
+                cfg.overlay_prefix = val;
+            } else if (std.mem.eql(u8, key, "dtoverlay") or std.mem.eql(u8, key, "device_tree_overlay") or
+                std.mem.eql(u8, key, "dtparam") or std.mem.eql(u8, key, "device_tree_param"))
+            {
+                const is_overlay = std.mem.eql(u8, key, "dtoverlay") or std.mem.eql(u8, key, "device_tree_overlay");
+                if (is_overlay and std.mem.startsWith(u8, val, "vc4-kms-v3d")) {
                     cfg.vc4_kms_v3d = true;
+                }
+                if (cfg.dt_directive_count < max_dt_directives) {
+                    cfg.dt_directives[cfg.dt_directive_count] = .{ .kind = if (is_overlay) .overlay else .param, .text = val };
+                    cfg.dt_directive_count += 1;
                 }
             }
         }
         return cfg;
     }
+
+    /// Groups the `dtoverlay=` / `dtparam=` lines, in order, into overlays with their parameters.
+    /// Parameters apply to the most recent overlay, or to the base device tree before any overlay
+    /// (or after an empty `dtoverlay=`). A parameter without a value means `true`.
+    pub fn dtOverlays(self: *const BootConfig, allocator: std.mem.Allocator) ![]DtOverlay {
+        var overlays: std.ArrayList(DtOverlay) = .empty;
+        var params: std.ArrayList(DtParam) = .empty;
+        var name: []const u8 = "";
+        for (self.dt_directives[0..self.dt_directive_count]) |d| {
+            var parts = std.mem.splitScalar(u8, d.text, ',');
+            if (d.kind == .overlay) {
+                if (name.len > 0 or params.items.len > 0) {
+                    try overlays.append(allocator, .{ .name = name, .params = try params.toOwnedSlice(allocator) });
+                }
+                name = std.mem.trim(u8, parts.first(), " \t");
+            }
+            while (parts.next()) |raw| {
+                const p = std.mem.trim(u8, raw, " \t");
+                if (p.len == 0) continue;
+                if (std.mem.indexOfScalar(u8, p, '=')) |eq| {
+                    try params.append(allocator, .{ .name = p[0..eq], .value = p[eq + 1 ..] });
+                } else {
+                    try params.append(allocator, .{ .name = p, .value = "true" });
+                }
+            }
+        }
+        if (name.len > 0 or params.items.len > 0) {
+            try overlays.append(allocator, .{ .name = name, .params = try params.toOwnedSlice(allocator) });
+        }
+        return overlays.toOwnedSlice(allocator);
+    }
 };
+
+/// Applies `dtoverlay=` / `dtparam=` settings to `tree` the way the VideoCore firmware does.
+/// Problems (missing overlays, unknown parameters) are reported and skipped, as on real hardware.
+fn applyDtOverlays(allocator: std.mem.Allocator, tree: *fdt.Tree, overlays: []const DtOverlay) void {
+    for (overlays) |o| {
+        var overlay_tree: ?fdt.Tree = null;
+        if (o.dtbo) |bytes| {
+            overlay_tree = fdt.Tree.parse(allocator, bytes) catch |err| {
+                std.debug.print("fauxpi: dtoverlay {s}: {s}\n", .{ o.name, @errorName(err) });
+                continue;
+            };
+            tree.fixupOverlay(&overlay_tree.?) catch |err| {
+                std.debug.print("fauxpi: dtoverlay {s}: {s}\n", .{ o.name, @errorName(err) });
+                continue;
+            };
+        } else if (o.name.len > 0) {
+            continue;
+        }
+
+        const overlay_ptr: ?*fdt.Tree = if (overlay_tree) |*t| t else null;
+        for (o.params) |p| {
+            const known = tree.applyParam(overlay_ptr, p.name, p.value) catch |err| {
+                std.debug.print("fauxpi: dtparam {s}={s}: {s}\n", .{ p.name, p.value, @errorName(err) });
+                continue;
+            };
+            if (!known) std.debug.print("fauxpi: dtparam {s}: unknown parameter\n", .{p.name});
+        }
+
+        if (overlay_ptr) |t| {
+            tree.mergeOverlay(t) catch |err| {
+                std.debug.print("fauxpi: dtoverlay {s}: {s}\n", .{ o.name, @errorName(err) });
+            };
+        }
+    }
+}
 
 pub const BootResult = struct {
     entry_pc: u32 = kernel_load_addr,
@@ -263,7 +364,17 @@ pub fn loadFromSdImageForModel(
     else
         trimmed_cmdline;
 
-    return loadDirect(allocator, ram, kernel_bytes, dtb_bytes, initrd_bytes, full_cmdline, cfg.vc4_kms_v3d or true);
+    const overlays = try cfg.dtOverlays(alloc);
+    for (overlays) |*o| {
+        if (o.name.len == 0) continue;
+        const p = try std.fmt.allocPrint(alloc, "{s}{s}{s}.dtbo", .{ cfg.os_prefix, cfg.overlay_prefix, o.name });
+        o.dtbo = fs.readFileAlloc(alloc, p) catch |err| blk: {
+            std.debug.print("fauxpi: dtoverlay {s}: failed to load {s}: {s}\n", .{ o.name, p, @errorName(err) });
+            break :blk null;
+        };
+    }
+
+    return loadDirectWithOverlays(allocator, ram, kernel_bytes, dtb_bytes, initrd_bytes, full_cmdline, cfg.vc4_kms_v3d or true, overlays);
 }
 
 const SliceLzma2Buffer = struct {
@@ -504,6 +615,20 @@ pub fn loadDirect(
     cmdline: []const u8,
     enable_vc4_kms: bool,
 ) !BootResult {
+    return loadDirectWithOverlays(allocator, ram, raw_kernel_bytes, dtb_bytes, initrd_bytes, cmdline, enable_vc4_kms, &.{});
+}
+
+/// Like `loadDirect`, also applying `dtoverlay=` / `dtparam=` settings to the device tree.
+pub fn loadDirectWithOverlays(
+    allocator: std.mem.Allocator,
+    ram: []u8,
+    raw_kernel_bytes: []const u8,
+    dtb_bytes: []const u8,
+    initrd_bytes: ?[]const u8,
+    cmdline: []const u8,
+    enable_vc4_kms: bool,
+    overlays: []const DtOverlay,
+) !BootResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -551,7 +676,18 @@ pub fn loadDirect(
     }
 
     var tree = try fdt.Tree.parse(alloc, dtb_bytes);
-    try tree.patchForPiZero(@intCast(ram.len), cmdline, initrd_range, enable_vc4_kms);
+
+    // Overlays may append to /chosen/bootargs; keep those additions after the command line,
+    // which otherwise replaces the device tree's bootargs.
+    const base_bootargs = if (tree.findNode("/chosen")) |c| c.getStringProp("bootargs") orelse "" else "";
+    applyDtOverlays(alloc, &tree, overlays);
+    const overlay_bootargs = if (tree.findNode("/chosen")) |c| c.getStringProp("bootargs") orelse "" else "";
+    const full_cmdline = if (overlay_bootargs.len > base_bootargs.len and std.mem.startsWith(u8, overlay_bootargs, base_bootargs))
+        std.mem.trim(u8, try std.fmt.allocPrint(alloc, "{s} {s}", .{ cmdline, overlay_bootargs[base_bootargs.len..] }), " ")
+    else
+        cmdline;
+
+    try tree.patchForPiZero(@intCast(ram.len), full_cmdline, initrd_range, enable_vc4_kms);
     if (is_aarch64) {
         try tree.configureSpinTable64();
     }
@@ -636,3 +772,39 @@ test "parse config.txt" {
     try std.testing.expectEqual(@as(u32, 0x0008_0000), arm64KernelLoadOffset(&fake_arm64_hdr));
 }
 
+test "config.txt dtoverlay and dtparam grouping" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sample =
+        \\dtparam=audio=on,i2c_arm
+        \\dtoverlay=i2c-rtc,ds3231
+        \\dtparam=wakeup-source
+        \\dtoverlay=
+        \\dtparam=spi=on
+        \\[pi4]
+        \\dtoverlay=disable-bt
+        \\[all]
+        \\dtoverlay=gpio-fan,gpiopin=18,temp=55000
+    ;
+    const cfg = BootConfig.parseForModel(sample, .pi_3_b_plus);
+    const overlays = try cfg.dtOverlays(arena.allocator());
+    try std.testing.expectEqual(@as(usize, 4), overlays.len);
+
+    try std.testing.expectEqualStrings("", overlays[0].name);
+    try std.testing.expectEqual(@as(usize, 2), overlays[0].params.len);
+    try std.testing.expectEqualStrings("audio", overlays[0].params[0].name);
+    try std.testing.expectEqualStrings("on", overlays[0].params[0].value);
+    try std.testing.expectEqualStrings("i2c_arm", overlays[0].params[1].name);
+    try std.testing.expectEqualStrings("true", overlays[0].params[1].value);
+
+    try std.testing.expectEqualStrings("i2c-rtc", overlays[1].name);
+    try std.testing.expectEqual(@as(usize, 2), overlays[1].params.len);
+    try std.testing.expectEqualStrings("ds3231", overlays[1].params[0].name);
+    try std.testing.expectEqualStrings("wakeup-source", overlays[1].params[1].name);
+
+    try std.testing.expectEqualStrings("", overlays[2].name);
+    try std.testing.expectEqualStrings("spi", overlays[2].params[0].name);
+
+    try std.testing.expectEqualStrings("gpio-fan", overlays[3].name);
+    try std.testing.expectEqualStrings("55000", overlays[3].params[1].value);
+}

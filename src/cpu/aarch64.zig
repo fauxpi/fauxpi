@@ -1360,7 +1360,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 }
                             } else if (cmode < 0b1100) {
                                 const is_16 = (cmode & 0b1000) != 0;
-                                const sh: u5 = if (is_16) @intCast(((cmode >> 1) & 1) * 8) else @intCast(((cmode >> 1) & 3) * 8);
+                                const sh: u5 = if (is_16) @as(u5, (cmode >> 1) & 1) * 8 else @as(u5, (cmode >> 1) & 3) * 8;
                                 const elem: u64 = (@as(u64, imm8) << sh);
                                 if (is_16) {
                                     const rep16: u64 = (elem & 0xffff) * 0x0001_0001_0001_0001;
@@ -4960,7 +4960,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     // 32-bit (0000..0111) or 16-bit (1000..1011) immediate:
                     // MOVI (cmode[0]=0, op=0), MVNI (cmode[0]=0, op=1), ORR (cmode[0]=1, op=0), BIC (cmode[0]=1, op=1)
                     const is_16 = (cmode & 0b1000) != 0;
-                    const sh: u5 = if (is_16) @intCast(((cmode >> 1) & 1) * 8) else @intCast(((cmode >> 1) & 3) * 8);
+                    const sh: u5 = if (is_16) @as(u5, (cmode >> 1) & 1) * 8 else @as(u5, (cmode >> 1) & 3) * 8;
                     const elem: u64 = (@as(u64, imm8) << sh);
                     if (is_16) {
                         const rep16: u64 = (elem & 0xffff) * 0x0001_0001_0001_0001;
@@ -4983,7 +4983,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     val64 = if (op) ~rep32 else rep32;
                 } else {
                     const byte_val: u64 = if (op) ~@as(u64, imm8) & 0xff else imm8;
-                    const sh: u5 = @intCast(((cmode >> 1) & 3) * 8);
+                    const sh: u5 = @as(u5, (cmode >> 1) & 3) * 8;
                     const elem32: u64 = (byte_val << sh) & 0xffff_ffff;
                     val64 = elem32 | (elem32 << 32);
                 }
@@ -6477,4 +6477,71 @@ test "AArch64 pre-decoded LDPSW, FP64/128 reg-offset, and NEON LD1/ST1/EXT/USHR/
     try std.testing.expectEqual(@as(u128, 0x80706050_40302010_00000000_00000000), cpu.vfp.v[4]);
     try std.testing.expectEqual(cpu.vfp.v[3], std.mem.readInt(u128, ram[0x3100..][0..16], .little));
     try std.testing.expectEqual(cpu.vfp.v[4], std.mem.readInt(u128, ram[0x3110..][0..16], .little));
+}
+
+test "AArch64 AdvSIMD modified immediate shifts (MOVI/MVNI/ORR/BIC LSL #8/#16/#24)" {
+    const arm1176 = @import("arm1176.zig");
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+    @memset(ram, 0);
+
+    var bus: TestBus = .{ .ram = ram };
+    const Cpu = arm1176.Arm1176(TestBus);
+    var cpu: Cpu = .{};
+    cpu.initReset64(0x1000, 0);
+    cpu.x[1] = 0x3000;
+    cpu.vfp.v[3] = 0x0000_0011_0000_0011;
+    cpu.vfp.v[4] = ~@as(u128, 0);
+
+    // mke2fs builds the JBD2 superblock's big-endian s_first / s_sequence (htonl(1)) this way.
+    // 0x1000: movi v0.2s, #0x1, lsl #24   (0x0f006420)
+    // 0x1004: movi v1.4s, #0xab, lsl #16  (0x4f054561)
+    // 0x1008: mvni v2.2s, #0x1, lsl #24   (0x2f006422)
+    // 0x100c: orr v3.2s, #0x1, lsl #24    (0x0f007423)
+    // 0x1010: bic v4.4s, #0xff, lsl #16   (0x6f0757e4)
+    // 0x1014: movi v5.4h, #0x12, lsl #8   (0x0f00a645)
+    // 0x1018: stur d0, [x1, #20]          (0xfc014020)
+    // 0x101c: wfi                         (0xd503207f)
+    const prog = [_]u32{ 0x0f006420, 0x4f054561, 0x2f006422, 0x0f007423, 0x6f0757e4, 0x0f00a645, 0xfc014020, 0xd503207f };
+    for (prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+    }
+
+    _ = cpu.runSteps(&bus, 16);
+    try std.testing.expectEqual(@as(u128, 0x0100_0000_0100_0000), cpu.vfp.v[0]);
+    try std.testing.expectEqual(@as(u128, 0x00ab_0000_00ab_0000_00ab_0000_00ab_0000), cpu.vfp.v[1]);
+    try std.testing.expectEqual(@as(u128, 0xfeff_ffff_feff_ffff), cpu.vfp.v[2]);
+    try std.testing.expectEqual(@as(u128, 0x0100_0011_0100_0011), cpu.vfp.v[3]);
+    try std.testing.expectEqual(@as(u128, 0xff00_ffff_ff00_ffff_ff00_ffff_ff00_ffff), cpu.vfp.v[4]);
+    try std.testing.expectEqual(@as(u128, 0x1200_1200_1200_1200), cpu.vfp.v[5]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0, 1, 0, 0, 0, 1 }, ram[0x3014..0x301c]);
 }
