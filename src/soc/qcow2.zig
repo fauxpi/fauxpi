@@ -84,13 +84,17 @@ pub const Qcow2Disk = struct {
     // In-memory L1 table (each entry holds host byte offset of L2 cluster, or 0)
     l1_table: []u64,
 
-    // Cached L2 table
-    cached_l1_idx: usize = std.math.maxInt(usize),
-    l2_cache: [L2_ENTRIES]u64 = @splat(0),
-    l2_dirty: bool = false,
+    // 4-way (2 GiB span) LRU L2 table cache with O(1) MRU fast-path
+    l2_mru_slot: u2 = 0,
+    l2_lru_tick: u64 = 0,
+    l2_cache_l1_idx: [L2_CACHE_WAYS]usize = @splat(std.math.maxInt(usize)),
+    l2_cache_last_used: [L2_CACHE_WAYS]u64 = @splat(0),
+    l2_cache_dirty: [L2_CACHE_WAYS]bool = @splat(false),
+    l2_cache: *[L2_CACHE_WAYS][L2_ENTRIES]u64,
 
-    // 8-way (512 KiB) LRU data cluster cache with O(1) MRU fast-path
+    // 8-way (512 KiB) LRU data cluster cache with O(1) MRU fast-path and unallocated-cluster memo
     mru_slot: u3 = 0,
+    last_unalloc_vcluster: u64 = std.math.maxInt(u64),
     cache_lru_tick: u64 = 0,
     cache_vclusters: [CACHE_WAYS]u64 = @splat(std.math.maxInt(u64)),
     cache_last_used: [CACHE_WAYS]u64 = @splat(0),
@@ -98,6 +102,7 @@ pub const Qcow2Disk = struct {
     cluster_cache: *[CACHE_WAYS][CLUSTER_SIZE]u8,
 
     pub const CACHE_WAYS: usize = 8;
+    pub const L2_CACHE_WAYS: usize = 4;
 
     /// XZ stream header magic bytes (`\xFD7zXZ\x00`).
     pub const XZ_HEADER_MAGIC = [6]u8{ 0xFD, '7', 'z', 'X', 'Z', 0x00 };
@@ -293,6 +298,10 @@ pub const Qcow2Disk = struct {
         errdefer allocator.free(l1_table);
         @memset(l1_table, 0);
 
+        const l2_cache = try allocator.create([L2_CACHE_WAYS][L2_ENTRIES]u64);
+        errdefer allocator.destroy(l2_cache);
+        for (l2_cache) |*slot| @memset(slot, 0);
+
         const cluster_cache = try allocator.create([CACHE_WAYS][CLUSTER_SIZE]u8);
         errdefer allocator.destroy(cluster_cache);
         for (cluster_cache) |*slot| @memset(slot, 0);
@@ -302,6 +311,7 @@ pub const Qcow2Disk = struct {
             .fd = fd,
             .virtual_size = virtual_size,
             .l1_table = l1_table,
+            .l2_cache = l2_cache,
             .cluster_cache = cluster_cache,
         };
         try disk.writeInitialHeaders();
@@ -344,6 +354,10 @@ pub const Qcow2Disk = struct {
             }
         }
 
+        const l2_cache = try allocator.create([L2_CACHE_WAYS][L2_ENTRIES]u64);
+        errdefer allocator.destroy(l2_cache);
+        for (l2_cache) |*slot| @memset(slot, 0);
+
         const cluster_cache = try allocator.create([CACHE_WAYS][CLUSTER_SIZE]u8);
         errdefer allocator.destroy(cluster_cache);
         for (cluster_cache) |*slot| @memset(slot, 0);
@@ -359,6 +373,7 @@ pub const Qcow2Disk = struct {
             .next_cluster = max_cluster,
             .allocated_data_clusters = 0,
             .l1_table = l1_table,
+            .l2_cache = l2_cache,
             .cluster_cache = cluster_cache,
         };
 
@@ -368,9 +383,9 @@ pub const Qcow2Disk = struct {
             const l2_c = (l2_off / CLUSTER_SIZE) + 1;
             if (l2_c > max_cluster) max_cluster = l2_c;
 
-            const raw_l2 = std.mem.sliceAsBytes(&disk.l2_cache);
+            const raw_l2 = std.mem.sliceAsBytes(&disk.l2_cache[0]);
             preadAll(fd, raw_l2, l2_off) catch continue;
-            for (disk.l2_cache) |l2_be| {
+            for (disk.l2_cache[0]) |l2_be| {
                 const d_off = std.mem.bigToNative(u64, l2_be) & OFFSET_MASK;
                 if (d_off != 0) {
                     data_clusters += 1;
@@ -379,8 +394,7 @@ pub const Qcow2Disk = struct {
                 }
             }
         }
-        @memset(&disk.l2_cache, 0);
-        disk.cached_l1_idx = std.math.maxInt(usize);
+        @memset(&disk.l2_cache[0], 0);
         disk.next_cluster = max_cluster;
         disk.allocated_data_clusters = data_clusters;
         return disk;
@@ -393,6 +407,7 @@ pub const Qcow2Disk = struct {
             self.fd = -1;
         }
         self.allocator.free(self.l1_table);
+        self.allocator.destroy(self.l2_cache);
         self.allocator.destroy(self.cluster_cache);
     }
 
@@ -405,9 +420,19 @@ pub const Qcow2Disk = struct {
         if (offset >= self.virtual_size) return 0;
         const vcluster = offset >> CLUSTER_BITS;
         const in_cluster: usize = @intCast(offset & CLUSTER_MASK);
-        if (self.cache_vclusters[self.mru_slot] != vcluster) {
-            self.loadClusterIntoCache(vcluster) catch return 0;
+        if (self.cache_vclusters[self.mru_slot] == vcluster) {
+            return self.cluster_cache[self.mru_slot][in_cluster];
         }
+        if (self.last_unalloc_vcluster == vcluster) return 0;
+        if (self.findCachedClusterSlot(vcluster)) |slot| {
+            return self.cluster_cache[slot][in_cluster];
+        }
+        const host_off = self.lookupHostClusterOffset(vcluster, false) catch return 0;
+        if (host_off == 0) {
+            self.last_unalloc_vcluster = vcluster;
+            return 0;
+        }
+        self.loadAllocatedClusterIntoCache(vcluster, host_off) catch return 0;
         return self.cluster_cache[self.mru_slot][in_cluster];
     }
 
@@ -430,9 +455,19 @@ pub const Qcow2Disk = struct {
             const in_cluster: usize = @intCast(offset & CLUSTER_MASK);
             if (in_cluster <= CLUSTER_SIZE - 4) {
                 const vcluster = offset >> CLUSTER_BITS;
-                if (self.cache_vclusters[self.mru_slot] != vcluster) {
-                    self.loadClusterIntoCache(vcluster) catch return 0;
+                if (self.cache_vclusters[self.mru_slot] == vcluster) {
+                    return std.mem.readInt(u32, self.cluster_cache[self.mru_slot][in_cluster..][0..4], .little);
                 }
+                if (self.last_unalloc_vcluster == vcluster) return 0;
+                if (self.findCachedClusterSlot(vcluster)) |slot| {
+                    return std.mem.readInt(u32, self.cluster_cache[slot][in_cluster..][0..4], .little);
+                }
+                const host_off = self.lookupHostClusterOffset(vcluster, false) catch return 0;
+                if (host_off == 0) {
+                    self.last_unalloc_vcluster = vcluster;
+                    return 0;
+                }
+                self.loadAllocatedClusterIntoCache(vcluster, host_off) catch return 0;
                 return std.mem.readInt(u32, self.cluster_cache[self.mru_slot][in_cluster..][0..4], .little);
             }
         }
@@ -476,15 +511,23 @@ pub const Qcow2Disk = struct {
             const avail_in_cluster = CLUSTER_SIZE - in_cluster;
             const avail_in_disk: usize = @intCast(@min(@as(u64, avail_in_cluster), self.virtual_size - cur_off));
             const chunk = @min(dst.len - pos, avail_in_disk);
-            if (self.cache_vclusters[self.mru_slot] != vcluster) {
-                self.loadClusterIntoCache(vcluster) catch {
+            if (self.cache_vclusters[self.mru_slot] == vcluster) {
+                @memcpy(dst[pos .. pos + chunk], self.cluster_cache[self.mru_slot][in_cluster .. in_cluster + chunk]);
+            } else if (self.last_unalloc_vcluster == vcluster) {
+                @memset(dst[pos .. pos + chunk], 0);
+            } else if (self.findCachedClusterSlot(vcluster)) |slot| {
+                @memcpy(dst[pos .. pos + chunk], self.cluster_cache[slot][in_cluster .. in_cluster + chunk]);
+            } else {
+                const host_off = self.lookupHostClusterOffset(vcluster, false) catch 0;
+                if (host_off == 0) {
+                    self.last_unalloc_vcluster = vcluster;
                     @memset(dst[pos .. pos + chunk], 0);
-                    pos += chunk;
-                    cur_off += chunk;
-                    continue;
-                };
+                } else if (self.loadAllocatedClusterIntoCache(vcluster, host_off)) |_| {
+                    @memcpy(dst[pos .. pos + chunk], self.cluster_cache[self.mru_slot][in_cluster .. in_cluster + chunk]);
+                } else |_| {
+                    @memset(dst[pos .. pos + chunk], 0);
+                }
             }
-            @memcpy(dst[pos .. pos + chunk], self.cluster_cache[self.mru_slot][in_cluster .. in_cluster + chunk]);
             pos += chunk;
             cur_off += chunk;
         }
@@ -574,16 +617,33 @@ pub const Qcow2Disk = struct {
         for (0..CACHE_WAYS) |slot| {
             try self.flushSlot(slot);
         }
-        if (self.l2_dirty and self.cached_l1_idx < self.l1_table.len) {
-            self.l2_dirty = false;
-            const l2_host_off = self.l1_table[self.cached_l1_idx] & OFFSET_MASK;
-            if (l2_host_off != 0) {
-                try self.writeL2TableToDisk(l2_host_off);
+        for (0..L2_CACHE_WAYS) |l2_slot| {
+            if (self.l2_cache_dirty[l2_slot] and self.l2_cache_l1_idx[l2_slot] < self.l1_table.len) {
+                self.l2_cache_dirty[l2_slot] = false;
+                const l2_host_off = self.l1_table[self.l2_cache_l1_idx[l2_slot]] & OFFSET_MASK;
+                if (l2_host_off != 0) {
+                    try self.writeL2SlotToDisk(l2_slot, l2_host_off);
+                }
             }
         }
     }
 
+    inline fn findCachedClusterSlot(self: *Qcow2Disk, vcluster: u64) ?u3 {
+        for (0..CACHE_WAYS) |slot| {
+            if (self.cache_vclusters[slot] == vcluster) {
+                self.cache_lru_tick += 1;
+                self.cache_last_used[slot] = self.cache_lru_tick;
+                self.mru_slot = @intCast(slot);
+                return @intCast(slot);
+            }
+        }
+        return null;
+    }
+
     fn writeClusterSlice(self: *Qcow2Disk, vcluster: u64, data: []const u8) !void {
+        if (self.last_unalloc_vcluster == vcluster) {
+            self.last_unalloc_vcluster = std.math.maxInt(u64);
+        }
         for (0..CACHE_WAYS) |slot| {
             if (self.cache_vclusters[slot] == vcluster) {
                 @memset(&self.cluster_cache[slot], 0);
@@ -606,14 +666,10 @@ pub const Qcow2Disk = struct {
     }
 
     fn acquireClusterSlotNoLoad(self: *Qcow2Disk, vcluster: u64) !void {
-        for (0..CACHE_WAYS) |slot| {
-            if (self.cache_vclusters[slot] == vcluster) {
-                self.cache_lru_tick += 1;
-                self.cache_last_used[slot] = self.cache_lru_tick;
-                self.mru_slot = @intCast(slot);
-                return;
-            }
+        if (self.last_unalloc_vcluster == vcluster) {
+            self.last_unalloc_vcluster = std.math.maxInt(u64);
         }
+        if (self.findCachedClusterSlot(vcluster)) |_| return;
         var victim: usize = 0;
         var min_used: u64 = self.cache_last_used[0];
         for (1..CACHE_WAYS) |slot| {
@@ -630,15 +686,29 @@ pub const Qcow2Disk = struct {
         self.mru_slot = @intCast(victim);
     }
 
-    fn loadClusterIntoCache(self: *Qcow2Disk, vcluster: u64) !void {
-        for (0..CACHE_WAYS) |slot| {
-            if (self.cache_vclusters[slot] == vcluster) {
-                self.cache_lru_tick += 1;
-                self.cache_last_used[slot] = self.cache_lru_tick;
-                self.mru_slot = @intCast(slot);
-                return;
+    fn loadAllocatedClusterIntoCache(self: *Qcow2Disk, vcluster: u64, host_off: u64) !void {
+        var victim: usize = 0;
+        var min_used: u64 = self.cache_last_used[0];
+        for (1..CACHE_WAYS) |slot| {
+            if (self.cache_last_used[slot] < min_used) {
+                min_used = self.cache_last_used[slot];
+                victim = slot;
             }
         }
+        try self.flushSlot(victim);
+        try preadAll(self.fd, &self.cluster_cache[victim], host_off);
+        self.cache_vclusters[victim] = vcluster;
+        self.cache_dirty[victim] = false;
+        self.cache_lru_tick += 1;
+        self.cache_last_used[victim] = self.cache_lru_tick;
+        self.mru_slot = @intCast(victim);
+    }
+
+    fn loadClusterIntoCache(self: *Qcow2Disk, vcluster: u64) !void {
+        if (self.last_unalloc_vcluster == vcluster) {
+            self.last_unalloc_vcluster = std.math.maxInt(u64);
+        }
+        if (self.findCachedClusterSlot(vcluster)) |_| return;
 
         var victim: usize = 0;
         var min_used: u64 = self.cache_last_used[0];
@@ -669,58 +739,97 @@ pub const Qcow2Disk = struct {
         const l2_idx: usize = @intCast(vcluster & L2_MASK);
         if (l1_idx >= self.l1_table.len) return 0;
 
-        try self.loadL2Table(l1_idx, allocate);
+        if (!allocate and self.l1_table[l1_idx] == 0) return 0;
+
+        const l2_slot = try self.getL2TableSlot(l1_idx, allocate);
         if (self.l1_table[l1_idx] == 0) return 0;
 
-        const l2_entry = self.l2_cache[l2_idx];
+        const l2_entry = self.l2_cache[l2_slot][l2_idx];
         var data_off = l2_entry & OFFSET_MASK;
         if (data_off == 0 and allocate) {
+            if (self.last_unalloc_vcluster == vcluster) {
+                self.last_unalloc_vcluster = std.math.maxInt(u64);
+            }
             data_off = self.allocCluster();
             self.allocated_data_clusters += 1;
-            self.l2_cache[l2_idx] = OFLAG_COPIED | data_off;
-            self.l2_dirty = true;
+            self.l2_cache[l2_slot][l2_idx] = OFLAG_COPIED | data_off;
+            self.l2_cache_dirty[l2_slot] = true;
         }
         return data_off;
     }
 
-    fn loadL2Table(self: *Qcow2Disk, l1_idx: usize, allocate: bool) !void {
-        if (self.cached_l1_idx == l1_idx) {
+    fn getL2TableSlot(self: *Qcow2Disk, l1_idx: usize, allocate: bool) !u2 {
+        const mru = self.l2_mru_slot;
+        if (self.l2_cache_l1_idx[mru] == l1_idx) {
             if (self.l1_table[l1_idx] == 0 and allocate) {
                 const new_l2_off = self.allocCluster();
                 self.l1_table[l1_idx] = OFLAG_COPIED | new_l2_off;
-                @memset(&self.l2_cache, 0);
+                @memset(&self.l2_cache[mru], 0);
                 try self.writeL1EntryToDisk(l1_idx);
-                try self.writeL2TableToDisk(new_l2_off);
+                try self.writeL2SlotToDisk(mru, new_l2_off);
             }
-            return;
+            return mru;
         }
 
-        if (self.l2_dirty and self.cached_l1_idx < self.l1_table.len) {
-            self.l2_dirty = false;
-            const old_l2_off = self.l1_table[self.cached_l1_idx] & OFFSET_MASK;
+        for (0..L2_CACHE_WAYS) |way| {
+            if (self.l2_cache_l1_idx[way] == l1_idx) {
+                self.l2_lru_tick += 1;
+                self.l2_cache_last_used[way] = self.l2_lru_tick;
+                const slot: u2 = @intCast(way);
+                self.l2_mru_slot = slot;
+                if (self.l1_table[l1_idx] == 0 and allocate) {
+                    const new_l2_off = self.allocCluster();
+                    self.l1_table[l1_idx] = OFLAG_COPIED | new_l2_off;
+                    @memset(&self.l2_cache[slot], 0);
+                    try self.writeL1EntryToDisk(l1_idx);
+                    try self.writeL2SlotToDisk(slot, new_l2_off);
+                }
+                return slot;
+            }
+        }
+
+        var victim: usize = 0;
+        var min_used: u64 = self.l2_cache_last_used[0];
+        for (1..L2_CACHE_WAYS) |way| {
+            if (self.l2_cache_last_used[way] < min_used) {
+                min_used = self.l2_cache_last_used[way];
+                victim = way;
+            }
+        }
+
+        if (self.l2_cache_dirty[victim] and self.l2_cache_l1_idx[victim] < self.l1_table.len) {
+            self.l2_cache_dirty[victim] = false;
+            const old_l2_off = self.l1_table[self.l2_cache_l1_idx[victim]] & OFFSET_MASK;
             if (old_l2_off != 0) {
-                try self.writeL2TableToDisk(old_l2_off);
+                try self.writeL2SlotToDisk(victim, old_l2_off);
             }
         }
 
-        self.cached_l1_idx = l1_idx;
+        self.l2_cache_l1_idx[victim] = l1_idx;
+        self.l2_cache_dirty[victim] = false;
+        self.l2_lru_tick += 1;
+        self.l2_cache_last_used[victim] = self.l2_lru_tick;
+        const slot: u2 = @intCast(victim);
+        self.l2_mru_slot = slot;
+
         var l2_off = self.l1_table[l1_idx] & OFFSET_MASK;
         if (l2_off == 0) {
-            @memset(&self.l2_cache, 0);
+            @memset(&self.l2_cache[victim], 0);
             if (allocate) {
                 l2_off = self.allocCluster();
                 self.l1_table[l1_idx] = OFLAG_COPIED | l2_off;
                 try self.writeL1EntryToDisk(l1_idx);
-                try self.writeL2TableToDisk(l2_off);
+                try self.writeL2SlotToDisk(victim, l2_off);
             }
-            return;
+            return slot;
         }
 
-        const raw_bytes = std.mem.sliceAsBytes(&self.l2_cache);
+        const raw_bytes = std.mem.sliceAsBytes(&self.l2_cache[victim]);
         try preadAll(self.fd, raw_bytes, l2_off);
-        for (&self.l2_cache) |*entry| {
+        for (&self.l2_cache[victim]) |*entry| {
             entry.* = std.mem.bigToNative(u64, entry.*);
         }
+        return slot;
     }
 
     fn writeL1EntryToDisk(self: *Qcow2Disk, l1_idx: usize) !void {
@@ -730,9 +839,9 @@ pub const Qcow2Disk = struct {
         try pwriteAll(self.fd, &be_val, l1_disk_off);
     }
 
-    fn writeL2TableToDisk(self: *Qcow2Disk, l2_host_off: u64) !void {
+    fn writeL2SlotToDisk(self: *Qcow2Disk, l2_slot: usize, l2_host_off: u64) !void {
         var be_table: [L2_ENTRIES]u64 = undefined;
-        for (self.l2_cache, 0..) |v, i| {
+        for (self.l2_cache[l2_slot], 0..) |v, i| {
             be_table[i] = std.mem.nativeToBig(u64, v);
         }
         try pwriteAll(self.fd, std.mem.sliceAsBytes(&be_table), l2_host_off);
@@ -1033,6 +1142,21 @@ const ClusterSink = struct {
         }
     }
 
+    pub fn writeSlice(self: *ClusterSink, bytes: []const u8) !void {
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            const avail = CLUSTER_SIZE - self.cluster_pos;
+            const n = @min(avail, bytes.len - pos);
+            @memcpy(self.cluster_buf[self.cluster_pos..][0..n], bytes[pos..][0..n]);
+            self.cluster_pos += n;
+            self.total_written += n;
+            pos += n;
+            if (self.cluster_pos == CLUSTER_SIZE) {
+                try self.flushFullCluster();
+            }
+        }
+    }
+
     fn flushFullCluster(self: *ClusterSink) !void {
         if (self.total_written > self.disk.virtual_size) return error.ImageTooLarge;
         if (!isAllZero(self.cluster_buf)) {
@@ -1090,6 +1214,20 @@ const StreamingLzma2Buffer = struct {
         try self.sink.writeByte(b);
     }
 
+    pub fn appendSliceDirect(self: *StreamingLzma2Buffer, bytes: []const u8) !void {
+        var pos: usize = 0;
+        while (pos < bytes.len) {
+            const avail = self.dict.len - self.dict_pos;
+            const n = @min(avail, bytes.len - pos);
+            @memcpy(self.dict[self.dict_pos..][0..n], bytes[pos..][0..n]);
+            self.dict_pos += n;
+            if (self.dict_pos == self.dict.len) self.dict_pos = 0;
+            pos += n;
+        }
+        self.len += bytes.len;
+        try self.sink.writeSlice(bytes);
+    }
+
     pub fn appendLiteral(
         self: *StreamingLzma2Buffer,
         _: std.mem.Allocator,
@@ -1111,6 +1249,18 @@ const StreamingLzma2Buffer = struct {
             self.dict_pos - dist
         else
             self.dict.len - (dist - self.dict_pos);
+
+        // Fast path for non-overlapping contiguous dictionary match within ring buffer
+        if (dist >= match_len and src_pos + match_len <= self.dict.len and self.dict_pos + match_len <= self.dict.len) {
+            const dst_slice = self.dict[self.dict_pos..][0..match_len];
+            @memcpy(dst_slice, self.dict[src_pos..][0..match_len]);
+            self.dict_pos += match_len;
+            if (self.dict_pos == self.dict.len) self.dict_pos = 0;
+            self.len += match_len;
+            try self.sink.writeSlice(dst_slice);
+            return;
+        }
+
         for (0..match_len) |_| {
             const b = self.dict[src_pos];
             src_pos += 1;
@@ -1250,8 +1400,12 @@ pub fn streamXzToQcow2WithProgress(
                     const chunk_unpacked = @as(usize, try input.takeInt(u16, .big)) + 1;
                     packed_bytes_read += 2 + chunk_unpacked;
                     if (status == 1) lzma2_buf.resetDict();
-                    for (0..chunk_unpacked) |_| {
-                        try lzma2_buf.appendByteDirect(try input.takeByte());
+                    var rem = chunk_unpacked;
+                    while (rem > 0) {
+                        const step = @min(rem, 4096);
+                        const slice = try input.take(step);
+                        try lzma2_buf.appendSliceDirect(slice);
+                        rem -= step;
                     }
                 } else {
                     if ((status & 0x80) == 0) return error.CorruptInput;
@@ -1626,5 +1780,21 @@ test "QCOW2 creation and uncompressed size inspection from .img.xz file and slic
     }
     for (0..12) |ci| {
         try testing.expectEqual(@as(u32, @intCast(0x1000 + ci)), disk.readWord32(@as(u64, ci + 10) * CLUSTER_SIZE + 8));
+    }
+
+    // Exercise 4-way L2 cache across 4 distinct 512 MiB L1 regions and verify unallocated reads do not evict data cache
+    const l2_span: u64 = @as(u64, L2_ENTRIES) * CLUSTER_SIZE; // 512 MiB
+    for (0..4) |l1_i| {
+        disk.writeWord32(@as(u64, l1_i) * l2_span + 64, @as(u32, @intCast(0xA000 + l1_i)));
+    }
+    const cached_before = disk.cache_vclusters;
+    var zero_buf: [1024]u8 = @splat(0xff);
+    disk.readSlice(3 * l2_span + 100 * CLUSTER_SIZE, &zero_buf);
+    for (zero_buf) |b| try testing.expectEqual(@as(u8, 0), b);
+    try testing.expectEqual(@as(u32, 0), disk.readWord32(3 * l2_span + 101 * CLUSTER_SIZE));
+    // Verify reading unallocated clusters did not evict any of the 8 cached data clusters
+    try testing.expectEqual(cached_before, disk.cache_vclusters);
+    for (0..4) |l1_i| {
+        try testing.expectEqual(@as(u32, @intCast(0xA000 + l1_i)), disk.readWord32(@as(u64, l1_i) * l2_span + 64));
     }
 }
