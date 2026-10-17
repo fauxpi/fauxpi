@@ -164,6 +164,16 @@ pub const xdg_toplevel = struct {
         pub const configure_bounds = 2;
         pub const wm_capabilities = 3;
     };
+    pub const state = struct {
+        pub const maximized: u32 = 1;
+        pub const fullscreen: u32 = 2;
+        pub const resizing: u32 = 3;
+        pub const activated: u32 = 4;
+        pub const tiled_left: u32 = 5;
+        pub const tiled_right: u32 = 6;
+        pub const tiled_top: u32 = 7;
+        pub const tiled_bottom: u32 = 8;
+    };
 };
 
 pub const wl_seat = struct {

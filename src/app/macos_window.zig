@@ -185,6 +185,7 @@ const NSApplicationActivationPolicyRegular: isize = 0;
 const NSWindowStyleMaskTitled: usize = 1 << 0;
 const NSWindowStyleMaskClosable: usize = 1 << 1;
 const NSWindowStyleMaskMiniaturizable: usize = 1 << 2;
+const NSWindowStyleMaskResizable: usize = 1 << 3;
 const NSWindowStyleMaskFullSizeContentView: usize = 1 << 15;
 const NSBackingStoreBuffered: usize = 2;
 const NSWindowTitleHidden: isize = 1;
@@ -301,6 +302,8 @@ pub const MacosWindow = struct {
     backbuf_had_sheet: bool = false,
     backbuf_hdmi_state: u2 = 0,
     backbuf_sheet_rect: board_sheet.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    backbuf_display_rect: board_sheet.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    backbuf_sheet_docked: bool = false,
 
     closed: bool = false,
     ui_dirty: bool = true,
@@ -434,6 +437,7 @@ pub const MacosWindow = struct {
         const style_mask = NSWindowStyleMaskTitled |
             NSWindowStyleMaskClosable |
             NSWindowStyleMaskMiniaturizable |
+            NSWindowStyleMaskResizable |
             NSWindowStyleMaskFullSizeContentView;
 
         const raw_win = msgSend0(Id, cls("NSWindow"), sel("alloc")) orelse return error.CocoaInitFailed;
@@ -563,6 +567,8 @@ pub const MacosWindow = struct {
         self.backbuf_had_sheet = false;
         self.backbuf_hdmi_state = 0;
         self.backbuf_sheet_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        self.backbuf_display_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+        self.backbuf_sheet_docked = false;
         self.cursor_mode = .unknown;
         self.ui_dirty = true;
     }
@@ -588,14 +594,31 @@ pub const MacosWindow = struct {
         self.ui_dirty = false;
         self.queryBackingScale();
 
-        const desired_h = self.display_height + board_sheet.BoardUi.title_bar_height +
+        const default_w = self.display_width;
+        const default_h = self.display_height + board_sheet.BoardUi.title_bar_height +
             (if (self.status.gpio_connected) board_sheet.BoardUi.gpio_panel_height else 0);
-        if ((self.pending_scale != self.scale and self.pending_scale >= 1) or self.height != desired_h) {
+        var desired_w = default_w;
+        var desired_h = default_h;
+        if (self.ns_window) |w| {
+            const is_zoomed = msgSend0(bool, w, sel("isZoomed"));
+            self.ui.maximized = is_zoomed;
+            if (is_zoomed) {
+                if (self.ns_view) |v| {
+                    const bounds = msgSend0(NSRect, v, sel("bounds"));
+                    if (bounds.size.width >= 1.0 and bounds.size.height >= 1.0) {
+                        desired_w = @intFromFloat(@round(bounds.size.width));
+                        desired_h = @intFromFloat(@round(bounds.size.height));
+                    }
+                }
+            }
+        }
+        if ((self.pending_scale != self.scale and self.pending_scale >= 1) or self.width != desired_w or self.height != desired_h) {
             if (self.pending_scale >= 1) self.scale = self.pending_scale;
-            const height_changed = (self.height != desired_h);
+            const size_changed = (self.width != desired_w or self.height != desired_h);
+            self.width = desired_w;
             self.height = desired_h;
             self.initBackbuffer() catch {};
-            if (height_changed) {
+            if (size_changed and !self.ui.maximized) {
                 if (self.ns_window) |w| {
                     msgSend1(
                         void,
@@ -612,17 +635,26 @@ pub const MacosWindow = struct {
         const sc = @max(self.scale, 1);
         const full = self.backbufferPixels();
         const buf_w: usize = @as(usize, self.width) * @as(usize, sc);
-        const top_phys_rows: usize = @as(usize, board_sheet.BoardUi.title_bar_height) * @as(usize, sc);
         const dw: usize = self.display_width;
         const dh: usize = self.display_height;
 
         self.ui.updateLayout(self.width, self.height, self.status, self.gpio);
+        const disp_x: u32 = @intFromFloat(@max(0.0, @floor(self.ui.display_rect.x)));
+        const disp_y: u32 = @intFromFloat(@max(0.0, @floor(self.ui.display_rect.y)));
+        const left_phys_cols: usize = @as(usize, disp_x) * @as(usize, sc);
+        const top_phys_rows: usize = @as(usize, disp_y) * @as(usize, sc);
+
         const has_overlay = self.ui.sheet_open or self.ui.hasSnackbar();
+        const has_popup = self.ui.sd_manage_open or self.ui.sd_card_menu_open or self.ui.board_menu_open;
+        const can_reuse_sheet_backdrop = self.ui.sheet_open and !self.ui.hasSnackbar() and !has_popup;
         const hdmi_state: u2 = (@as(u2, @intFromBool(self.status.hdmi_connected)) |
             (@as(u2, @intFromBool(self.status.hdmi_active)) << 1));
-        const same_sheet_backdrop = self.ui.sheet_open and !self.ui.hasSnackbar() and
+        const same_display_layout = std.meta.eql(self.backbuf_display_rect, self.ui.display_rect) and
+            (self.backbuf_sheet_docked == self.ui.sheet_docked_above);
+        const same_sheet_backdrop = can_reuse_sheet_backdrop and
             self.backbuf_had_sheet and
             self.backbuf_hdmi_state == hdmi_state and
+            same_display_layout and
             std.meta.eql(self.backbuf_sheet_rect, self.ui.sheet_rect);
 
         var reuse_dimmed_backdrop = false;
@@ -631,11 +663,12 @@ pub const MacosWindow = struct {
                 reuse_dimmed_backdrop = true;
             } else {
                 const need_hdmi_blit = (self.backbuf_hdmi_gen != self.hdmi_gen) or
+                    !same_display_layout or
                     has_overlay or
                     self.backbuf_had_sheet or
                     (self.backbuf_hdmi_state != hdmi_state);
                 if (need_hdmi_blit) {
-                    board_sheet.BoardUi.blitHdmiToBackbuffer(full, buf_w, top_phys_rows, self.hdmi_fb, dw, dh, sc);
+                    board_sheet.BoardUi.blitHdmiToBackbufferAt(full, buf_w, left_phys_cols, top_phys_rows, self.hdmi_fb, dw, dh, sc);
                     self.backbuf_hdmi_gen = self.hdmi_gen;
                 }
             }
@@ -647,7 +680,9 @@ pub const MacosWindow = struct {
         }
         self.backbuf_had_sheet = has_overlay;
         self.backbuf_hdmi_state = hdmi_state;
-        self.backbuf_sheet_rect = if (self.ui.sheet_open and !self.ui.hasSnackbar())
+        self.backbuf_display_rect = self.ui.display_rect;
+        self.backbuf_sheet_docked = self.ui.sheet_docked_above;
+        self.backbuf_sheet_rect = if (can_reuse_sheet_backdrop)
             self.ui.sheet_rect
         else
             .{ .x = 0, .y = 0, .w = 0, .h = 0 };
@@ -994,15 +1029,8 @@ pub const MacosWindow = struct {
 
     fn updateGuestMouseTarget(self: *MacosWindow, sx: f64, sy: f64) void {
         const hid = self.hid orelse return;
-        const max_x = @max(@as(i32, @intCast(self.display_width)) - 1, 0);
-        const max_y = @max(@as(i32, @intCast(self.display_height)) - 1, 0);
-        const hdmi_x = std.math.clamp(@as(i32, @intFromFloat(@floor(sx))), 0, max_x);
-        const hdmi_y = std.math.clamp(
-            @as(i32, @intFromFloat(@floor(sy))) - @as(i32, board_sheet.BoardUi.title_bar_height),
-            0,
-            max_y,
-        );
-        hid.setMouseTarget(hdmi_x, hdmi_y);
+        const coords = self.ui.windowToHdmiCoords(sx, sy, self.display_width, self.display_height);
+        hid.setMouseTarget(coords.x, coords.y);
     }
 
     fn handleMouseButton(self: *MacosWindow, button_bit: u8, pressed: bool, sx_f64: f64, sy_f64: f64) void {
@@ -1014,7 +1042,7 @@ pub const MacosWindow = struct {
         if (button_bit == (1 << 0)) {
             const prev_sheet = self.ui.sheet_open;
             const action = self.ui.pointerButton(sx, sy, pressed, self.status, self.gpio);
-            if (!prev_sheet and self.ui.sheet_open) {
+            if (!prev_sheet and self.ui.sheet_open and !self.ui.sheet_docked_above) {
                 hid.releaseAllKeys();
             }
             const over_ui = self.ui.isPointInUi(sx, sy, self.status);
@@ -1277,12 +1305,17 @@ pub const MacosWindow = struct {
                     self.ui.sd_card_menu_open = false;
                     return;
                 }
-                self.ui.sheet_open = false;
-                const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
-                const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
-                self.updateCursorShape(self.ui.isPointInUi(sx, sy, self.status));
+                if (!self.ui.sheet_docked_above) {
+                    self.ui.sheet_open = false;
+                    const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
+                    const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
+                    self.updateCursorShape(self.ui.isPointInUi(sx, sy, self.status));
+                    return;
+                }
             }
-            return;
+            if (!self.ui.sheet_docked_above or self.ui.focused_field != .none or self.ui.sd_manage_open or self.ui.sd_card_menu_open) {
+                return;
+            }
         }
         if (self.hid) |hid| {
             hid.handleEvdevKey(key, pressed);

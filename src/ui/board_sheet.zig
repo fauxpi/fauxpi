@@ -292,6 +292,7 @@ pub const BoardUi = struct {
     pub const title_bar_height: u32 = 44;
     pub const gpio_panel_height: u32 = 136;
     pub const bar_btn_size: f32 = 34;
+    pub const board_btn_width: f32 = 52;
 
     pub const TitleCacheKey = struct {
         win_w: u32 = 0,
@@ -299,6 +300,7 @@ pub const BoardUi = struct {
         board_model: BoardModel = .pi_zero,
         maximized: bool = false,
         sheet_open: bool = false,
+        sheet_docked_above: bool = false,
         board_btn_hovered: bool = false,
         board_btn_pressed: bool = false,
         max_btn_hovered: bool = false,
@@ -439,6 +441,11 @@ pub const BoardUi = struct {
     /// Last computed geometry for hit-testing.
     last_win_w: u32 = 1280,
     last_win_h: u32 = 764,
+    display_rect: Rect = .{ .x = 0, .y = 44, .w = 1280, .h = 720 },
+    has_display_border: bool = false,
+    sheet_docked_above: bool = false,
+    was_sheet_fitting_above: bool = false,
+    saved_overlay_sheet_open: bool = true,
     sheet_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     board_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     settings_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -1293,13 +1300,14 @@ pub const BoardUi = struct {
     }
 
     fn boardBtnRect(self: *const BoardUi, win_w: u32) Rect {
+        if (self.sheet_docked_above) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         const w_f: f32 = @floatFromInt(win_w);
         const title_w = @import("../font/text.zig").measure(.{ .font = &self.font, .size = 22.0 }, self.title);
         const title_x = @round((w_f - title_w) * 0.5);
         return .{
             .x = @round(title_x + title_w + 8.0),
             .y = (44.0 - bar_btn_size) * 0.5,
-            .w = bar_btn_size,
+            .w = board_btn_width,
             .h = bar_btn_size,
         };
     }
@@ -1765,11 +1773,26 @@ pub const BoardUi = struct {
         const sheet_x = @round((w_f - sheet_w) * 0.5);
         const sheet_y: f32 = @floatFromInt(title_bar_height);
         const pad: f32 = 24.0;
+        const btn_w: f32 = 128.0;
+        const btn_h: f32 = 30.0;
+
+        const disp_bottom_h: u32 = if (status.gpio_connected and win_h > gpio_panel_height)
+            win_h - gpio_panel_height
+        else
+            win_h;
+        const disp_bottom_y: f32 = @floatFromInt(disp_bottom_h);
+        const content_h: f32 = @max(0.0, disp_bottom_y - sheet_y);
+        const req_disp_w: f32 = @min(w_f, @as(f32, @floatFromInt(@max(status.hdmi_width, 1))));
+        const req_disp_h: f32 = @min(content_h, @as(f32, @floatFromInt(@max(status.hdmi_height, 1))));
+        const sheet_chrome_h: f32 = pad + 12.0 + btn_h + 14.0;
+        const min_disp_margin: f32 = 8.0;
+        const avail_above_disp: f32 = content_h - req_disp_h - min_disp_margin;
+        const can_fit_sheet_above = (w_f >= req_disp_w) and (avail_above_disp >= 180.0 + sheet_chrome_h);
 
         const drawing = board.forModel(status.model) orelse &board.pi_zero;
         const bounds = boardBoundsWithPeripherals(drawing);
         const max_bw: f32 = sheet_w - 2.0 * pad;
-        const max_bh: f32 = 300.0;
+        const max_bh: f32 = if (can_fit_sheet_above) @min(300.0, avail_above_disp - sheet_chrome_h) else 300.0;
         const bw = max_bw;
         const bh = @min(bw * bounds.h / bounds.w, max_bh);
         const actual_bw = bw * @min(1.0, bh / (bw * bounds.h / bounds.w));
@@ -1778,8 +1801,6 @@ pub const BoardUi = struct {
         const y: f32 = sheet_y + pad;
         self.board_rect = .{ .x = board_x, .y = y, .w = actual_bw, .h = bh };
 
-        const btn_w: f32 = 128.0;
-        const btn_h: f32 = 30.0;
         const btn_y: f32 = @round(y + bh + 12.0);
         self.settings_btn_rect = .{
             .x = @round(sheet_x + (sheet_w - btn_w) * 0.5),
@@ -1900,13 +1921,15 @@ pub const BoardUi = struct {
             .h = mg_h,
         };
 
+        const collapsed_bottom: f32 = btn_y + btn_h + 14.0;
+        const collapsed_sheet_h: f32 = collapsed_bottom - sheet_y;
         const menu_bottom: f32 = if (self.board_menu_open) (self.board_menu_rect.y + self.board_menu_rect.h + 16.0) else 0.0;
         const sd_menu_bottom: f32 = if (self.sd_card_menu_open) (self.sd_card_menu_rect.y + self.sd_card_menu_rect.h + 16.0) else 0.0;
         const sd_manage_bottom: f32 = if (self.sd_manage_open) (self.sd_manage_rect.y + self.sd_manage_rect.h + 18.0) else 0.0;
         const base_bottom: f32 = if (self.settings_open)
             @max(panel_y + panel_h + 16.0, menu_bottom)
         else
-            (btn_y + btn_h + 14.0);
+            collapsed_bottom;
         const total_h: f32 = @max(base_bottom, @max(sd_menu_bottom, sd_manage_bottom)) - sheet_y;
 
         self.sheet_rect = .{
@@ -1915,6 +1938,39 @@ pub const BoardUi = struct {
             .w = sheet_w,
             .h = total_h,
         };
+
+        const sheet_fits_above = (w_f >= req_disp_w) and (content_h >= collapsed_sheet_h + req_disp_h + min_disp_margin);
+        if (sheet_fits_above) {
+            if (!self.was_sheet_fitting_above) {
+                self.saved_overlay_sheet_open = self.sheet_open;
+            }
+            self.sheet_open = true;
+            self.board_btn_hovered = false;
+            self.board_btn_pressed = false;
+        } else {
+            if (self.was_sheet_fitting_above) {
+                self.sheet_open = self.saved_overlay_sheet_open;
+            } else {
+                self.saved_overlay_sheet_open = self.sheet_open;
+            }
+        }
+        self.was_sheet_fitting_above = sheet_fits_above;
+        self.sheet_docked_above = sheet_fits_above;
+
+        const disp_area_top: f32 = if (self.sheet_docked_above) blk: {
+            const eff_sheet_h = if (content_h >= total_h + req_disp_h + min_disp_margin) total_h else collapsed_sheet_h;
+            break :blk sheet_y + eff_sheet_h;
+        } else sheet_y;
+        const disp_area_h: f32 = @max(req_disp_h, disp_bottom_y - disp_area_top);
+        const disp_x: f32 = @floor((w_f - req_disp_w) * 0.5);
+        const disp_y: f32 = @floor(disp_area_top + (disp_area_h - req_disp_h) * 0.5);
+        self.display_rect = .{
+            .x = disp_x,
+            .y = disp_y,
+            .w = req_disp_w,
+            .h = req_disp_h,
+        };
+        self.has_display_border = (w_f > req_disp_w) or (content_h > req_disp_h);
 
         if (self.snackbar_len > 0) {
             const msg_w = @import("../font/text.zig").measure(
@@ -1937,6 +1993,24 @@ pub const BoardUi = struct {
             self.snackbar_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
             self.snackbar_dismiss_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         }
+    }
+
+    /// Maps logical window coordinates `(sx, sy)` to clamped guest HDMI display coordinates `(0..display_width-1, 0..display_height-1)`.
+    pub fn windowToHdmiCoords(
+        self: *const BoardUi,
+        sx: f64,
+        sy: f64,
+        display_width: u32,
+        display_height: u32,
+    ) struct { x: i32, y: i32 } {
+        const max_x = @max(@as(i32, @intCast(display_width)) - 1, 0);
+        const max_y = @max(@as(i32, @intCast(display_height)) - 1, 0);
+        const rel_x = @floor(sx - @as(f64, self.display_rect.x));
+        const rel_y = @floor(sy - @as(f64, self.display_rect.y));
+        return .{
+            .x = std.math.clamp(@as(i32, @intFromFloat(rel_x)), 0, max_x),
+            .y = std.math.clamp(@as(i32, @intFromFloat(rel_y)), 0, max_y),
+        };
     }
 
     /// Returns a 28-bit mask of BCM GPIO numbers (`0..27`) exposed on the board's 40-pin GPIO header.
@@ -1984,12 +2058,20 @@ pub const BoardUi = struct {
         };
     }
 
-    /// Returns true if `(x, y)` is over the TitleBar, an open BoardSheet, the connected GPIO box, or the Snackbar.
+    /// Returns true if `(x, y)` is over the TitleBar, an open BoardSheet, the connected GPIO box, the Snackbar, or the display border.
     pub fn isPointInUi(self: *const BoardUi, x: f32, y: f32, status: SystemStatus) bool {
+        const pt: Point = .{ x, y };
         if (y < @as(f32, @floatFromInt(title_bar_height))) return true;
-        if (self.sheet_open) return true;
-        if (self.hasSnackbar() and self.snackbar_rect.contains(.{ x, y })) return true;
-        if (status.gpio_connected and self.gpio_box_rect.contains(.{ x, y })) return true;
+        if (self.hasSnackbar() and self.snackbar_rect.contains(pt)) return true;
+        if (status.gpio_connected and self.gpio_box_rect.contains(pt)) return true;
+        if (self.sheet_open) {
+            if (!self.sheet_docked_above) return true;
+            if (self.sheet_rect.contains(pt)) return true;
+            if (self.sd_manage_open and self.sd_manage_rect.contains(pt)) return true;
+            if (self.sd_card_menu_open and self.sd_card_menu_rect.contains(pt)) return true;
+            if (self.settings_open and self.board_menu_open and self.board_menu_rect.contains(pt)) return true;
+        }
+        if (!self.display_rect.contains(pt)) return true;
         return false;
     }
 
@@ -2066,9 +2148,7 @@ pub const BoardUi = struct {
             self.sd_browse_btn_hovered = false;
             self.sd_add_btn_hovered = false;
             self.sd_manage_close_hovered = false;
-            return y < @as(f32, @floatFromInt(title_bar_height)) or
-                (self.hasSnackbar() and self.snackbar_rect.contains(pt)) or
-                (status.gpio_connected and self.gpio_box_rect.contains(pt));
+            return self.isPointInUi(x, y, status);
         }
 
         if (self.sd_manage_open) {
@@ -2166,7 +2246,7 @@ pub const BoardUi = struct {
             self.hovered_target = null;
         }
 
-        return true;
+        return self.isPointInUi(x, y, status);
     }
 
     pub fn pointerLeave(self: *BoardUi) void {
@@ -2289,11 +2369,19 @@ pub const BoardUi = struct {
             return .consumed;
         }
 
-        if (!self.sheet_open) return .none;
+        if (!self.sheet_open) {
+            return if (self.display_rect.contains(pt)) .none else .consumed;
+        }
 
         if (pressed) {
             if (!self.sd_manage_open and !self.sd_card_menu_open and self.settings_btn_rect.contains(pt)) {
                 self.settings_btn_pressed = true;
+            }
+            if (self.sheet_docked_above and !self.sd_manage_open and !self.sd_card_menu_open and
+                !(self.settings_open and self.board_menu_open) and !self.sheet_rect.contains(pt))
+            {
+                self.focused_field = .none;
+                return if (self.display_rect.contains(pt)) .none else .consumed;
             }
             return .consumed;
         } else {
@@ -2467,10 +2555,16 @@ pub const BoardUi = struct {
                 }
             }
 
-            // Release outside the sheet card (on the dimmed HDMI area) dismisses the sheet
+            // Release outside the sheet card:
+            // - In overlay mode (!sheet_docked_above), dismisses the sheet.
+            // - In docked-above-display mode (sheet_docked_above), keeps the sheet open and forwards clicks inside display_rect to the guest.
             if (!self.sheet_rect.contains(pt)) {
-                self.sheet_open = false;
                 self.focused_field = .none;
+                if (!self.sheet_docked_above) {
+                    self.sheet_open = false;
+                    return .consumed;
+                }
+                return if (self.display_rect.contains(pt)) .none else .consumed;
             }
             return .consumed;
         }
@@ -2523,9 +2617,12 @@ pub const BoardUi = struct {
         else
             win_h;
 
-        if (!status.hdmi_connected or !status.hdmi_active) {
-            if (!backdrop_already_dimmed) {
-                self.paintNoSignal(&c, win_w, disp_bottom_h, status.hdmi_connected);
+        if (!backdrop_already_dimmed) {
+            if (!status.hdmi_connected or !status.hdmi_active) {
+                self.paintNoSignal(&c, status.hdmi_connected);
+            }
+            if (self.has_display_border) {
+                self.paintDisplayBorder(&c, win_w, disp_bottom_h);
             }
         }
         if (status.gpio_connected and win_h > gpio_panel_height) {
@@ -2577,21 +2674,53 @@ pub const BoardUi = struct {
         );
     }
 
-    fn paintNoSignal(self: *BoardUi, c: *Canvas, win_w: u32, disp_bottom_h: u32, hdmi_connected: bool) void {
-        const w_f: f32 = @floatFromInt(win_w);
-        const h_f: f32 = @floatFromInt(disp_bottom_h);
-        const top_y: f32 = @floatFromInt(title_bar_height);
-        if (h_f <= top_y) return;
+    fn paintDisplayBorder(self: *const BoardUi, c: *Canvas, win_w: u32, disp_bottom_h: u32) void {
+        const sc_f = @max(c.scale, 1.0);
+        const sc: u32 = @intFromFloat(sc_f);
+        const top_py: u32 = title_bar_height * sc;
+        const bot_py: u32 = @min(c.height, disp_bottom_h * sc);
+        if (bot_py <= top_py) return;
+
+        const dr = self.display_rect;
+        const dx0: u32 = @min(c.width, @as(u32, @intFromFloat(@max(0.0, @round(dr.x * sc_f)))));
+        const dy0: u32 = @min(bot_py, @max(top_py, @as(u32, @intFromFloat(@max(0.0, @round(dr.y * sc_f))))));
+        const dx1: u32 = @min(c.width, @as(u32, @intFromFloat(@max(0.0, @round((dr.x + dr.w) * sc_f)))));
+        const dy1: u32 = @min(bot_py, @max(dy0, @as(u32, @intFromFloat(@max(0.0, @round((dr.y + dr.h) * sc_f))))));
+
+        const bg_argb = self.theme.surface.toArgb();
+        const full_w = @min(c.width, win_w * sc);
+
+        // Top surround strip (between TitleBar and top of display_rect)
+        for (top_py..dy0) |py| {
+            @memset(c.pixels[py * c.stride ..][0..full_w], bg_argb);
+        }
+        // Left & right surround strips beside display_rect
+        for (dy0..dy1) |py| {
+            const row = c.pixels[py * c.stride ..][0..full_w];
+            if (dx0 > 0) @memset(row[0..dx0], bg_argb);
+            if (dx1 < full_w) @memset(row[dx1..full_w], bg_argb);
+        }
+        // Bottom surround strip (between bottom of display_rect and disp_bottom_h)
+        for (dy1..bot_py) |py| {
+            @memset(c.pixels[py * c.stride ..][0..full_w], bg_argb);
+        }
+
+        // Crisp 1px border frame around the display
+        c.strokeRect(dr.outset(1.0), 1.0, self.theme.outline_variant);
+    }
+
+    fn paintNoSignal(self: *BoardUi, c: *Canvas, hdmi_connected: bool) void {
+        const dr = self.display_rect;
+        if (dr.w <= 0 or dr.h <= 0) return;
 
         // Monitor matte dark panel background
-        const disp_h = h_f - top_y;
-        c.fillRect(.{ .x = 0, .y = top_y, .w = w_f, .h = disp_h }, Color.rgb(0x0b0d11));
+        c.fillRect(dr, Color.rgb(0x0b0d11));
 
         // Centered monitor On-Screen Display (OSD) dialog
         const osd_w: f32 = 288.0;
         const osd_h: f32 = 122.0;
-        const osd_x = @round((w_f - osd_w) * 0.5);
-        const osd_y = @round(top_y + (disp_h - osd_h) * 0.5);
+        const osd_x = @round(dr.x + (dr.w - osd_w) * 0.5);
+        const osd_y = @round(dr.y + (dr.h - osd_h) * 0.5);
         const osd_rect: Rect = .{ .x = osd_x, .y = osd_y, .w = osd_w, .h = osd_h };
 
         c.fillRoundedRect(osd_rect, .all(12.0), Color.rgb(0x161920).withAlpha(0.96));
@@ -2659,6 +2788,7 @@ pub const BoardUi = struct {
             .board_model = BoardModel.fromModel(self.title),
             .maximized = self.maximized,
             .sheet_open = self.sheet_open,
+            .sheet_docked_above = self.sheet_docked_above,
             .board_btn_hovered = self.board_btn_hovered,
             .board_btn_pressed = self.board_btn_pressed,
             .max_btn_hovered = self.max_btn_hovered,
@@ -2685,16 +2815,18 @@ pub const BoardUi = struct {
         const title_base = @round((h_f - style.lineHeight()) * 0.5 + style.ascent());
         _ = c.drawText(22.0, title_x, title_base, self.title, t.on_surface);
 
-        // Button to the right of the window title: Board sheet toggle (.developer_board)
-        paintBarButton(
-            c,
-            t,
-            self.boardBtnRect(win_w),
-            .developer_board,
-            self.board_btn_hovered,
-            self.board_btn_pressed,
-            self.sheet_open,
-        );
+        // Button to the right of the window title: Board sheet drop-down toggle (.developer_board + arrow).
+        // Hidden when the window is large enough that the board is always visible above the display.
+        if (!self.sheet_docked_above) {
+            paintBoardToggleButton(
+                c,
+                t,
+                self.boardBtnRect(win_w),
+                self.board_btn_hovered,
+                self.board_btn_pressed,
+                self.sheet_open,
+            );
+        }
 
         // Right buttons: Maximize/Restore and Close (omitted on macOS where native traffic lights are on the left)
         if (!host_posix.is_macos) {
@@ -2726,6 +2858,41 @@ pub const BoardUi = struct {
             @memcpy(self.title_cache, c.pixels[0..total_px]);
             self.title_cache_key = key;
         }
+    }
+
+    fn paintBoardToggleButton(
+        c: *Canvas,
+        t: *const Theme,
+        r: Rect,
+        hovered: bool,
+        pressed: bool,
+        active: bool,
+    ) void {
+        const radii: Radii = .all(r.h * 0.5);
+        if (active) {
+            c.fillRoundedRect(r, radii, t.secondary_container);
+        }
+        if (hovered or pressed) {
+            c.fillRoundedRect(r, radii, t.on_surface.withAlpha(if (pressed) 0.16 else 0.08));
+        }
+        const icon_color = if (active) t.primary else t.on_surface_variant;
+        const board_icon_s: f32 = 20.0;
+        const arrow_icon_s: f32 = 18.0;
+        const arrow_icon: Icon = if (active) .expand_less else .expand_more;
+        c.drawIcon(
+            .developer_board,
+            @round(r.x + 8.0),
+            @round(r.y + (r.h - board_icon_s) * 0.5),
+            board_icon_s,
+            icon_color,
+        );
+        c.drawIcon(
+            arrow_icon,
+            @round(r.x + 28.0),
+            @round(r.y + (r.h - arrow_icon_s) * 0.5),
+            arrow_icon_s,
+            icon_color,
+        );
     }
 
     fn paintBarButton(
@@ -2760,13 +2927,33 @@ pub const BoardUi = struct {
         dh: usize,
         sc: u32,
     ) void {
+        blitHdmiToBackbufferAt(dst_full, buf_w, 0, top_phys_rows, src_hdmi, dw, dh, sc);
+    }
+
+    /// Blits the 1x `src_hdmi` (`dw * dh`) at `(left_phys_cols, top_phys_rows)` into the physical
+    /// window backbuffer `dst_full`, using SIMD `@shuffle` pixel expansion for `sc == 2, 3, 4`.
+    pub fn blitHdmiToBackbufferAt(
+        dst_full: []u32,
+        buf_w: usize,
+        left_phys_cols: usize,
+        top_phys_rows: usize,
+        src_hdmi: []const u32,
+        dw: usize,
+        dh: usize,
+        sc: u32,
+    ) void {
+        const s_check: usize = @max(sc, 1);
+        if (dw == 0 or dh == 0 or left_phys_cols + dw * s_check > buf_w) return;
+        const end_row = top_phys_rows + dh * s_check;
+        if (end_row * buf_w > dst_full.len) return;
+
         if (sc == 1) {
-            if (buf_w == dw) {
+            if (left_phys_cols == 0 and buf_w == dw) {
                 const dst = dst_full[top_phys_rows * buf_w ..][0 .. dw * dh];
                 @memcpy(dst, src_hdmi[0 .. dw * dh]);
             } else {
                 for (0..dh) |sy| {
-                    const dst_row = dst_full[(top_phys_rows + sy) * buf_w ..][0..dw];
+                    const dst_row = dst_full[(top_phys_rows + sy) * buf_w + left_phys_cols ..][0..dw];
                     @memcpy(dst_row, src_hdmi[sy * dw ..][0..dw]);
                 }
             }
@@ -2775,8 +2962,8 @@ pub const BoardUi = struct {
             for (0..dh) |sy| {
                 const src_row = src_hdmi[sy * dw ..][0..dw];
                 const dst_y0 = top_phys_rows + sy * 2;
-                const row0 = dst_full[dst_y0 * buf_w ..][0 .. dw * 2];
-                const row1 = dst_full[(dst_y0 + 1) * buf_w ..][0 .. dw * 2];
+                const row0 = dst_full[dst_y0 * buf_w + left_phys_cols ..][0 .. dw * 2];
+                const row1 = dst_full[(dst_y0 + 1) * buf_w + left_phys_cols ..][0 .. dw * 2];
                 var sx: usize = 0;
                 while (sx + 8 <= dw) : (sx += 8) {
                     const v: @Vector(8, u32) = src_row[sx..][0..8].*;
@@ -2797,9 +2984,9 @@ pub const BoardUi = struct {
             for (0..dh) |sy| {
                 const src_row = src_hdmi[sy * dw ..][0..dw];
                 const dst_y0 = top_phys_rows + sy * 3;
-                const row0 = dst_full[dst_y0 * buf_w ..][0 .. dw * 3];
-                const row1 = dst_full[(dst_y0 + 1) * buf_w ..][0 .. dw * 3];
-                const row2 = dst_full[(dst_y0 + 2) * buf_w ..][0 .. dw * 3];
+                const row0 = dst_full[dst_y0 * buf_w + left_phys_cols ..][0 .. dw * 3];
+                const row1 = dst_full[(dst_y0 + 1) * buf_w + left_phys_cols ..][0 .. dw * 3];
+                const row2 = dst_full[(dst_y0 + 2) * buf_w + left_phys_cols ..][0 .. dw * 3];
                 var sx: usize = 0;
                 while (sx + 4 <= dw) : (sx += 4) {
                     const v: @Vector(4, u32) = src_row[sx..][0..4].*;
@@ -2821,10 +3008,10 @@ pub const BoardUi = struct {
             for (0..dh) |sy| {
                 const src_row = src_hdmi[sy * dw ..][0..dw];
                 const dst_y0 = top_phys_rows + sy * 4;
-                const row0 = dst_full[dst_y0 * buf_w ..][0 .. dw * 4];
-                const row1 = dst_full[(dst_y0 + 1) * buf_w ..][0 .. dw * 4];
-                const row2 = dst_full[(dst_y0 + 2) * buf_w ..][0 .. dw * 4];
-                const row3 = dst_full[(dst_y0 + 3) * buf_w ..][0 .. dw * 4];
+                const row0 = dst_full[dst_y0 * buf_w + left_phys_cols ..][0 .. dw * 4];
+                const row1 = dst_full[(dst_y0 + 1) * buf_w + left_phys_cols ..][0 .. dw * 4];
+                const row2 = dst_full[(dst_y0 + 2) * buf_w + left_phys_cols ..][0 .. dw * 4];
+                const row3 = dst_full[(dst_y0 + 3) * buf_w + left_phys_cols ..][0 .. dw * 4];
                 var sx: usize = 0;
                 while (sx + 4 <= dw) : (sx += 4) {
                     const v: @Vector(4, u32) = src_row[sx..][0..4].*;
@@ -2848,12 +3035,12 @@ pub const BoardUi = struct {
             for (0..dh) |sy| {
                 const src_row = src_hdmi[sy * dw ..][0..dw];
                 const dst_y0 = top_phys_rows + sy * s;
-                const first_dst_row = dst_full[dst_y0 * buf_w ..][0 .. dw * s];
+                const first_dst_row = dst_full[dst_y0 * buf_w + left_phys_cols ..][0 .. dw * s];
                 for (src_row, 0..) |px, sx| {
                     @memset(first_dst_row[sx * s ..][0..s], px);
                 }
                 for (1..s) |ry| {
-                    const dup_dst_row = dst_full[(dst_y0 + ry) * buf_w ..][0 .. dw * s];
+                    const dup_dst_row = dst_full[(dst_y0 + ry) * buf_w + left_phys_cols ..][0 .. dw * s];
                     @memcpy(dup_dst_row, first_dst_row);
                 }
             }
@@ -2905,8 +3092,8 @@ pub const BoardUi = struct {
         const cache_box_y1 = @min(@round(sr.y + sr.h - 16.0), @round(self.board_rect.y + self.board_rect.h + pad_in));
 
         if (!backdrop_already_dimmed) {
-            // Dim the HDMI display behind the drop-down sheet using SWAR (skipping the opaque upper body of sheet_rect)
-            if (h_f > top_y) {
+            // Dim the HDMI display behind the drop-down sheet using SWAR when overlaying the display
+            if (!self.sheet_docked_above and h_f > top_y) {
                 const py_start: u32 = title_bar_height * sc;
                 const py_end: u32 = @min(c.height, disp_bottom_h * sc);
                 const sr_x0: u32 = @intFromFloat(@max(0.0, @ceil((sr.x + 2.0) * sc_f)));
@@ -6156,5 +6343,100 @@ test "BoardUi.paintWithBackdrop reuses dimmed HDMI backdrop bit-identically on s
     ui.paintWithBackdrop(pixels_ref, win_w, win_h, 1, status, &hw, false);
 
     try testing.expectEqualSlices(u32, pixels_ref, pixels_fast);
+}
+
+test "BoardUi centers display with border when extra space is available and docks board sheet above display when it fits" {
+    var ui = try BoardUi.init(testing.allocator);
+    defer ui.deinit();
+
+    var hw: Gpio = .{};
+    const status: SystemStatus = .{
+        .hdmi_connected = true,
+        .hdmi_active = true,
+        .hdmi_width = 800,
+        .hdmi_height = 480,
+    };
+
+    // 1. Default exact fit: 800 x (480 + 44) = 800 x 524 -> no display border, sheet not docked above
+    ui.sheet_open = false;
+    ui.updateLayout(800, 524, status, &hw);
+    try testing.expect(!ui.has_display_border);
+    try testing.expect(!ui.sheet_docked_above);
+    try testing.expectEqual(@as(f32, 0.0), ui.display_rect.x);
+    try testing.expectEqual(@as(f32, 44.0), ui.display_rect.y);
+    try testing.expectEqual(@as(f32, 800.0), ui.display_rect.w);
+    try testing.expectEqual(@as(f32, 480.0), ui.display_rect.h);
+
+    // 2. Wider & slightly taller window (1000 x 624): extra space around display -> border enabled, display centered,
+    //    but vertical space (580px) is less than sheet_h + 480 -> sheet not docked above
+    ui.updateLayout(1000, 624, status, &hw);
+    try testing.expect(ui.has_display_border);
+    try testing.expect(!ui.sheet_docked_above);
+    try testing.expect(!ui.sheet_open);
+    try testing.expectEqual(@as(f32, 100.0), ui.display_rect.x);
+    try testing.expectEqual(@as(f32, 94.0), ui.display_rect.y);
+    try testing.expectEqual(@as(f32, 800.0), ui.display_rect.w);
+    try testing.expectEqual(@as(f32, 480.0), ui.display_rect.h);
+
+    // Coordinate mapping into offset display_rect
+    const c0 = ui.windowToHdmiCoords(100.0, 94.0, 800, 480);
+    try testing.expectEqual(@as(i32, 0), c0.x);
+    try testing.expectEqual(@as(i32, 0), c0.y);
+    const c1 = ui.windowToHdmiCoords(250.0, 194.0, 800, 480);
+    try testing.expectEqual(@as(i32, 150), c1.x);
+    try testing.expectEqual(@as(i32, 100), c1.y);
+
+    // Points in the border surround outside display_rect are treated as UI
+    try testing.expect(ui.isPointInUi(50.0, 200.0, status));
+    try testing.expect(!ui.isPointInUi(200.0, 200.0, status));
+
+    // 3. Maximized / large window (1280 x 1080): enough vertical space for both the board sheet and the 800x480 display!
+    //    Board sheet automatically opens and docks above the display so both are visible, and the board button is hidden.
+    try testing.expectEqual(BoardUi.board_btn_width, ui.boardBtnRect(1000).w);
+    ui.updateLayout(1280, 1080, status, &hw);
+    try testing.expect(ui.sheet_open);
+    try testing.expect(ui.sheet_docked_above);
+    try testing.expect(ui.has_display_border);
+    try testing.expectEqual(@as(f32, 0.0), ui.boardBtnRect(1280).w);
+    try testing.expectEqual(@as(f32, 0.0), ui.boardBtnRect(1280).h);
+    try testing.expect(ui.display_rect.y >= ui.sheet_rect.y + ui.sheet_rect.h);
+    try testing.expectEqual(@as(f32, 240.0), ui.display_rect.x);
+
+    // Verify rendering when docked above: HDMI display pixels inside display_rect are NOT dimmed,
+    // and the 1px border is drawn around display_rect.
+    const win_w: u32 = 1280;
+    const win_h: u32 = 1080;
+    const pixels = try testing.allocator.alloc(u32, win_w * win_h);
+    defer testing.allocator.free(pixels);
+    @memset(pixels, 0xFF000000);
+
+    const hdmi_fb = try testing.allocator.alloc(u32, 800 * 480);
+    defer testing.allocator.free(hdmi_fb);
+    @memset(hdmi_fb, 0xFF2288EE);
+
+    const disp_x: usize = @intFromFloat(ui.display_rect.x);
+    const disp_y: usize = @intFromFloat(ui.display_rect.y);
+    BoardUi.blitHdmiToBackbufferAt(pixels, win_w, disp_x, disp_y, hdmi_fb, 800, 480, 1);
+    ui.paintWithBackdrop(pixels, win_w, win_h, 1, status, &hw, false);
+
+    // Pixel inside display_rect remains undimmed 0xFF2288EE
+    try testing.expectEqual(@as(u32, 0xFF2288EE), pixels[(disp_y + 100) * win_w + (disp_x + 100)]);
+    // 1px border just outside display_rect (at disp_x - 1, disp_y + 100) is outline_variant, not 0xFF2288EE
+    try testing.expect(pixels[(disp_y + 100) * win_w + (disp_x - 1)] != 0xFF2288EE);
+    try testing.expect(pixels[(disp_y + 100) * win_w + (disp_x - 1)] != ui.theme.surface.toArgb());
+
+    // Clicking inside display_rect while sheet is docked above passes through (.none) without closing the sheet
+    const click_x = ui.display_rect.x + 50.0;
+    const click_y = ui.display_rect.y + 50.0;
+    try testing.expect(!ui.isPointInUi(click_x, click_y, status));
+    try testing.expectEqual(Action.none, ui.pointerButton(click_x, click_y, true, status, &hw));
+    try testing.expectEqual(Action.none, ui.pointerButton(click_x, click_y, false, status, &hw));
+    try testing.expect(ui.sheet_open);
+
+    // 4. Restoring back to default window size restores previous sheet_open state and shows the board button again
+    ui.updateLayout(800, 524, status, &hw);
+    try testing.expect(!ui.sheet_docked_above);
+    try testing.expect(!ui.sheet_open);
+    try testing.expectEqual(BoardUi.board_btn_width, ui.boardBtnRect(800).w);
 }
 

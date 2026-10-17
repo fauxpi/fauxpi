@@ -91,9 +91,15 @@ pub const WaylandWindow = struct {
     /// Logical HDMI display size (e.g. 1280 x 720)
     display_width: u32,
     display_height: u32,
-    /// Logical window size (`display_width` x `display_height + 44`)
+    /// Logical window size (`display_width` x `display_height + 44` when unmaximized, or compositor-configured size when maximized)
     width: u32,
     height: u32,
+    configured_width: u32 = 0,
+    configured_height: u32 = 0,
+    pending_toplevel_width: u32 = 0,
+    pending_toplevel_height: u32 = 0,
+    pending_maximized: bool = false,
+    has_pending_toplevel_configure: bool = false,
     /// HiDPI buffer scale factor (`1` on standard displays, `2` on 2x2 scaled outputs)
     scale: u32 = 1,
     pending_scale: u32 = 1,
@@ -112,6 +118,8 @@ pub const WaylandWindow = struct {
     buf_had_sheet: [2]bool = .{ false, false },
     buf_hdmi_state: [2]u2 = .{ 0, 0 },
     buf_sheet_rect: [2]board_sheet.Rect = .{ .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 } },
+    buf_display_rect: [2]board_sheet.Rect = .{ .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 } },
+    buf_sheet_docked: [2]bool = .{ false, false },
     last_composite_damaged_hdmi: bool = true,
 
     configured: bool = false,
@@ -279,6 +287,10 @@ pub const WaylandWindow = struct {
         }
 
         win.scale = @max(win.pending_scale, 1);
+        if (win.ui.maximized and win.configured_width > 0 and win.configured_height > 0) {
+            win.width = win.configured_width;
+            win.height = win.configured_height;
+        }
         try win.initShmBuffers();
 
         return win;
@@ -518,6 +530,8 @@ pub const WaylandWindow = struct {
         self.buf_had_sheet = .{ false, false };
         self.buf_hdmi_state = .{ 0, 0 };
         self.buf_sheet_rect = .{ .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 } };
+        self.buf_display_rect = .{ .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 } };
+        self.buf_sheet_docked = .{ false, false };
         self.last_composite_damaged_hdmi = true;
         self.cursor_mode = .unknown;
         self.ui_dirty = true;
@@ -552,10 +566,14 @@ pub const WaylandWindow = struct {
     /// `BoardUi` at native HiDPI resolution (`scale`).
     pub fn compositeUi(self: *WaylandWindow) void {
         self.ui_dirty = false;
-        const desired_h = self.display_height + board_sheet.BoardUi.title_bar_height +
+        const default_w = self.display_width;
+        const default_h = self.display_height + board_sheet.BoardUi.title_bar_height +
             (if (self.status.gpio_connected) board_sheet.BoardUi.gpio_panel_height else 0);
-        if ((self.pending_scale != self.scale and self.pending_scale >= 1) or self.height != desired_h) {
+        const desired_w = if (self.ui.maximized and self.configured_width > 0) self.configured_width else default_w;
+        const desired_h = if (self.ui.maximized and self.configured_height > 0) self.configured_height else default_h;
+        if ((self.pending_scale != self.scale and self.pending_scale >= 1) or self.width != desired_w or self.height != desired_h) {
             if (self.pending_scale >= 1) self.scale = self.pending_scale;
+            self.width = desired_w;
             self.height = desired_h;
             self.initShmBuffers() catch {};
             self.ui_dirty = false;
@@ -564,18 +582,27 @@ pub const WaylandWindow = struct {
         const sc = @max(self.scale, 1);
         const full = self.backbufferPixels();
         const buf_w: usize = @as(usize, self.width) * @as(usize, sc);
-        const top_phys_rows: usize = @as(usize, board_sheet.BoardUi.title_bar_height) * @as(usize, sc);
         const dw: usize = self.display_width;
         const dh: usize = self.display_height;
         const b_idx: usize = self.cur_buf;
 
         self.ui.updateLayout(self.width, self.height, self.status, self.gpio);
+        const disp_x: u32 = @intFromFloat(@max(0.0, @floor(self.ui.display_rect.x)));
+        const disp_y: u32 = @intFromFloat(@max(0.0, @floor(self.ui.display_rect.y)));
+        const left_phys_cols: usize = @as(usize, disp_x) * @as(usize, sc);
+        const top_phys_rows: usize = @as(usize, disp_y) * @as(usize, sc);
+
         const has_overlay = self.ui.sheet_open or self.ui.hasSnackbar();
+        const has_popup = self.ui.sd_manage_open or self.ui.sd_card_menu_open or self.ui.board_menu_open;
+        const can_reuse_sheet_backdrop = self.ui.sheet_open and !self.ui.hasSnackbar() and !has_popup;
         const hdmi_state: u2 = (@as(u2, @intFromBool(self.status.hdmi_connected)) |
             (@as(u2, @intFromBool(self.status.hdmi_active)) << 1));
-        const same_sheet_backdrop = self.ui.sheet_open and !self.ui.hasSnackbar() and
+        const same_display_layout = std.meta.eql(self.buf_display_rect[b_idx], self.ui.display_rect) and
+            (self.buf_sheet_docked[b_idx] == self.ui.sheet_docked_above);
+        const same_sheet_backdrop = can_reuse_sheet_backdrop and
             self.buf_had_sheet[b_idx] and
             self.buf_hdmi_state[b_idx] == hdmi_state and
+            same_display_layout and
             std.meta.eql(self.buf_sheet_rect[b_idx], self.ui.sheet_rect);
 
         var reuse_dimmed_backdrop = false;
@@ -585,11 +612,12 @@ pub const WaylandWindow = struct {
                 self.last_composite_damaged_hdmi = false;
             } else {
                 const need_hdmi_blit = (self.buf_hdmi_gen[b_idx] != self.hdmi_gen) or
+                    !same_display_layout or
                     has_overlay or
                     self.buf_had_sheet[b_idx] or
                     (self.buf_hdmi_state[b_idx] != hdmi_state);
                 if (need_hdmi_blit) {
-                    board_sheet.BoardUi.blitHdmiToBackbuffer(full, buf_w, top_phys_rows, self.hdmi_fb, dw, dh, sc);
+                    board_sheet.BoardUi.blitHdmiToBackbufferAt(full, buf_w, left_phys_cols, top_phys_rows, self.hdmi_fb, dw, dh, sc);
                     self.buf_hdmi_gen[b_idx] = self.hdmi_gen;
                     self.last_composite_damaged_hdmi = true;
                 } else {
@@ -603,13 +631,16 @@ pub const WaylandWindow = struct {
                 self.last_composite_damaged_hdmi = false;
             } else {
                 self.last_composite_damaged_hdmi = (self.buf_hdmi_state[b_idx] != hdmi_state) or
+                    !same_display_layout or
                     has_overlay or
                     self.buf_had_sheet[b_idx];
             }
         }
         self.buf_had_sheet[b_idx] = has_overlay;
         self.buf_hdmi_state[b_idx] = hdmi_state;
-        self.buf_sheet_rect[b_idx] = if (self.ui.sheet_open and !self.ui.hasSnackbar())
+        self.buf_display_rect[b_idx] = self.ui.display_rect;
+        self.buf_sheet_docked[b_idx] = self.ui.sheet_docked_above;
+        self.buf_sheet_rect[b_idx] = if (can_reuse_sheet_backdrop)
             self.ui.sheet_rect
         else
             .{ .x = 0, .y = 0, .w = 0, .h = 0 };
@@ -793,6 +824,10 @@ pub const WaylandWindow = struct {
 
     fn toggleMaximized(self: *WaylandWindow) void {
         self.ui.maximized = !self.ui.maximized;
+        if (!self.ui.maximized) {
+            self.configured_width = 0;
+            self.configured_height = 0;
+        }
         self.ui_dirty = true;
         const op: u16 = if (self.ui.maximized)
             protocol.xdg_toplevel.request.set_maximized
@@ -845,14 +880,41 @@ pub const WaylandWindow = struct {
             const serial = r.uint() catch return;
             var m = self.xdg_surface.request(protocol.xdg_surface.request.ack_configure) catch return;
             m.uint(serial).end();
+            if (self.has_pending_toplevel_configure) {
+                self.has_pending_toplevel_configure = false;
+                self.ui.maximized = self.pending_maximized;
+                if (self.pending_maximized and self.pending_toplevel_width > 0 and self.pending_toplevel_height > 0) {
+                    self.configured_width = self.pending_toplevel_width;
+                    self.configured_height = self.pending_toplevel_height;
+                } else if (!self.pending_maximized) {
+                    self.configured_width = 0;
+                    self.configured_height = 0;
+                }
+            }
             self.configured = true;
             self.ui_dirty = true;
         }
     }
 
-    fn toplevelEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, _: *client.Reader) void {
+    fn toplevelEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
         const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
-        if (opcode == protocol.xdg_toplevel.event.close) {
+        if (opcode == protocol.xdg_toplevel.event.configure) {
+            const w = r.int() catch return;
+            const h = r.int() catch return;
+            const states = r.array() catch return;
+            var is_max = false;
+            var i: usize = 0;
+            while (i + 4 <= states.len) : (i += 4) {
+                const st = std.mem.readInt(u32, states[i..][0..4], .little);
+                if (st == protocol.xdg_toplevel.state.maximized or st == protocol.xdg_toplevel.state.fullscreen) {
+                    is_max = true;
+                }
+            }
+            self.pending_toplevel_width = if (w > 0) @intCast(w) else 0;
+            self.pending_toplevel_height = if (h > 0) @intCast(h) else 0;
+            self.pending_maximized = is_max;
+            self.has_pending_toplevel_configure = true;
+        } else if (opcode == protocol.xdg_toplevel.event.close) {
             self.closed = true;
             self.ui_dirty = true;
         }
@@ -939,15 +1001,8 @@ pub const WaylandWindow = struct {
 
     fn updateGuestMouseTarget(self: *WaylandWindow, sx: f64, sy: f64) void {
         const hid = self.hid orelse return;
-        const max_x = @max(@as(i32, @intCast(self.display_width)) - 1, 0);
-        const max_y = @max(@as(i32, @intCast(self.display_height)) - 1, 0);
-        const hdmi_x = std.math.clamp(@as(i32, @intFromFloat(@floor(sx))), 0, max_x);
-        const hdmi_y = std.math.clamp(
-            @as(i32, @intFromFloat(@floor(sy))) - @as(i32, board_sheet.BoardUi.title_bar_height),
-            0,
-            max_y,
-        );
-        hid.setMouseTarget(hdmi_x, hdmi_y);
+        const coords = self.ui.windowToHdmiCoords(sx, sy, self.display_width, self.display_height);
+        hid.setMouseTarget(coords.x, coords.y);
     }
 
     fn pointerEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
@@ -1014,7 +1069,7 @@ pub const WaylandWindow = struct {
                 if (button == protocol.input.btn_left) {
                     const prev_sheet = self.ui.sheet_open;
                     const action = self.ui.pointerButton(sx, sy, pressed, self.status, self.gpio);
-                    if (!prev_sheet and self.ui.sheet_open) {
+                    if (!prev_sheet and self.ui.sheet_open and !self.ui.sheet_docked_above) {
                         hid.releaseAllKeys();
                     }
                     const over_ui = self.ui.isPointInUi(sx, sy, self.status);
@@ -1178,7 +1233,7 @@ pub const WaylandWindow = struct {
                 self.ui.saveSettings(self.status) catch {};
                 return;
             }
-            // Escape (evdev key 1) closes any open SD popup/menu first, then the board sheet
+            // Escape (evdev key 1) closes any open SD popup/menu first, then the board sheet (when overlaying)
             if (key == 1 and pressed and !is_repeat) {
                 if (self.ui.sd_manage_open) {
                     self.ui.sd_manage_open = false;
@@ -1188,12 +1243,17 @@ pub const WaylandWindow = struct {
                     self.ui.sd_card_menu_open = false;
                     return;
                 }
-                self.ui.sheet_open = false;
-                const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
-                const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
-                self.updateCursorShape(self.ui.isPointInUi(sx, sy, self.status));
+                if (!self.ui.sheet_docked_above) {
+                    self.ui.sheet_open = false;
+                    const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
+                    const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
+                    self.updateCursorShape(self.ui.isPointInUi(sx, sy, self.status));
+                    return;
+                }
             }
-            return;
+            if (!self.ui.sheet_docked_above or self.ui.focused_field != .none or self.ui.sd_manage_open or self.ui.sd_card_menu_open) {
+                return;
+            }
         }
         if (self.hid) |hid| {
             hid.handleEvdevKey(key, pressed);
@@ -1231,7 +1291,7 @@ pub const WaylandWindow = struct {
                     const key = std.mem.readInt(u32, keys[i..][0..4], .little);
                     if (key < 256) self.keys_down.set(key);
                     self.ui.updateModifierKey(key, true);
-                    if (!self.ui.sheet_open) {
+                    if (!self.ui.sheet_open or (self.ui.sheet_docked_above and self.ui.focused_field == .none and !self.ui.sd_manage_open)) {
                         if (self.hid) |hid| {
                             hid.handleEvdevKey(key, true);
                         }
@@ -1410,5 +1470,61 @@ test "WaylandWindow keyboard repeat_info, serviceRepeat, keymap fd mmap, and lea
     var r_leave: client.Reader = .{ .data = &leave_payload, .c = &conn };
     WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.leave, &r_leave);
     try testing.expectEqual(@as(u8, 0), hid.kbd_state[2]);
+
+    // 5. Test xdg_toplevel.configure + xdg_surface.configure for maximize and unmaximize
+    var disp: client.Display = .{
+        .gpa = testing.allocator,
+        .conn = .{ .fd = -1 },
+    };
+    win.display = &disp;
+    win.xdg_surface = .{ .display = &disp, .id = 10 };
+
+    // Build xdg_toplevel.configure payload: width=1920, height=1080, states=[maximized(1), activated(4)]
+    var tl_cfg_max: [20]u8 = undefined;
+    std.mem.writeInt(i32, tl_cfg_max[0..4], 1920, .little);
+    std.mem.writeInt(i32, tl_cfg_max[4..8], 1080, .little);
+    std.mem.writeInt(u32, tl_cfg_max[8..12], 8, .little); // array byte len = 8
+    std.mem.writeInt(u32, tl_cfg_max[12..16], protocol.xdg_toplevel.state.maximized, .little);
+    std.mem.writeInt(u32, tl_cfg_max[16..20], protocol.xdg_toplevel.state.activated, .little);
+    var r_tl_max: client.Reader = .{ .data = &tl_cfg_max, .c = &conn };
+    WaylandWindow.toplevelEvent(&win, &disp, 11, protocol.xdg_toplevel.event.configure, &r_tl_max);
+    try testing.expect(win.has_pending_toplevel_configure);
+    try testing.expect(win.pending_maximized);
+    try testing.expectEqual(@as(u32, 1920), win.pending_toplevel_width);
+    try testing.expectEqual(@as(u32, 1080), win.pending_toplevel_height);
+
+    var surf_cfg: [4]u8 = undefined;
+    std.mem.writeInt(u32, surf_cfg[0..4], 42, .little);
+    var r_surf: client.Reader = .{ .data = &surf_cfg, .c = &conn };
+    WaylandWindow.xdgSurfaceEvent(&win, &disp, 10, protocol.xdg_surface.event.configure, &r_surf);
+    try testing.expect(win.configured);
+    try testing.expect(win.ui.maximized);
+    try testing.expectEqual(@as(u32, 1920), win.configured_width);
+    try testing.expectEqual(@as(u32, 1080), win.configured_height);
+
+    // When sheet_docked_above is true (both sheet and display visible) and no text field is focused,
+    // typing forwards keys to guest USB HID
+    win.ui.sheet_open = true;
+    win.ui.sheet_docked_above = true;
+    win.ui.sd_manage_open = false;
+    win.ui.focused_field = .none;
+    win.dispatchKey(30, true, false); // KEY_A -> USB HID 0x04
+    try testing.expectEqual(@as(u8, 0x04), hid.kbd_state[2]);
+    win.dispatchKey(30, false, false);
+    try testing.expectEqual(@as(u8, 0), hid.kbd_state[2]);
+
+    // Unmaximize via xdg_toplevel.configure(0, 0, [activated])
+    var tl_cfg_unmax: [16]u8 = undefined;
+    std.mem.writeInt(i32, tl_cfg_unmax[0..4], 0, .little);
+    std.mem.writeInt(i32, tl_cfg_unmax[4..8], 0, .little);
+    std.mem.writeInt(u32, tl_cfg_unmax[8..12], 4, .little);
+    std.mem.writeInt(u32, tl_cfg_unmax[12..16], protocol.xdg_toplevel.state.activated, .little);
+    var r_tl_unmax: client.Reader = .{ .data = &tl_cfg_unmax, .c = &conn };
+    WaylandWindow.toplevelEvent(&win, &disp, 11, protocol.xdg_toplevel.event.configure, &r_tl_unmax);
+    r_surf = .{ .data = &surf_cfg, .c = &conn };
+    WaylandWindow.xdgSurfaceEvent(&win, &disp, 10, protocol.xdg_surface.event.configure, &r_surf);
+    try testing.expect(!win.ui.maximized);
+    try testing.expectEqual(@as(u32, 0), win.configured_width);
+    try testing.expectEqual(@as(u32, 0), win.configured_height);
 }
 
