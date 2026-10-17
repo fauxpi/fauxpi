@@ -88,18 +88,14 @@ const State = struct {
     uniforms_read: usize = 0,
     varyings_read: usize = 0,
     vpm_words_read: usize = 0,
-    tmu: [2]Tmu = .{ .{}, .{} },
-
-    const Tmu = struct {
-        params: [4]u32 = undefined,
-        param_count: usize = 0,
-        coord_t: Vec = undefined,
-        has_coord_t: bool = false,
-        fifo: [4]Vec = undefined,
-        fifo_head: u2 = 0,
-        fifo_len: u3 = 0,
-        cached: TexCache = .{},
-    };
+    tmu_param_count: [2]u8 = .{ 0, 0 },
+    tmu_has_coord_t: [2]bool = .{ false, false },
+    tmu_fifo_head: [2]u2 = .{ 0, 0 },
+    tmu_fifo_len: [2]u3 = .{ 0, 0 },
+    tmu_params: [2][4]u32 = undefined,
+    tmu_coord_t: [2]Vec = undefined,
+    tmu_fifo: [2][4]Vec = undefined,
+    tmu_cached: [2]TexCache = .{ .{}, .{} },
 };
 
 fn f(v: u32) f32 {
@@ -318,6 +314,7 @@ pub const DecodedInst = struct {
     pub const FLAG_FLT_ADD: u8 = 1 << 4;
     pub const FLAG_FLT_MUL: u8 = 1 << 5;
     pub const FLAG_HAS_UNPACK: u8 = 1 << 6;
+    pub const FLAG_FUSED_LINTERP: u8 = 1 << 7;
 };
 
 pub fn decodeInst(inst: qpu.Inst) DecodedInst {
@@ -400,7 +397,563 @@ pub fn decodeProgram(code: []const qpu.Inst, out_buf: []DecodedInst) []const Dec
     for (0..len) |i| {
         out_buf[i] = decodeInst(code[i]);
     }
+    // Fuse canonical varying linear interpolation pairs:
+    //   inst[i]:     fmul r_acc, vary, ra15 (frag_w)
+    //   inst[i + 1]: fadd dst, r_acc, r5
+    var end_limit: usize = len;
+    var i: usize = 0;
+    while (i + 1 < end_limit) : (i += 1) {
+        const d0 = out_buf[i];
+        if (d0.sig == .prog_end or d0.sig == .color_load_end) {
+            end_limit = @min(len, i + 3);
+        }
+        if (i + 1 >= end_limit) break;
+        const d1 = out_buf[i + 1];
+        if (d0.sig == .none and d1.sig == .none and
+            d0.add_op == .nop and d0.waddr_add == qpu.W.nop and
+            d0.mul_op == .fmul and d0.cond_mul == .always and
+            d0.mul_pack_a == 0 and d0.mul_pack_m == 0 and
+            (d0.flags & (DecodedInst.FLAG_HAS_UNPACK | DecodedInst.FLAG_SF)) == 0 and
+            d0.waddr_mul >= qpu.W.acc0 and d0.waddr_mul <= qpu.W.acc0 + 3 and
+            ((d0.mux2 == .a and d0.mux3 == .b) or (d0.mux2 == .b and d0.mux3 == .a)) and
+            d0.raddr_a == qpu.R.frag_payload_zw and d0.raddr_b == qpu.R.vary and
+            d1.mul_op == .nop and d1.waddr_mul == qpu.W.nop and
+            d1.add_op == .fadd and d1.cond_add == .always and d1.add_pack_a == 0 and
+            (d1.flags & (DecodedInst.FLAG_HAS_UNPACK | DecodedInst.FLAG_SF)) == 0)
+        {
+            const acc_mux: qpu.Mux = @enumFromInt(d0.waddr_mul - qpu.W.acc0);
+            if ((d1.mux0 == acc_mux and d1.mux1 == .r5) or (d1.mux0 == .r5 and d1.mux1 == acc_mux)) {
+                out_buf[i].flags |= DecodedInst.FLAG_FUSED_LINTERP;
+                out_buf[i].waddr_add = d1.waddr_add;
+                out_buf[i].add_file = d1.add_file;
+                i += 1;
+            }
+        }
+    }
     return out_buf[0..len];
+}
+
+pub const FastFragKind = enum(u8) {
+    none,
+    constant_color,
+    varying_pack_rgba,
+    tmu0_blit,
+};
+
+pub const FastFragShader = struct {
+    kind: FastFragKind = .none,
+    color: u32 = 0,
+    var_idx: [4]u8 = .{ 0xff, 0xff, 0xff, 0xff },
+    tmu_p0_unif: u8 = 0,
+    tmu_p1_unif: u8 = 1,
+    tmu_modulate: bool = false,
+};
+
+const Tmu0SampleInfo = struct {
+    s_var: u8,
+    t_var: u8,
+    p0_unif: u8,
+    p1_unif: u8,
+};
+
+const PackedRgbaInfo = struct {
+    var_idx: [4]u8,
+    const_rgba: u32,
+};
+
+const SymVal = union(enum) {
+    unknown,
+    constant: u32,
+    varying: u8,
+    packed_rgba: PackedRgbaInfo,
+    tmu0_texel: Tmu0SampleInfo,
+    tmu0_modulated: struct {
+        s_var: u8,
+        t_var: u8,
+        p0_unif: u8,
+        p1_unif: u8,
+        color: u32,
+    },
+};
+
+pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: []const u32) FastFragShader {
+    if (decoded.len == 0) return .{};
+
+    var reads_vary = false;
+    var reads_other_per_pixel = false;
+    var uses_tmu0 = false;
+    var can_use_sym = true;
+
+    var ra_sym: [32]SymVal = @splat(.{ .constant = 0 });
+    var rb_sym: [32]SymVal = @splat(.{ .constant = 0 });
+    var acc_sym: [8]SymVal = @splat(.{ .constant = 0 });
+    var sym_unifs_read: usize = 0;
+    var sym_varyings_read: u8 = 0;
+
+    var tmu0_has_t = false;
+    var tmu0_t_var: u8 = 0xff;
+    var tmu0_p0_unif: u8 = 0;
+    var tmu0_pending: ?Tmu0SampleInfo = null;
+    var tmu0_loads: usize = 0;
+
+    var tlb_sym: SymVal = .unknown;
+    var tlb_writes: usize = 0;
+    var end_at: ?usize = null;
+
+    const writeSym = struct {
+        fn apply(
+            waddr: u6,
+            file: File,
+            val: SymVal,
+            cond: qpu.Cond,
+            a_pack: u4,
+            mul_pack: u4,
+            ra: *[32]SymVal,
+            rb: *[32]SymVal,
+            acc: *[8]SymVal,
+            unifs_read: *usize,
+            has_t: *bool,
+            t_var: *u8,
+            p0_unif: *u8,
+            pending: *?Tmu0SampleInfo,
+            tlb_out: *SymVal,
+            tlb_cnt: *usize,
+            sym_ok: *bool,
+        ) void {
+            if (waddr == qpu.W.nop or cond == .never) return;
+            if (cond != .always) {
+                sym_ok.* = false;
+                return;
+            }
+            const dst_ptr: ?*SymVal = switch (waddr) {
+                0...31 => if (file == .a) &ra[waddr] else &rb[waddr],
+                qpu.W.acc0...qpu.W.acc0 + 3 => &acc[waddr - qpu.W.acc0],
+                qpu.W.acc5 => &acc[5],
+                else => null,
+            };
+            if (dst_ptr) |dst| {
+                if (a_pack == 0 and mul_pack == 0) {
+                    dst.* = val;
+                    return;
+                }
+                if (a_pack == 0 and mul_pack >= 4 and mul_pack <= 7) {
+                    const byte_lane: u2 = @intCast(mul_pack - 4);
+                    const shift: u5 = @as(u5, byte_lane) * 8;
+                    var cur_pack: PackedRgbaInfo = switch (dst.*) {
+                        .constant => |c| .{ .var_idx = [4]u8{ 0xff, 0xff, 0xff, 0xff }, .const_rgba = c },
+                        .packed_rgba => |p| p,
+                        else => {
+                            dst.* = .unknown;
+                            return;
+                        },
+                    };
+                    switch (val) {
+                        .varying => |vi| {
+                            cur_pack.var_idx[byte_lane] = vi;
+                            cur_pack.const_rgba &= ~(@as(u32, 0xff) << shift);
+                            dst.* = .{ .packed_rgba = cur_pack };
+                        },
+                        .constant => |c| {
+                            const b_val: u32 = unorm8(@bitCast(c));
+                            cur_pack.var_idx[byte_lane] = 0xff;
+                            cur_pack.const_rgba = (cur_pack.const_rgba & ~(@as(u32, 0xff) << shift)) | (b_val << shift);
+                            if (cur_pack.var_idx[0] == 0xff and cur_pack.var_idx[1] == 0xff and
+                                cur_pack.var_idx[2] == 0xff and cur_pack.var_idx[3] == 0xff)
+                            {
+                                dst.* = .{ .constant = cur_pack.const_rgba };
+                            } else {
+                                dst.* = .{ .packed_rgba = cur_pack };
+                            }
+                        },
+                        else => dst.* = .unknown,
+                    }
+                    return;
+                }
+                if (mul_pack == 0 and ((a_pack >= 4 and a_pack <= 7) or (a_pack >= 12 and a_pack <= 15))) {
+                    const byte_lane: u2 = @intCast((a_pack & 7) - 4);
+                    const shift: u5 = @as(u5, byte_lane) * 8;
+                    if (val == .constant) {
+                        const b_val: u32 = val.constant & 0xff;
+                        var cur_pack: PackedRgbaInfo = switch (dst.*) {
+                            .constant => |c| .{ .var_idx = [4]u8{ 0xff, 0xff, 0xff, 0xff }, .const_rgba = c },
+                            .packed_rgba => |p| p,
+                            else => {
+                                dst.* = .unknown;
+                                return;
+                            },
+                        };
+                        cur_pack.var_idx[byte_lane] = 0xff;
+                        cur_pack.const_rgba = (cur_pack.const_rgba & ~(@as(u32, 0xff) << shift)) | (b_val << shift);
+                        if (cur_pack.var_idx[0] == 0xff and cur_pack.var_idx[1] == 0xff and
+                            cur_pack.var_idx[2] == 0xff and cur_pack.var_idx[3] == 0xff)
+                        {
+                            dst.* = .{ .constant = cur_pack.const_rgba };
+                        } else {
+                            dst.* = .{ .packed_rgba = cur_pack };
+                        }
+                        return;
+                    }
+                }
+                dst.* = .unknown;
+                return;
+            }
+
+            switch (waddr) {
+                qpu.W.tlb_color_all => {
+                    tlb_out.* = val;
+                    tlb_cnt.* += 1;
+                },
+                qpu.W.tmu0_t => {
+                    if (unifs_read.* < 255) {
+                        p0_unif.* = @intCast(unifs_read.*);
+                        unifs_read.* += 1;
+                        if (val == .varying) {
+                            t_var.* = val.varying;
+                            has_t.* = true;
+                        } else {
+                            sym_ok.* = false;
+                        }
+                    } else {
+                        sym_ok.* = false;
+                    }
+                },
+                qpu.W.tmu0_s => {
+                    if (unifs_read.* < 255 and has_t.* and val == .varying and pending.* == null) {
+                        const p1_u: u8 = @intCast(unifs_read.*);
+                        unifs_read.* += 1;
+                        pending.* = .{
+                            .s_var = val.varying,
+                            .t_var = t_var.*,
+                            .p0_unif = p0_unif.*,
+                            .p1_unif = p1_u,
+                        };
+                        has_t.* = false;
+                    } else {
+                        sym_ok.* = false;
+                    }
+                },
+                else => {
+                    sym_ok.* = false;
+                },
+            }
+        }
+    }.apply;
+
+    var ip: usize = 0;
+    while (ip < decoded.len) : (ip += 1) {
+        if (end_at) |e| if (ip > e) break;
+        const d = decoded[ip];
+
+        switch (d.sig) {
+            .branch, .color_load, .color_load_end, .load_tmu1, .coverage_load, .alpha_mask_load => return .{},
+            .load_tmu0 => uses_tmu0 = true,
+            else => {},
+        }
+        if (d.waddr_add == qpu.W.tlb_z or d.waddr_mul == qpu.W.tlb_z or
+            d.waddr_add == qpu.W.tlb_color_ms or d.waddr_mul == qpu.W.tlb_color_ms or
+            d.waddr_add == qpu.W.tlb_stencil_setup or d.waddr_mul == qpu.W.tlb_stencil_setup or
+            d.waddr_add == qpu.W.tlb_alpha_mask or d.waddr_mul == qpu.W.tlb_alpha_mask or
+            d.waddr_add >= qpu.W.tmu1_s or d.waddr_mul >= qpu.W.tmu1_s)
+        {
+            return .{};
+        }
+        if (d.waddr_add >= qpu.W.tmu0_s or d.waddr_mul >= qpu.W.tmu0_s) {
+            uses_tmu0 = true;
+        }
+        if ((d.flags & DecodedInst.FLAG_SF) != 0) {
+            can_use_sym = false;
+        }
+
+        if ((d.flags & DecodedInst.FLAG_FUSED_LINTERP) != 0) {
+            reads_vary = true;
+            const v_idx = sym_varyings_read;
+            sym_varyings_read +|= 1;
+            acc_sym[5] = .{ .constant = @bitCast(varying_c) };
+            acc_sym[d.waddr_mul - qpu.W.acc0] = .unknown;
+            writeSym(
+                d.waddr_add,
+                d.add_file,
+                .{ .varying = v_idx },
+                .always,
+                0,
+                0,
+                &ra_sym,
+                &rb_sym,
+                &acc_sym,
+                &sym_unifs_read,
+                &tmu0_has_t,
+                &tmu0_t_var,
+                &tmu0_p0_unif,
+                &tmu0_pending,
+                &tlb_sym,
+                &tlb_writes,
+                &can_use_sym,
+            );
+            ip += 1;
+            continue;
+        }
+
+        if ((d.flags & DecodedInst.FLAG_READS_VARY) != 0) {
+            reads_vary = true;
+            can_use_sym = false;
+        }
+        if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0) {
+            switch (d.raddr_a) {
+                qpu.R.frag_payload_zw, qpu.R.xy_pixel_coord, qpu.R.elem_qpu, qpu.R.ms_rev_flags, qpu.R.vpm => {
+                    reads_other_per_pixel = true;
+                    can_use_sym = false;
+                },
+                else => {},
+            }
+        }
+        if ((d.flags & DecodedInst.FLAG_FETCH_B) != 0) {
+            switch (d.raddr_b) {
+                qpu.R.frag_payload_zw, qpu.R.xy_pixel_coord, qpu.R.elem_qpu, qpu.R.ms_rev_flags, qpu.R.vpm => {
+                    reads_other_per_pixel = true;
+                    can_use_sym = false;
+                },
+                else => {},
+            }
+        }
+
+        if (can_use_sym) {
+            var add_sym: SymVal = .{ .constant = 0 };
+            var mul_sym: SymVal = .{ .constant = 0 };
+
+            if (d.sig == .load_imm) {
+                add_sym = .{ .constant = d.imm_or_small };
+                mul_sym = add_sym;
+            } else {
+                if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0) {
+                    acc_sym[6] = if (d.raddr_a < 32)
+                        ra_sym[d.raddr_a]
+                    else if (d.raddr_a == qpu.R.unif) blk: {
+                        const c = if (sym_unifs_read < uniforms.len) uniforms[sym_unifs_read] else 0;
+                        sym_unifs_read += 1;
+                        break :blk .{ .constant = c };
+                    } else .unknown;
+                }
+                if (d.sig == .small_imm) {
+                    acc_sym[7] = .{ .constant = d.imm_or_small };
+                } else if ((d.flags & DecodedInst.FLAG_FETCH_B) != 0) {
+                    acc_sym[7] = if (d.raddr_b < 32)
+                        rb_sym[d.raddr_b]
+                    else if (d.raddr_b == qpu.R.unif) blk: {
+                        const c = if (sym_unifs_read < uniforms.len) uniforms[sym_unifs_read] else 0;
+                        sym_unifs_read += 1;
+                        break :blk .{ .constant = c };
+                    } else .unknown;
+                }
+
+                if ((d.flags & DecodedInst.FLAG_HAS_UNPACK) != 0) {
+                    if (d.add_op != .nop) add_sym = .unknown;
+                    if (d.mul_op != .nop) mul_sym = .unknown;
+                } else {
+                    if (d.add_op != .nop) {
+                        const in0 = acc_sym[@intFromEnum(d.mux0)];
+                        const in1 = acc_sym[@intFromEnum(d.mux1)];
+                        if (d.add_op == .@"or" and d.mux0 == d.mux1) {
+                            add_sym = in0;
+                        } else if (in0 == .constant and in1 == .constant) {
+                            add_sym = .{ .constant = addOpVec(d.add_op, splat(in0.constant), splat(in1.constant))[0] };
+                        } else {
+                            add_sym = .unknown;
+                        }
+                    }
+                    if (d.mul_op != .nop) {
+                        const in2 = acc_sym[@intFromEnum(d.mux2)];
+                        const in3 = acc_sym[@intFromEnum(d.mux3)];
+                        if (in2 == .constant and in3 == .constant) {
+                            mul_sym = .{ .constant = mulOpVec(d.mul_op, splat(in2.constant), splat(in3.constant))[0] };
+                        } else if (d.mul_op == .fmul) {
+                            if (in2 == .varying and in3 == .constant and in3.constant == 0x3f800000) {
+                                mul_sym = in2;
+                            } else if (in3 == .varying and in2 == .constant and in2.constant == 0x3f800000) {
+                                mul_sym = in3;
+                            } else {
+                                mul_sym = .unknown;
+                            }
+                        } else if (d.mul_op == .v8muld) {
+                            if (in2 == .tmu0_texel and in3 == .constant) {
+                                mul_sym = .{ .tmu0_modulated = .{
+                                    .s_var = in2.tmu0_texel.s_var,
+                                    .t_var = in2.tmu0_texel.t_var,
+                                    .p0_unif = in2.tmu0_texel.p0_unif,
+                                    .p1_unif = in2.tmu0_texel.p1_unif,
+                                    .color = in3.constant,
+                                } };
+                            } else if (in3 == .tmu0_texel and in2 == .constant) {
+                                mul_sym = .{ .tmu0_modulated = .{
+                                    .s_var = in3.tmu0_texel.s_var,
+                                    .t_var = in3.tmu0_texel.t_var,
+                                    .p0_unif = in3.tmu0_texel.p0_unif,
+                                    .p1_unif = in3.tmu0_texel.p1_unif,
+                                    .color = in2.constant,
+                                } };
+                            } else if (in2 == .tmu0_texel and d.mux2 == d.mux3) {
+                                mul_sym = .unknown;
+                            } else {
+                                mul_sym = .unknown;
+                            }
+                        } else {
+                            mul_sym = .unknown;
+                        }
+                    }
+                }
+            }
+
+            writeSym(
+                d.waddr_add,
+                d.add_file,
+                add_sym,
+                d.cond_add,
+                d.add_pack_a,
+                0,
+                &ra_sym,
+                &rb_sym,
+                &acc_sym,
+                &sym_unifs_read,
+                &tmu0_has_t,
+                &tmu0_t_var,
+                &tmu0_p0_unif,
+                &tmu0_pending,
+                &tlb_sym,
+                &tlb_writes,
+                &can_use_sym,
+            );
+            writeSym(
+                d.waddr_mul,
+                d.mul_file,
+                mul_sym,
+                d.cond_mul,
+                d.mul_pack_a,
+                d.mul_pack_m,
+                &ra_sym,
+                &rb_sym,
+                &acc_sym,
+                &sym_unifs_read,
+                &tmu0_has_t,
+                &tmu0_t_var,
+                &tmu0_p0_unif,
+                &tmu0_pending,
+                &tlb_sym,
+                &tlb_writes,
+                &can_use_sym,
+            );
+        }
+
+        switch (d.sig) {
+            .load_tmu0 => {
+                if (can_use_sym and tmu0_pending != null and tmu0_loads == 0) {
+                    const p = tmu0_pending.?;
+                    acc_sym[4] = .{ .tmu0_texel = .{
+                        .s_var = p.s_var,
+                        .t_var = p.t_var,
+                        .p0_unif = p.p0_unif,
+                        .p1_unif = p.p1_unif,
+                    } };
+                    tmu0_pending = null;
+                    tmu0_loads = 1;
+                } else {
+                    can_use_sym = false;
+                }
+            },
+            .prog_end => end_at = ip + 2,
+            else => {},
+        }
+    }
+
+    if (end_at == null) return .{};
+
+    if (!reads_vary and !reads_other_per_pixel and !uses_tmu0) {
+        const env: Env = .{ .uniforms = uniforms };
+        if (runFragmentDecoded(decoded, &env)) |res| {
+            if (res.tlb_color) |c| {
+                if (res.tlb_z == null) {
+                    return .{ .kind = .constant_color, .color = c[0] };
+                }
+            }
+        } else |_| {}
+    }
+
+    if (can_use_sym and tlb_writes == 1 and !reads_other_per_pixel) {
+        switch (tlb_sym) {
+            .constant => |c| return .{ .kind = .constant_color, .color = c },
+            .packed_rgba => |p| {
+                if (!uses_tmu0) {
+                    return .{
+                        .kind = .varying_pack_rgba,
+                        .color = p.const_rgba,
+                        .var_idx = p.var_idx,
+                    };
+                }
+            },
+            .tmu0_texel => |t| {
+                if (tmu0_loads == 1 and tmu0_pending == null) {
+                    return .{
+                        .kind = .tmu0_blit,
+                        .color = 0xffff_ffff,
+                        .var_idx = .{ t.s_var, t.t_var, 0xff, 0xff },
+                        .tmu_p0_unif = t.p0_unif,
+                        .tmu_p1_unif = t.p1_unif,
+                        .tmu_modulate = false,
+                    };
+                }
+            },
+            .tmu0_modulated => |t| {
+                if (tmu0_loads == 1 and tmu0_pending == null) {
+                    return .{
+                        .kind = .tmu0_blit,
+                        .color = t.color,
+                        .var_idx = .{ t.s_var, t.t_var, 0xff, 0xff },
+                        .tmu_p0_unif = t.p0_unif,
+                        .tmu_p1_unif = t.p1_unif,
+                        .tmu_modulate = true,
+                    };
+                }
+            },
+            else => {},
+        }
+    }
+
+    return .{};
+}
+
+pub inline fn runFragmentFast(
+    fast: FastFragShader,
+    decoded: []const DecodedInst,
+    env: *const Env,
+) Error!FragResult {
+    switch (fast.kind) {
+        .none => return runFragmentDecoded(decoded, env),
+        .constant_color => return .{ .tlb_color = splat(fast.color) },
+        .varying_pack_rgba => {
+            var out: VecU = @splat(fast.color);
+            inline for (0..4) |b_i| {
+                const vi = fast.var_idx[b_i];
+                if (vi != 0xff) {
+                    const shift: u5 = @intCast(b_i * 8);
+                    const v_vec: VecU = if (vi < env.varyings.len) env.varyings[vi] else @splat(0);
+                    out |= unorm8Vec(v_vec) << @as(@Vector(lanes, u5), @splat(shift));
+                }
+            }
+            return .{ .tlb_color = out };
+        },
+        .tmu0_blit => {
+            const p0 = if (fast.tmu_p0_unif < env.uniforms.len) env.uniforms[fast.tmu_p0_unif] else 0;
+            const p1 = if (fast.tmu_p1_unif < env.uniforms.len) env.uniforms[fast.tmu_p1_unif] else 0;
+            const s_var = fast.var_idx[0];
+            const t_var = fast.var_idx[1];
+            const s_vec: Vec = if (s_var < env.varyings.len) env.varyings[s_var] else splat(0);
+            const t_vec: Vec = if (t_var < env.varyings.len) env.varyings[t_var] else splat(0);
+            var local_cache: TexCache = .{};
+            const texel = sampleTmuVec(0, p0, p1, s_vec, t_vec, env, &local_cache);
+            if (fast.tmu_modulate) {
+                return .{ .tlb_color = v8muldVec(texel, @splat(fast.color)) };
+            }
+            return .{ .tlb_color = texel };
+        },
+    }
 }
 
 inline fn resolveMuxSlow(
@@ -450,6 +1003,36 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
         const d = decoded[ip];
         if (@hasField(RType, "instructions")) r.instructions += 1;
         if (d.sig == .branch) continue;
+
+        if ((d.flags & DecodedInst.FLAG_FUSED_LINTERP) != 0) {
+            const val: Vec = if (s.varyings_read < env.varyings.len) blk: {
+                defer s.varyings_read += 1;
+                break :blk env.varyings[s.varyings_read];
+            } else splat(0);
+            s.acc[5] = splatF(varying_c);
+            if (d.waddr_add != d.waddr_mul) {
+                s.acc[d.waddr_mul - qpu.W.acc0] = @bitCast(@as(VecF, @bitCast(val)) - @as(VecF, @splat(varying_c)));
+            }
+            if (d.waddr_add != qpu.W.nop) {
+                if (d.waddr_add < 32) {
+                    const bit = @as(u32, 1) << @intCast(d.waddr_add);
+                    if (d.add_file == .a) {
+                        s.ra_init |= bit;
+                        s.ra[d.waddr_add] = val;
+                    } else {
+                        s.rb_init |= bit;
+                        s.rb[d.waddr_add] = val;
+                    }
+                } else if (d.waddr_add >= qpu.W.acc0 and d.waddr_add <= qpu.W.acc0 + 3) {
+                    s.acc[d.waddr_add - qpu.W.acc0] = val;
+                } else {
+                    try write(RType, &s, r, env, d.waddr_add, d.add_file, val, .always, 0, 0);
+                }
+            }
+            if (@hasField(RType, "instructions")) r.instructions += 1;
+            ip += 1;
+            continue;
+        }
 
         var add_result: Vec = undefined;
         var mul_result: Vec = undefined;
@@ -549,11 +1132,11 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
 
         switch (d.sig) {
             .load_tmu0, .load_tmu1 => {
-                const t = &s.tmu[if (d.sig == .load_tmu0) 0 else 1];
-                if (t.fifo_len > 0) {
-                    s.acc[4] = t.fifo[t.fifo_head];
-                    t.fifo_head +%= 1;
-                    t.fifo_len -= 1;
+                const unit: usize = if (d.sig == .load_tmu0) 0 else 1;
+                if (s.tmu_fifo_len[unit] > 0) {
+                    s.acc[4] = s.tmu_fifo[unit][s.tmu_fifo_head[unit]];
+                    s.tmu_fifo_head[unit] +%= 1;
+                    s.tmu_fifo_len[unit] -= 1;
                 } else {
                     s.acc[4] = splat(0xff000000);
                 }
@@ -612,6 +1195,84 @@ fn readPort(s: *State, env: *const Env, raddr: u6, file: File) Error!Vec {
         qpu.R.vpm_ld_busy, qpu.R.vpm_ld_wait, qpu.R.mutex_acquire => return splat(0),
         else => return splat(0),
     }
+}
+
+fn sampleTmuVec(
+    unit: usize,
+    p0_in: u32,
+    p1: u32,
+    s_vec: Vec,
+    t_vec: ?Vec,
+    env: *const Env,
+    fallback_cache: *TexCache,
+) Vec {
+    var memory = if (unit == 0) env.texture_memory else if (env.texture_memory1.len > 0) env.texture_memory1 else env.texture_memory;
+    var p0 = p0_in;
+    if (env.textures.len > 0) {
+        const i = p0 / texture_base;
+        if (i < env.textures.len) {
+            memory = env.textures[i];
+            p0 -= i * texture_base;
+        }
+    }
+    const cache_slot: *TexCache = if (env.tex_cache) |tc| &tc[unit] else fallback_cache;
+    if (cache_slot.p0 != p0 or cache_slot.p1 != p1) {
+        cache_slot.p0 = p0;
+        cache_slot.p1 = p1;
+        if (PrecomputedTex.init(texture.decodeConfig(p0, p1))) |inited| {
+            cache_slot.pt = inited;
+            cache_slot.valid = true;
+        } else |_| {
+            cache_slot.valid = false;
+        }
+    }
+    if (!cache_slot.valid) return splat(0xff000000);
+    const pt = &cache_slot.pt;
+    var texel: Vec = undefined;
+    if (pt.cfg.mag_filter == .nearest) {
+        const p = pt.cfg;
+        var prev_wx: u32 = 0xffff_ffff;
+        var prev_wy: u32 = 0xffff_ffff;
+        var prev_out: u32 = 0;
+        const zero_wy: u32 = if (t_vec == null) (if (0.0 < pt.fh) 0 else wrap(0.0, p.height, p.wrap_t)) else 0;
+        for (0..lanes) |lane| {
+            const s_coord = f(s_vec[lane]);
+            const fx = @floor(s_coord * pt.fw);
+            const wx: u32 = if (fx >= 0.0 and fx < pt.fw) @intFromFloat(fx) else wrap(fx, p.width, p.wrap_s);
+            const wy: u32 = if (t_vec) |tv| blk: {
+                const t_coord = f(tv[lane]);
+                const fy = @floor(t_coord * pt.fh);
+                break :blk if (fy >= 0.0 and fy < pt.fh) @intFromFloat(fy) else wrap(fy, p.height, p.wrap_t);
+            } else zero_wy;
+            if (wx == prev_wx and wy == prev_wy) {
+                texel[lane] = prev_out;
+                continue;
+            }
+            const sampled = pt.fetchAt(memory, wx, wy) catch 0xff000000;
+            texel[lane] = sampled;
+            prev_wx = wx;
+            prev_wy = wy;
+            prev_out = sampled;
+        }
+    } else {
+        var prev_sc: u32 = 0;
+        var prev_tc: u32 = 0;
+        var prev_out: u32 = 0;
+        for (0..lanes) |lane| {
+            const sc = s_vec[lane];
+            const tc = if (t_vec) |tv| tv[lane] else 0;
+            if (lane > 0 and sc == prev_sc and tc == prev_tc) {
+                texel[lane] = prev_out;
+                continue;
+            }
+            const sampled = pt.sample(memory, f(sc), f(tc)) catch 0xff000000;
+            texel[lane] = sampled;
+            prev_sc = sc;
+            prev_tc = tc;
+            prev_out = sampled;
+        }
+    }
+    return texel;
 }
 
 fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6, file: File, value: Vec, cond: qpu.Cond, a_pack: u4, mul_pack: u4) Error!void {
@@ -690,102 +1351,36 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
         },
         qpu.W.tmu0_s, qpu.W.tmu0_t, qpu.W.tmu0_r, qpu.W.tmu0_b, qpu.W.tmu1_s, qpu.W.tmu1_t, qpu.W.tmu1_r, qpu.W.tmu1_b => {
             const unit: usize = if (waddr <= qpu.W.tmu0_b) 0 else 1;
-            const t = &s.tmu[unit];
-            if (s.uniforms_read < env.uniforms.len and t.param_count < t.params.len) {
-                t.params[t.param_count] = env.uniforms[s.uniforms_read];
-                t.param_count += 1;
+            const p_cnt = s.tmu_param_count[unit];
+            if (s.uniforms_read < env.uniforms.len and p_cnt < 4) {
+                s.tmu_params[unit][p_cnt] = env.uniforms[s.uniforms_read];
+                s.tmu_param_count[unit] = p_cnt + 1;
                 s.uniforms_read += 1;
             }
             if (waddr == qpu.W.tmu0_t or waddr == qpu.W.tmu1_t) {
-                t.coord_t = value;
-                t.has_coord_t = true;
+                s.tmu_coord_t[unit] = value;
+                s.tmu_has_coord_t[unit] = true;
                 return;
             }
             if (waddr != qpu.W.tmu0_s and waddr != qpu.W.tmu1_s) return;
-            if (t.param_count < 2 or t.fifo_len == t.fifo.len) {
-                t.param_count = 0;
+            if (s.tmu_param_count[unit] < 2 or s.tmu_fifo_len[unit] == 4) {
+                s.tmu_param_count[unit] = 0;
                 return;
             }
-            var memory = if (unit == 0) env.texture_memory else if (env.texture_memory1.len > 0) env.texture_memory1 else env.texture_memory;
-            var p0 = t.params[0];
-            if (env.textures.len > 0) {
-                const i = p0 / texture_base;
-                if (i < env.textures.len) {
-                    memory = env.textures[i];
-                    p0 -= i * texture_base;
-                }
-            }
-            const write_idx: u2 = t.fifo_head +% @as(u2, @truncate(t.fifo_len));
-            const p1 = t.params[1];
-            const cache_slot: *TexCache = if (env.tex_cache) |tc| &tc[unit] else &t.cached;
-            if (cache_slot.p0 != p0 or cache_slot.p1 != p1) {
-                cache_slot.p0 = p0;
-                cache_slot.p1 = p1;
-                if (PrecomputedTex.init(texture.decodeConfig(p0, p1))) |inited| {
-                    cache_slot.pt = inited;
-                    cache_slot.valid = true;
-                } else |_| {
-                    cache_slot.valid = false;
-                }
-            }
-            if (!cache_slot.valid) {
-                t.fifo[write_idx] = splat(0xff000000);
-                t.fifo_len += 1;
-                t.param_count = 0;
-                t.has_coord_t = false;
-                if (@hasField(RType, "texture_samples")) r.texture_samples += 1;
-                return;
-            }
-            const pt = &cache_slot.pt;
-            var texel: Vec = undefined;
-            const has_t = t.has_coord_t;
-            if (pt.cfg.mag_filter == .nearest) {
-                const p = pt.cfg;
-                var prev_wx: u32 = 0xffff_ffff;
-                var prev_wy: u32 = 0xffff_ffff;
-                var prev_out: u32 = 0;
-                const zero_wy: u32 = if (!has_t) (if (0.0 < pt.fh) 0 else wrap(0.0, p.height, p.wrap_t)) else 0;
-                for (0..lanes) |lane| {
-                    const s_coord = f(value[lane]);
-                    const fx = @floor(s_coord * pt.fw);
-                    const wx: u32 = if (fx >= 0.0 and fx < pt.fw) @intFromFloat(fx) else wrap(fx, p.width, p.wrap_s);
-                    const wy: u32 = if (has_t) blk: {
-                        const t_coord = f(t.coord_t[lane]);
-                        const fy = @floor(t_coord * pt.fh);
-                        break :blk if (fy >= 0.0 and fy < pt.fh) @intFromFloat(fy) else wrap(fy, p.height, p.wrap_t);
-                    } else zero_wy;
-                    if (wx == prev_wx and wy == prev_wy) {
-                        texel[lane] = prev_out;
-                        continue;
-                    }
-                    const sampled = pt.fetchAt(memory, wx, wy) catch 0xff000000;
-                    texel[lane] = sampled;
-                    prev_wx = wx;
-                    prev_wy = wy;
-                    prev_out = sampled;
-                }
-            } else {
-                var prev_sc: u32 = 0;
-                var prev_tc: u32 = 0;
-                var prev_out: u32 = 0;
-                for (0..lanes) |lane| {
-                    const sc = value[lane];
-                    const tc = if (has_t) t.coord_t[lane] else 0;
-                    if (lane > 0 and sc == prev_sc and tc == prev_tc) {
-                        texel[lane] = prev_out;
-                        continue;
-                    }
-                    const sampled = pt.sample(memory, f(sc), f(tc)) catch 0xff000000;
-                    texel[lane] = sampled;
-                    prev_sc = sc;
-                    prev_tc = tc;
-                    prev_out = sampled;
-                }
-            }
-            t.fifo[write_idx] = texel;
-            t.fifo_len += 1;
-            t.param_count = 0;
-            t.has_coord_t = false;
+            const write_idx: u2 = s.tmu_fifo_head[unit] +% @as(u2, @truncate(s.tmu_fifo_len[unit]));
+            const t_opt: ?Vec = if (s.tmu_has_coord_t[unit]) s.tmu_coord_t[unit] else null;
+            s.tmu_fifo[unit][write_idx] = sampleTmuVec(
+                unit,
+                s.tmu_params[unit][0],
+                s.tmu_params[unit][1],
+                value,
+                t_opt,
+                env,
+                &s.tmu_cached[unit],
+            );
+            s.tmu_fifo_len[unit] += 1;
+            s.tmu_param_count[unit] = 0;
+            s.tmu_has_coord_t[unit] = false;
             if (@hasField(RType, "texture_samples")) r.texture_samples += 1;
         },
         else => {},
@@ -1280,4 +1875,97 @@ test "QPU TexCache memoization, nearest coordinate deduplication, and exact texe
     const r2 = try runFragmentDecoded(decoded, &env);
     for (0..lanes) |l| try std.testing.expectEqual(@as(u32, 0xff304050), r2.tlb_color.?[l]);
 }
+
+test "QPU fused varying linterp and fast-path fragment shader compilation" {
+    // 1. Constant/uniform color shader
+    var p_const: qpu.Program(16) = .{};
+    p_const.emit(try qpu.mov(qpu.tlb_color_all, qpu.unif));
+    p_const.end(.fragment);
+    var dec_const_buf: [16]DecodedInst = undefined;
+    const dec_const = decodeProgram(p_const.code(), &dec_const_buf);
+    const unif_const = [_]u32{0xff112233};
+    const fast_const = analyzeFragmentShader(dec_const, &unif_const);
+    try std.testing.expectEqual(FastFragKind.constant_color, fast_const.kind);
+    try std.testing.expectEqual(@as(u32, 0xff112233), fast_const.color);
+
+    // 2. Smooth-shaded varying RGBA shader with fused varying linterp
+    var p_var: qpu.Program(16) = .{};
+    for (0..3) |i| {
+        const acc: u3 = @intCast(i);
+        p_var.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(acc), .a = qpu.vary, .b = qpu.frag_w } }));
+        p_var.emit(try qpu.alu(.{ .add = .{ .op = .fadd, .dst = qpu.wr(acc), .a = qpu.r(acc), .b = qpu.r(5) } }));
+    }
+    const one = qpu.smallImmFloat(1.0);
+    p_var.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(2), .b = one }, .pack = .{ .mul = .@"8a" } }));
+    p_var.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(1), .b = one }, .pack = .{ .mul = .@"8b" } }));
+    p_var.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(0), .b = one }, .pack = .{ .mul = .@"8c" } }));
+    p_var.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = one, .b = one }, .pack = .{ .mul = .@"8d" } }));
+    p_var.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(3)));
+    p_var.end(.fragment);
+
+    var dec_var_buf: [16]DecodedInst = undefined;
+    const dec_var = decodeProgram(p_var.code(), &dec_var_buf);
+    try std.testing.expect((dec_var[0].flags & DecodedInst.FLAG_FUSED_LINTERP) != 0);
+    try std.testing.expect((dec_var[2].flags & DecodedInst.FLAG_FUSED_LINTERP) != 0);
+    try std.testing.expect((dec_var[4].flags & DecodedInst.FLAG_FUSED_LINTERP) != 0);
+
+    const fast_var = analyzeFragmentShader(dec_var, &.{});
+    try std.testing.expectEqual(FastFragKind.varying_pack_rgba, fast_var.kind);
+    try std.testing.expectEqual([4]u8{ 2, 1, 0, 0xff }, fast_var.var_idx);
+    try std.testing.expectEqual(@as(u32, 0xff000000), fast_var.color);
+
+    const varyings = [_]Vec{ splatF(1.0), splatF(0.5), splatF(0.25) };
+    const env_var: Env = .{ .varyings = &varyings, .frag_w = splatF(2.0) };
+    const res_var_fast = try runFragmentFast(fast_var, dec_var, &env_var);
+    const res_var_dec = try runFragmentDecoded(dec_var, &env_var);
+    try std.testing.expectEqual(res_var_dec.tlb_color.?[0], res_var_fast.tlb_color.?[0]);
+    try std.testing.expectEqual(packColor(1.0, 0.5, 0.25, 1.0), res_var_fast.tlb_color.?[0]);
+
+    // 3. Textured compositor blit shader with v8muld modulation
+    var mem: [256]u8 = @splat(0);
+    const cfg_nearest: texture.Config = .{
+        .offset = 0,
+        .width = 2,
+        .height = 2,
+        .type = .rgba8888,
+        .mag_filter = .nearest,
+        .min_filter = .nearest,
+        .wrap_s = .clamp,
+        .wrap_t = .clamp,
+    };
+    const pt = try PrecomputedTex.init(cfg_nearest);
+    std.mem.writeInt(u32, mem[pt.texelOffset(1, 0)..][0..4], 0xff804020, .little);
+
+    var p_tex: qpu.Program(16) = .{};
+    // Interpolate t (varying 0) -> tmu0_t
+    p_tex.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(0), .a = qpu.vary, .b = qpu.frag_w } }));
+    p_tex.emit(try qpu.alu(.{ .add = .{ .op = .fadd, .dst = .{ .periph = qpu.W.tmu0_t }, .a = qpu.r(0), .b = qpu.r(5) } }));
+    // Interpolate s (varying 1) -> tmu0_s
+    p_tex.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(1), .a = qpu.vary, .b = qpu.frag_w } }));
+    p_tex.emit(try qpu.alu(.{ .add = .{ .op = .fadd, .dst = .{ .periph = qpu.W.tmu0_s }, .a = qpu.r(1), .b = qpu.r(5) } }));
+    p_tex.emit(qpu.nop(.load_tmu0));
+    p_tex.emit(try qpu.alu(.{ .mul = .{ .op = .v8muld, .dst = qpu.tlb_color_all, .a = qpu.r(4), .b = qpu.unif } }));
+    p_tex.end(.fragment);
+
+    var dec_tex_buf: [16]DecodedInst = undefined;
+    const dec_tex = decodeProgram(p_tex.code(), &dec_tex_buf);
+    const unif_tex = [_]u32{ texture.p0(cfg_nearest), texture.p1(cfg_nearest), 0x80ffffff };
+    const fast_tex = analyzeFragmentShader(dec_tex, &unif_tex);
+    try std.testing.expectEqual(FastFragKind.tmu0_blit, fast_tex.kind);
+    try std.testing.expect(fast_tex.tmu_modulate);
+    try std.testing.expectEqual(@as(u32, 0x80ffffff), fast_tex.color);
+
+    const tex_varyings = [_]Vec{ splatF(0.25), splatF(0.75) }; // t=0.25 (y=0), s=0.75 (x=1)
+    var shared_cache: [2]TexCache = .{ .{}, .{} };
+    const env_tex: Env = .{
+        .uniforms = &unif_tex,
+        .varyings = &tex_varyings,
+        .texture_memory = &mem,
+        .tex_cache = &shared_cache,
+    };
+    const res_tex_fast = try runFragmentFast(fast_tex, dec_tex, &env_tex);
+    const res_tex_dec = try runFragmentDecoded(dec_tex, &env_tex);
+    try std.testing.expectEqual(res_tex_dec.tlb_color.?[0], res_tex_fast.tlb_color.?[0]);
+}
+
 

@@ -49,6 +49,7 @@ pub const V3d = struct {
         fs_unif_start: u16 = 0,
         fs_cached: bool = false,
         fs_num_varyings: u8 = 0,
+        fast_frag: qpu_sim.FastFragShader = .{},
         valid: bool = false,
     };
 
@@ -595,21 +596,24 @@ pub const V3d = struct {
             var fs_inst_start: u16 = 0;
             var fs_unif_start: u16 = 0;
             var fs_cached = false;
+            var fast_frag: qpu_sim.FastFragShader = .{};
             if (self.prep_fs_insts_len + fs_code.len <= MAX_PREP_FS_INSTS and
                 self.prep_fs_unifs_len + max_unif_words <= MAX_PREP_FS_UNIFS)
             {
                 fs_inst_start = @intCast(self.prep_fs_insts_len);
-                _ = qpu_sim.decodeProgram(fs_code, self.prep_fs_insts[self.prep_fs_insts_len..][0..fs_code.len]);
+                const fs_dec = qpu_sim.decodeProgram(fs_code, self.prep_fs_insts[self.prep_fs_insts_len..][0..fs_code.len]);
                 self.prep_fs_insts_len += fs_code.len;
 
                 fs_unif_start = @intCast(self.prep_fs_unifs_len);
                 const unif_words: usize = max_unif_words;
+                const fs_u = self.prep_fs_unifs[self.prep_fs_unifs_len..][0..unif_words];
                 @memcpy(
-                    std.mem.sliceAsBytes(self.prep_fs_unifs[self.prep_fs_unifs_len..][0..unif_words]),
+                    std.mem.sliceAsBytes(fs_u),
                     ram[fs_unif_phys..][0 .. unif_words * 4],
                 );
                 self.prep_fs_unifs_len += unif_words;
                 fs_cached = true;
+                fast_frag = qpu_sim.analyzeFragmentShader(fs_dec, fs_u);
             }
 
             self.prep_draws[draw_idx] = .{
@@ -621,6 +625,7 @@ pub const V3d = struct {
                 .fs_unif_start = fs_unif_start,
                 .fs_cached = fs_cached,
                 .fs_num_varyings = fs_num_varyings,
+                .fast_frag = fast_frag,
                 .valid = true,
             };
 
@@ -1606,6 +1611,7 @@ pub const V3d = struct {
                             cur_fs_decoded,
                             cur_fs_unifs,
                             prep.fs_num_varyings,
+                            prep.fast_frag,
                             tile_px_x,
                             tile_px_y,
                             tile_size,
@@ -1650,6 +1656,7 @@ pub const V3d = struct {
                     cur_fs_decoded,
                     cur_fs_unifs,
                     prep.fs_num_varyings,
+                    prep.fast_frag,
                     tile_px_x,
                     tile_px_y,
                     tile_size,
@@ -1691,6 +1698,7 @@ pub const V3d = struct {
         var fs_unif_buf: [128]u32 = undefined;
         const vs_unifs = extractUniforms(ram, vs_unif_phys, &vs_unif_buf);
         const fs_unifs = extractUniforms(ram, fs_unif_phys, &fs_unif_buf);
+        const fast_frag = qpu_sim.analyzeFragmentShader(fs_decoded, fs_unifs);
 
         const num_tris: u32 = switch (draw.mode) {
             4 => draw.count / 3,
@@ -1818,7 +1826,7 @@ pub const V3d = struct {
                     verts,
                     n_var,
                 );
-                self.rasterizeShadedTriangleDecodedInTile(ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, tile_px_x, tile_px_y, tile_size);
+                self.rasterizeShadedTriangleDecodedInTile(ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
             }
         }
     }
@@ -1854,7 +1862,8 @@ pub const V3d = struct {
     ) void {
         var fs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
         const fs_decoded = qpu_sim.decodeProgram(fs_code, &fs_decoded_buf);
-        self.rasterizeShadedTriangleDecodedInTile(ram, draw, tri, fs_decoded, fs_unifs, num_varyings, tile_px_x, tile_px_y, tile_size);
+        const fast_frag = qpu_sim.analyzeFragmentShader(fs_decoded, fs_unifs);
+        self.rasterizeShadedTriangleDecodedInTile(ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
     }
 
     fn rasterizeShadedTriangleDecodedInTile(
@@ -1865,6 +1874,7 @@ pub const V3d = struct {
         fs_decoded: []const qpu_sim.DecodedInst,
         fs_unifs: []const u32,
         num_varyings: u8,
+        fast_frag: qpu_sim.FastFragShader,
         tile_px_x: u32,
         tile_px_y: u32,
         tile_size: u32,
@@ -1934,6 +1944,7 @@ pub const V3d = struct {
                 fy: *qpu_sim.Vec,
                 tin: *qpu_sim.Vec,
                 vvecs: []qpu_sim.Vec,
+                ffrag: qpu_sim.FastFragShader,
                 fcode: []const qpu_sim.DecodedInst,
                 funifs: []const u32,
                 mem: []const u8,
@@ -1964,7 +1975,7 @@ pub const V3d = struct {
                     .tlb_color_in = tin.*,
                     .tex_cache = tcache,
                 };
-                const res = qpu_sim.runFragmentDecoded(fcode, &env) catch return;
+                const res = qpu_sim.runFragmentFast(ffrag, fcode, &env) catch return;
                 if (res.tlb_color) |colors| {
                     var i: usize = 0;
                     while (i + 4 <= count) {
@@ -2112,6 +2123,18 @@ pub const V3d = struct {
                         };
 
                         if (depth_all_pass) {
+                            if (fast_frag.kind == .constant_color) {
+                                self.tile_color[tile_idx..][0..16].* = @splat(fast_frag.color);
+                                if (z_updates) {
+                                    self.tile_depth[tile_idx..][0..16].* = z_vec;
+                                }
+                                px += 16;
+                                cur_e0 += step_x0 * 16.0;
+                                cur_e1 += step_x1 * 16.0;
+                                cur_e2 += step_x2 * 16.0;
+                                continue;
+                            }
+
                             const w_vec: @Vector(16, f32) = if (all_unit_w)
                                 @splat(1.0)
                             else blk: {
@@ -2138,7 +2161,7 @@ pub const V3d = struct {
                                 .tlb_color_in = self.tile_color[tile_idx..][0..16].*,
                                 .tex_cache = &tex_cache,
                             };
-                            const span_res = qpu_sim.runFragmentDecoded(fs_decoded, &span_env) catch null;
+                            const span_res = qpu_sim.runFragmentFast(fast_frag, fs_decoded, &span_env) catch null;
 
                             if (span_res) |res| {
                                 if (res.tlb_color) |colors| {
@@ -2220,6 +2243,31 @@ pub const V3d = struct {
                         }
                     }
 
+                    if (fast_frag.kind == .constant_color) {
+                        if (mask4 == 0xf) {
+                            self.tile_color[base_tile_idx..][0..4].* = @splat(fast_frag.color);
+                            if (z_updates) {
+                                self.tile_depth[base_tile_idx..][0..4].* = z_4;
+                            }
+                        } else {
+                            const z_arr_c: [4]f32 = z_4;
+                            while (mask4 != 0) {
+                                const k: usize = @ctz(mask4);
+                                mask4 &= mask4 - 1;
+                                const t_idx = base_tile_idx + @as(u32, @intCast(k));
+                                self.tile_color[t_idx] = fast_frag.color;
+                                if (z_updates) {
+                                    self.tile_depth[t_idx] = z_arr_c[k];
+                                }
+                            }
+                        }
+                        px += 4;
+                        cur_e0 += step_x0 * 4.0;
+                        cur_e1 += step_x1 * 4.0;
+                        cur_e2 += step_x2 * 4.0;
+                        continue;
+                    }
+
                     const w_vec_4: @Vector(4, f32) = if (all_unit_w)
                         @splat(1.0)
                     else blk: {
@@ -2257,6 +2305,7 @@ pub const V3d = struct {
                                 &frag_y_vec,
                                 &tlb_in,
                                 vary_vecs[0..n_var],
+                                fast_frag,
                                 fs_decoded,
                                 fs_unifs,
                                 ram,
@@ -2312,6 +2361,7 @@ pub const V3d = struct {
                                 &frag_y_vec,
                                 &tlb_in,
                                 vary_vecs[0..n_var],
+                                fast_frag,
                                 fs_decoded,
                                 fs_unifs,
                                 ram,
@@ -2365,6 +2415,14 @@ pub const V3d = struct {
                     if (!depth_pass) continue;
                 }
 
+                if (fast_frag.kind == .constant_color) {
+                    self.tile_color[tile_idx] = fast_frag.color;
+                    if (z_updates) {
+                        self.tile_depth[tile_idx] = z;
+                    }
+                    continue;
+                }
+
                 const w_val: f32 = if (all_unit_w) 1.0 else blk: {
                     const interp_inv_w = invw2 + w0 * dinvw0 + w1 * dinvw1;
                     break :blk if (@abs(interp_inv_w) > 1e-12) (1.0 / interp_inv_w) else 1.0;
@@ -2397,6 +2455,7 @@ pub const V3d = struct {
                         &frag_y_vec,
                         &tlb_in,
                         vary_vecs[0..n_var],
+                        fast_frag,
                         fs_decoded,
                         fs_unifs,
                         ram,
@@ -2420,6 +2479,7 @@ pub const V3d = struct {
                 &frag_y_vec,
                 &tlb_in,
                 vary_vecs[0..n_var],
+                fast_frag,
                 fs_decoded,
                 fs_unifs,
                 ram,
