@@ -1524,17 +1524,21 @@ pub fn Arm1176(comptime Bus: type) type {
                 self.last_inst = cur_last_inst;
                 self.excl_valid = false;
             }
+            const ic_pages_mask = (icache_size >> 10) - 1;
             var priv: u1 = @intFromBool(self.isPrivileged());
             var code_vbase: u32 = 0xffff_ffff;
             var code_pbase: u32 = 0;
             var code_page_ptr: [*]const u8 = bus.ram.ptr;
+            var code_icache_ptr: [*]DecodedSlot = self.icache[0..].ptr;
             var data_r_vbase: u32 = 0xffff_ffff;
             var data_w_vbase: u32 = 0xffff_ffff;
             var data_page_ptr: [*]u8 = bus.ram.ptr;
 
-            while (executed < limit) {
-                if (executed >= max_steps and (self.cpsr & PsrFlags.I) == 0) break;
-                if ((executed & 255) == 0 and atomic_ram.busParallel(bus)) {
+            step_loop: while (true) {
+                if (executed >= max_steps) {
+                    if (executed >= limit or (self.cpsr & PsrFlags.I) == 0) break;
+                }
+                if (atomic_ram.busParallel(bus)) {
                     // Apply TLB invalidations other cores broadcast while this slice runs
                     if (bus.smp.serviceTlb(self.mmu.core_id, &self.mmu)) {
                         code_vbase = 0xffff_ffff;
@@ -1542,19 +1546,75 @@ pub fn Arm1176(comptime Bus: type) type {
                         data_w_vbase = 0xffff_ffff;
                     }
                 }
-                if (self.isThumb()) {
-                    const pc = self.r[15] & ~@as(u32, 1);
-                    const inst16: u16 = if ((pc & 0xffff_f000) == code_vbase)
-                        std.mem.readInt(u16, code_page_ptr[pc & 0xffe ..][0..2], .little)
+                const batch_end = if (executed >= max_steps)
+                    (executed + 1)
+                else if (atomic_ram.busParallel(bus))
+                    @min(max_steps, executed + 256)
+                else
+                    max_steps;
+
+                while (executed < batch_end) {
+                    if (self.isThumb()) {
+                        const pc = self.r[15] & ~@as(u32, 1);
+                        const inst16: u16 = if ((pc & 0xffff_f000) == code_vbase)
+                            std.mem.readInt(u16, code_page_ptr[pc & 0xffe ..][0..2], .little)
+                        else blk: {
+                            const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
+                            if ((pc & 0xffff_f000) == islot.x_vbase) {
+                                code_vbase = islot.x_vbase;
+                                code_pbase = islot.pbase;
+                                code_page_ptr = bus.ram.ptr + code_pbase;
+                                const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
+                                code_icache_ptr = self.icache[page_slot..].ptr;
+                                break :blk std.mem.readInt(u16, code_page_ptr[pc & 0xffe ..][0..2], .little);
+                            }
+                            const fetched = self.fetch16(bus, pc) catch {
+                                self.enterException(.abt, 0x0c, pc +% 4, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = 0xffff_ffff;
+                                data_w_vbase = 0xffff_ffff;
+                                executed += 1;
+                                continue;
+                            };
+                            const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
+                            if ((pc & 0xffff_f000) == islot2.x_vbase) {
+                                code_vbase = islot2.x_vbase;
+                                code_pbase = islot2.pbase;
+                                code_page_ptr = bus.ram.ptr + code_pbase;
+                                const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
+                                code_icache_ptr = self.icache[page_slot..].ptr;
+                            }
+                            break :blk fetched;
+                        };
+                        self.r[15] = pc +% 2;
+                        executed += 1;
+                        if (self.executeThumb(bus, pc, inst16, priv, code_vbase, code_pbase, &data_r_vbase, &data_w_vbase, &data_page_ptr)) {
+                            if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = 0xffff_ffff;
+                            data_w_vbase = 0xffff_ffff;
+                        }
+                        continue;
+                    }
+
+                    const pc = self.r[15] & ~@as(u32, 3);
+                    const page_word: usize = (pc >> 2) & 0x3ff;
+                    const inst: u32 = if ((pc & 0xffff_f000) == code_vbase)
+                        std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little)
                     else blk: {
                         const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
                         if ((pc & 0xffff_f000) == islot.x_vbase) {
                             code_vbase = islot.x_vbase;
                             code_pbase = islot.pbase;
                             code_page_ptr = bus.ram.ptr + code_pbase;
-                            break :blk std.mem.readInt(u16, code_page_ptr[pc & 0xffe ..][0..2], .little);
+                            const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
+                            code_icache_ptr = self.icache[page_slot..].ptr;
+                            break :blk std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
                         }
-                        const fetched = self.fetch16(bus, pc) catch {
+                        const fetched = self.fetch32(bus, pc) catch {
                             self.enterException(.abt, 0x0c, pc +% 4, false);
                             priv = 1;
                             code_vbase = 0xffff_ffff;
@@ -1568,65 +1628,28 @@ pub fn Arm1176(comptime Bus: type) type {
                             code_vbase = islot2.x_vbase;
                             code_pbase = islot2.pbase;
                             code_page_ptr = bus.ram.ptr + code_pbase;
+                            const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
+                            code_icache_ptr = self.icache[page_slot..].ptr;
+                        } else {
+                            const page_slot = (@as(usize, (pc >> 12) ^ (pc >> 16)) & ic_pages_mask) << 10;
+                            code_icache_ptr = self.icache[page_slot..].ptr;
                         }
                         break :blk fetched;
                     };
-                    self.r[15] = pc +% 2;
+
+                    self.r[15] = pc +% 4;
+                    cur_last_inst = inst;
                     executed += 1;
-                    if (self.executeThumb(bus, pc, inst16, priv, code_vbase, code_pbase, &data_r_vbase, &data_w_vbase, &data_page_ptr)) {
-                        if (self.mmu.halted_wfi or self.yield_slice) break;
-                        _ = self.checkInterrupts(bus);
-                        priv = @intFromBool(self.isPrivileged());
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
+
+                    if (inst < 0xe000_0000) {
+                        if (!dec.checkCond(@truncate(inst >> 28), self.cpsr)) continue;
                     }
-                    continue;
-                }
 
-                const pc = self.r[15] & ~@as(u32, 3);
-                const inst: u32 = if ((pc & 0xffff_f000) == code_vbase)
-                    std.mem.readInt(u32, code_page_ptr[pc & 0xfff ..][0..4], .little)
-                else blk: {
-                    const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
-                    if ((pc & 0xffff_f000) == islot.x_vbase) {
-                        code_vbase = islot.x_vbase;
-                        code_pbase = islot.pbase;
-                        code_page_ptr = bus.ram.ptr + code_pbase;
-                        break :blk std.mem.readInt(u32, code_page_ptr[pc & 0xfff ..][0..4], .little);
+                    var d = code_icache_ptr[page_word];
+                    if (d.raw != inst) {
+                        d = decodeArm32(inst);
+                        code_icache_ptr[page_word] = d;
                     }
-                    const fetched = self.fetch32(bus, pc) catch {
-                        self.enterException(.abt, 0x0c, pc +% 4, false);
-                        priv = 1;
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = 0xffff_ffff;
-                        data_w_vbase = 0xffff_ffff;
-                        executed += 1;
-                        continue;
-                    };
-                    const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
-                    if ((pc & 0xffff_f000) == islot2.x_vbase) {
-                        code_vbase = islot2.x_vbase;
-                        code_pbase = islot2.pbase;
-                        code_page_ptr = bus.ram.ptr + code_pbase;
-                    }
-                    break :blk fetched;
-                };
-
-                self.r[15] = pc +% 4;
-                cur_last_inst = inst;
-                executed += 1;
-
-                if (inst < 0xe000_0000) {
-                    if (!dec.checkCond(@truncate(inst >> 28), self.cpsr)) continue;
-                }
-
-                const ic_idx: usize = @truncate(((pc >> 2) ^ (pc >> 16)) & icache_mask);
-                var d = self.icache[ic_idx];
-                if (d.raw != inst) {
-                    d = decodeArm32(inst);
-                    self.icache[ic_idx] = d;
-                }
 
                 const imm32: u32 = @truncate(d.imm);
                 const op: ArmOp = @enumFromInt(d.op);
@@ -2767,7 +2790,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             }
                         }
                         self.r[15] = (pc +% 8) +% imm32;
-                        if (self.yield_slice) break;
+                        if (self.yield_slice) break :step_loop;
                     },
                     .bl_al => {
                         const target_pc = (pc +% 8) +% imm32;
@@ -2787,7 +2810,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             }
                         }
                         self.r[15] = target_pc;
-                        if (self.yield_slice) break;
+                        if (self.yield_slice) break :step_loop;
                     },
                     .bx_lr_al => {
                         self.setPcWithInterworking(self.r[14]);
@@ -2802,7 +2825,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .dp_imm_general => {
                         self.executeGroup001(pc, inst);
-                        if (self.mmu.halted_wfi or self.yield_slice) break;
+                        if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
@@ -2811,7 +2834,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .dp_reg_general => {
                         self.executeGroup000(bus, pc, inst);
-                        if (self.mmu.halted_wfi or self.yield_slice) break;
+                        if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
@@ -2857,14 +2880,14 @@ pub fn Arm1176(comptime Bus: type) type {
                     .nop_al => {},
                     .yield_wfe_al => {
                         self.yield_slice = true;
-                        break;
+                        break :step_loop;
                     },
                     .clrex_al => self.excl_valid = false,
                     .dmb_dsb_v7_al => {
                         self.memoryBarrier(bus, d.rd != 0);
                         if (self.last_dmb_pc == pc) {
                             self.yield_slice = true;
-                            break;
+                            break :step_loop;
                         } else {
                             self.last_dmb_pc = pc;
                         }
@@ -2928,7 +2951,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .coproc_svc => {
                         self.executeCoprocOrSvc(bus, pc, inst);
-                        if (self.mmu.halted_wfi or self.yield_slice) break;
+                        if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
@@ -3417,13 +3440,14 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .unconditional => {
                         self.executeUnconditional(bus, pc, inst);
-                        if (self.mmu.halted_wfi or self.yield_slice) break;
+                        if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
                         code_vbase = 0xffff_ffff;
                         data_r_vbase = 0xffff_ffff;
                         data_w_vbase = 0xffff_ffff;
                     },
+                }
                 }
             }
             return executed;

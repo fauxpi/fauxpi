@@ -1798,20 +1798,23 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
 
             const limit = if (max_steps == 4096) max_steps + 256 else max_steps;
             const SlotType = @TypeOf(cpu.icache[0]);
-            const ic_mask = cpu.icache.len - 1;
+            const ic_pages_mask = (cpu.icache.len >> 10) - 1;
             var executed: usize = 0;
             var cur_last_inst: u32 = cpu.last_inst;
             var priv: u1 = @intFromBool(currentEl(cpu) != 0);
             var code_vbase: u64 = 0xffff_ffff_ffff_ffff;
             var code_pbase: u32 = 0;
             var code_page_ptr: [*]const u8 = bus.ram.ptr;
+            var code_icache_ptr: [*]SlotType = cpu.icache[0..].ptr;
             var data_r_vbase: u64 = 0xffff_ffff_ffff_ffff;
             var data_w_vbase: u64 = 0xffff_ffff_ffff_ffff;
             var data_page_ptr: [*]u8 = bus.ram.ptr;
 
-            while (executed < limit) {
-                if (cpu.mmu.halted_wfi or cpu.yield_slice or !cpu.is_aarch64) break;
-                if ((executed & 255) == 0 and atomic_ram.busParallel(bus)) {
+            step_loop: while (true) {
+                if (executed >= max_steps) {
+                    if (executed >= limit or (cpu.pstate & PstateFlags.I) == 0) break;
+                }
+                if (atomic_ram.busParallel(bus)) {
                     // Apply TLB invalidations other cores broadcast while this slice runs
                     if (bus.smp.serviceTlb(cpu.mmu.core_id, &cpu.mmu)) {
                         code_vbase = 0xffff_ffff_ffff_ffff;
@@ -1819,49 +1822,62 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         data_w_vbase = 0xffff_ffff_ffff_ffff;
                     }
                 }
-                if (executed >= max_steps and (cpu.pstate & PstateFlags.I) == 0) break;
+                const batch_end = if (executed >= max_steps)
+                    (executed + 1)
+                else if (atomic_ram.busParallel(bus))
+                    @min(max_steps, executed + 256)
+                else
+                    max_steps;
 
-                const cur_pc = cpu.pc64;
-                const inst: u32 = if ((cur_pc & ~@as(u64, 0xfff)) == code_vbase)
-                    std.mem.readInt(u32, code_page_ptr[@as(usize, @truncate(cur_pc & 0xffc))..][0..4], .little)
-                else blk: {
-                    const islot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                    if ((cur_pc & ~@as(u64, 0xfff)) == islot.x_vbase) {
-                        code_vbase = islot.x_vbase;
-                        code_pbase = islot.pbase;
-                        code_page_ptr = bus.ram.ptr + code_pbase;
-                        break :blk std.mem.readInt(u32, code_page_ptr[@as(usize, @truncate(cur_pc & 0xffc))..][0..4], .little);
-                    }
-                    const fetched = fetchInst64(cpu, bus, cur_pc) catch {
-                        const target_el: u2 = @max(currentEl(cpu), 1);
-                        const esr = if (target_el >= 2) cpu.mmu.esr_el2 else cpu.mmu.esr_el1;
-                        takeException64(cpu, target_el, 0x000, esr, cur_pc, cur_pc);
-                        priv = 1;
-                        code_vbase = 0xffff_ffff_ffff_ffff;
-                        data_r_vbase = 0xffff_ffff_ffff_ffff;
-                        data_w_vbase = 0xffff_ffff_ffff_ffff;
-                        executed += 1;
-                        continue;
+                while (executed < batch_end) {
+                    const cur_pc = cpu.pc64;
+                    const page_word: usize = @truncate((cur_pc >> 2) & 0x3ff);
+                    const inst: u32 = if ((cur_pc & ~@as(u64, 0xfff)) == code_vbase)
+                        std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little)
+                    else blk: {
+                        const islot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                        if ((cur_pc & ~@as(u64, 0xfff)) == islot.x_vbase) {
+                            code_vbase = islot.x_vbase;
+                            code_pbase = islot.pbase;
+                            code_page_ptr = bus.ram.ptr + code_pbase;
+                            const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
+                            code_icache_ptr = cpu.icache[page_slot..].ptr;
+                            break :blk std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
+                        }
+                        const fetched = fetchInst64(cpu, bus, cur_pc) catch {
+                            const target_el: u2 = @max(currentEl(cpu), 1);
+                            const esr = if (target_el >= 2) cpu.mmu.esr_el2 else cpu.mmu.esr_el1;
+                            takeException64(cpu, target_el, 0x000, esr, cur_pc, cur_pc);
+                            priv = 1;
+                            code_vbase = 0xffff_ffff_ffff_ffff;
+                            data_r_vbase = 0xffff_ffff_ffff_ffff;
+                            data_w_vbase = 0xffff_ffff_ffff_ffff;
+                            executed += 1;
+                            continue;
+                        };
+                        const islot2 = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                        if ((cur_pc & ~@as(u64, 0xfff)) == islot2.x_vbase) {
+                            code_vbase = islot2.x_vbase;
+                            code_pbase = islot2.pbase;
+                            code_page_ptr = bus.ram.ptr + code_pbase;
+                            const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
+                            code_icache_ptr = cpu.icache[page_slot..].ptr;
+                        } else {
+                            const page_slot = (@as(usize, @truncate((cur_pc >> 12) ^ (cur_pc >> 16))) & ic_pages_mask) << 10;
+                            code_icache_ptr = cpu.icache[page_slot..].ptr;
+                        }
+                        break :blk fetched;
                     };
-                    const islot2 = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                    if ((cur_pc & ~@as(u64, 0xfff)) == islot2.x_vbase) {
-                        code_vbase = islot2.x_vbase;
-                        code_pbase = islot2.pbase;
-                        code_page_ptr = bus.ram.ptr + code_pbase;
+
+                    cur_last_inst = inst;
+                    cpu.pc64 = cur_pc +% 4;
+                    executed += 1;
+
+                    var d = code_icache_ptr[page_word];
+                    if (d.raw != inst) {
+                        d = decodeA64(SlotType, inst);
+                        code_icache_ptr[page_word] = d;
                     }
-                    break :blk fetched;
-                };
-
-                cur_last_inst = inst;
-                cpu.pc64 = cur_pc +% 4;
-                executed += 1;
-
-                const idx: usize = @as(usize, @truncate((cur_pc >> 2) ^ (cur_pc >> 16))) & ic_mask;
-                var d = cpu.icache[idx];
-                if (d.raw != inst) {
-                    d = decodeA64(SlotType, inst);
-                    cpu.icache[idx] = d;
-                }
 
                 const op: A64Op = @enumFromInt(d.op);
                 switch (op) {
@@ -3918,7 +3934,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .msr_safe => {
                         switch (d.rn) {
                             0 => cpu.excl_valid = false,
-                            1 => cpu.yield_slice = true,
+                            1 => {
+                                cpu.yield_slice = true;
+                                break :step_loop;
+                            },
                             2 => {
                                 if (atomic_ram.busParallel(bus)) {
                                     atomic_ram.fence(&cpu.fence_word);
@@ -3927,6 +3946,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const pc32: u32 = @truncate(cur_pc);
                                 if ((cpu.last_dmb_pc ^ pc32) < 256) {
                                     cpu.yield_slice = true;
+                                    cpu.last_dmb_pc = pc32;
+                                    break :step_loop;
                                 }
                                 cpu.last_dmb_pc = pc32;
                             },
@@ -4017,6 +4038,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         code_vbase = 0xffff_ffff_ffff_ffff;
                         data_r_vbase = 0xffff_ffff_ffff_ffff;
                         data_w_vbase = 0xffff_ffff_ffff_ffff;
+                        if (cpu.mmu.halted_wfi or cpu.yield_slice or !cpu.is_aarch64) break :step_loop;
                     },
                     .fmov_d_x => cpu.vfp.v[@as(u5, @truncate(d.rd))] = getX(cpu, @truncate(d.rn)),
                     .fmov_x_d => setX(cpu, @truncate(d.rd), @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])),
@@ -4484,6 +4506,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     },
                     .fp_simd => executeFpSimd(cpu, inst),
                     .nop => {},
+                }
                 }
             }
 
