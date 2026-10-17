@@ -288,14 +288,33 @@ pub const Hvs = struct {
                             if (linear_pitch == span_w * cpp) {
                                 const total_bytes = row_bytes * @as(usize, span_h);
                                 if (@as(usize, ptr0) + total_bytes <= ram.len) {
-                                    hasher.update(ram[ptr0 .. ptr0 + total_bytes]);
+                                    if (total_bytes <= 16384) {
+                                        hasher.update(ram[ptr0 .. ptr0 + total_bytes]);
+                                    } else {
+                                        // Sparse strided 64-byte cacheline sampling across large linear planes
+                                        // (~20 samples per 1280px row, cutting 3.68 MB/frame bandwidth by 4x).
+                                        var off: usize = 0;
+                                        while (off + 64 <= total_bytes) : (off += 256) {
+                                            hasher.update(ram[@as(usize, ptr0) + off ..][0..64]);
+                                        }
+                                        hasher.update(ram[@as(usize, ptr0) + total_bytes - 64 ..][0..64]);
+                                    }
                                 }
                             } else {
+                                const row_step: u32 = if (span_h > 64) 2 else 1;
                                 var sy: u32 = 0;
-                                while (sy < span_h) : (sy += 1) {
+                                while (sy < span_h) : (sy += row_step) {
                                     const row_off: usize = @as(usize, ptr0) + @as(usize, sy) * linear_pitch;
                                     if (row_off + row_bytes <= ram.len) {
-                                        hasher.update(ram[row_off .. row_off + row_bytes]);
+                                        if (row_bytes <= 1024) {
+                                            hasher.update(ram[row_off .. row_off + row_bytes]);
+                                        } else {
+                                            var off: usize = 0;
+                                            while (off + 64 <= row_bytes) : (off += 256) {
+                                                hasher.update(ram[row_off + off ..][0..64]);
+                                            }
+                                            hasher.update(ram[row_off + row_bytes - 64 ..][0..64]);
+                                        }
                                     }
                                 }
                             }
@@ -386,19 +405,64 @@ pub const Hvs = struct {
         return dst_w >= out_w and dst_h >= out_h and (alpha_mode == 1 or pix_fmt == 0 or pix_fmt == 4);
     }
 
+    inline fn div255(x: u32) u32 {
+        return (x + 1 + (x >> 8)) >> 8;
+    }
+
+    inline fn div255Vec4(x: @Vector(4, u32)) @Vector(4, u32) {
+        const one: @Vector(4, u32) = @splat(1);
+        const shift8: @Vector(4, u5) = @splat(8);
+        return (x + one + (x >> shift8)) >> shift8;
+    }
+
     inline fn blendPixel(dst_c: u32, src_color: u32, a: u32, premult: bool) u32 {
         const inv_a = 255 - a;
         if (premult) {
-            const r: u32 = @min(((src_color >> 16) & 0xff) + (((dst_c >> 16) & 0xff) * inv_a) / 255, @as(u32, 255));
-            const g: u32 = @min(((src_color >> 8) & 0xff) + (((dst_c >> 8) & 0xff) * inv_a) / 255, @as(u32, 255));
-            const b: u32 = @min((src_color & 0xff) + ((dst_c & 0xff) * inv_a) / 255, @as(u32, 255));
+            const r: u32 = @min(((src_color >> 16) & 0xff) + div255(((dst_c >> 16) & 0xff) * inv_a), @as(u32, 255));
+            const g: u32 = @min(((src_color >> 8) & 0xff) + div255(((dst_c >> 8) & 0xff) * inv_a), @as(u32, 255));
+            const b: u32 = @min((src_color & 0xff) + div255((dst_c & 0xff) * inv_a), @as(u32, 255));
             return 0xFF000000 | (r << 16) | (g << 8) | b;
         } else {
-            const r = (((src_color >> 16) & 0xff) * a + ((dst_c >> 16) & 0xff) * inv_a) / 255;
-            const g = (((src_color >> 8) & 0xff) * a + ((dst_c >> 8) & 0xff) * inv_a) / 255;
-            const b = ((src_color & 0xff) * a + (dst_c & 0xff) * inv_a) / 255;
+            const r = div255(((src_color >> 16) & 0xff) * a + ((dst_c >> 16) & 0xff) * inv_a);
+            const g = div255(((src_color >> 8) & 0xff) * a + ((dst_c >> 8) & 0xff) * inv_a);
+            const b = div255((src_color & 0xff) * a + (dst_c & 0xff) * inv_a);
             return 0xFF000000 | (r << 16) | (g << 8) | b;
         }
+    }
+
+    pub inline fn blendPixels4(dst_v: @Vector(4, u32), src_v: @Vector(4, u32), premult: bool) @Vector(4, u32) {
+        const zero: @Vector(4, u32) = @splat(0);
+        const full: @Vector(4, u32) = @splat(255);
+        const mask_ff: @Vector(4, u32) = @splat(0xff);
+        const opaque_a: @Vector(4, u32) = @splat(0xFF000000);
+        const shift24: @Vector(4, u5) = @splat(24);
+        const shift16: @Vector(4, u5) = @splat(16);
+        const shift8: @Vector(4, u5) = @splat(8);
+
+        const a = src_v >> shift24;
+        const inv_a = full - a;
+
+        const sr = (src_v >> shift16) & mask_ff;
+        const sg = (src_v >> shift8) & mask_ff;
+        const sb = src_v & mask_ff;
+
+        const dr = (dst_v >> shift16) & mask_ff;
+        const dg = (dst_v >> shift8) & mask_ff;
+        const db = dst_v & mask_ff;
+
+        const blended = if (premult) blk: {
+            const r: @Vector(4, u32) = @min(sr + div255Vec4(dr * inv_a), full);
+            const g: @Vector(4, u32) = @min(sg + div255Vec4(dg * inv_a), full);
+            const b: @Vector(4, u32) = @min(sb + div255Vec4(db * inv_a), full);
+            break :blk opaque_a | (r << shift16) | (g << shift8) | b;
+        } else blk: {
+            const r: @Vector(4, u32) = div255Vec4(sr * a + dr * inv_a);
+            const g: @Vector(4, u32) = div255Vec4(sg * a + dg * inv_a);
+            const b: @Vector(4, u32) = div255Vec4(sb * a + db * inv_a);
+            break :blk opaque_a | (r << shift16) | (g << shift8) | b;
+        };
+
+        return @select(u32, a == zero, dst_v, @select(u32, a == full, src_v, blended));
     }
 
     fn compositePlane(
@@ -483,17 +547,12 @@ pub const Hvs = struct {
                         if (@reduce(.And, alphas) == 0xff) {
                             dst_row[x..][0..8].* = @bitCast(src_v);
                         } else if (@reduce(.Or, alphas) != 0) {
-                            const src_arr: [8]u32 = @bitCast(src_v);
-                            inline for (0..8) |k| {
-                                const sc = src_arr[k];
-                                const a = sc >> 24;
-                                if (a == 255) {
-                                    dst_row[x + @as(u32, @intCast(k))] = sc;
-                                } else if (a > 0) {
-                                    const idx_x = x + @as(u32, @intCast(k));
-                                    dst_row[idx_x] = blendPixel(dst_row[idx_x], sc, a, premult);
-                                }
-                            }
+                            const src_lo: @Vector(4, u32) = @bitCast(src_bytes[x * 4 ..][0..16].*);
+                            const src_hi: @Vector(4, u32) = @bitCast(src_bytes[x * 4 + 16 ..][0..16].*);
+                            const dst_lo: @Vector(4, u32) = dst_row[x..][0..4].*;
+                            const dst_hi: @Vector(4, u32) = dst_row[x + 4 ..][0..4].*;
+                            dst_row[x..][0..4].* = blendPixels4(dst_lo, src_lo, premult);
+                            dst_row[x + 4 ..][0..4].* = blendPixels4(dst_hi, src_hi, premult);
                         }
                     }
                     while (x < span_w) : (x += 1) {
@@ -566,16 +625,8 @@ pub const Hvs = struct {
                             if (@reduce(.And, alphas) == 0xff) {
                                 dst_row.* = @bitCast(src_v);
                             } else if (@reduce(.Or, alphas) != 0) {
-                                const src_arr: [4]u32 = @bitCast(src_v);
-                                inline for (0..4) |rx| {
-                                    const src_color = src_arr[rx];
-                                    const a = src_color >> 24;
-                                    if (a == 255) {
-                                        dst_row[rx] = src_color;
-                                    } else if (a > 0) {
-                                        dst_row[rx] = blendPixel(dst_row[rx], src_color, a, premult);
-                                    }
-                                }
+                                const dst_v: @Vector(4, u32) = dst_row.*;
+                                dst_row.* = blendPixels4(dst_v, src_v, premult);
                             }
                         }
                     }
@@ -953,3 +1004,26 @@ test "HVS Linear RGB565 SIMD scanline and offset T-tiled ARGB8888 overlay compos
         }
     }
 }
+
+test "HVS 4-wide SIMD blendPixels4 matches scalar division by 255" {
+    const dst_v: @Vector(4, u32) = .{ 0xFF102030, 0xFF8040C0, 0xFFFFFFFF, 0xFF000000 };
+    const src_v: @Vector(4, u32) = .{ 0x00AABBCC, 0xFFAABBCC, 0x804080C0, 0x33112233 };
+
+    inline for ([_]bool{ false, true }) |premult| {
+        const res = Hvs.blendPixels4(dst_v, src_v, premult);
+        const res_arr: [4]u32 = res;
+        const dst_arr: [4]u32 = dst_v;
+        const src_arr: [4]u32 = src_v;
+        for (0..4) |i| {
+            const a = src_arr[i] >> 24;
+            const expected = if (a == 0)
+                dst_arr[i]
+            else if (a == 255)
+                src_arr[i]
+            else
+                Hvs.blendPixel(dst_arr[i], src_arr[i], a, premult);
+            try std.testing.expectEqual(expected, res_arr[i]);
+        }
+    }
+}
+

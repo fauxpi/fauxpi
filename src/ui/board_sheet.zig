@@ -2733,7 +2733,7 @@ pub const BoardUi = struct {
     }
 
     /// Blits the 1x `src_hdmi` (`dw * dh`) into the physical window backbuffer `dst_full`,
-    /// using 8-wide SIMD `@shuffle` pixel-doubling when `sc == 2`.
+    /// using SIMD `@shuffle` pixel expansion for `sc == 2, 3, 4`.
     pub fn blitHdmiToBackbuffer(
         dst_full: []u32,
         buf_w: usize,
@@ -2744,8 +2744,15 @@ pub const BoardUi = struct {
         sc: u32,
     ) void {
         if (sc == 1) {
-            const dst = dst_full[top_phys_rows * buf_w ..][0 .. dw * dh];
-            @memcpy(dst, src_hdmi[0 .. dw * dh]);
+            if (buf_w == dw) {
+                const dst = dst_full[top_phys_rows * buf_w ..][0 .. dw * dh];
+                @memcpy(dst, src_hdmi[0 .. dw * dh]);
+            } else {
+                for (0..dh) |sy| {
+                    const dst_row = dst_full[(top_phys_rows + sy) * buf_w ..][0..dw];
+                    @memcpy(dst_row, src_hdmi[sy * dw ..][0..dw]);
+                }
+            }
         } else if (sc == 2) {
             const dup_mask = [16]i32{ 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7 };
             for (0..dh) |sy| {
@@ -2766,6 +2773,57 @@ pub const BoardUi = struct {
                     row0[sx * 2 + 1] = px;
                     row1[sx * 2] = px;
                     row1[sx * 2 + 1] = px;
+                }
+            }
+        } else if (sc == 3) {
+            const dup3_mask = [12]i32{ 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3 };
+            for (0..dh) |sy| {
+                const src_row = src_hdmi[sy * dw ..][0..dw];
+                const dst_y0 = top_phys_rows + sy * 3;
+                const row0 = dst_full[dst_y0 * buf_w ..][0 .. dw * 3];
+                const row1 = dst_full[(dst_y0 + 1) * buf_w ..][0 .. dw * 3];
+                const row2 = dst_full[(dst_y0 + 2) * buf_w ..][0 .. dw * 3];
+                var sx: usize = 0;
+                while (sx + 4 <= dw) : (sx += 4) {
+                    const v: @Vector(4, u32) = src_row[sx..][0..4].*;
+                    const v3: @Vector(12, u32) = @shuffle(u32, v, undefined, dup3_mask);
+                    row0[sx * 3 ..][0..12].* = v3;
+                    row1[sx * 3 ..][0..12].* = v3;
+                    row2[sx * 3 ..][0..12].* = v3;
+                }
+                while (sx < dw) : (sx += 1) {
+                    const px = src_row[sx];
+                    const dx = sx * 3;
+                    row0[dx..][0..3].* = .{ px, px, px };
+                    row1[dx..][0..3].* = .{ px, px, px };
+                    row2[dx..][0..3].* = .{ px, px, px };
+                }
+            }
+        } else if (sc == 4) {
+            const dup4_mask = [16]i32{ 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3 };
+            for (0..dh) |sy| {
+                const src_row = src_hdmi[sy * dw ..][0..dw];
+                const dst_y0 = top_phys_rows + sy * 4;
+                const row0 = dst_full[dst_y0 * buf_w ..][0 .. dw * 4];
+                const row1 = dst_full[(dst_y0 + 1) * buf_w ..][0 .. dw * 4];
+                const row2 = dst_full[(dst_y0 + 2) * buf_w ..][0 .. dw * 4];
+                const row3 = dst_full[(dst_y0 + 3) * buf_w ..][0 .. dw * 4];
+                var sx: usize = 0;
+                while (sx + 4 <= dw) : (sx += 4) {
+                    const v: @Vector(4, u32) = src_row[sx..][0..4].*;
+                    const v4: @Vector(16, u32) = @shuffle(u32, v, undefined, dup4_mask);
+                    row0[sx * 4 ..][0..16].* = v4;
+                    row1[sx * 4 ..][0..16].* = v4;
+                    row2[sx * 4 ..][0..16].* = v4;
+                    row3[sx * 4 ..][0..16].* = v4;
+                }
+                while (sx < dw) : (sx += 1) {
+                    const px = src_row[sx];
+                    const dx = sx * 4;
+                    row0[dx..][0..4].* = .{ px, px, px, px };
+                    row1[dx..][0..4].* = .{ px, px, px, px };
+                    row2[dx..][0..4].* = .{ px, px, px, px };
+                    row3[dx..][0..4].* = .{ px, px, px, px };
                 }
             }
         } else {
@@ -2969,10 +3027,14 @@ pub const BoardUi = struct {
         };
 
         if (self.gpio_cache.len == total_px and std.meta.eql(self.gpio_cache_key, gkey)) {
-            for (0..box_h_px) |ry| {
-                const dst_row = c.pixels[(box_y_px + ry) * c.stride ..][0..box_w_px];
-                const src_row = self.gpio_cache[ry * box_w_px ..][0..box_w_px];
-                @memcpy(dst_row, src_row);
+            if (box_w_px == c.stride) {
+                @memcpy(c.pixels[@as(usize, box_y_px) * c.stride ..][0..total_px], self.gpio_cache[0..total_px]);
+            } else {
+                for (0..box_h_px) |ry| {
+                    const dst_row = c.pixels[(box_y_px + ry) * c.stride ..][0..box_w_px];
+                    const src_row = self.gpio_cache[ry * box_w_px ..][0..box_w_px];
+                    @memcpy(dst_row, src_row);
+                }
             }
             return;
         }
@@ -3088,10 +3150,14 @@ pub const BoardUi = struct {
             self.gpio_cache = self.gpa.alloc(u32, total_px) catch &.{};
         }
         if (self.gpio_cache.len == total_px) {
-            for (0..box_h_px) |ry| {
-                const src_row = c.pixels[(box_y_px + ry) * c.stride ..][0..box_w_px];
-                const dst_row = self.gpio_cache[ry * box_w_px ..][0..box_w_px];
-                @memcpy(dst_row, src_row);
+            if (box_w_px == c.stride) {
+                @memcpy(self.gpio_cache[0..total_px], c.pixels[@as(usize, box_y_px) * c.stride ..][0..total_px]);
+            } else {
+                for (0..box_h_px) |ry| {
+                    const src_row = c.pixels[(box_y_px + ry) * c.stride ..][0..box_w_px];
+                    const dst_row = self.gpio_cache[ry * box_w_px ..][0..box_w_px];
+                    @memcpy(dst_row, src_row);
+                }
             }
             self.gpio_cache_key = gkey;
         }
@@ -5987,5 +6053,34 @@ test "BoardUi snackbar displays boot errors and dismisses on close button click"
     try testing.expectEqual(Action.consumed, ui.pointerButton(dx, dy, true, status, &hw));
     try testing.expectEqual(Action.consumed, ui.pointerButton(dx, dy, false, status, &hw));
     try testing.expect(!ui.hasSnackbar());
+}
+
+test "BoardUi.blitHdmiToBackbuffer SIMD pixel scaling for sc = 1, 2, 3, 4" {
+    const dw: usize = 11;
+    const dh: usize = 3;
+    var src: [dw * dh]u32 = undefined;
+    for (0..dw * dh) |i| {
+        src[i] = 0xFF000000 | @as(u32, @intCast(i + 1));
+    }
+
+    inline for ([_]u32{ 1, 2, 3, 4 }) |sc| {
+        const s: usize = sc;
+        const buf_w: usize = dw * s;
+        const top_rows: usize = 2 * s;
+        var dst: [(2 + dh) * 4 * (dw * 4)]u32 = @splat(0);
+        BoardUi.blitHdmiToBackbuffer(&dst, buf_w, top_rows, &src, dw, dh, sc);
+
+        for (0..dh) |sy| {
+            for (0..dw) |sx| {
+                const expected = src[sy * dw + sx];
+                for (0..s) |ry| {
+                    for (0..s) |rx| {
+                        const actual = dst[(top_rows + sy * s + ry) * buf_w + sx * s + rx];
+                        try testing.expectEqual(expected, actual);
+                    }
+                }
+            }
+        }
+    }
 }
 
