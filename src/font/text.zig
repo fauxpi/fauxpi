@@ -136,7 +136,7 @@ pub const Canvas = struct {
     }
 };
 
-inline fn blendCov4(
+pub inline fn blendCov4(
     dst_ptr: *[4]u32,
     cov4: [4]u8,
     color_opaque: u32,
@@ -249,15 +249,17 @@ pub const Bitmap = struct {
 pub const GlyphCache = struct {
     gpa: std.mem.Allocator,
     map: std.AutoHashMapUnmanaged(Key, Bitmap) = .empty,
+    runs: RunCache,
 
     pub fn init(gpa: std.mem.Allocator) GlyphCache {
-        return .{ .gpa = gpa };
+        return .{ .gpa = gpa, .runs = RunCache.init(gpa) };
     }
 
     pub fn deinit(cache: *GlyphCache) void {
         var it = cache.map.valueIterator();
         while (it.next()) |b| cache.gpa.free(b.mask);
         cache.map.deinit(cache.gpa);
+        cache.runs.deinit();
     }
 
     /// The glyph rasterized at `size` pixels per em, shifted right by
@@ -434,32 +436,66 @@ pub fn measure(style: Style, text: []const u8) f32 {
     return l.x;
 }
 
+inline fn drawGlyph(canvas: Canvas, cache: *GlyphCache, style: Style, base: i32, item: Layout.Item, item_x: f32) !void {
+    const quarter: i32 = @intFromFloat(@round(item_x * 4));
+    const subpixel: u2 = @intCast(@mod(quarter, 4));
+    const pen_x = @divFloor(quarter, 4);
+    if (item.font.colorLayers(item.glyph)) |layers_init| {
+        const style_alpha = style.color >> 24;
+        var layers = layers_init;
+        while (layers.next()) |layer| {
+            const b = try cache.get(item.font, layer.glyph, style.size, subpixel);
+            if (b.width == 0) continue;
+            const color = if (layer.color) |c|
+                (c & 0x00ffffff) | (div255((c >> 24) * style_alpha) << 24)
+            else
+                style.color;
+            canvas.blendMask(pen_x + b.left, base + b.top, b.mask, b.width, b.height, color);
+        }
+        return;
+    }
+    const b = try cache.get(item.font, item.glyph, style.size, subpixel);
+    if (b.width == 0) return;
+    canvas.blendMask(pen_x + b.left, base + b.top, b.mask, b.width, b.height, style.color);
+}
+
+inline fn drawGlyphRotated90Ccw(canvas: Canvas, cache: *GlyphCache, style: Style, base: i32, y: f32, item: Layout.Item) !void {
+    const pen_y_f = y - item.x;
+    const quarter: i32 = @intFromFloat(@round(pen_y_f * 4));
+    const subpixel: u2 = @intCast(@mod(-quarter, 4));
+    const pen_y = -@divFloor(-quarter, 4);
+    if (item.font.colorLayers(item.glyph)) |layers_init| {
+        const style_alpha = style.color >> 24;
+        var layers = layers_init;
+        while (layers.next()) |layer| {
+            const b = try cache.get(item.font, layer.glyph, style.size, subpixel);
+            if (b.width == 0) continue;
+            const color = if (layer.color) |c|
+                (c & 0x00ffffff) | (div255((c >> 24) * style_alpha) << 24)
+            else
+                style.color;
+            canvas.blendMaskRotated90Ccw(base, pen_y, b.left, b.top, b.mask, b.width, b.height, color);
+        }
+        return;
+    }
+    const b = try cache.get(item.font, item.glyph, style.size, subpixel);
+    if (b.width == 0) return;
+    canvas.blendMaskRotated90Ccw(base, pen_y, b.left, b.top, b.mask, b.width, b.height, style.color);
+}
+
 /// Draws `text` with its baseline at `baseline` (rounded to a pixel),
 /// starting at `x`. Returns the pen position after the text.
 pub fn draw(canvas: Canvas, cache: *GlyphCache, style: Style, x: f32, baseline: f32, text: []const u8) !f32 {
     const base: i32 = @intFromFloat(@round(baseline));
+    if (cache.runs.get(style, text)) |run| {
+        for (run.glyphs) |item| {
+            try drawGlyph(canvas, cache, style, base, item, x + item.x);
+        }
+        return x + run.width;
+    }
     var l: Layout = .{ .style = style, .text = text, .x = x };
     while (l.next()) |item| {
-        const quarter: i32 = @intFromFloat(@round(item.x * 4));
-        const subpixel: u2 = @intCast(@mod(quarter, 4));
-        const pen_x = @divFloor(quarter, 4);
-        if (item.font.colorLayers(item.glyph)) |layers_init| {
-            const style_alpha = style.color >> 24;
-            var layers = layers_init;
-            while (layers.next()) |layer| {
-                const b = try cache.get(item.font, layer.glyph, style.size, subpixel);
-                if (b.width == 0) continue;
-                const color = if (layer.color) |c|
-                    (c & 0x00ffffff) | (div255((c >> 24) * style_alpha) << 24)
-                else
-                    style.color;
-                canvas.blendMask(pen_x + b.left, base + b.top, b.mask, b.width, b.height, color);
-            }
-            continue;
-        }
-        const b = try cache.get(item.font, item.glyph, style.size, subpixel);
-        if (b.width == 0) continue;
-        canvas.blendMask(pen_x + b.left, base + b.top, b.mask, b.width, b.height, style.color);
+        try drawGlyph(canvas, cache, style, base, item, item.x);
     }
     return l.x;
 }
@@ -469,29 +505,15 @@ pub fn draw(canvas: Canvas, cache: *GlyphCache, style: Style, x: f32, baseline: 
 /// and advancing upward (`-Y`). Returns the vertical pen position after the text.
 pub fn drawRotated90Ccw(canvas: Canvas, cache: *GlyphCache, style: Style, base_x: f32, y: f32, text: []const u8) !f32 {
     const base: i32 = @intFromFloat(@round(base_x));
+    if (cache.runs.get(style, text)) |run| {
+        for (run.glyphs) |item| {
+            try drawGlyphRotated90Ccw(canvas, cache, style, base, y, item);
+        }
+        return y - run.width;
+    }
     var l: Layout = .{ .style = style, .text = text, .x = 0 };
     while (l.next()) |item| {
-        const pen_y_f = y - item.x;
-        const quarter: i32 = @intFromFloat(@round(pen_y_f * 4));
-        const subpixel: u2 = @intCast(@mod(-quarter, 4));
-        const pen_y = -@divFloor(-quarter, 4);
-        if (item.font.colorLayers(item.glyph)) |layers_init| {
-            const style_alpha = style.color >> 24;
-            var layers = layers_init;
-            while (layers.next()) |layer| {
-                const b = try cache.get(item.font, layer.glyph, style.size, subpixel);
-                if (b.width == 0) continue;
-                const color = if (layer.color) |c|
-                    (c & 0x00ffffff) | (div255((c >> 24) * style_alpha) << 24)
-                else
-                    style.color;
-                canvas.blendMaskRotated90Ccw(base, pen_y, b.left, b.top, b.mask, b.width, b.height, color);
-            }
-            continue;
-        }
-        const b = try cache.get(item.font, item.glyph, style.size, subpixel);
-        if (b.width == 0) continue;
-        canvas.blendMaskRotated90Ccw(base, pen_y, b.left, b.top, b.mask, b.width, b.height, style.color);
+        try drawGlyphRotated90Ccw(canvas, cache, style, base, y, item);
     }
     return y - l.x;
 }

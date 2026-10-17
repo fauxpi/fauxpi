@@ -185,6 +185,15 @@ inline fn shapeCoverage(d: f32, sx: f32, sy: f32, inset: f32) f32 {
     return @min(by_distance, cx * cy);
 }
 
+inline fn shapeCoverageVec4(v_d: @Vector(4, f32), v_sx: @Vector(4, f32), cy_clamped: f32, inset: f32) @Vector(4, f32) {
+    const v_zero: @Vector(4, f32) = @splat(0.0);
+    const v_one: @Vector(4, f32) = @splat(1.0);
+    const v_half_minus_inset: @Vector(4, f32) = @splat(0.5 - inset);
+    const by_distance = @min(@max(v_half_minus_inset - v_d, v_zero), v_one);
+    const cx = @min(@max(v_half_minus_inset - v_sx, v_zero), v_one);
+    return @min(by_distance, cx * @as(@Vector(4, f32), @splat(cy_clamped)));
+}
+
 pub const Canvas = struct {
     pixels: []u32,
     width: u32,
@@ -243,7 +252,7 @@ pub const Canvas = struct {
     }
 
     pub fn measureText(c: *const Canvas, size: f32, str: []const u8) f32 {
-        return text_mod.measure(.{ .font = c.font, .size = size }, str);
+        return c.cache.runs.measure(.{ .font = c.font, .size = size }, str);
     }
 
     pub fn drawText(c: *Canvas, size: f32, x: f32, baseline: f32, str: []const u8, color: Color) f32 {
@@ -264,7 +273,7 @@ pub const Canvas = struct {
         const sc = @max(c.scale, 1.0);
         const argb = color.toArgb();
         if (color.a <= 0) {
-            return x + text_mod.measure(.{ .font = f, .size = size, .color = argb }, str);
+            return x + c.cache.runs.measure(.{ .font = f, .size = size, .color = argb }, str);
         }
 
         const phys_style: Style = .{
@@ -282,7 +291,7 @@ pub const Canvas = struct {
             .stride = c.stride,
         };
         const end_phys = text_mod.draw(tc, c.cache, phys_style, ox, oy, str) catch
-            (ox + text_mod.measure(.{ .font = f, .size = size, .color = argb }, str) * sc);
+            (ox + c.cache.runs.measure(.{ .font = f, .size = size, .color = argb }, str) * sc);
         return (end_phys / sc) - c.origin[0];
     }
 
@@ -291,7 +300,7 @@ pub const Canvas = struct {
         const sc = @max(c.scale, 1.0);
         const argb = color.toArgb();
         if (color.a <= 0) {
-            return y - text_mod.measure(.{ .font = f, .size = size, .color = argb }, str);
+            return y - c.cache.runs.measure(.{ .font = f, .size = size, .color = argb }, str);
         }
 
         const phys_style: Style = .{
@@ -309,7 +318,7 @@ pub const Canvas = struct {
             .stride = c.stride,
         };
         const end_phys = text_mod.drawRotated90Ccw(tc, c.cache, phys_style, ox, oy, str) catch
-            (oy - text_mod.measure(.{ .font = f, .size = size, .color = argb }, str) * sc);
+            (oy - c.cache.runs.measure(.{ .font = f, .size = size, .color = argb }, str) * sc);
         return (end_phys / sc) - c.origin[1];
     }
 
@@ -361,6 +370,9 @@ pub const Canvas = struct {
         const filled = stroke_in >= fill_stroke;
         const stroke = if (filled) fill_stroke else stroke_in * sc;
         const argb = color.toArgb();
+        const argb_opaque: u32 = argb | 0xff000000;
+        const v_src_rb: @Vector(4, u32) = @splat(argb & 0x00ff00ff);
+        const v_src_g: @Vector(4, u32) = @splat(argb & 0x0000ff00);
         const base_alpha: f32 = color.a * 255.0;
 
         // Horizontal span `inner_x0..inner_x1` where `ax <= hw - inner_margin` (`mx == 0` and `cx == 1.0`)
@@ -371,10 +383,25 @@ pub const Canvas = struct {
         const has_mid_span = has_inner_x and (inner_x0 < inner_x1);
         const full_a_u32: u32 = @intFromFloat(@round(base_alpha));
 
+        const FVec4 = @Vector(4, f32);
+        const v_zero: FVec4 = @splat(0.0);
+        const v_hw: FVec4 = @splat(hw);
+        const v_base_alpha: FVec4 = @splat(base_alpha);
+        const v_lane_step = FVec4{ 0.0, 1.0, 2.0, 3.0 };
+
         for (y0..y1) |py| {
             const fy = @as(f32, @floatFromInt(py)) + 0.5 - cy;
             const ay = @abs(fy);
             const sy = ay - hh;
+            const cy_0 = std.math.clamp(0.5 - sy, 0.0, 1.0);
+            if (cy_0 <= 0.0) continue;
+            const cy_stroke = if (filled) 0.0 else std.math.clamp(0.5 - (sy + stroke), 0.0, 1.0);
+            const rad_left = if (fy < 0.0) radii.tl else radii.bl;
+            const rad_right = if (fy < 0.0) radii.tr else radii.br;
+            const v_rad_left: FVec4 = @splat(rad_left);
+            const v_rad_right: FVec4 = @splat(rad_right);
+            const v_sy: FVec4 = @splat(sy);
+
             const row = c.pixels[py * c.stride ..];
             const in_inner_y = (hh > inner_margin) and (ay <= hh - inner_margin);
 
@@ -386,8 +413,7 @@ pub const Canvas = struct {
                             text_mod.blendSpan(row[inner_x0..inner_x1], argb, full_a_u32);
                         }
                     } else {
-                        const span_cov = std.math.clamp(0.5 - sy, 0.0, 1.0) -
-                            (if (filled) @as(f32, 0.0) else std.math.clamp(0.5 - (sy + stroke), 0.0, 1.0));
+                        const span_cov = cy_0 - cy_stroke;
                         if (span_cov > 0.0) {
                             const span_a: u32 = @intFromFloat(@round(base_alpha * span_cov));
                             text_mod.blendSpan(row[inner_x0..inner_x1], argb, span_a);
@@ -397,28 +423,48 @@ pub const Canvas = struct {
                     continue;
                 }
 
-                const fx = @as(f32, @floatFromInt(px)) + 0.5 - cx;
-                const ax = @abs(fx);
-                const rad = if (fx < 0.0)
-                    (if (fy < 0.0) radii.tl else radii.bl)
-                else
-                    (if (fy < 0.0) radii.tr else radii.br);
+                const limit_x = if (has_mid_span and px < inner_x0) inner_x0 else x1;
+                while (px + 4 <= limit_x) : (px += 4) {
+                    const v_fx: FVec4 = @as(FVec4, @splat(@as(f32, @floatFromInt(px)) + 0.5 - cx)) + v_lane_step;
+                    const v_ax = @abs(v_fx);
+                    const v_rad = @select(f32, v_fx < v_zero, v_rad_left, v_rad_right);
+                    const v_qx = v_ax - (v_hw - v_rad);
+                    const v_qy = v_sy + v_rad;
+                    const v_mx = @max(v_qx, v_zero);
+                    const v_my = @max(v_qy, v_zero);
+                    const v_d = @sqrt(v_mx * v_mx + v_my * v_my) + @min(@max(v_qx, v_qy), v_zero) - v_rad;
+                    const v_sx = v_ax - v_hw;
 
-                const qx = ax - (hw - rad);
-                const qy = ay - (hh - rad);
-                const mx = @max(qx, 0.0);
-                const my = @max(qy, 0.0);
-                const d = @sqrt(mx * mx + my * my) + @min(@max(qx, qy), 0.0) - rad;
-                const sx = ax - hw;
+                    const v_cov0 = shapeCoverageVec4(v_d, v_sx, cy_0, 0.0);
+                    const v_cov = if (filled)
+                        v_cov0
+                    else
+                        @max(v_cov0 - shapeCoverageVec4(v_d, v_sx, cy_stroke, stroke), v_zero);
 
-                const cov = shapeCoverage(d, sx, sy, 0.0) - (if (filled) 0.0 else shapeCoverage(d, sx, sy, stroke));
-                if (cov > 0.0) {
-                    const a_u32: u32 = @intFromFloat(@round(base_alpha * cov));
-                    if (a_u32 > 0) {
-                        row[px] = text_mod.blend(row[px], argb, a_u32);
+                    const v_a_u8: @Vector(4, u8) = @intFromFloat(@round(v_base_alpha * v_cov));
+                    text_mod.blendCov4(row[px..][0..4], @bitCast(v_a_u8), argb_opaque, 255, v_src_rb, v_src_g);
+                }
+
+                while (px < limit_x) : (px += 1) {
+                    const fx = @as(f32, @floatFromInt(px)) + 0.5 - cx;
+                    const ax = @abs(fx);
+                    const rad = if (fx < 0.0) rad_left else rad_right;
+
+                    const qx = ax - (hw - rad);
+                    const qy = ay - (hh - rad);
+                    const mx = @max(qx, 0.0);
+                    const my = @max(qy, 0.0);
+                    const d = @sqrt(mx * mx + my * my) + @min(@max(qx, qy), 0.0) - rad;
+                    const sx = ax - hw;
+
+                    const cov = shapeCoverage(d, sx, sy, 0.0) - (if (filled) 0.0 else shapeCoverage(d, sx, sy, stroke));
+                    if (cov > 0.0) {
+                        const a_u32: u32 = @intFromFloat(@round(base_alpha * cov));
+                        if (a_u32 > 0) {
+                            row[px] = text_mod.blend(row[px], argb, a_u32);
+                        }
                     }
                 }
-                px += 1;
             }
         }
     }
