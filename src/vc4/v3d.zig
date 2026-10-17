@@ -60,6 +60,56 @@ pub const V3d = struct {
         persp_varyings: [16]f32 = @splat(0),
     };
 
+    pub const EdgeSetup = struct {
+        p0x: f32 = 0,
+        p0y: f32 = 0,
+        dx: f32 = 0,
+        dy: f32 = 0,
+        sign: f32 = 1.0,
+        step_x: f32 = 0,
+        is_top_left: bool = false,
+
+        pub inline fn init(ax: f32, ay: f32, bx: f32, by: f32, area_sign: f32) EdgeSetup {
+            const is_tl = topLeft(ax, ay, bx, by, area_sign);
+            if (ax > bx or (ax == bx and ay > by)) {
+                const dy = ay - by;
+                const s = -area_sign;
+                return .{
+                    .p0x = bx,
+                    .p0y = by,
+                    .dx = ax - bx,
+                    .dy = dy,
+                    .sign = s,
+                    .step_x = -dy * s,
+                    .is_top_left = is_tl,
+                };
+            }
+            const dy = by - ay;
+            return .{
+                .p0x = ax,
+                .p0y = ay,
+                .dx = bx - ax,
+                .dy = dy,
+                .sign = area_sign,
+                .step_x = -dy * area_sign,
+                .is_top_left = is_tl,
+            };
+        }
+
+        pub inline fn eval(self: EdgeSetup, row_term: f32, fx: f32) f32 {
+            return (row_term - self.dy * (fx - self.p0x)) * self.sign;
+        }
+
+        pub inline fn passes(self: EdgeSetup, val: f32) bool {
+            return if (self.is_top_left) (val >= 0.0) else (val > 0.0);
+        }
+
+        pub inline fn passesMask4(self: EdgeSetup, val4: @Vector(4, f32)) u4 {
+            const zero4: @Vector(4, f32) = @splat(0.0);
+            return @bitCast(if (self.is_top_left) (val4 >= zero4) else (val4 > zero4));
+        }
+    };
+
     pub const ShadedTriangle = struct {
         draw_idx: u16,
         min_x: u32,
@@ -68,6 +118,63 @@ pub const V3d = struct {
         max_y: u32,
         area: f32,
         v: [3]ShadedVertex,
+        inv_area: f32 = 0,
+        edge0: EdgeSetup = .{},
+        edge1: EdgeSetup = .{},
+        edge2: EdgeSetup = .{},
+        dz0: f32 = 0,
+        dz1: f32 = 0,
+        dinvw0: f32 = 0,
+        dinvw1: f32 = 0,
+        dvar0: [16]f32 = @splat(0),
+        dvar1: [16]f32 = @splat(0),
+        all_unit_w: bool = true,
+        setup_valid: bool = false,
+
+        pub fn init(
+            draw_idx: u16,
+            min_x: u32,
+            min_y: u32,
+            max_x: u32,
+            max_y: u32,
+            area: f32,
+            verts: [3]ShadedVertex,
+            n_var: usize,
+        ) ShadedTriangle {
+            const abs_area = @abs(area);
+            const area_sign = std.math.sign(area);
+            const inv_area = if (abs_area > 0) (1.0 / abs_area) else 0.0;
+            const z2 = verts[2].z;
+            const invw2 = verts[2].inv_w;
+            var dvar0: [16]f32 = @splat(0);
+            var dvar1: [16]f32 = @splat(0);
+            for (0..n_var) |vi| {
+                const v2 = verts[2].persp_varyings[vi];
+                dvar0[vi] = verts[0].persp_varyings[vi] - v2;
+                dvar1[vi] = verts[1].persp_varyings[vi] - v2;
+            }
+            return .{
+                .draw_idx = draw_idx,
+                .min_x = min_x,
+                .min_y = min_y,
+                .max_x = max_x,
+                .max_y = max_y,
+                .area = area,
+                .v = verts,
+                .inv_area = inv_area,
+                .edge0 = EdgeSetup.init(verts[1].x, verts[1].y, verts[2].x, verts[2].y, area_sign),
+                .edge1 = EdgeSetup.init(verts[2].x, verts[2].y, verts[0].x, verts[0].y, area_sign),
+                .edge2 = EdgeSetup.init(verts[0].x, verts[0].y, verts[1].x, verts[1].y, area_sign),
+                .dz0 = verts[0].z - z2,
+                .dz1 = verts[1].z - z2,
+                .dinvw0 = verts[0].inv_w - invw2,
+                .dinvw1 = verts[1].inv_w - invw2,
+                .dvar0 = dvar0,
+                .dvar1 = dvar1,
+                .all_unit_w = (verts[0].inv_w == 1.0 and verts[1].inv_w == 1.0 and verts[2].inv_w == 1.0),
+                .setup_valid = true,
+            };
+        }
     };
 
     pub const LazyTileLoad = struct {
@@ -656,15 +763,16 @@ pub const V3d = struct {
                     const min_uy: u32 = @intFromFloat(min_fy);
                     const max_ux: u32 = @intFromFloat(max_fx);
                     const max_uy: u32 = @intFromFloat(max_fy);
-                    self.shaded_tris[tri_slot] = .{
-                        .draw_idx = @intCast(draw_idx),
-                        .min_x = min_ux,
-                        .min_y = min_uy,
-                        .max_x = max_ux,
-                        .max_y = max_uy,
-                        .area = area,
-                        .v = verts,
-                    };
+                    self.shaded_tris[tri_slot] = ShadedTriangle.init(
+                        @intCast(draw_idx),
+                        min_ux,
+                        min_uy,
+                        max_ux,
+                        max_uy,
+                        area,
+                        verts,
+                        n_var,
+                    );
                     self.shaded_tris_len = tri_slot + 1;
 
                     // Spatially bin this triangle into overlapping 64x64 tiles
@@ -1681,15 +1789,16 @@ pub const V3d = struct {
                 const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
                 if (min_fx >= max_fx or min_fy >= max_fy) continue;
 
-                const tri = ShadedTriangle{
-                    .draw_idx = 0,
-                    .min_x = @intFromFloat(min_fx),
-                    .min_y = @intFromFloat(min_fy),
-                    .max_x = @intFromFloat(max_fx),
-                    .max_y = @intFromFloat(max_fy),
-                    .area = area,
-                    .v = verts,
-                };
+                const tri = ShadedTriangle.init(
+                    0,
+                    @intFromFloat(min_fx),
+                    @intFromFloat(min_fy),
+                    @intFromFloat(max_fx),
+                    @intFromFloat(max_fy),
+                    area,
+                    verts,
+                    n_var,
+                );
                 self.rasterizeShadedTriangleDecodedInTile(ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, tile_px_x, tile_px_y, tile_size);
             }
         }
@@ -1711,54 +1820,6 @@ pub const V3d = struct {
         const dy = (by - ay) * area_sign;
         return (dy == 0 and dx < 0) or dy > 0;
     }
-
-    const EdgeSetup = struct {
-        p0x: f32,
-        p0y: f32,
-        dx: f32,
-        dy: f32,
-        sign: f32,
-        is_top_left: bool,
-
-        inline fn init(ax: f32, ay: f32, bx: f32, by: f32, area_sign: f32) EdgeSetup {
-            const is_tl = topLeft(ax, ay, bx, by, area_sign);
-            if (ax > bx or (ax == bx and ay > by)) {
-                return .{
-                    .p0x = bx,
-                    .p0y = by,
-                    .dx = ax - bx,
-                    .dy = ay - by,
-                    .sign = -area_sign,
-                    .is_top_left = is_tl,
-                };
-            }
-            return .{
-                .p0x = ax,
-                .p0y = ay,
-                .dx = bx - ax,
-                .dy = by - ay,
-                .sign = area_sign,
-                .is_top_left = is_tl,
-            };
-        }
-
-        inline fn eval(self: EdgeSetup, row_term: f32, fx: f32) f32 {
-            return (row_term - self.dy * (fx - self.p0x)) * self.sign;
-        }
-
-        inline fn evalVec4(self: EdgeSetup, row_term: f32, fx4: @Vector(4, f32)) @Vector(4, f32) {
-            return (@as(@Vector(4, f32), @splat(row_term)) - @as(@Vector(4, f32), @splat(self.dy)) * (fx4 - @as(@Vector(4, f32), @splat(self.p0x)))) * @as(@Vector(4, f32), @splat(self.sign));
-        }
-
-        inline fn passes(self: EdgeSetup, val: f32) bool {
-            return if (self.is_top_left) (val >= 0.0) else (val > 0.0);
-        }
-
-        inline fn passesMask4(self: EdgeSetup, val4: @Vector(4, f32)) u4 {
-            const zero4: @Vector(4, f32) = @splat(0.0);
-            return @bitCast(if (self.is_top_left) (val4 >= zero4) else (val4 > zero4));
-        }
-    };
 
     fn rasterizeShadedTriangleInTile(
         self: *V3d,
@@ -1800,34 +1861,31 @@ pub const V3d = struct {
         const need_depth = (depth_func != 7) or z_updates;
         var tile_materialized = false;
 
-        const v = &tri.v;
-        const abs_area = @abs(tri.area);
-        if (abs_area <= 0) return;
-        const area_sign = std.math.sign(tri.area);
-        const inv_area = 1.0 / abs_area;
         const n_var = @min(@as(usize, num_varyings), 16);
+        const setup_tri = if (tri.setup_valid)
+            tri.*
+        else
+            ShadedTriangle.init(tri.draw_idx, tri.min_x, tri.min_y, tri.max_x, tri.max_y, tri.area, tri.v, n_var);
 
-        const edge0 = EdgeSetup.init(v[1].x, v[1].y, v[2].x, v[2].y, area_sign);
-        const edge1 = EdgeSetup.init(v[2].x, v[2].y, v[0].x, v[0].y, area_sign);
-        const edge2 = EdgeSetup.init(v[0].x, v[0].y, v[1].x, v[1].y, area_sign);
+        const inv_area = setup_tri.inv_area;
+        if (inv_area <= 0) return;
 
-        const z2 = v[2].z;
-        const dz0 = v[0].z - z2;
-        const dz1 = v[1].z - z2;
+        const edge0 = setup_tri.edge0;
+        const edge1 = setup_tri.edge1;
+        const edge2 = setup_tri.edge2;
 
-        const all_unit_w = (v[0].inv_w == 1.0 and v[1].inv_w == 1.0 and v[2].inv_w == 1.0);
-        const invw2 = v[2].inv_w;
-        const dinvw0 = v[0].inv_w - invw2;
-        const dinvw1 = v[1].inv_w - invw2;
+        const z2 = setup_tri.v[2].z;
+        const dz0 = setup_tri.dz0;
+        const dz1 = setup_tri.dz1;
 
-        var var2: [16]f32 = undefined;
-        var dvar0: [16]f32 = undefined;
-        var dvar1: [16]f32 = undefined;
-        for (0..n_var) |vi| {
-            var2[vi] = v[2].persp_varyings[vi];
-            dvar0[vi] = v[0].persp_varyings[vi] - var2[vi];
-            dvar1[vi] = v[1].persp_varyings[vi] - var2[vi];
-        }
+        const all_unit_w = setup_tri.all_unit_w;
+        const invw2 = setup_tri.v[2].inv_w;
+        const dinvw0 = setup_tri.dinvw0;
+        const dinvw1 = setup_tri.dinvw1;
+
+        const var2 = &setup_tri.v[2].persp_varyings;
+        const dvar0 = &setup_tri.dvar0;
+        const dvar1 = &setup_tri.dvar1;
 
         // Batch up to 16 covered pixels per SIMD QPU invocation
         var batch_idx: [16]u32 = undefined;
@@ -1839,6 +1897,7 @@ pub const V3d = struct {
         var tlb_in: qpu_sim.Vec = qpu_sim.splat(0);
         var vary_vecs: [16]qpu_sim.Vec = @splat(qpu_sim.splat(0));
         var span_vary_vecs: [16]qpu_sim.Vec = undefined;
+        var tex_cache: [2]qpu_sim.TexCache = .{ .{}, .{} };
         var batch_len: usize = 0;
 
         const flushBatch = struct {
@@ -1857,6 +1916,7 @@ pub const V3d = struct {
                 funifs: []const u32,
                 mem: []const u8,
                 z_upd: bool,
+                tcache: *[2]qpu_sim.TexCache,
             ) void {
                 if (count < 16 and count > 0) {
                     const last = count - 1;
@@ -1880,6 +1940,7 @@ pub const V3d = struct {
                     .frag_y = fy.*,
                     .texture_memory = mem,
                     .tlb_color_in = tin.*,
+                    .tex_cache = tcache,
                 };
                 const res = qpu_sim.runFragmentDecoded(fcode, &env) catch return;
                 if (res.tlb_color) |colors| {
@@ -1920,9 +1981,14 @@ pub const V3d = struct {
         const lane_u_offsets = @Vector(16, u32){ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         const fx_min_tile = @as(f32, @floatFromInt(x_start)) + 0.5;
         const fx_max_tile = @as(f32, @floatFromInt(x_end - 1)) + 0.5;
-        const step_x0 = -edge0.dy * edge0.sign;
-        const step_x1 = -edge1.dy * edge1.sign;
-        const step_x2 = -edge2.dy * edge2.sign;
+        const step_x0 = edge0.step_x;
+        const step_x1 = edge1.step_x;
+        const step_x2 = edge2.step_x;
+        const step16_e0 = @as(@Vector(16, f32), @splat(step_x0)) * lane_f_offsets;
+        const step16_e1 = @as(@Vector(16, f32), @splat(step_x1)) * lane_f_offsets;
+        const step4_e0 = @as(@Vector(4, f32), @splat(step_x0)) * lane4_f_offsets;
+        const step4_e1 = @as(@Vector(4, f32), @splat(step_x1)) * lane4_f_offsets;
+        const step4_e2 = @as(@Vector(4, f32), @splat(step_x2)) * lane4_f_offsets;
 
         var py = y_start;
         while (py < y_end) : (py += 1) {
@@ -1975,28 +2041,29 @@ pub const V3d = struct {
             if (px_start >= px_end) continue;
 
             const row_base = (py - tile_px_y) * tile_size;
+            const fx_start = @as(f32, @floatFromInt(px_start)) + 0.5;
+            var cur_e0 = edge0.eval(row_term0, fx_start);
+            var cur_e1 = edge1.eval(row_term1, fx_start);
+            var cur_e2 = edge2.eval(row_term2, fx_start);
 
             var px = px_start;
             while (px < px_end) {
                 // 16-lane SIMD interior span fast-path (runs even when batch_len > 0 holds earlier edge pixels)
                 if (px + 16 <= px_end) {
-                    const fx0 = @as(f32, @floatFromInt(px)) + 0.5;
-                    const fx15 = fx0 + 15.0;
-                    if (edge0.passes(edge0.eval(row_term0, fx0)) and
-                        edge0.passes(edge0.eval(row_term0, fx15)) and
-                        edge1.passes(edge1.eval(row_term1, fx0)) and
-                        edge1.passes(edge1.eval(row_term1, fx15)) and
-                        edge2.passes(edge2.eval(row_term2, fx0)) and
-                        edge2.passes(edge2.eval(row_term2, fx15)))
+                    if (edge0.passes(cur_e0) and
+                        edge0.passes(cur_e0 + step_x0 * 15.0) and
+                        edge1.passes(cur_e1) and
+                        edge1.passes(cur_e1 + step_x1 * 15.0) and
+                        edge2.passes(cur_e2) and
+                        edge2.passes(cur_e2 + step_x2 * 15.0))
                     {
                         if (!tile_materialized) {
                             self.ensureTileMaterialized(ram, need_depth);
                             tile_materialized = true;
                         }
                         const tile_idx = row_base + (px - tile_px_x);
-                        const fx_vec = @as(@Vector(16, f32), @splat(fx0)) + lane_f_offsets;
-                        const e0_vec = (@as(@Vector(16, f32), @splat(row_term0)) - @as(@Vector(16, f32), @splat(edge0.dy)) * (fx_vec - @as(@Vector(16, f32), @splat(edge0.p0x)))) * @as(@Vector(16, f32), @splat(edge0.sign));
-                        const e1_vec = (@as(@Vector(16, f32), @splat(row_term1)) - @as(@Vector(16, f32), @splat(edge1.dy)) * (fx_vec - @as(@Vector(16, f32), @splat(edge1.p0x)))) * @as(@Vector(16, f32), @splat(edge1.sign));
+                        const e0_vec = @as(@Vector(16, f32), @splat(cur_e0)) + step16_e0;
+                        const e1_vec = @as(@Vector(16, f32), @splat(cur_e1)) + step16_e1;
                         const w0_vec = e0_vec * @as(@Vector(16, f32), @splat(inv_area));
                         const w1_vec = e1_vec * @as(@Vector(16, f32), @splat(inv_area));
                         const z_vec = @as(@Vector(16, f32), @splat(z2)) + w0_vec * @as(@Vector(16, f32), @splat(dz0)) + w1_vec * @as(@Vector(16, f32), @splat(dz1));
@@ -2042,6 +2109,7 @@ pub const V3d = struct {
                                 .frag_y = @splat(py),
                                 .texture_memory = ram,
                                 .tlb_color_in = self.tile_color[tile_idx..][0..16].*,
+                                .tex_cache = &tex_cache,
                             };
                             const span_res = qpu_sim.runFragmentDecoded(fs_decoded, &span_env) catch null;
 
@@ -2054,6 +2122,9 @@ pub const V3d = struct {
                                 }
                             }
                             px += 16;
+                            cur_e0 += step_x0 * 16.0;
+                            cur_e1 += step_x1 * 16.0;
+                            cur_e2 += step_x2 * 16.0;
                             continue;
                         }
                     }
@@ -2061,24 +2132,31 @@ pub const V3d = struct {
 
                 // 4-wide SIMD edge stepping & coverage evaluation
                 if (px + 4 <= px_end) {
-                    const fx0 = @as(f32, @floatFromInt(px)) + 0.5;
-                    const fx4 = @as(@Vector(4, f32), @splat(fx0)) + lane4_f_offsets;
-                    const e0_4 = edge0.evalVec4(row_term0, fx4);
+                    const e0_4 = @as(@Vector(4, f32), @splat(cur_e0)) + step4_e0;
                     var mask4: u4 = edge0.passesMask4(e0_4);
                     if (mask4 == 0) {
                         px += 4;
+                        cur_e0 += step_x0 * 4.0;
+                        cur_e1 += step_x1 * 4.0;
+                        cur_e2 += step_x2 * 4.0;
                         continue;
                     }
-                    const e1_4 = edge1.evalVec4(row_term1, fx4);
+                    const e1_4 = @as(@Vector(4, f32), @splat(cur_e1)) + step4_e1;
                     mask4 &= edge1.passesMask4(e1_4);
                     if (mask4 == 0) {
                         px += 4;
+                        cur_e0 += step_x0 * 4.0;
+                        cur_e1 += step_x1 * 4.0;
+                        cur_e2 += step_x2 * 4.0;
                         continue;
                     }
-                    const e2_4 = edge2.evalVec4(row_term2, fx4);
+                    const e2_4 = @as(@Vector(4, f32), @splat(cur_e2)) + step4_e2;
                     mask4 &= edge2.passesMask4(e2_4);
                     if (mask4 == 0) {
                         px += 4;
+                        cur_e0 += step_x0 * 4.0;
+                        cur_e1 += step_x1 * 4.0;
+                        cur_e2 += step_x2 * 4.0;
                         continue;
                     }
 
@@ -2107,6 +2185,9 @@ pub const V3d = struct {
                         mask4 &= dmask;
                         if (mask4 == 0) {
                             px += 4;
+                            cur_e0 += step_x0 * 4.0;
+                            cur_e1 += step_x1 * 4.0;
+                            cur_e2 += step_x2 * 4.0;
                             continue;
                         }
                     }
@@ -2154,10 +2235,14 @@ pub const V3d = struct {
                                 fs_unifs,
                                 ram,
                                 z_updates,
+                                &tex_cache,
                             );
                             batch_len = 0;
                         }
                         px += 4;
+                        cur_e0 += step_x0 * 4.0;
+                        cur_e1 += step_x1 * 4.0;
+                        cur_e2 += step_x2 * 4.0;
                         continue;
                     }
 
@@ -2206,21 +2291,27 @@ pub const V3d = struct {
                                 fs_unifs,
                                 ram,
                                 z_updates,
+                                &tex_cache,
                             );
                             batch_len = 0;
                         }
                     }
                     px += 4;
+                    cur_e0 += step_x0 * 4.0;
+                    cur_e1 += step_x1 * 4.0;
+                    cur_e2 += step_x2 * 4.0;
                     continue;
                 }
 
-                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const e0 = cur_e0;
+                const e1 = cur_e1;
+                const e2 = cur_e2;
                 px += 1;
-                const e0 = edge0.eval(row_term0, fx);
+                cur_e0 += step_x0;
+                cur_e1 += step_x1;
+                cur_e2 += step_x2;
                 if (!edge0.passes(e0)) continue;
-                const e1 = edge1.eval(row_term1, fx);
                 if (!edge1.passes(e1)) continue;
-                const e2 = edge2.eval(row_term2, fx);
                 if (!edge2.passes(e2)) continue;
 
                 if (!tile_materialized) {
@@ -2285,6 +2376,7 @@ pub const V3d = struct {
                         fs_unifs,
                         ram,
                         z_updates,
+                        &tex_cache,
                     );
                     batch_len = 0;
                 }
@@ -2307,6 +2399,7 @@ pub const V3d = struct {
                 fs_unifs,
                 ram,
                 z_updates,
+                &tex_cache,
             );
         }
     }
