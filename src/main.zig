@@ -561,16 +561,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             }
         }
 
-        var runnable_cores: usize = 0;
-        for (0..num_cores) |i| {
-            if (cpus[i].halted_spin) continue;
-            const cid: u2 = @intCast(i);
-            if (!cpus[i].mmu.halted_wfi or soc.hasPendingIrqForCore(cid) or soc.hasPendingFiqForCore(cid)) {
-                runnable_cores += 1;
-            }
-        }
-
-        const max_slice: u64 = if (runnable_cores > 1) 4096 else 65536;
+        const max_slice: u64 = if (num_cores > 1) 4096 else 65536;
         const batch: usize = if (opts.max_steps != 0)
             @intCast(@min(max_slice, opts.max_steps - cpus[0].cycles))
         else
@@ -581,6 +572,25 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             if (cpus[i].halted_spin) continue;
             const ran = cpus[i].runSteps(&soc, batch);
             if (ran > max_ran) max_ran = ran;
+            if (cpus[i].mmu.tlb_broadcast_full) {
+                cpus[i].mmu.tlb_broadcast_full = false;
+                cpus[i].mmu.tlb_broadcast_va_count = 0;
+                for (0..num_cores) |j| {
+                    if (j != i) {
+                        cpus[j].mmu.flushTlb();
+                    }
+                }
+            } else if (cpus[i].mmu.tlb_broadcast_va_count > 0) {
+                const count = cpus[i].mmu.tlb_broadcast_va_count;
+                cpus[i].mmu.tlb_broadcast_va_count = 0;
+                for (0..num_cores) |j| {
+                    if (j != i) {
+                        for (cpus[i].mmu.tlb_broadcast_vas[0..count]) |va_arg| {
+                            cpus[j].mmu.flushTlbVa64(va_arg);
+                        }
+                    }
+                }
+            }
         }
 
         // Advance 1 MHz system timer and ARM timer proportionally to instructions executed (~256 instructions per us)

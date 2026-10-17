@@ -144,6 +144,9 @@ pub const Mmu = struct {
     /// 64-bit bitmaps tracking which 64-entry chunks (`0..63`) in `soft_tlb32` / `soft_tlb64` have been populated since the last `flushTlb()`.
     soft_tlb32_dirty_chunks: u64 = 0,
     soft_tlb64_dirty_chunks: u64 = 0,
+    tlb_broadcast_full: bool = false,
+    tlb_broadcast_va_count: u16 = 0,
+    tlb_broadcast_vas: [256]u64 = @splat(0),
 
     pub const tlb_bits = 12;
     pub const tlb_size = 1 << tlb_bits;
@@ -245,7 +248,7 @@ pub const Mmu = struct {
     }
 
     pub fn flushTlbVa64(self: *Mmu, va_page_shifted: u64) void {
-        const vpn: u52 = @truncate(va_page_shifted & 0x000f_ffff_ffff_ffff);
+        const vpn: u52 = @truncate(va_page_shifted & 0x0000_0fff_ffff_ffff);
         const idx: usize = @as(usize, @truncate(vpn)) & tlb_mask;
         if (self.tlb[idx].gen == self.tlb_gen and self.tlb[idx].vpn == vpn) {
             self.tlb[idx].gen = 0;
@@ -1288,6 +1291,7 @@ pub const Mmu = struct {
                 } else {
                     self.flushTlb();
                 }
+                if (crm == 3) self.tlb_broadcast_full = true;
             },
             10 => switch (crm) {
                 2 => switch (opc2) {

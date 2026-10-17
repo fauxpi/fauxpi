@@ -404,15 +404,15 @@ pub const Tree = struct {
 
         // 2. /chosen bootargs, initrd, and rng-seed (initializes kernel CRNG immediately at boot)
         const chosen = try self.findOrCreateNode("/chosen");
+        const serial0_target = if (self.findNode("/aliases")) |aliases|
+            aliases.getStringProp("serial0")
+        else
+            null;
+        const serial0_is_aux = if (serial0_target) |st|
+            std.mem.indexOf(u8, st, "7e215040") != null
+        else
+            false;
         if (cmdline.len > 0) {
-            const serial0_target = if (self.findNode("/aliases")) |aliases|
-                aliases.getStringProp("serial0")
-            else
-                null;
-            const serial0_is_aux = if (serial0_target) |st|
-                std.mem.indexOf(u8, st, "7e215040") != null
-            else
-                false;
             const serial0_tty = if (serial0_is_aux) "ttyS0" else "ttyAMA0";
             const serial1_tty = if (serial0_is_aux) "ttyAMA0" else "ttyS0";
 
@@ -450,11 +450,14 @@ pub const Tree = struct {
         try sys_node.setU32Prop(self.allocator, "linux,revision", 0x00900093);
         try self.setBoardSerial(0x00000000fa000001);
 
-        // 2c. Ensure PL011 UART0 (/soc/serial@7e201000) is enabled and mapped to serial0
+        // 2c. Ensure PL011 UART0 (/soc/serial@7e201000) is enabled without Bluetooth serdev children
         if (self.findNode("/soc/serial@7e201000") orelse self.findNode("uart0")) |uart0| {
             try uart0.setStringProp(self.allocator, "status", "okay");
-            if (self.findNode("/aliases")) |aliases| {
-                try aliases.setStringProp(self.allocator, "serial0", "/soc/serial@7e201000");
+            uart0.children.clearRetainingCapacity();
+            if (!serial0_is_aux) {
+                if (self.findNode("/aliases")) |aliases| {
+                    try aliases.setStringProp(self.allocator, "serial0", "/soc/serial@7e201000");
+                }
             }
         }
 

@@ -3137,7 +3137,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 // Hints, barriers, CLREX, MSR (immediate)
                 if (crn == 2) {
                     // Hints: NOP (0), YIELD (1), WFE (2), WFI (3), SEV (4), SEVL (5)
-                    const hint = (crm << 3) | op2;
+                    const hint = (@as(u8, crm) << 3) | op2;
                     if (hint == 1 or hint == 2) {
                         cpu.yield_slice = true;
                     } else if (hint == 3) {
@@ -3148,11 +3148,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         cpu.excl_valid = false; // CLREX
                     } else if (op2 == 4 or op2 == 5) {
                         const pc32: u32 = @truncate(cur_pc);
-                        if (cpu.last_dmb_pc == pc32) {
+                        if ((cpu.last_dmb_pc ^ pc32) < 256) {
                             cpu.yield_slice = true;
-                        } else {
-                            cpu.last_dmb_pc = pc32;
                         }
+                        cpu.last_dmb_pc = pc32;
                     }
                 } else if (crn == 4) {
                     // MSR (immediate): SPSel (op1=0, op2=5), DAIFSet (op1=3, op2=6), DAIFClr (op1=3, op2=7)
@@ -3187,7 +3186,23 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         }
                     } else if (crn == 8) {
                         // TLBI maintenance
-                        cpu.mmu.flushTlb();
+                        if (op1 == 0 and (crm == 3 or crm == 7) and (op2 == 1 or op2 == 3 or op2 == 5 or op2 == 7)) {
+                            const va_arg = getX(cpu, rt);
+                            cpu.mmu.flushTlbVa64(va_arg);
+                            if (crm == 3 and !cpu.mmu.tlb_broadcast_full) {
+                                if (cpu.mmu.tlb_broadcast_va_count < cpu.mmu.tlb_broadcast_vas.len) {
+                                    cpu.mmu.tlb_broadcast_vas[cpu.mmu.tlb_broadcast_va_count] = va_arg;
+                                    cpu.mmu.tlb_broadcast_va_count += 1;
+                                } else {
+                                    cpu.mmu.tlb_broadcast_full = true;
+                                }
+                            }
+                        } else {
+                            cpu.mmu.flushTlb();
+                            if (crm == 3) {
+                                cpu.mmu.tlb_broadcast_full = true;
+                            }
+                        }
                     } else if (crn == 7 and crm == 8) {
                         // AT S1E1R / S1E1W / S1E0R / S1E0W -> update PAR_EL1
                         const va = getX(cpu, rt);
@@ -5948,3 +5963,80 @@ test "AArch64 pre-decoded scalar FP and NEON vector fast-paths" {
     try std.testing.expectEqual(~@as(u128, 0), cpu.vfp.v[8]);
     try std.testing.expectEqual(@as(u64, 0x15151515_15151515), cpu.x[4]);
 }
+
+test "AArch64 TLBI VAE1IS masks 16-bit ASID and queues broadcast VA while BTI c does not yield slice" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+    @memset(ram, 0);
+
+    const arm1176 = @import("arm1176.zig");
+    var bus: TestBus = .{ .ram = ram };
+    const Cpu = arm1176.Arm1176(TestBus);
+    var cpu: Cpu = .{};
+    cpu.initReset64(0x1000, 0);
+
+    const vaddr: u64 = 0xffff_ffc0_8207_2000;
+    const vpn: u52 = @truncate((vaddr & 0x00ff_ffff_ffff_ffff) >> 12);
+    const idx: usize = @as(usize, @truncate(vpn)) & mmu_mod.Mmu.tlb_mask;
+    cpu.mmu.tlb[idx] = .{
+        .vpn = vpn,
+        .ppn_base = 0x4000,
+        .gen = cpu.mmu.tlb_gen,
+        .perms = 0xff,
+    };
+
+    // Pass non-zero ASID (including low 4 bits 0xf) in bits [63:48] of TLBI operand
+    const tlbi_arg: u64 = (0x123f << 48) | ((vaddr >> 12) & 0x0000_0fff_ffff_ffff);
+    cpu.x[0] = tlbi_arg;
+
+    // 0x1000: bti c          (0xd503245f) -> must NOT yield slice
+    // 0x1004: tlbi vae1is,x0 (0xd5088320) -> invalidates vpn and queues broadcast VA
+    // 0x1008: add x1, x1, #1 (0x91000421) -> executes within the same slice
+    // 0x100c: wfi            (0xd503207f)
+    const prog = [_]u32{
+        0xd503245f,
+        0xd5088320,
+        0x91000421,
+        0xd503207f,
+    };
+    for (prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+    }
+
+    const ran = cpu.runSteps(&bus, 16);
+    try std.testing.expectEqual(@as(usize, 4), ran);
+    try std.testing.expectEqual(@as(u64, 1), cpu.x[1]);
+    try std.testing.expectEqual(@as(u32, 0), cpu.mmu.tlb[idx].gen);
+    try std.testing.expectEqual(@as(u16, 1), cpu.mmu.tlb_broadcast_va_count);
+    try std.testing.expectEqual(tlbi_arg, cpu.mmu.tlb_broadcast_vas[0]);
+}
+
