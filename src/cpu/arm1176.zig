@@ -20,8 +20,9 @@ pub const Vfp = vfp_mod.Vfp;
 pub const PsrFlags = dec.PsrFlags;
 pub const PstateFlags = aarch64_mod.PstateFlags;
 
-pub const icache_size: usize = 16384;
+pub const icache_size: usize = 65536;
 pub const icache_mask: usize = icache_size - 1;
+pub const icache_pages: usize = icache_size >> 10;
 
 pub const DecodedSlot = struct {
     raw: u32 = 0xffff_ffff,
@@ -1006,7 +1007,7 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                             if (crm == 10 and (opc2 == 4 or opc2 == 5)) {
                                 return .{ .raw = inst, .op = @intFromEnum(ArmOp.mcr_barrier_al), .rd = @intFromBool(opc2 == 4) };
                             } else if (crm == 5 and (opc2 == 4 or opc2 == 6)) {
-                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.nop_al) };
+                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mcr_barrier_al), .rd = 2 };
                             }
                         }
                     }
@@ -1091,9 +1092,24 @@ pub fn Arm1176(comptime Bus: type) type {
 
         /// Direct-mapped decoded instruction cache (`icache_size` entries)
         icache: [icache_size]DecodedSlot = @splat(.{}),
+        /// Physical page base tags (`pbase`) for each 1024-word 4 KB page in `icache` (`0xffff_ffff` = untagged/invalid)
+        icache_page_tags: [icache_pages]u32 = @splat(0xffff_ffff),
+
+        pub inline fn invalidateIcache(self: *Self) void {
+            @memset(&self.icache_page_tags, 0xffff_ffff);
+        }
+
+        pub inline fn invalidateIcachePage(self: *Self, pbase: u32) void {
+            const ic_pages_mask = icache_pages - 1;
+            const page_idx: usize = @as(usize, (pbase >> 12) ^ (pbase >> 16) ^ (pbase >> 20)) & ic_pages_mask;
+            if (self.icache_page_tags[page_idx] == pbase) {
+                self.icache_page_tags[page_idx] = 0xffff_ffff;
+            }
+        }
 
         pub inline fn invalidateInlineTlb(self: *Self) void {
             self.mmu.flushTlb();
+            self.invalidateIcache();
         }
 
         pub fn initReset(self: *Self, entry_pc: u32, r0: u32, r1: u32, r2: u32) void {
@@ -1565,7 +1581,12 @@ pub fn Arm1176(comptime Bus: type) type {
                                 code_vbase = islot.x_vbase;
                                 code_pbase = islot.pbase;
                                 code_page_ptr = bus.ram.ptr + code_pbase;
-                                const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
+                                const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
+                                const page_slot = page_idx << 10;
+                                if (self.icache_page_tags[page_idx] != code_pbase) {
+                                    @memset(self.icache[page_slot..][0..1024], .{});
+                                    self.icache_page_tags[page_idx] = code_pbase;
+                                }
                                 code_icache_ptr = self.icache[page_slot..].ptr;
                                 break :blk std.mem.readInt(u16, code_page_ptr[pc & 0xffe ..][0..2], .little);
                             }
@@ -1583,7 +1604,12 @@ pub fn Arm1176(comptime Bus: type) type {
                                 code_vbase = islot2.x_vbase;
                                 code_pbase = islot2.pbase;
                                 code_page_ptr = bus.ram.ptr + code_pbase;
-                                const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
+                                const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
+                                const page_slot = page_idx << 10;
+                                if (self.icache_page_tags[page_idx] != code_pbase) {
+                                    @memset(self.icache[page_slot..][0..1024], .{});
+                                    self.icache_page_tags[page_idx] = code_pbase;
+                                }
                                 code_icache_ptr = self.icache[page_slot..].ptr;
                             }
                             break :blk fetched;
@@ -1603,40 +1629,72 @@ pub fn Arm1176(comptime Bus: type) type {
 
                     const pc = self.r[15] & ~@as(u32, 3);
                     const page_word: usize = (pc >> 2) & 0x3ff;
-                    const inst: u32 = if ((pc & 0xffff_f000) == code_vbase)
-                        std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little)
-                    else blk: {
+                    var d: DecodedSlot = undefined;
+                    var inst: u32 = undefined;
+                    if ((pc & 0xffff_f000) == code_vbase) {
+                        d = code_icache_ptr[page_word];
+                        if (d.raw != 0xffff_ffff) {
+                            inst = d.raw;
+                        } else {
+                            inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
+                            d = decodeArm32(inst);
+                            code_icache_ptr[page_word] = d;
+                        }
+                    } else {
                         const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
                         if ((pc & 0xffff_f000) == islot.x_vbase) {
                             code_vbase = islot.x_vbase;
                             code_pbase = islot.pbase;
                             code_page_ptr = bus.ram.ptr + code_pbase;
-                            const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
+                            const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
+                            const page_slot = page_idx << 10;
+                            if (self.icache_page_tags[page_idx] != code_pbase) {
+                                @memset(self.icache[page_slot..][0..1024], .{});
+                                self.icache_page_tags[page_idx] = code_pbase;
+                            }
                             code_icache_ptr = self.icache[page_slot..].ptr;
-                            break :blk std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
-                        }
-                        const fetched = self.fetch32(bus, pc) catch {
-                            self.enterException(.abt, 0x0c, pc +% 4, false);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            executed += 1;
-                            continue;
-                        };
-                        const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
-                        if ((pc & 0xffff_f000) == islot2.x_vbase) {
-                            code_vbase = islot2.x_vbase;
-                            code_pbase = islot2.pbase;
-                            code_page_ptr = bus.ram.ptr + code_pbase;
-                            const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
-                            code_icache_ptr = self.icache[page_slot..].ptr;
+                            d = code_icache_ptr[page_word];
+                            if (d.raw != 0xffff_ffff) {
+                                inst = d.raw;
+                            } else {
+                                inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
+                                d = decodeArm32(inst);
+                                code_icache_ptr[page_word] = d;
+                            }
                         } else {
-                            const page_slot = (@as(usize, (pc >> 12) ^ (pc >> 16)) & ic_pages_mask) << 10;
-                            code_icache_ptr = self.icache[page_slot..].ptr;
+                            inst = self.fetch32(bus, pc) catch {
+                                self.enterException(.abt, 0x0c, pc +% 4, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                executed += 1;
+                                continue;
+                            };
+                            const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
+                            if ((pc & 0xffff_f000) == islot2.x_vbase) {
+                                code_vbase = islot2.x_vbase;
+                                code_pbase = islot2.pbase;
+                                code_page_ptr = bus.ram.ptr + code_pbase;
+                                const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
+                                const page_slot = page_idx << 10;
+                                if (self.icache_page_tags[page_idx] != code_pbase) {
+                                    @memset(self.icache[page_slot..][0..1024], .{});
+                                    self.icache_page_tags[page_idx] = code_pbase;
+                                }
+                                code_icache_ptr = self.icache[page_slot..].ptr;
+                            } else {
+                                const page_idx = @as(usize, (pc >> 12) ^ (pc >> 16)) & ic_pages_mask;
+                                self.icache_page_tags[page_idx] = 0xffff_ffff;
+                                code_icache_ptr = self.icache[page_idx << 10 ..].ptr;
+                            }
+                            d = code_icache_ptr[page_word];
+                            if (d.raw != inst) {
+                                d = decodeArm32(inst);
+                                code_icache_ptr[page_word] = d;
+                            }
                         }
-                        break :blk fetched;
-                    };
+                    }
 
                     self.r[15] = pc +% 4;
                     cur_last_inst = inst;
@@ -1644,12 +1702,6 @@ pub fn Arm1176(comptime Bus: type) type {
 
                     if (inst < 0xe000_0000) {
                         if (!dec.checkCond(@truncate(inst >> 28), self.cpsr)) continue;
-                    }
-
-                    var d = code_icache_ptr[page_word];
-                    if (d.raw != inst) {
-                        d = decodeArm32(inst);
-                        code_icache_ptr[page_word] = d;
                     }
 
                 const imm32: u32 = @truncate(d.imm);
@@ -2849,7 +2901,14 @@ pub fn Arm1176(comptime Bus: type) type {
                             data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         }
                     },
-                    .mcr_barrier_al => self.memoryBarrier(bus, d.rd != 0),
+                    .mcr_barrier_al => {
+                        if (d.rd == 2) {
+                            self.invalidateIcache();
+                            code_vbase = 0xffff_ffff;
+                        } else {
+                            self.memoryBarrier(bus, d.rd != 0);
+                        }
+                    },
                     .nop_al => {},
                     .yield_wfe_al => {
                         self.yield_slice = true;
@@ -3588,6 +3647,8 @@ pub fn Arm1176(comptime Bus: type) type {
                     } else {
                         self.last_dmb_pc = inst_pc;
                     }
+                } else if ((inst & 0x0fff_fff0) == 0x057f_f060) {
+                    self.invalidateIcache();
                 }
                 // PLD / PLI / DMB / DSB / ISB are memory/cache hints
                 return;
@@ -4595,8 +4656,12 @@ pub fn Arm1176(comptime Bus: type) type {
                         }
                     } else {
                         self.mmu.writeCp15(opc1, crn, crm, opc2, self.r[rt]);
-                        if (crn == 7 and crm == 10 and (opc2 == 4 or opc2 == 5)) {
-                            self.memoryBarrier(bus, opc2 == 4);
+                        if (crn == 7) {
+                            if (crm == 10 and (opc2 == 4 or opc2 == 5)) {
+                                self.memoryBarrier(bus, opc2 == 4);
+                            } else if (crm == 5 or crm == 1) {
+                                self.invalidateIcache();
+                            }
                         }
                         if (crn == 14) self.syncCoreTimerLines(bus);
                     }

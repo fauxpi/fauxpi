@@ -1472,7 +1472,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 } else if (op2_sys == 4 or op2_sys == 5) {
                                     return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 2, .imm = op2_sys }; // DSB / DMB
                                 } else if (op2_sys == 6) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.nop) }; // ISB
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 11 }; // ISB
                                 }
                             } else if (crn == 4 and op1_sys == 3) {
                                 if (op2_sys == 6) {
@@ -1915,70 +1915,112 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 while (executed < batch_end) {
                     const cur_pc = cpu.pc64;
                     const page_word: usize = @truncate((cur_pc >> 2) & 0x3ff);
-                    const inst: u32 = if ((cur_pc & ~@as(u64, 0xfff)) == code_vbase)
-                        std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little)
-                    else blk: {
+                    var d: SlotType = undefined;
+                    var inst: u32 = undefined;
+                    if ((cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                        d = code_icache_ptr[page_word];
+                        if (d.raw != 0xffff_ffff) {
+                            inst = d.raw;
+                        } else {
+                            inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
+                            d = decodeA64(SlotType, inst);
+                            if (page_word < 1023) {
+                                const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
+                                if (tryFusePairA64(SlotType, d, next_inst)) |fused| {
+                                    d = fused;
+                                    if (code_icache_ptr[page_word + 1].raw != next_inst) {
+                                        code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
+                                    }
+                                }
+                            }
+                            code_icache_ptr[page_word] = d;
+                        }
+                    } else {
                         const islot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
                         if ((cur_pc & ~@as(u64, 0xfff)) == islot.x_vbase) {
                             code_vbase = islot.x_vbase;
                             code_pbase = islot.pbase;
                             code_page_ptr = bus.ram.ptr + code_pbase;
-                            const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
+                            const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
+                            const page_slot = page_idx << 10;
+                            if (cpu.icache_page_tags[page_idx] != code_pbase) {
+                                @memset(cpu.icache[page_slot..][0..1024], .{});
+                                cpu.icache_page_tags[page_idx] = code_pbase;
+                            }
                             code_icache_ptr = cpu.icache[page_slot..].ptr;
-                            break :blk std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
-                        }
-                        const fetched = fetchInst64(cpu, bus, cur_pc) catch {
-                            const target_el: u2 = @max(currentEl(cpu), 1);
-                            const esr = if (target_el >= 2) cpu.mmu.esr_el2 else cpu.mmu.esr_el1;
-                            takeException64(cpu, target_el, 0x000, esr, cur_pc, cur_pc);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff_ffff_ffff;
-                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                            executed += 1;
-                            continue;
-                        };
-                        const islot2 = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((cur_pc & ~@as(u64, 0xfff)) == islot2.x_vbase) {
-                            code_vbase = islot2.x_vbase;
-                            code_pbase = islot2.pbase;
-                            code_page_ptr = bus.ram.ptr + code_pbase;
-                            const page_slot = (@as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask) << 10;
-                            code_icache_ptr = cpu.icache[page_slot..].ptr;
+                            d = code_icache_ptr[page_word];
+                            if (d.raw != 0xffff_ffff) {
+                                inst = d.raw;
+                            } else {
+                                inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
+                                d = decodeA64(SlotType, inst);
+                                if (page_word < 1023) {
+                                    const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
+                                    if (tryFusePairA64(SlotType, d, next_inst)) |fused| {
+                                        d = fused;
+                                        if (code_icache_ptr[page_word + 1].raw != next_inst) {
+                                            code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
+                                        }
+                                    }
+                                }
+                                code_icache_ptr[page_word] = d;
+                            }
                         } else {
-                            const page_slot = (@as(usize, @truncate((cur_pc >> 12) ^ (cur_pc >> 16))) & ic_pages_mask) << 10;
-                            code_icache_ptr = cpu.icache[page_slot..].ptr;
+                            inst = fetchInst64(cpu, bus, cur_pc) catch {
+                                const target_el: u2 = @max(currentEl(cpu), 1);
+                                const esr = if (target_el >= 2) cpu.mmu.esr_el2 else cpu.mmu.esr_el1;
+                                takeException64(cpu, target_el, 0x000, esr, cur_pc, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                executed += 1;
+                                continue;
+                            };
+                            const islot2 = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((cur_pc & ~@as(u64, 0xfff)) == islot2.x_vbase) {
+                                code_vbase = islot2.x_vbase;
+                                code_pbase = islot2.pbase;
+                                code_page_ptr = bus.ram.ptr + code_pbase;
+                                const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
+                                const page_slot = page_idx << 10;
+                                if (cpu.icache_page_tags[page_idx] != code_pbase) {
+                                    @memset(cpu.icache[page_slot..][0..1024], .{});
+                                    cpu.icache_page_tags[page_idx] = code_pbase;
+                                }
+                                code_icache_ptr = cpu.icache[page_slot..].ptr;
+                            } else {
+                                const page_idx = @as(usize, @truncate((cur_pc >> 12) ^ (cur_pc >> 16))) & ic_pages_mask;
+                                cpu.icache_page_tags[page_idx] = 0xffff_ffff;
+                                code_icache_ptr = cpu.icache[page_idx << 10 ..].ptr;
+                            }
+                            d = code_icache_ptr[page_word];
+                            if (d.raw != inst) {
+                                d = decodeA64(SlotType, inst);
+                                if (page_word < 1023 and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                                    const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
+                                    if (tryFusePairA64(SlotType, d, next_inst)) |fused| {
+                                        d = fused;
+                                        if (code_icache_ptr[page_word + 1].raw != next_inst) {
+                                            code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
+                                        }
+                                    }
+                                }
+                                code_icache_ptr[page_word] = d;
+                            }
                         }
-                        break :blk fetched;
-                    };
+                    }
 
                     cur_last_inst = inst;
                     cpu.pc64 = cur_pc +% 4;
                     executed += 1;
-
-                    var d = code_icache_ptr[page_word];
-                    if (d.raw != inst) {
-                        d = decodeA64(SlotType, inst);
-                        if (page_word < 1023 and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                            const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
-                            if (tryFusePairA64(SlotType, d, next_inst)) |fused| {
-                                d = fused;
-                                if (code_icache_ptr[page_word + 1].raw != next_inst) {
-                                    code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
-                                }
-                            }
-                        }
-                        code_icache_ptr[page_word] = d;
-                    }
 
                 const op: A64Op = @enumFromInt(d.op);
                 switch (op) {
                     .adr => setX(cpu, @truncate(d.rd), cur_pc +% d.imm),
                     .adrp => setX(cpu, @truncate(d.rd), (cur_pc & ~@as(u64, 0xfff)) +% d.imm),
                     .adrp_add => {
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase and
-                            std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little) == code_icache_ptr[page_word + 1].raw)
-                        {
+                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
                             setX(cpu, @truncate(d.rd), (cur_pc & ~@as(u64, 0xfff)) +% d.imm);
                             cpu.pc64 = cur_pc +% 8;
                             executed += 1;
@@ -1989,9 +2031,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .adrp_ldr64, .adrp_ldr32 => {
                         const base = (cur_pc & ~@as(u64, 0xfff)) +% (d.imm & ~@as(u64, 0xfff));
                         setX(cpu, @truncate(d.rn), base);
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase and
-                            std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little) == code_icache_ptr[page_word + 1].raw)
-                        {
+                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
                             cpu.pc64 = cur_pc +% 8;
                             executed += 1;
                             if (op == .adrp_ldr64) {
@@ -2044,9 +2084,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .cmp_imm_bcond => {
                         const cmp_imm: u64 = @as(u32, @truncate(d.imm));
                         addSub(cpu, @truncate(d.rm), true, true, 31, getXOrSp(cpu, @truncate(d.rn)), cmp_imm, 1, false);
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase and
-                            std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little) == code_icache_ptr[page_word + 1].raw)
-                        {
+                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
                             executed += 1;
                             if (evalCond(cpu.pstate, @truncate(d.rd))) {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
@@ -2059,9 +2097,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .cmp_reg_bcond => {
                         const sf: u1 = @truncate(d.rd >> 4);
                         addSub(cpu, sf, true, true, 31, getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false);
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase and
-                            std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little) == code_icache_ptr[page_word + 1].raw)
-                        {
+                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
                             executed += 1;
                             if (evalCond(cpu.pstate, @truncate(d.rd))) {
                                 cpu.pc64 = cur_pc +% d.imm;
@@ -3211,9 +3247,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 }
                             }
                         }
-                        if ((d.rn & 0x80) != 0 and executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase and
-                            std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little) == 0x9100_03fd)
-                        {
+                        if ((d.rn & 0x80) != 0 and executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
                             cpu.x[29] = wb_addr;
                             cpu.pc64 = cur_pc +% 8;
                             executed += 1;
@@ -4216,6 +4250,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             7 => cpu.mmu.tpidr_el0 = getX(cpu, @truncate(d.rd)),
                             8 => cpu.mmu.tpidr_el1 = getX(cpu, @truncate(d.rd)),
                             9 => cpu.sp_el[0] = getX(cpu, @truncate(d.rd)),
+                            11 => {
+                                cpu.invalidateIcache();
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                            },
                             else => {
                                 if (d.imm == 0) cpu.vfp.fpcr64 = getX(cpu, @truncate(d.rd)) else cpu.vfp.fpsr64 = getX(cpu, @truncate(d.rd));
                             },
@@ -5109,8 +5147,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 try writeData64(cpu, bus, base_va +% off, 0);
                             }
                         }
+                    } else if (crn == 7 and (crm == 1 or crm == 5)) {
+                        // IC IALLUIS / IC IALLU / IC IVAU
+                        cpu.invalidateIcache();
                     } else if (crn == 8) {
                         // TLBI maintenance
+                        cpu.invalidateIcache();
                         if (op1 == 0 and (crm == 3 or crm == 7) and (op2 == 1 or op2 == 3 or op2 == 5 or op2 == 7)) {
                             const va_arg = getX(cpu, rt);
                             cpu.mmu.flushTlbVa64(va_arg);
@@ -8349,6 +8391,22 @@ test "AArch64 superinstruction fusion (ADRP+ADD, ADRP+LDR, STP+MOV FP, CMP+B.con
     try std.testing.expectEqual(@as(u64, 0x2000), cpu.x[3]);
     try std.testing.expectEqual(@as(u64, 42), cpu.x[4]);
     try std.testing.expectEqual(@as(u64, 77), cpu.x[5]);
+
+    // Enable 1:1 MMU identity mapping at EL2 or populate SoftTLB64 for VA 0x1000 -> PA 0x1000
+    cpu.mmu.populateSoftTlb64(ram.len, 0x1000, 0x1000, mmu_mod.Mmu.perm_priv_r | mmu_mod.Mmu.perm_priv_x, true);
+    cpu.mmu.halted_wfi = false;
+    cpu.pc64 = 0x1034;
+    _ = cpu.runSteps(&bus, 16);
+    const page_idx: usize = ((0x1000 >> 12) ^ (0x1000 >> 16) ^ (0x1000 >> 20)) & (arm1176.icache_pages - 1);
+    try std.testing.expectEqual(@as(u32, 0x1000), cpu.icache_page_tags[page_idx]);
+
+    // Overwrite 0x1034 with `movz x5, #123` (0xd2800f65) and issue `ic iallu` + `isb` before branching back
+    std.mem.writeInt(u32, ram[0x1034..][0..4], 0xd2800f65, .little);
+    std.mem.writeInt(u32, ram[0x103c..][0..4], 0xd508751f, .little); // ic iallu
+    std.mem.writeInt(u32, ram[0x1040..][0..4], 0xd5033fdf, .little); // isb
+    std.mem.writeInt(u32, ram[0x1044..][0..4], 0x17fffffc, .little); // b 0x1034 (-16)
+    cpu.mmu.halted_wfi = false;
+    cpu.pc64 = 0x103c;
+    _ = cpu.runSteps(&bus, 16);
+    try std.testing.expectEqual(@as(u64, 123), cpu.x[5]);
 }
-
-
