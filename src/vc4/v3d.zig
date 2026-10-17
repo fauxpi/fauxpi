@@ -1125,16 +1125,25 @@ pub const V3d = struct {
                 }
                 return;
             } else if (tiling != 0 and (valid_w & 3) == 0) {
+                const is_lt = (fb_w <= 16 or fb_h <= 16);
+                const lt_row_stride = ((fb_w + 3) & ~@as(u32, 3)) << 2;
+                const utile_stride = ((fb_w + 31) & ~@as(u32, 31)) >> 2;
+                const base_ux = x0 >> 2;
+                const base_uy = y0 >> 2;
                 const utiles_x = valid_w >> 2;
                 const utiles_y = valid_h >> 2;
                 if (self.tile_color_solid) |solid_c| {
                     var solid_utile: [16]u32 = @splat(solid_c);
                     const utile_bytes = std.mem.asBytes(&solid_utile);
                     for (0..utiles_y) |uy| {
+                        const abs_uy = base_uy + @as(u32, @intCast(uy));
+                        var group_base: u32 = 0;
                         for (0..utiles_x) |ux| {
-                            const px = x0 + @as(u32, @intCast(ux * 4));
-                            const py = y0 + @as(u32, @intCast(uy * 4));
-                            const utile_off = base + texture.texelOffsetOf(.argb8888, fb_w, fb_h, px, py);
+                            const abs_ux = base_ux + @as(u32, @intCast(ux));
+                            if ((ux & 3) == 0) {
+                                group_base = base + texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, abs_ux & ~@as(u32, 3), abs_uy);
+                            }
+                            const utile_off = group_base + ((abs_ux & 3) << 6);
                             if (utile_off + 64 <= ram.len) {
                                 @memcpy(ram[utile_off..][0..64], utile_bytes);
                             }
@@ -1142,10 +1151,14 @@ pub const V3d = struct {
                     }
                 } else {
                     for (0..utiles_y) |uy| {
+                        const abs_uy = base_uy + @as(u32, @intCast(uy));
+                        var group_base: u32 = 0;
                         for (0..utiles_x) |ux| {
-                            const px = x0 + @as(u32, @intCast(ux * 4));
-                            const py = y0 + @as(u32, @intCast(uy * 4));
-                            const utile_off = base + texture.texelOffsetOf(.argb8888, fb_w, fb_h, px, py);
+                            const abs_ux = base_ux + @as(u32, @intCast(ux));
+                            if ((ux & 3) == 0) {
+                                group_base = base + texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, abs_ux & ~@as(u32, 3), abs_uy);
+                            }
+                            const utile_off = group_base + ((abs_ux & 3) << 6);
                             if (utile_off + 64 <= ram.len) {
                                 inline for (0..4) |ry| {
                                     const src_idx = (uy * 4 + ry) * 64 + ux * 4;
@@ -1164,16 +1177,25 @@ pub const V3d = struct {
 
         const solid_565 = if (self.tile_color_solid) |sc| format_mod.toRgb565(sc) else 0;
         if (is_565 and tile_size == 64 and tiling != 0 and (valid_w & 7) == 0) {
+            const is_lt = (fb_w <= 32 or fb_h <= 16);
+            const lt_row_stride = ((fb_w + 7) & ~@as(u32, 7)) << 1;
+            const utile_stride = ((fb_w + 63) & ~@as(u32, 63)) >> 3;
+            const base_ux = x0 >> 3;
+            const base_uy = y0 >> 2;
             const utiles_x = valid_w >> 3;
             const utiles_y = valid_h >> 2;
             if (self.tile_color_solid != null) {
                 var solid_utile: [32]u16 = @splat(solid_565);
                 const utile_bytes = std.mem.asBytes(&solid_utile);
                 for (0..utiles_y) |uy| {
+                    const abs_uy = base_uy + @as(u32, @intCast(uy));
+                    var group_base: u32 = 0;
                     for (0..utiles_x) |ux| {
-                        const px = x0 + @as(u32, @intCast(ux * 8));
-                        const py = y0 + @as(u32, @intCast(uy * 4));
-                        const utile_off = base + texture.texelOffsetOf(.rgb565, fb_w, fb_h, px, py);
+                        const abs_ux = base_ux + @as(u32, @intCast(ux));
+                        if ((ux & 3) == 0) {
+                            group_base = base + texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, abs_ux & ~@as(u32, 3), abs_uy);
+                        }
+                        const utile_off = group_base + ((abs_ux & 3) << 6);
                         if (utile_off + 64 <= ram.len) {
                             @memcpy(ram[utile_off..][0..64], utile_bytes);
                         }
@@ -1181,17 +1203,19 @@ pub const V3d = struct {
                 }
             } else {
                 for (0..utiles_y) |uy| {
+                    const abs_uy = base_uy + @as(u32, @intCast(uy));
+                    var group_base: u32 = 0;
                     for (0..utiles_x) |ux| {
-                        const px = x0 + @as(u32, @intCast(ux * 8));
-                        const py = y0 + @as(u32, @intCast(uy * 4));
-                        const utile_off = base + texture.texelOffsetOf(.rgb565, fb_w, fb_h, px, py);
+                        const abs_ux = base_ux + @as(u32, @intCast(ux));
+                        if ((ux & 3) == 0) {
+                            group_base = base + texture.utileGroupOffset(is_lt, lt_row_stride, utile_stride, abs_ux & ~@as(u32, 3), abs_uy);
+                        }
+                        const utile_off = group_base + ((abs_ux & 3) << 6);
                         if (utile_off + 64 <= ram.len) {
                             inline for (0..4) |ry| {
-                                const src_row = self.tile_color[(uy * 4 + ry) * 64 + ux * 8 ..][0..8];
+                                const src_row: @Vector(8, u32) = self.tile_color[(uy * 4 + ry) * 64 + ux * 8 ..][0..8].*;
                                 const dst_bytes = ram[utile_off + ry * 16 ..][0..16];
-                                inline for (0..8) |rx| {
-                                    std.mem.writeInt(u16, dst_bytes[rx * 2 ..][0..2], format_mod.toRgb565(src_row[rx]), .little);
-                                }
+                                dst_bytes.* = @bitCast(format_mod.toRgb565Vec8(src_row));
                             }
                         }
                     }
@@ -1571,8 +1595,17 @@ pub const V3d = struct {
             return (row_term - self.dy * (fx - self.p0x)) * self.sign;
         }
 
+        inline fn evalVec4(self: EdgeSetup, row_term: f32, fx4: @Vector(4, f32)) @Vector(4, f32) {
+            return (@as(@Vector(4, f32), @splat(row_term)) - @as(@Vector(4, f32), @splat(self.dy)) * (fx4 - @as(@Vector(4, f32), @splat(self.p0x)))) * @as(@Vector(4, f32), @splat(self.sign));
+        }
+
         inline fn passes(self: EdgeSetup, val: f32) bool {
-            return val > 0 or (val == 0 and self.is_top_left);
+            return if (self.is_top_left) (val >= 0.0) else (val > 0.0);
+        }
+
+        inline fn passesMask4(self: EdgeSetup, val4: @Vector(4, f32)) u4 {
+            const zero4: @Vector(4, f32) = @splat(0.0);
+            return @bitCast(if (self.is_top_left) (val4 >= zero4) else (val4 > zero4));
         }
     };
 
@@ -1654,6 +1687,7 @@ pub const V3d = struct {
         var frag_y_vec: qpu_sim.Vec = qpu_sim.splat(0);
         var tlb_in: qpu_sim.Vec = qpu_sim.splat(0);
         var vary_vecs: [16]qpu_sim.Vec = [_]qpu_sim.Vec{qpu_sim.splat(0)} ** 16;
+        var span_vary_vecs: [16]qpu_sim.Vec = undefined;
         var batch_len: usize = 0;
 
         const flushBatch = struct {
@@ -1686,7 +1720,7 @@ pub const V3d = struct {
                         }
                     }
                 }
-                const res = qpu_sim.runDecoded(fcode, .{
+                const env: qpu_sim.Env = .{
                     .uniforms = funifs,
                     .varyings = vvecs,
                     .frag_w = fw.*,
@@ -1695,7 +1729,8 @@ pub const V3d = struct {
                     .frag_y = fy.*,
                     .texture_memory = mem,
                     .tlb_color_in = tin.*,
-                }) catch return;
+                };
+                const res = qpu_sim.runFragmentDecoded(fcode, &env) catch return;
                 if (res.tlb_color) |colors| {
                     for (0..count) |i| {
                         const idx = b_idx[i];
@@ -1708,6 +1743,7 @@ pub const V3d = struct {
             }
         }.f;
 
+        const lane4_f_offsets = @Vector(4, f32){ 0.0, 1.0, 2.0, 3.0 };
         const lane_f_offsets = @Vector(16, f32){ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         const lane_u_offsets = @Vector(16, u32){ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         const fx_min_tile = @as(f32, @floatFromInt(x_start)) + 0.5;
@@ -1770,8 +1806,8 @@ pub const V3d = struct {
 
             var px = px_start;
             while (px < px_end) {
-                // 16-lane SIMD interior span fast-path when batch buffer is empty
-                if (batch_len == 0 and px + 16 <= px_end) {
+                // 16-lane SIMD interior span fast-path (runs even when batch_len > 0 holds earlier edge pixels)
+                if (px + 16 <= px_end) {
                     const fx0 = @as(f32, @floatFromInt(px)) + 0.5;
                     const fx15 = fx0 + 15.0;
                     if (edge0.passes(edge0.eval(row_term0, fx0)) and
@@ -1822,19 +1858,20 @@ pub const V3d = struct {
                                 const p_vec = (@as(@Vector(16, f32), @splat(var2[vi])) +
                                     w0_vec * @as(@Vector(16, f32), @splat(dvar0[vi])) +
                                     w1_vec * @as(@Vector(16, f32), @splat(dvar1[vi]))) * w_vec;
-                                vary_vecs[vi] = @bitCast(p_vec);
+                                span_vary_vecs[vi] = @bitCast(p_vec);
                             }
 
-                            const span_res = qpu_sim.runDecoded(fs_decoded, .{
+                            const span_env: qpu_sim.Env = .{
                                 .uniforms = fs_unifs,
-                                .varyings = vary_vecs[0..n_var],
+                                .varyings = span_vary_vecs[0..n_var],
                                 .frag_w = @bitCast(w_vec),
                                 .frag_z = @bitCast(z_vec),
                                 .frag_x = @as(qpu_sim.Vec, @splat(px)) + lane_u_offsets,
                                 .frag_y = @splat(py),
                                 .texture_memory = ram,
                                 .tlb_color_in = self.tile_color[tile_idx..][0..16].*,
-                            }) catch null;
+                            };
+                            const span_res = qpu_sim.runFragmentDecoded(fs_decoded, &span_env) catch null;
 
                             if (span_res) |res| {
                                 if (res.tlb_color) |colors| {
@@ -1848,6 +1885,119 @@ pub const V3d = struct {
                             continue;
                         }
                     }
+                }
+
+                // 4-wide SIMD edge stepping & coverage evaluation
+                if (px + 4 <= px_end) {
+                    const fx0 = @as(f32, @floatFromInt(px)) + 0.5;
+                    const fx4 = @as(@Vector(4, f32), @splat(fx0)) + lane4_f_offsets;
+                    const e0_4 = edge0.evalVec4(row_term0, fx4);
+                    var mask4: u4 = edge0.passesMask4(e0_4);
+                    if (mask4 == 0) {
+                        px += 4;
+                        continue;
+                    }
+                    const e1_4 = edge1.evalVec4(row_term1, fx4);
+                    mask4 &= edge1.passesMask4(e1_4);
+                    if (mask4 == 0) {
+                        px += 4;
+                        continue;
+                    }
+                    const e2_4 = edge2.evalVec4(row_term2, fx4);
+                    mask4 &= edge2.passesMask4(e2_4);
+                    if (mask4 == 0) {
+                        px += 4;
+                        continue;
+                    }
+
+                    if (!tile_materialized) {
+                        self.ensureTileMaterialized(ram, need_depth);
+                        tile_materialized = true;
+                    }
+
+                    const w0_4 = e0_4 * @as(@Vector(4, f32), @splat(inv_area));
+                    const w1_4 = e1_4 * @as(@Vector(4, f32), @splat(inv_area));
+                    const z_4 = @as(@Vector(4, f32), @splat(z2)) + w0_4 * @as(@Vector(4, f32), @splat(dz0)) + w1_4 * @as(@Vector(4, f32), @splat(dz1));
+                    const base_tile_idx = row_base + (px - tile_px_x);
+
+                    if (depth_func != 7) {
+                        const cur_z_4: @Vector(4, f32) = self.tile_depth[base_tile_idx..][0..4].*;
+                        const dmask: u4 = switch (depth_func) {
+                            0 => 0,
+                            1 => @bitCast(z_4 < cur_z_4),
+                            2 => @bitCast(z_4 == cur_z_4),
+                            3 => @bitCast(z_4 <= cur_z_4),
+                            4 => @bitCast(z_4 > cur_z_4),
+                            5 => @bitCast(z_4 != cur_z_4),
+                            6 => @bitCast(z_4 >= cur_z_4),
+                            7 => 0xf,
+                        };
+                        mask4 &= dmask;
+                        if (mask4 == 0) {
+                            px += 4;
+                            continue;
+                        }
+                    }
+
+                    const w_val_4: [4]f32 = if (all_unit_w)
+                        @splat(1.0)
+                    else blk: {
+                        const interp_inv_w = @as(@Vector(4, f32), @splat(invw2)) +
+                            w0_4 * @as(@Vector(4, f32), @splat(dinvw0)) +
+                            w1_4 * @as(@Vector(4, f32), @splat(dinvw1));
+                        const valid_mask = @abs(interp_inv_w) > @as(@Vector(4, f32), @splat(1e-12));
+                        break :blk @select(f32, valid_mask, @as(@Vector(4, f32), @splat(1.0)) / interp_inv_w, @as(@Vector(4, f32), @splat(1.0)));
+                    };
+                    const w0_arr: [4]f32 = w0_4;
+                    const w1_arr: [4]f32 = w1_4;
+                    const z_arr: [4]f32 = z_4;
+
+                    while (mask4 != 0) {
+                        const k: usize = @ctz(mask4);
+                        mask4 &= mask4 - 1;
+                        const tile_idx = base_tile_idx + @as(u32, @intCast(k));
+                        const w0 = w0_arr[k];
+                        const w1 = w1_arr[k];
+                        const z = z_arr[k];
+                        const w_val = w_val_4[k];
+
+                        const lane = batch_len;
+                        batch_idx[lane] = tile_idx;
+                        batch_z[lane] = z;
+                        frag_w[lane] = @bitCast(w_val);
+                        frag_z[lane] = @bitCast(z);
+                        frag_x_vec[lane] = px + @as(u32, @intCast(k));
+                        frag_y_vec[lane] = py;
+                        tlb_in[lane] = self.tile_color[tile_idx];
+
+                        for (0..n_var) |vi| {
+                            const p_val = (var2[vi] + w0 * dvar0[vi] + w1 * dvar1[vi]) * w_val;
+                            vary_vecs[vi][lane] = @bitCast(p_val);
+                        }
+
+                        batch_len += 1;
+                        if (batch_len == 16) {
+                            flushBatch(
+                                self,
+                                batch_len,
+                                &batch_idx,
+                                &batch_z,
+                                &frag_w,
+                                &frag_z,
+                                &frag_x_vec,
+                                &frag_y_vec,
+                                &tlb_in,
+                                vary_vecs[0..n_var],
+                                fs_decoded,
+                                fs_unifs,
+                                ram,
+                                z_updates,
+                            );
+                            batch_len = 0;
+                        }
+                    }
+                    px += 4;
+                    continue;
                 }
 
                 const fx = @as(f32, @floatFromInt(px)) + 0.5;

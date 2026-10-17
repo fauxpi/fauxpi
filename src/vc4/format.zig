@@ -99,6 +99,19 @@ pub inline fn fromRgb565(p: u16) u32 {
     return 0xff000000 | (r << 3 | r >> 2) << 16 | (g << 2 | g >> 4) << 8 | (b << 3 | b >> 2);
 }
 
+pub inline fn toRgb565Vec8(argb: @Vector(8, u32)) @Vector(8, u16) {
+    const r = (argb >> @splat(16)) & @as(@Vector(8, u32), @splat(0xff));
+    const g = (argb >> @splat(8)) & @as(@Vector(8, u32), @splat(0xff));
+    const b = argb & @as(@Vector(8, u32), @splat(0xff));
+    const rx = r * @as(@Vector(8, u32), @splat(31)) + @as(@Vector(8, u32), @splat(127));
+    const gx = g * @as(@Vector(8, u32), @splat(63)) + @as(@Vector(8, u32), @splat(127));
+    const bx = b * @as(@Vector(8, u32), @splat(31)) + @as(@Vector(8, u32), @splat(127));
+    const r5 = (rx + @as(@Vector(8, u32), @splat(1)) + (rx >> @splat(8))) >> @splat(8);
+    const g6 = (gx + @as(@Vector(8, u32), @splat(1)) + (gx >> @splat(8))) >> @splat(8);
+    const b5 = (bx + @as(@Vector(8, u32), @splat(1)) + (bx >> @splat(8))) >> @splat(8);
+    return @truncate((b5 << @splat(11)) | (g6 << @splat(5)) | r5);
+}
+
 pub inline fn fromRgb565Vec8(p16: @Vector(8, u16)) @Vector(8, u32) {
     const p: @Vector(8, u32) = p16;
     const b = p >> @splat(11);
@@ -117,4 +130,17 @@ test "formats' codes and RGB565 conversions" {
     try std.testing.expectEqual(@as(u16, 0x07e0), toRgb565(0xff00ff00));
     try std.testing.expectEqual(@as(u16, 0xf800), toRgb565(0xff0000ff));
     try std.testing.expectEqual(@as(u32, 0xffffffff), fromRgb565(0xffff));
+
+    var base: u32 = 0;
+    while (base < 256) : (base += 8) {
+        var in_vec: [8]u32 = undefined;
+        for (0..8) |i| {
+            const c = base + @as(u32, @intCast(i));
+            in_vec[i] = 0xff000000 | (c << 16) | ((255 - c) << 8) | ((c *% 73) & 0xff);
+        }
+        const out_vec: [8]u16 = toRgb565Vec8(in_vec);
+        for (0..8) |i| {
+            try std.testing.expectEqual(toRgb565(in_vec[i]), out_vec[i]);
+        }
+    }
 }

@@ -56,6 +56,11 @@ pub const Result = struct {
     }
 };
 
+pub const FragResult = struct {
+    tlb_color: ?Vec = null,
+    tlb_z: ?Vec = null,
+};
+
 pub const Error = error{
     Unsupported,
     UniformUnderflow,
@@ -74,16 +79,20 @@ const State = struct {
     ra_init: u32 = 0,
     rb_init: u32 = 0,
     /// Indices 0..5 are accumulators r0..r5; index 6 is mux .a; index 7 is mux .b.
-    acc: [8]Vec = std.mem.zeroes([8]Vec),
+    acc: [8]Vec = undefined,
     zero: [lanes]bool = @splat(false),
     neg: [lanes]bool = @splat(false),
     vpm_read_left: u32 = 16,
+    uniforms_read: usize = 0,
+    varyings_read: usize = 0,
+    vpm_words_read: usize = 0,
     tmu: [2]Tmu = .{ .{}, .{} },
 
     const Tmu = struct {
         params: [4]u32 = undefined,
         param_count: usize = 0,
-        coord_t: Vec = splat(0),
+        coord_t: Vec = undefined,
+        has_coord_t: bool = false,
         fifo: [4]Vec = undefined,
         fifo_len: usize = 0,
     };
@@ -387,8 +396,20 @@ pub fn run(code: []const qpu.Inst, env: Env) Error!Result {
 }
 
 pub fn runDecoded(decoded: []const DecodedInst, env: Env) Error!Result {
-    var s: State = .{};
     var r: Result = .{};
+    try executeDecoded(Result, decoded, &env, &r);
+    return r;
+}
+
+pub fn runFragmentDecoded(decoded: []const DecodedInst, env: *const Env) Error!FragResult {
+    var r: FragResult = .{};
+    try executeDecoded(FragResult, decoded, env, &r);
+    return r;
+}
+
+fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *const Env, r: *RType) Error!void {
+    var s: State = .{};
+    @memset(s.acc[0..6], splat(0));
     s.ra[qpu.R.frag_payload_zw] = env.frag_w;
     s.rb[qpu.R.frag_payload_zw] = env.frag_z;
     s.ra_init = @as(u32, 1) << qpu.R.frag_payload_zw;
@@ -399,7 +420,7 @@ pub fn runDecoded(decoded: []const DecodedInst, env: Env) Error!Result {
     while (ip < decoded.len) : (ip += 1) {
         if (end_at) |e| if (ip > e) break;
         const d = decoded[ip];
-        r.instructions += 1;
+        if (@hasField(RType, "instructions")) r.instructions += 1;
         if (d.sig == .branch) continue;
 
         var add_result: Vec = undefined;
@@ -410,12 +431,12 @@ pub fn runDecoded(decoded: []const DecodedInst, env: Env) Error!Result {
             mul_result = add_result;
         } else {
             if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0) {
-                s.acc[6] = try readPort(&s, &r, env, d.raddr_a, .a);
+                s.acc[6] = try readPort(&s, env, d.raddr_a, .a);
             }
             if (d.sig == .small_imm) {
                 s.acc[7] = splat(d.imm_or_small);
             } else if ((d.flags & DecodedInst.FLAG_FETCH_B) != 0) {
-                s.acc[7] = try readPort(&s, &r, env, d.raddr_b, .b);
+                s.acc[7] = try readPort(&s, env, d.raddr_b, .b);
             }
 
             if ((d.flags & DecodedInst.FLAG_HAS_UNPACK) == 0) {
@@ -458,10 +479,10 @@ pub fn runDecoded(decoded: []const DecodedInst, env: Env) Error!Result {
         }
 
         if (d.waddr_add != qpu.W.nop) {
-            try write(&s, &r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0);
+            try write(RType, &s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0);
         }
         if (d.waddr_mul != qpu.W.nop) {
-            try write(&s, &r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m);
+            try write(RType, &s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m);
         }
 
         switch (d.sig) {
@@ -477,18 +498,22 @@ pub fn runDecoded(decoded: []const DecodedInst, env: Env) Error!Result {
             },
             .color_load, .color_load_end => {
                 s.acc[4] = env.tlb_color_in;
-                r.color_loads += 1;
+                if (@hasField(RType, "color_loads")) r.color_loads += 1;
                 if (d.sig == .color_load_end) end_at = ip + 2;
             },
             .prog_end => end_at = ip + 2,
             else => {},
         }
     }
+    if (@hasField(RType, "uniforms_read")) {
+        r.uniforms_read = s.uniforms_read;
+        r.varyings_read = s.varyings_read;
+        r.vpm_words_read = s.vpm_words_read;
+    }
     if (end_at == null) return error.MissingProgramEnd;
-    return r;
 }
 
-fn readPort(s: *State, r: *Result, env: Env, raddr: u6, file: File) Error!Vec {
+fn readPort(s: *State, env: *const Env, raddr: u6, file: File) Error!Vec {
     if (raddr < 32) {
         const bit = @as(u32, 1) << @intCast(raddr);
         if (file == .a) {
@@ -500,23 +525,23 @@ fn readPort(s: *State, r: *Result, env: Env, raddr: u6, file: File) Error!Vec {
     switch (raddr) {
         qpu.R.nop => return splat(0),
         qpu.R.unif => {
-            if (r.uniforms_read >= env.uniforms.len) return splat(0);
-            defer r.uniforms_read += 1;
-            return splat(env.uniforms[r.uniforms_read]);
+            if (s.uniforms_read >= env.uniforms.len) return splat(0);
+            defer s.uniforms_read += 1;
+            return splat(env.uniforms[s.uniforms_read]);
         },
         qpu.R.vary => {
-            if (r.varyings_read >= env.varyings.len) return splat(0);
-            defer r.varyings_read += 1;
-            const val_f: VecF = @bitCast(env.varyings[r.varyings_read]);
+            if (s.varyings_read >= env.varyings.len) return splat(0);
+            defer s.varyings_read += 1;
+            const val_f: VecF = @bitCast(env.varyings[s.varyings_read]);
             const w_f: VecF = @bitCast(env.frag_w);
             const c_f: VecF = @splat(varying_c);
             return @bitCast((val_f - c_f) / w_f);
         },
         qpu.R.vpm => {
-            if (r.vpm_words_read >= env.vpm_in.len) return splat(0);
+            if (s.vpm_words_read >= env.vpm_in.len) return splat(0);
             if (s.vpm_read_left > 0) s.vpm_read_left -= 1;
-            defer r.vpm_words_read += 1;
-            return env.vpm_in[r.vpm_words_read];
+            defer s.vpm_words_read += 1;
+            return env.vpm_in[s.vpm_words_read];
         },
         qpu.R.elem_qpu => {
             return .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
@@ -527,7 +552,7 @@ fn readPort(s: *State, r: *Result, env: Env, raddr: u6, file: File) Error!Vec {
     }
 }
 
-fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, cond: qpu.Cond, a_pack: u4, mul_pack: u4) Error!void {
+fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6, file: File, value: Vec, cond: qpu.Cond, a_pack: u4, mul_pack: u4) Error!void {
     if (waddr == qpu.W.nop or cond == .never) return;
 
     const dst: ?*Vec = switch (waddr) {
@@ -638,9 +663,11 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
 
     switch (waddr) {
         qpu.W.vpm => {
-            if (r.vpm_out_len < max_vpm_out) {
-                r.vpm_out[r.vpm_out_len] = value;
-                r.vpm_out_len += 1;
+            if (@hasField(RType, "vpm_out")) {
+                if (r.vpm_out_len < max_vpm_out) {
+                    r.vpm_out[r.vpm_out_len] = value;
+                    r.vpm_out_len += 1;
+                }
             }
         },
         qpu.W.vpmvcd_setup => {
@@ -652,8 +679,10 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
         },
         qpu.W.tlb_color_all => r.tlb_color = value,
         qpu.W.tlb_color_ms => {
-            if (r.tlb_samples < r.tlb_color_samples.len) r.tlb_color_samples[r.tlb_samples] = value;
-            r.tlb_samples += 1;
+            if (@hasField(RType, "tlb_color_samples")) {
+                if (r.tlb_samples < r.tlb_color_samples.len) r.tlb_color_samples[r.tlb_samples] = value;
+                r.tlb_samples += 1;
+            }
             r.tlb_color = value;
         },
         qpu.W.tlb_z => r.tlb_z = value,
@@ -668,13 +697,14 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
         qpu.W.tmu0_s, qpu.W.tmu0_t, qpu.W.tmu0_r, qpu.W.tmu0_b, qpu.W.tmu1_s, qpu.W.tmu1_t, qpu.W.tmu1_r, qpu.W.tmu1_b => {
             const unit: usize = if (waddr <= qpu.W.tmu0_b) 0 else 1;
             const t = &s.tmu[unit];
-            if (r.uniforms_read < env.uniforms.len and t.param_count < t.params.len) {
-                t.params[t.param_count] = env.uniforms[r.uniforms_read];
+            if (s.uniforms_read < env.uniforms.len and t.param_count < t.params.len) {
+                t.params[t.param_count] = env.uniforms[s.uniforms_read];
                 t.param_count += 1;
-                r.uniforms_read += 1;
+                s.uniforms_read += 1;
             }
             if (waddr == qpu.W.tmu0_t or waddr == qpu.W.tmu1_t) {
                 t.coord_t = value;
+                t.has_coord_t = true;
                 return;
             }
             if (waddr != qpu.W.tmu0_s and waddr != qpu.W.tmu1_s) return;
@@ -696,17 +726,18 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
                 t.fifo[t.fifo_len] = splat(0xff000000);
                 t.fifo_len += 1;
                 t.param_count = 0;
-                t.coord_t = splat(0);
-                r.texture_samples += 1;
+                t.has_coord_t = false;
+                if (@hasField(RType, "texture_samples")) r.texture_samples += 1;
                 return;
             };
             var texel: Vec = undefined;
             var prev_sc: u32 = 0;
             var prev_tc: u32 = 0;
             var prev_out: u32 = 0;
+            const has_t = t.has_coord_t;
             for (0..lanes) |lane| {
                 const sc = value[lane];
-                const tc = t.coord_t[lane];
+                const tc = if (has_t) t.coord_t[lane] else 0;
                 if (lane > 0 and sc == prev_sc and tc == prev_tc) {
                     texel[lane] = prev_out;
                     continue;
@@ -720,8 +751,8 @@ fn write(s: *State, r: *Result, env: Env, waddr: u6, file: File, value: Vec, con
             t.fifo[t.fifo_len] = texel;
             t.fifo_len += 1;
             t.param_count = 0;
-            t.coord_t = splat(0);
-            r.texture_samples += 1;
+            t.has_coord_t = false;
+            if (@hasField(RType, "texture_samples")) r.texture_samples += 1;
         },
         else => {},
     }
@@ -852,7 +883,11 @@ const PrecomputedTex = struct {
     inline fn sample(pt: *const PrecomputedTex, memory: []const u8, s: f32, t: f32) Error!u32 {
         const p = pt.cfg;
         if (p.mag_filter == .nearest) {
-            return pt.fetchAt(memory, wrap(@floor(s * pt.fw), p.width, p.wrap_s), wrap(@floor(t * pt.fh), p.height, p.wrap_t));
+            const fx = @floor(s * pt.fw);
+            const fy = @floor(t * pt.fh);
+            const wx: u32 = if (fx >= 0.0 and fx < pt.fw) @intFromFloat(fx) else wrap(fx, p.width, p.wrap_s);
+            const wy: u32 = if (fy >= 0.0 and fy < pt.fh) @intFromFloat(fy) else wrap(fy, p.height, p.wrap_t);
+            return pt.fetchAt(memory, wx, wy);
         }
         const fx = s * pt.fw - 0.5;
         const fy = t * pt.fh - 0.5;
