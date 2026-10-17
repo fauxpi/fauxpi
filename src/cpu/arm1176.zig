@@ -37,6 +37,9 @@ pub const ArmOp = enum(u8) {
     add_imm_al,
     sub_imm_al,
     rsb_imm_al,
+    adc_imm_al,
+    sbc_imm_al,
+    rsc_imm_al,
     and_imm_al,
     orr_imm_al,
     eor_imm_al,
@@ -51,6 +54,8 @@ pub const ArmOp = enum(u8) {
     // Data Processing Immediate with flags (S == 1, rd != 15, rn != 15)
     adds_imm_al,
     subs_imm_al,
+    adcs_imm_al,
+    sbcs_imm_al,
     // MOVW / MOVT (rd != 15)
     movw_al,
     movt_al,
@@ -58,6 +63,9 @@ pub const ArmOp = enum(u8) {
     add_reg_al,
     sub_reg_al,
     rsb_reg_al,
+    adc_reg_al,
+    sbc_reg_al,
+    rsc_reg_al,
     and_reg_al,
     orr_reg_al,
     eor_reg_al,
@@ -66,6 +74,8 @@ pub const ArmOp = enum(u8) {
     mvn_reg_al,
     adds_reg_al,
     subs_reg_al,
+    adcs_reg_al,
+    sbcs_reg_al,
     // Unshifted Register Compare / Test (S == 1, shift == 0, rn != 15, rm != 15)
     cmp_reg_al,
     cmn_reg_al,
@@ -75,14 +85,31 @@ pub const ArmOp = enum(u8) {
     lsl_imm_al,
     lsr_imm_al,
     asr_imm_al,
+    mvn_lsl_imm_al,
+    mvn_lsr_imm_al,
     add_lsl_reg_al,
     sub_lsl_reg_al,
     rsb_lsl_reg_al,
     orr_lsl_reg_al,
-    orr_lsr_reg_al,
+    eor_lsl_reg_al,
     and_lsl_reg_al,
-    and_lsr_reg_al,
     bic_lsl_reg_al,
+    add_lsr_reg_al,
+    sub_lsr_reg_al,
+    rsb_lsr_reg_al,
+    orr_lsr_reg_al,
+    eor_lsr_reg_al,
+    and_lsr_reg_al,
+    bic_lsr_reg_al,
+    add_asr_reg_al,
+    sub_asr_reg_al,
+    orr_asr_reg_al,
+    and_asr_reg_al,
+    bic_asr_reg_al,
+    cmp_lsl_reg_al,
+    cmp_lsr_reg_al,
+    tst_lsl_reg_al,
+    tst_lsr_reg_al,
     // Single Load/Store Immediate & Register Offset
     ldr_imm_al,
     str_imm_al,
@@ -107,6 +134,12 @@ pub const ArmOp = enum(u8) {
     str_reg_lsl_al,
     ldrb_reg_lsl_al,
     strb_reg_lsl_al,
+    ldr_reg_sub_lsl_al,
+    str_reg_sub_lsl_al,
+    ldrb_reg_sub_lsl_al,
+    strb_reg_sub_lsl_al,
+    ldr_reg_lsr_al,
+    str_reg_lsr_al,
     ldm_al,
     ldm_pc_al,
     stm_al,
@@ -138,9 +171,17 @@ pub const ArmOp = enum(u8) {
     sxth_al,
     uxtab_al,
     uxtah_al,
+    sxtab_al,
+    sxtah_al,
     rev_al,
     rev16_al,
+    rbit_al,
     ubfx_al,
+    sbfx_al,
+    bfi_al,
+    bfc_al,
+    udiv_al,
+    sdiv_al,
     vldr_f64_al,
     vstr_f64_al,
     vldr_f32_al,
@@ -353,6 +394,9 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                             0x2 => .sub_reg_al,
                             0x3 => .rsb_reg_al,
                             0x4 => .add_reg_al,
+                            0x5 => .adc_reg_al,
+                            0x6 => .sbc_reg_al,
+                            0x7 => .rsc_reg_al,
                             0xc => .orr_reg_al,
                             0xd => .mov_reg_al,
                             0xe => .bic_reg_al,
@@ -366,6 +410,8 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                         const fast_s: ?ArmOp = switch (op) {
                             0x2 => if (rd != 15) .subs_reg_al else null,
                             0x4 => if (rd != 15) .adds_reg_al else null,
+                            0x5 => if (rd != 15) .adcs_reg_al else null,
+                            0x6 => if (rd != 15) .sbcs_reg_al else null,
                             0x8 => .tst_reg_al,
                             0x9 => .teq_reg_al,
                             0xa => .cmp_reg_al,
@@ -387,10 +433,19 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                         if (sh_op) |sop| {
                             return .{ .raw = inst, .op = @intFromEnum(sop), .rd = rd, .rm = rm, .imm = shift_imm };
                         }
+                    } else if (op == 0xf and (shift_type == 0b00 or shift_type == 0b01)) {
+                        return .{
+                            .raw = inst,
+                            .op = @intFromEnum(if (shift_type == 0b00) ArmOp.mvn_lsl_imm_al else ArmOp.mvn_lsr_imm_al),
+                            .rd = rd,
+                            .rm = rm,
+                            .imm = shift_imm,
+                        };
                     } else if (rn != 15) {
                         if (shift_type == 0b00) {
                             const lsl_op: ?ArmOp = switch (op) {
                                 0x0 => .and_lsl_reg_al,
+                                0x1 => .eor_lsl_reg_al,
                                 0x2 => .sub_lsl_reg_al,
                                 0x3 => .rsb_lsl_reg_al,
                                 0x4 => .add_lsl_reg_al,
@@ -404,13 +459,48 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                         } else if (shift_type == 0b01) {
                             const lsr_op: ?ArmOp = switch (op) {
                                 0x0 => .and_lsr_reg_al,
+                                0x1 => .eor_lsr_reg_al,
+                                0x2 => .sub_lsr_reg_al,
+                                0x3 => .rsb_lsr_reg_al,
+                                0x4 => .add_lsr_reg_al,
                                 0xc => .orr_lsr_reg_al,
+                                0xe => .bic_lsr_reg_al,
                                 else => null,
                             };
                             if (lsr_op) |lop| {
                                 return .{ .raw = inst, .op = @intFromEnum(lop), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
                             }
+                        } else if (shift_type == 0b10) {
+                            const asr_op: ?ArmOp = switch (op) {
+                                0x0 => .and_asr_reg_al,
+                                0x2 => .sub_asr_reg_al,
+                                0x4 => .add_asr_reg_al,
+                                0xc => .orr_asr_reg_al,
+                                0xe => .bic_asr_reg_al,
+                                else => null,
+                            };
+                            if (asr_op) |aop| {
+                                return .{ .raw = inst, .op = @intFromEnum(aop), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
+                            }
                         }
+                    }
+                } else if (s and shift_imm != 0 and rn != 15 and rm != 15 and (shift_type == 0b00 or shift_type == 0b01)) {
+                    if (op == 0xa) {
+                        return .{
+                            .raw = inst,
+                            .op = @intFromEnum(if (shift_type == 0b00) ArmOp.cmp_lsl_reg_al else ArmOp.cmp_lsr_reg_al),
+                            .rn = rn,
+                            .rm = rm,
+                            .imm = shift_imm,
+                        };
+                    } else if (op == 0x8) {
+                        return .{
+                            .raw = inst,
+                            .op = @intFromEnum(if (shift_type == 0b00) ArmOp.tst_lsl_reg_al else ArmOp.tst_lsr_reg_al),
+                            .rn = rn,
+                            .rm = rm,
+                            .imm = shift_imm,
+                        };
                     }
                 }
             }
@@ -445,6 +535,9 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                     0x2 => .sub_imm_al,
                     0x3 => .rsb_imm_al,
                     0x4 => .add_imm_al,
+                    0x5 => .adc_imm_al,
+                    0x6 => .sbc_imm_al,
+                    0x7 => .rsc_imm_al,
                     0xc => .orr_imm_al,
                     0xd => .mov_imm_al,
                     0xe => .bic_imm_al,
@@ -462,6 +555,8 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                     0x9 => if (rot == 0) .teq_imm_al else null,
                     0x4 => if (rd != 15) .adds_imm_al else null,
                     0x2 => if (rd != 15) .subs_imm_al else null,
+                    0x5 => if (rd != 15) .adcs_imm_al else null,
+                    0x6 => if (rd != 15) .sbcs_imm_al else null,
                     else => null,
                 };
                 if (fast_s) |fs| {
@@ -511,59 +606,104 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
                 const rn: u4 = @truncate((inst >> 16) & 0xf);
                 const rd: u4 = @truncate((inst >> 12) & 0xf);
                 const rm: u4 = @truncate(inst & 0xf);
-                if (rd != 15 and rm != 15) {
-                    if (op2 == 0b011) {
-                        const rot: u5 = @as(u5, @truncate((inst >> 10) & 3)) * 8;
-                        switch (op1) {
-                            0b01110 => return .{
-                                .raw = inst,
-                                .op = @intFromEnum(if (rn == 15) ArmOp.uxtb_al else ArmOp.uxtab_al),
-                                .rd = rd,
-                                .rn = rn,
-                                .rm = rm,
-                                .imm = rot,
-                            },
-                            0b01111 => return .{
-                                .raw = inst,
-                                .op = @intFromEnum(if (rn == 15) ArmOp.uxth_al else ArmOp.uxtah_al),
-                                .rd = rd,
-                                .rn = rn,
-                                .rm = rm,
-                                .imm = rot,
-                            },
-                            0b01010 => if (rn == 15) return .{
-                                .raw = inst,
-                                .op = @intFromEnum(ArmOp.sxtb_al),
-                                .rd = rd,
-                                .rm = rm,
-                                .imm = rot,
-                            },
-                            0b01011 => if (rn == 15) return .{
-                                .raw = inst,
-                                .op = @intFromEnum(ArmOp.sxth_al),
-                                .rd = rd,
-                                .rm = rm,
-                                .imm = rot,
-                            },
-                            else => {},
+                if (op2 == 0b000 and (op1 == 0b10001 or op1 == 0b10011) and rd == 15) {
+                    const div_rd: u4 = rn;
+                    const div_rn: u4 = rm;
+                    const div_rm: u4 = @truncate((inst >> 8) & 0xf);
+                    if (div_rd != 15 and div_rn != 15 and div_rm != 15) {
+                        return .{
+                            .raw = inst,
+                            .op = @intFromEnum(if (op1 == 0b10011) ArmOp.udiv_al else ArmOp.sdiv_al),
+                            .rd = div_rd,
+                            .rn = div_rn,
+                            .rm = div_rm,
+                        };
+                    }
+                }
+                if (rd != 15) {
+                    if (rm != 15) {
+                        if (op2 == 0b011) {
+                            const rot: u5 = @as(u5, @truncate((inst >> 10) & 3)) * 8;
+                            switch (op1) {
+                                0b01110 => return .{
+                                    .raw = inst,
+                                    .op = @intFromEnum(if (rn == 15) ArmOp.uxtb_al else ArmOp.uxtab_al),
+                                    .rd = rd,
+                                    .rn = rn,
+                                    .rm = rm,
+                                    .imm = rot,
+                                },
+                                0b01111 => return .{
+                                    .raw = inst,
+                                    .op = @intFromEnum(if (rn == 15) ArmOp.uxth_al else ArmOp.uxtah_al),
+                                    .rd = rd,
+                                    .rn = rn,
+                                    .rm = rm,
+                                    .imm = rot,
+                                },
+                                0b01010 => return .{
+                                    .raw = inst,
+                                    .op = @intFromEnum(if (rn == 15) ArmOp.sxtb_al else ArmOp.sxtab_al),
+                                    .rd = rd,
+                                    .rn = rn,
+                                    .rm = rm,
+                                    .imm = rot,
+                                },
+                                0b01011 => return .{
+                                    .raw = inst,
+                                    .op = @intFromEnum(if (rn == 15) ArmOp.sxth_al else ArmOp.sxtah_al),
+                                    .rd = rd,
+                                    .rn = rn,
+                                    .rm = rm,
+                                    .imm = rot,
+                                },
+                                else => {},
+                            }
+                        } else if (op1 == 0b01011) {
+                            if (op2 == 0b001 and rn == 15) {
+                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.rev_al), .rd = rd, .rm = rm };
+                            } else if (op2 == 0b101) {
+                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.rev16_al), .rd = rd, .rm = rm };
+                            }
+                        } else if (op1 == 0b01111 and op2 == 0b001) {
+                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.rbit_al), .rd = rd, .rm = rm };
+                        } else if ((op1 == 0b11110 or op1 == 0b11111) and (op2 & 0b011) == 0b010) {
+                            const lsb: u5 = @truncate((inst >> 7) & 0x1f);
+                            const widthm1: u5 = @truncate((inst >> 16) & 0x1f);
+                            const width: u6 = @as(u6, widthm1) + 1;
+                            const mask: u32 = if (width >= 32) 0xffff_ffff else (@as(u32, 1) << @truncate(width)) -% 1;
+                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.ubfx_al), .rd = rd, .rn = lsb, .rm = rm, .imm = mask };
+                        } else if ((op1 == 0b11010 or op1 == 0b11011) and (op2 & 0b011) == 0b010) {
+                            const lsb: u5 = @truncate((inst >> 7) & 0x1f);
+                            const widthm1: u5 = @truncate((inst >> 16) & 0x1f);
+                            const width: u6 = @as(u6, widthm1) + 1;
+                            if (width <= 32 - @as(u6, lsb)) {
+                                const sh_left: u5 = @truncate(32 - (width + @as(u6, lsb)));
+                                const sh_right: u5 = @truncate(32 - width);
+                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.sbfx_al), .rd = rd, .rn = sh_left, .rm = rm, .imm = sh_right };
+                            }
                         }
-                    } else if (op1 == 0b01011) {
-                        if (op2 == 0b001 and rn == 15) {
-                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.rev_al), .rd = rd, .rm = rm };
-                        } else if (op2 == 0b101) {
-                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.rev16_al), .rd = rd, .rm = rm };
-                        }
-                    } else if ((op1 == 0b11110 or op1 == 0b11111) and (op2 & 0b011) == 0b010) {
+                    }
+                    if ((op1 == 0b11100 or op1 == 0b11101) and (op2 & 0b011) == 0b000) {
                         const lsb: u5 = @truncate((inst >> 7) & 0x1f);
-                        const widthm1: u5 = @truncate((inst >> 16) & 0x1f);
-                        const width: u6 = @as(u6, widthm1) + 1;
-                        const mask: u32 = if (width >= 32) 0xffff_ffff else (@as(u32, 1) << @truncate(width)) -% 1;
-                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.ubfx_al), .rd = rd, .rn = lsb, .rm = rm, .imm = mask };
+                        const msb: u5 = @truncate((inst >> 16) & 0x1f);
+                        if (msb >= lsb) {
+                            const width: u6 = @as(u6, msb -% lsb) + 1;
+                            const mask: u32 = if (width >= 32) 0xffff_ffff else ((@as(u32, 1) << @truncate(width)) -% 1) << lsb;
+                            return .{
+                                .raw = inst,
+                                .op = @intFromEnum(if (rm == 15) ArmOp.bfc_al else ArmOp.bfi_al),
+                                .rd = rd,
+                                .rn = lsb,
+                                .rm = rm,
+                                .imm = mask,
+                            };
+                        }
                     }
                 }
                 return .{ .raw = inst, .op = @intFromEnum(ArmOp.media) };
             }
-            // Scaled register offset LDR/STR/LDRB/STRB (P == 1, U == 1, W == 0, shift_type == LSL)
+            // Scaled register offset LDR/STR/LDRB/STRB (P == 1, W == 0)
             const p = (inst & (1 << 24)) != 0;
             const u = (inst & (1 << 23)) != 0;
             const b = (inst & (1 << 22)) != 0;
@@ -573,13 +713,24 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
             const rn: u4 = @truncate((inst >> 16) & 0xf);
             const rd: u4 = @truncate((inst >> 12) & 0xf);
             const rm: u4 = @truncate(inst & 0xf);
-            if (p and u and !w and shift_type == 0 and rd != 15 and rn != 15 and rm != 15) {
+            if (p and !w and rd != 15 and rn != 15 and rm != 15) {
                 const shift_imm: u5 = @truncate((inst >> 7) & 0x1f);
-                const reg_op: ArmOp = if (l)
-                    (if (b) .ldrb_reg_lsl_al else .ldr_reg_lsl_al)
-                else
-                    (if (b) .strb_reg_lsl_al else .str_reg_lsl_al);
-                return .{ .raw = inst, .op = @intFromEnum(reg_op), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
+                if (shift_type == 0) {
+                    const reg_op: ArmOp = if (u)
+                        (if (l) (if (b) .ldrb_reg_lsl_al else .ldr_reg_lsl_al) else (if (b) .strb_reg_lsl_al else .str_reg_lsl_al))
+                    else
+                        (if (l) (if (b) .ldrb_reg_sub_lsl_al else .ldr_reg_sub_lsl_al) else (if (b) .strb_reg_sub_lsl_al else .str_reg_sub_lsl_al));
+                    return .{ .raw = inst, .op = @intFromEnum(reg_op), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
+                } else if (shift_type == 0b01 and u and shift_imm != 0 and !b) {
+                    return .{
+                        .raw = inst,
+                        .op = @intFromEnum(if (l) ArmOp.ldr_reg_lsr_al else ArmOp.str_reg_lsr_al),
+                        .rd = rd,
+                        .rn = rn,
+                        .rm = rm,
+                        .imm = shift_imm,
+                    };
+                }
             }
             return .{ .raw = inst, .op = @intFromEnum(ArmOp.ls_wb_reg) };
         },
@@ -1413,6 +1564,9 @@ pub fn Arm1176(comptime Bus: type) type {
                     .add_imm_al => self.r[d.rd] = self.r[d.rn] +% imm32,
                     .sub_imm_al => self.r[d.rd] = self.r[d.rn] -% imm32,
                     .rsb_imm_al => self.r[d.rd] = imm32 -% self.r[d.rn],
+                    .adc_imm_al => self.r[d.rd] = self.r[d.rn] +% imm32 +% ((self.cpsr >> 29) & 1),
+                    .sbc_imm_al => self.r[d.rd] = self.r[d.rn] +% ~imm32 +% ((self.cpsr >> 29) & 1),
+                    .rsc_imm_al => self.r[d.rd] = imm32 +% ~self.r[d.rn] +% ((self.cpsr >> 29) & 1),
                     .and_imm_al => self.r[d.rd] = self.r[d.rn] & imm32,
                     .orr_imm_al => self.r[d.rd] = self.r[d.rn] | imm32,
                     .eor_imm_al => self.r[d.rd] = self.r[d.rn] ^ imm32,
@@ -1433,11 +1587,24 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.r[d.rd] = res.val;
                         self.setNZCV(res);
                     },
+                    .adcs_imm_al => {
+                        const res = dec.addWithCarry(self.r[d.rn], imm32, @truncate((self.cpsr >> 29) & 1));
+                        self.r[d.rd] = res.val;
+                        self.setNZCV(res);
+                    },
+                    .sbcs_imm_al => {
+                        const res = dec.addWithCarry(self.r[d.rn], ~imm32, @truncate((self.cpsr >> 29) & 1));
+                        self.r[d.rd] = res.val;
+                        self.setNZCV(res);
+                    },
                     .movw_al => self.r[d.rd] = imm32,
                     .movt_al => self.r[d.rd] = (self.r[d.rd] & 0x0000_ffff) | (imm32 << 16),
                     .add_reg_al => self.r[d.rd] = self.r[d.rn] +% self.r[d.rm],
                     .sub_reg_al => self.r[d.rd] = self.r[d.rn] -% self.r[d.rm],
                     .rsb_reg_al => self.r[d.rd] = self.r[d.rm] -% self.r[d.rn],
+                    .adc_reg_al => self.r[d.rd] = self.r[d.rn] +% self.r[d.rm] +% ((self.cpsr >> 29) & 1),
+                    .sbc_reg_al => self.r[d.rd] = self.r[d.rn] +% ~self.r[d.rm] +% ((self.cpsr >> 29) & 1),
+                    .rsc_reg_al => self.r[d.rd] = self.r[d.rm] +% ~self.r[d.rn] +% ((self.cpsr >> 29) & 1),
                     .and_reg_al => self.r[d.rd] = self.r[d.rn] & self.r[d.rm],
                     .orr_reg_al => self.r[d.rd] = self.r[d.rn] | self.r[d.rm],
                     .eor_reg_al => self.r[d.rd] = self.r[d.rn] ^ self.r[d.rm],
@@ -1454,6 +1621,16 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.r[d.rd] = res.val;
                         self.setNZCV(res);
                     },
+                    .adcs_reg_al => {
+                        const res = dec.addWithCarry(self.r[d.rn], self.r[d.rm], @truncate((self.cpsr >> 29) & 1));
+                        self.r[d.rd] = res.val;
+                        self.setNZCV(res);
+                    },
+                    .sbcs_reg_al => {
+                        const res = dec.addWithCarry(self.r[d.rn], ~self.r[d.rm], @truncate((self.cpsr >> 29) & 1));
+                        self.r[d.rd] = res.val;
+                        self.setNZCV(res);
+                    },
                     .cmp_reg_al => self.setNZCV(dec.addWithCarry(self.r[d.rn], ~self.r[d.rm], 1)),
                     .cmn_reg_al => self.setNZCV(dec.addWithCarry(self.r[d.rn], self.r[d.rm], 0)),
                     .tst_reg_al => self.setNZ(self.r[d.rn] & self.r[d.rm]),
@@ -1461,14 +1638,41 @@ pub fn Arm1176(comptime Bus: type) type {
                     .lsl_imm_al => self.r[d.rd] = self.r[d.rm] << @as(u5, @truncate(imm32)),
                     .lsr_imm_al => self.r[d.rd] = self.r[d.rm] >> @as(u5, @truncate(imm32)),
                     .asr_imm_al => self.r[d.rd] = @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32))),
+                    .mvn_lsl_imm_al => self.r[d.rd] = ~(self.r[d.rm] << @as(u5, @truncate(imm32))),
+                    .mvn_lsr_imm_al => self.r[d.rd] = ~(self.r[d.rm] >> @as(u5, @truncate(imm32))),
                     .add_lsl_reg_al => self.r[d.rd] = self.r[d.rn] +% (self.r[d.rm] << @as(u5, @truncate(imm32))),
                     .sub_lsl_reg_al => self.r[d.rd] = self.r[d.rn] -% (self.r[d.rm] << @as(u5, @truncate(imm32))),
                     .rsb_lsl_reg_al => self.r[d.rd] = (self.r[d.rm] << @as(u5, @truncate(imm32))) -% self.r[d.rn],
                     .orr_lsl_reg_al => self.r[d.rd] = self.r[d.rn] | (self.r[d.rm] << @as(u5, @truncate(imm32))),
-                    .orr_lsr_reg_al => self.r[d.rd] = self.r[d.rn] | (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                    .eor_lsl_reg_al => self.r[d.rd] = self.r[d.rn] ^ (self.r[d.rm] << @as(u5, @truncate(imm32))),
                     .and_lsl_reg_al => self.r[d.rd] = self.r[d.rn] & (self.r[d.rm] << @as(u5, @truncate(imm32))),
-                    .and_lsr_reg_al => self.r[d.rd] = self.r[d.rn] & (self.r[d.rm] >> @as(u5, @truncate(imm32))),
                     .bic_lsl_reg_al => self.r[d.rd] = self.r[d.rn] & ~(self.r[d.rm] << @as(u5, @truncate(imm32))),
+                    .add_lsr_reg_al => self.r[d.rd] = self.r[d.rn] +% (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                    .sub_lsr_reg_al => self.r[d.rd] = self.r[d.rn] -% (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                    .rsb_lsr_reg_al => self.r[d.rd] = (self.r[d.rm] >> @as(u5, @truncate(imm32))) -% self.r[d.rn],
+                    .orr_lsr_reg_al => self.r[d.rd] = self.r[d.rn] | (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                    .eor_lsr_reg_al => self.r[d.rd] = self.r[d.rn] ^ (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                    .and_lsr_reg_al => self.r[d.rd] = self.r[d.rn] & (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                    .bic_lsr_reg_al => self.r[d.rd] = self.r[d.rn] & ~(self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                    .add_asr_reg_al => self.r[d.rd] = self.r[d.rn] +% @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
+                    .sub_asr_reg_al => self.r[d.rd] = self.r[d.rn] -% @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
+                    .orr_asr_reg_al => self.r[d.rd] = self.r[d.rn] | @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
+                    .and_asr_reg_al => self.r[d.rd] = self.r[d.rn] & @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
+                    .bic_asr_reg_al => self.r[d.rd] = self.r[d.rn] & ~@as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
+                    .cmp_lsl_reg_al => self.setNZCV(dec.addWithCarry(self.r[d.rn], ~(self.r[d.rm] << @as(u5, @truncate(imm32))), 1)),
+                    .cmp_lsr_reg_al => self.setNZCV(dec.addWithCarry(self.r[d.rn], ~(self.r[d.rm] >> @as(u5, @truncate(imm32))), 1)),
+                    .tst_lsl_reg_al => {
+                        const sh: u5 = @truncate(imm32);
+                        const inv: u5 = @truncate(@as(u6, 32) -% sh);
+                        const rm_val = self.r[d.rm];
+                        self.setNZC(self.r[d.rn] & (rm_val << sh), @truncate(rm_val >> inv));
+                    },
+                    .tst_lsr_reg_al => {
+                        const sh: u5 = @truncate(imm32);
+                        const m1: u5 = sh -% 1;
+                        const rm_val = self.r[d.rm];
+                        self.setNZC(self.r[d.rn] & (rm_val >> sh), @truncate(rm_val >> m1));
+                    },
                     .mul_al => self.r[d.rd] = self.r[d.rm] *% self.r[d.rn],
                     .mla_al => self.r[d.rd] = self.r[d.rm] *% self.r[d.rn] +% self.r[@as(u4, @truncate(imm32))],
                     .mls_al => self.r[d.rd] = self.r[@as(u4, @truncate(imm32))] -% (self.r[d.rm] *% self.r[d.rn]),
@@ -1667,6 +1871,16 @@ pub fn Arm1176(comptime Bus: type) type {
                     },
                     .uxtab_al => self.r[d.rd] = self.r[d.rn] +% (std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xff),
                     .uxtah_al => self.r[d.rd] = self.r[d.rn] +% (std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xffff),
+                    .sxtab_al => {
+                        const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
+                        const sext: u32 = @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(rot_rm))))));
+                        self.r[d.rd] = self.r[d.rn] +% sext;
+                    },
+                    .sxtah_al => {
+                        const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
+                        const sext: u32 = @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(rot_rm))))));
+                        self.r[d.rd] = self.r[d.rn] +% sext;
+                    },
                     .rev_al => self.r[d.rd] = @byteSwap(self.r[d.rm]),
                     .rev16_al => {
                         const v = self.r[d.rm];
@@ -1674,7 +1888,36 @@ pub fn Arm1176(comptime Bus: type) type {
                         const hi: u16 = @byteSwap(@as(u16, @truncate(v >> 16)));
                         self.r[d.rd] = (@as(u32, hi) << 16) | lo;
                     },
+                    .rbit_al => self.r[d.rd] = @bitReverse(self.r[d.rm]),
                     .ubfx_al => self.r[d.rd] = (self.r[d.rm] >> @as(u5, @truncate(d.rn))) & imm32,
+                    .sbfx_al => {
+                        const sh_left: u5 = @truncate(d.rn);
+                        const sh_right: u5 = @truncate(imm32);
+                        const shifted: i32 = @as(i32, @bitCast(self.r[d.rm] << sh_left)) >> sh_right;
+                        self.r[d.rd] = @bitCast(shifted);
+                    },
+                    .bfi_al => {
+                        const lsb: u5 = @truncate(d.rn);
+                        self.r[d.rd] = (self.r[d.rd] & ~imm32) | ((self.r[d.rm] << lsb) & imm32);
+                    },
+                    .bfc_al => self.r[d.rd] &= ~imm32,
+                    .udiv_al => {
+                        const den = self.r[d.rm];
+                        self.r[d.rd] = if (den == 0) 0 else self.r[d.rn] / den;
+                    },
+                    .sdiv_al => {
+                        const den_u = self.r[d.rm];
+                        if (den_u == 0) {
+                            self.r[d.rd] = 0;
+                        } else {
+                            const num: i32 = @bitCast(self.r[d.rn]);
+                            const den: i32 = @bitCast(den_u);
+                            self.r[d.rd] = if (num == std.math.minInt(i32) and den == -1)
+                                @bitCast(num)
+                            else
+                                @bitCast(@divTrunc(num, den));
+                        }
+                    },
                     .ldr_imm_al => {
                         const vaddr = self.r[d.rn] +% imm32;
                         if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase) {
@@ -2192,8 +2435,12 @@ pub fn Arm1176(comptime Bus: type) type {
                             }
                         }
                     },
-                    .ldr_reg_lsl_al => {
-                        const vaddr = self.r[d.rn] +% (self.r[d.rm] << @as(u5, @truncate(imm32)));
+                    .ldr_reg_lsl_al, .ldr_reg_sub_lsl_al, .ldr_reg_lsr_al => {
+                        const scaled = if (op == .ldr_reg_lsr_al)
+                            (self.r[d.rm] >> @as(u5, @truncate(imm32)))
+                        else
+                            (self.r[d.rm] << @as(u5, @truncate(imm32)));
+                        const vaddr = if (op == .ldr_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
                         if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase) {
                             self.r[d.rd] = std.mem.readInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], .little);
                         } else {
@@ -2215,8 +2462,12 @@ pub fn Arm1176(comptime Bus: type) type {
                             }
                         }
                     },
-                    .str_reg_lsl_al => {
-                        const vaddr = self.r[d.rn] +% (self.r[d.rm] << @as(u5, @truncate(imm32)));
+                    .str_reg_lsl_al, .str_reg_sub_lsl_al, .str_reg_lsr_al => {
+                        const scaled = if (op == .str_reg_lsr_al)
+                            (self.r[d.rm] >> @as(u5, @truncate(imm32)))
+                        else
+                            (self.r[d.rm] << @as(u5, @truncate(imm32)));
+                        const vaddr = if (op == .str_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
                         if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase) {
                             std.mem.writeInt(u32, data_page_ptr[vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
                         } else {
@@ -2246,8 +2497,9 @@ pub fn Arm1176(comptime Bus: type) type {
                             }
                         }
                     },
-                    .ldrb_reg_lsl_al => {
-                        const vaddr = self.r[d.rn] +% (self.r[d.rm] << @as(u5, @truncate(imm32)));
+                    .ldrb_reg_lsl_al, .ldrb_reg_sub_lsl_al => {
+                        const scaled = self.r[d.rm] << @as(u5, @truncate(imm32));
+                        const vaddr = if (op == .ldrb_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
                         if ((vaddr & 0xffff_f000) == data_r_vbase) {
                             self.r[d.rd] = data_page_ptr[vaddr & 0xfff];
                         } else {
@@ -2269,8 +2521,9 @@ pub fn Arm1176(comptime Bus: type) type {
                             }
                         }
                     },
-                    .strb_reg_lsl_al => {
-                        const vaddr = self.r[d.rn] +% (self.r[d.rm] << @as(u5, @truncate(imm32)));
+                    .strb_reg_lsl_al, .strb_reg_sub_lsl_al => {
+                        const scaled = self.r[d.rm] << @as(u5, @truncate(imm32));
+                        const vaddr = if (op == .strb_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
                         if ((vaddr & 0xffff_f000) == data_w_vbase) {
                             data_page_ptr[vaddr & 0xfff] = @truncate(self.r[d.rd]);
                         } else {
@@ -5726,5 +5979,60 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     try std.testing.expectEqual(@as(u32, 0x12), cpu.r[7]);
     try std.testing.expectEqual(@as(u32, 0xcafe_babe), cpu.r[8]);
     try std.testing.expectEqual(@as(u32, 0xcafe_babe), cpu.r[9]);
-}
 
+    // Verify newly pre-decoded ADC/SBC, shifted ALU, media (SBFX/BFI/BFC/RBIT/SXTAB), UDIV/SDIV, and subtracted-offset LSL loads/stores
+    cpu.r[15] = 0x1a00;
+    cpu.r[0] = 0x2600;
+    cpu.r[1] = 2; // index for [r0, -r1, lsl #2] -> 0x2600 - 8 = 0x25f8
+    cpu.r[2] = 100;
+    cpu.r[3] = 25;
+    cpu.cpsr |= PsrFlags.C;
+    // 0x1a00: adc r4, r2, #10             (0xe2a2400a) -> 100 + 10 + 1 = 111
+    // 0x1a04: sbc r5, r4, r3              (0xe0c45003) -> 111 - 25 - 0 = 86
+    // 0x1a08: add r6, r5, r2, lsr #2      (0xe0856122) -> 86 + (100 >> 2) = 111
+    // 0x1a0c: sbfx r7, r0, #8, #8         (0xe7a77450) -> signExtend8((0x2600 >> 8) & 0xff) = 0x26 = 38
+    // 0x1a10: bfi r7, r3, #8, #8          (0xe7cf7413) -> r7 = (25 << 8) | 38 = 0x1926
+    // 0x1a14: bfc r7, #8, #4              (0xe7cb741f) -> clear bits 8..11 of 0x1926 -> 0x1026
+    // 0x1a18: rbit r8, r1                 (0xe6ff8f31) -> bitReverse(2) = 0x4000_0000
+    // 0x1a1c: sxtab r9, r2, r0, ror #8    (0xe6a29470) -> 100 + signExtend8(0x26) = 138
+    // 0x1a20: udiv r10, r2, r3            (0xe73a_f312) -> 100 / 25 = 4
+    // 0x1a24: str r9, [r0, -r1, lsl #2]   (0xe7009101) -> [0x25f8] = 138
+    // 0x1a28: ldr r11, [r0, -r1, lsl #2]  (0xe710b101) -> r11 = 138
+    const ext_prog = [_]u32{
+        0xe2a2400a,
+        0xe0c45003,
+        0xe0856122,
+        0xe7a77450,
+        0xe7cf7413,
+        0xe7cb741f,
+        0xe6ff8f31,
+        0xe6a29470,
+        0xe73af312,
+        0xe7009101,
+        0xe710b101,
+    };
+    for (ext_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1a00 + i * 4 ..][0..4], inst, .little);
+    }
+    try std.testing.expectEqual(ArmOp.adc_imm_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[0]).op)));
+    try std.testing.expectEqual(ArmOp.sbc_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[1]).op)));
+    try std.testing.expectEqual(ArmOp.add_lsr_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[2]).op)));
+    try std.testing.expectEqual(ArmOp.sbfx_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[3]).op)));
+    try std.testing.expectEqual(ArmOp.bfi_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[4]).op)));
+    try std.testing.expectEqual(ArmOp.bfc_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[5]).op)));
+    try std.testing.expectEqual(ArmOp.rbit_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[6]).op)));
+    try std.testing.expectEqual(ArmOp.sxtab_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[7]).op)));
+    try std.testing.expectEqual(ArmOp.udiv_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[8]).op)));
+    try std.testing.expectEqual(ArmOp.str_reg_sub_lsl_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[9]).op)));
+    try std.testing.expectEqual(ArmOp.ldr_reg_sub_lsl_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[10]).op)));
+
+    _ = cpu.runSteps(&bus, ext_prog.len);
+    try std.testing.expectEqual(@as(u32, 111), cpu.r[4]);
+    try std.testing.expectEqual(@as(u32, 86), cpu.r[5]);
+    try std.testing.expectEqual(@as(u32, 111), cpu.r[6]);
+    try std.testing.expectEqual(@as(u32, 0x1026), cpu.r[7]);
+    try std.testing.expectEqual(@as(u32, 0x4000_0000), cpu.r[8]);
+    try std.testing.expectEqual(@as(u32, 138), cpu.r[9]);
+    try std.testing.expectEqual(@as(u32, 4), cpu.r[10]);
+    try std.testing.expectEqual(@as(u32, 138), cpu.r[11]);
+}
