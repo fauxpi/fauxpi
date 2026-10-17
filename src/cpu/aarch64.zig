@@ -64,28 +64,42 @@ pub fn decodeLogicalImm(sf: u1, n: u1, imms: u6, immr: u6) ?u64 {
     return if (sf == 0) (result & 0xffff_ffff) else result;
 }
 
-pub fn evalCond(pstate: u32, cond: u4) bool {
-    const n = (pstate & PstateFlags.N) != 0;
-    const z = (pstate & PstateFlags.Z) != 0;
-    const c = (pstate & PstateFlags.C) != 0;
-    const v = (pstate & PstateFlags.V) != 0;
-    return switch (cond) {
-        0x0 => z, // EQ
-        0x1 => !z, // NE
-        0x2 => c, // CS / HS
-        0x3 => !c, // CC / LO
-        0x4 => n, // MI
-        0x5 => !n, // PL
-        0x6 => v, // VS
-        0x7 => !v, // VC
-        0x8 => c and !z, // HI
-        0x9 => !c or z, // LS
-        0xa => n == v, // GE
-        0xb => n != v, // LT
-        0xc => !z and (n == v), // GT
-        0xd => z or (n != v), // LE
-        0xe, 0xf => true, // AL / NV
-    };
+const cond_lut64: [16]u16 = blk: {
+    var lut: [16]u16 = @splat(0);
+    for (0..16) |c_idx| {
+        var mask: u16 = 0;
+        for (0..16) |nzcv| {
+            const n = (nzcv >> 3) & 1;
+            const z = (nzcv >> 2) & 1;
+            const c = (nzcv >> 1) & 1;
+            const v = nzcv & 1;
+            const ok = switch (@as(u4, @intCast(c_idx))) {
+                0x0 => z == 1, // EQ
+                0x1 => z == 0, // NE
+                0x2 => c == 1, // CS / HS
+                0x3 => c == 0, // CC / LO
+                0x4 => n == 1, // MI
+                0x5 => n == 0, // PL
+                0x6 => v == 1, // VS
+                0x7 => v == 0, // VC
+                0x8 => c == 1 and z == 0, // HI
+                0x9 => c == 0 or z == 1, // LS
+                0xa => n == v, // GE
+                0xb => n != v, // LT
+                0xc => z == 0 and n == v, // GT
+                0xd => z == 1 or n != v, // LE
+                0xe, 0xf => true, // AL / NV
+            };
+            if (ok) mask |= (@as(u16, 1) << @intCast(nzcv));
+        }
+        lut[c_idx] = mask;
+    }
+    break :blk lut;
+};
+
+pub inline fn evalCond(pstate: u32, cond: u4) bool {
+    const nzcv: u4 = @truncate(pstate >> 28);
+    return ((cond_lut64[cond] >> nzcv) & 1) != 0;
 }
 
 pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
@@ -678,6 +692,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             adrp_ldr32,
             cmp_imm_bcond,
             cmp_reg_bcond,
+            tst_imm_bcond,
+            tst_reg_bcond,
             dp_imm_other,
             dp_reg_other,
             load_store_other,
@@ -720,25 +736,27 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         }
                     }
                 },
-                .subs_imm64, .subs_imm32 => {
-                    if (d.rd == 31 and (next_inst & 0xff00_0010) == 0x5400_0000) {
+                .subs_imm64, .subs_imm32, .adds_imm64, .adds_imm32 => {
+                    if ((next_inst & 0xff00_0010) == 0x5400_0000) {
                         const imm19: i32 = @as(i19, @bitCast(@as(u19, @truncate(next_inst >> 5))));
                         const target_off: u32 = @bitCast((imm19 << 2) + 4);
                         const cond: u8 = @truncate(next_inst & 0xf);
+                        const sf_bit: u8 = if (op == .subs_imm64 or op == .adds_imm64) 0x20 else 0;
+                        const sub_bit: u8 = if (op == .subs_imm64 or op == .subs_imm32) 0x40 else 0;
                         return .{
                             .raw = d.raw,
                             .op = @intFromEnum(A64Op.cmp_imm_bcond),
                             .rd = cond,
                             .rn = d.rn,
-                            .rm = if (op == .subs_imm64) 1 else 0,
+                            .rm = (d.rd & 0x1f) | sf_bit | sub_bit,
                             .imm = (@as(u64, target_off) << 32) | @as(u32, @truncate(d.imm)),
                         };
                     }
                 },
                 .subs_reg64, .subs_reg32 => {
-                    if (d.rd == 31 and (next_inst & 0xff00_0010) == 0x5400_0000) {
-                        const imm19: i64 = @as(i19, @bitCast(@as(u19, @truncate(next_inst >> 5))));
-                        const target_off: u64 = @bitCast((imm19 << 2) + 4);
+                    if ((next_inst & 0xff00_0010) == 0x5400_0000) {
+                        const imm19: i32 = @as(i19, @bitCast(@as(u19, @truncate(next_inst >> 5))));
+                        const target_off: u32 = @bitCast((imm19 << 2) + 4);
                         const cond: u8 = @truncate(next_inst & 0xf);
                         const sf_bit: u8 = if (op == .subs_reg64) 0x10 else 0;
                         return .{
@@ -747,7 +765,38 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             .rd = cond | sf_bit,
                             .rn = d.rn,
                             .rm = d.rm,
-                            .imm = target_off,
+                            .imm = (@as(u64, d.rd & 0x1f) << 32) | target_off,
+                        };
+                    }
+                },
+                .ands_imm64, .ands_imm32 => {
+                    if (d.rd == 31 and (d.imm >> 32) == 0 and (next_inst & 0xff00_0010) == 0x5400_0000) {
+                        const imm19: i32 = @as(i19, @bitCast(@as(u19, @truncate(next_inst >> 5))));
+                        const target_off: u32 = @bitCast((imm19 << 2) + 4);
+                        const cond: u8 = @truncate(next_inst & 0xf);
+                        const sf_bit: u8 = if (op == .ands_imm64) 0x10 else 0;
+                        return .{
+                            .raw = d.raw,
+                            .op = @intFromEnum(A64Op.tst_imm_bcond),
+                            .rd = cond | sf_bit,
+                            .rn = d.rn,
+                            .imm = (@as(u64, target_off) << 32) | @as(u32, @truncate(d.imm)),
+                        };
+                    }
+                },
+                .ands_reg64, .ands_reg32 => {
+                    if ((next_inst & 0xff00_0010) == 0x5400_0000) {
+                        const imm19: i32 = @as(i19, @bitCast(@as(u19, @truncate(next_inst >> 5))));
+                        const target_off: u32 = @bitCast((imm19 << 2) + 4);
+                        const cond: u8 = @truncate(next_inst & 0xf);
+                        const sf_bit: u8 = if (op == .ands_reg64) 0x10 else 0;
+                        return .{
+                            .raw = d.raw,
+                            .op = @intFromEnum(A64Op.tst_reg_bcond),
+                            .rd = cond | sf_bit,
+                            .rn = d.rn,
+                            .rm = d.rm,
+                            .imm = (@as(u64, d.rd & 0x1f) << 32) | target_off,
                         };
                     }
                 },
@@ -1880,12 +1929,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
 
             const limit = if (max_steps == 4096 or max_steps == 16384) max_steps + 256 else max_steps;
             const SlotType = @TypeOf(cpu.icache[0]);
-            const ic_pages_mask = (cpu.icache.len >> 10) - 1;
             var executed: usize = 0;
             var cur_last_inst: u32 = cpu.last_inst;
             var priv: u1 = @intFromBool(currentEl(cpu) != 0);
             var code_vbase: u64 = 0xffff_ffff_ffff_ffff;
             var code_pbase: u32 = 0;
+            var code_page_idx: usize = 0;
             var code_page_ptr: [*]const u8 = bus.ram.ptr;
             var code_icache_ptr: [*]SlotType = cpu.icache[0..].ptr;
             var data_r_vbase: [2]u64 = @splat(0xffff_ffff_ffff_ffff);
@@ -1930,10 +1979,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     d = fused;
                                     if (code_icache_ptr[page_word + 1].raw != next_inst) {
                                         code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
+                                        cpu.markIcacheDirty(code_page_idx, page_word + 1);
                                     }
                                 }
                             }
                             code_icache_ptr[page_word] = d;
+                            cpu.markIcacheDirty(code_page_idx, page_word);
                         }
                     } else {
                         const islot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
@@ -1941,13 +1992,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             code_vbase = islot.x_vbase;
                             code_pbase = islot.pbase;
                             code_page_ptr = bus.ram.ptr + code_pbase;
-                            const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
-                            const page_slot = page_idx << 10;
-                            if (cpu.icache_page_tags[page_idx] != code_pbase) {
-                                @memset(cpu.icache[page_slot..][0..1024], .{});
-                                cpu.icache_page_tags[page_idx] = code_pbase;
-                            }
-                            code_icache_ptr = cpu.icache[page_slot..].ptr;
+                            code_page_idx = CpuType.icachePageIdx(code_pbase);
+                            code_icache_ptr = cpu.prepareIcachePage(code_page_idx, code_pbase);
                             d = code_icache_ptr[page_word];
                             if (d.raw != 0xffff_ffff) {
                                 inst = d.raw;
@@ -1960,10 +2006,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                         d = fused;
                                         if (code_icache_ptr[page_word + 1].raw != next_inst) {
                                             code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
+                                            cpu.markIcacheDirty(code_page_idx, page_word + 1);
                                         }
                                     }
                                 }
                                 code_icache_ptr[page_word] = d;
+                                cpu.markIcacheDirty(code_page_idx, page_word);
                             }
                         } else {
                             inst = fetchInst64(cpu, bus, cur_pc) catch {
@@ -1982,17 +2030,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 code_vbase = islot2.x_vbase;
                                 code_pbase = islot2.pbase;
                                 code_page_ptr = bus.ram.ptr + code_pbase;
-                                const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
-                                const page_slot = page_idx << 10;
-                                if (cpu.icache_page_tags[page_idx] != code_pbase) {
-                                    @memset(cpu.icache[page_slot..][0..1024], .{});
-                                    cpu.icache_page_tags[page_idx] = code_pbase;
-                                }
-                                code_icache_ptr = cpu.icache[page_slot..].ptr;
+                                code_page_idx = CpuType.icachePageIdx(code_pbase);
+                                code_icache_ptr = cpu.prepareIcachePage(code_page_idx, code_pbase);
                             } else {
-                                const page_idx = @as(usize, @truncate((cur_pc >> 12) ^ (cur_pc >> 16))) & ic_pages_mask;
-                                cpu.icache_page_tags[page_idx] = 0xffff_ffff;
-                                code_icache_ptr = cpu.icache[page_idx << 10 ..].ptr;
+                                code_page_idx = CpuType.icachePageIdx(@truncate(cur_pc));
+                                code_icache_ptr = cpu.prepareIcachePage(code_page_idx, 0xffff_fffe);
+                                cpu.icache_page_tags[code_page_idx] = 0xffff_ffff;
                             }
                             d = code_icache_ptr[page_word];
                             if (d.raw != inst) {
@@ -2003,10 +2046,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                         d = fused;
                                         if (code_icache_ptr[page_word + 1].raw != next_inst) {
                                             code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
+                                            cpu.markIcacheDirty(code_page_idx, page_word + 1);
                                         }
                                     }
                                 }
                                 code_icache_ptr[page_word] = d;
+                                cpu.markIcacheDirty(code_page_idx, page_word);
                             }
                         }
                     }
@@ -2083,7 +2128,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     },
                     .cmp_imm_bcond => {
                         const cmp_imm: u64 = @as(u32, @truncate(d.imm));
-                        addSub(cpu, @truncate(d.rm), true, true, 31, getXOrSp(cpu, @truncate(d.rn)), cmp_imm, 1, false);
+                        const sf: u1 = @truncate((d.rm >> 5) & 1);
+                        const is_sub = (d.rm & 0x40) != 0;
+                        const dst_rd: u5 = @truncate(d.rm & 0x1f);
+                        addSub(cpu, sf, is_sub, true, dst_rd, getXOrSp(cpu, @truncate(d.rn)), cmp_imm, if (is_sub) 1 else 0, false);
                         if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
                             executed += 1;
                             if (evalCond(cpu.pstate, @truncate(d.rd))) {
@@ -2096,11 +2144,49 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     },
                     .cmp_reg_bcond => {
                         const sf: u1 = @truncate(d.rd >> 4);
-                        addSub(cpu, sf, true, true, 31, getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false);
+                        const dst_rd: u5 = @truncate(d.imm >> 32);
+                        addSub(cpu, sf, true, true, dst_rd, getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false);
                         if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
                             executed += 1;
                             if (evalCond(cpu.pstate, @truncate(d.rd))) {
-                                cpu.pc64 = cur_pc +% d.imm;
+                                const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
+                                cpu.pc64 = cur_pc +% @as(u64, @bitCast(target_off));
+                            } else {
+                                cpu.pc64 = cur_pc +% 8;
+                            }
+                        }
+                    },
+                    .tst_imm_bcond => {
+                        const mask: u64 = @as(u32, @truncate(d.imm));
+                        const res = getX(cpu, @truncate(d.rn)) & mask;
+                        const sign = if ((d.rd & 0x10) != 0) false else ((res >> 31) != 0);
+                        setNzcv(cpu, sign, res == 0, false, false);
+                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                            executed += 1;
+                            if (evalCond(cpu.pstate, @truncate(d.rd))) {
+                                const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
+                                cpu.pc64 = cur_pc +% @as(u64, @bitCast(target_off));
+                            } else {
+                                cpu.pc64 = cur_pc +% 8;
+                            }
+                        }
+                    },
+                    .tst_reg_bcond => {
+                        const dst_rd: u5 = @truncate(d.imm >> 32);
+                        if ((d.rd & 0x10) != 0) {
+                            const res = getX(cpu, @truncate(d.rn)) & getX(cpu, @truncate(d.rm));
+                            setNzcv(cpu, (res >> 63) != 0, res == 0, false, false);
+                            setX(cpu, dst_rd, res);
+                        } else {
+                            const res = getW(cpu, @truncate(d.rn)) & getW(cpu, @truncate(d.rm));
+                            setNzcv(cpu, (res >> 31) != 0, res == 0, false, false);
+                            setW(cpu, dst_rd, res);
+                        }
+                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                            executed += 1;
+                            if (evalCond(cpu.pstate, @truncate(d.rd))) {
+                                const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
+                                cpu.pc64 = cur_pc +% @as(u64, @bitCast(target_off));
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }

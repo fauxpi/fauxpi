@@ -385,8 +385,9 @@ test "Runner keeps LDXR/STXR atomic and spinlocks exclusive across parallel core
         for (prog, 0..) |inst, i| std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
 
         var bus: TestBus = .{ .ram = ram };
-        var cpus: [max_cores]Cpu = @splat(.{});
-        for (&cpus, 0..) |*cpu, i| {
+        const cpus = try std.testing.allocator.create([max_cores]Cpu);
+        defer std.testing.allocator.destroy(cpus);
+        for (cpus, 0..) |*cpu, i| {
             cpu.initReset64(0x1000, 0);
             cpu.mmu.core_id = @intCast(i);
             cpu.x[1] = atomic_counter;
@@ -395,14 +396,14 @@ test "Runner keeps LDXR/STXR atomic and spinlocks exclusive across parallel core
             cpu.x[7] = locked_counter;
         }
 
-        var runner = Runner(Cpu, TestBus).init(&cpus, &bus);
+        var runner = Runner(Cpu, TestBus).init(cpus, &bus);
         if (threaded) runner.start();
         defer runner.deinit();
 
         var slices: usize = 0;
         while (slices < 1_000_000) : (slices += 1) {
             var active: u4 = 0;
-            for (&cpus, 0..) |*cpu, i| {
+            for (cpus, 0..) |*cpu, i| {
                 if (!cpu.mmu.halted_wfi) active |= @as(u4, 1) << @intCast(i);
             }
             if (active == 0) break;

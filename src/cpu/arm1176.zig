@@ -20,11 +20,11 @@ pub const Vfp = vfp_mod.Vfp;
 pub const PsrFlags = dec.PsrFlags;
 pub const PstateFlags = aarch64_mod.PstateFlags;
 
-pub const icache_size: usize = 16384;
+pub const icache_pages: usize = 64;
+pub const icache_size: usize = icache_pages << 10;
 pub const icache_mask: usize = icache_size - 1;
-pub const icache_pages: usize = icache_size >> 10;
 
-pub const thumb_icache_pages: usize = 8;
+pub const thumb_icache_pages: usize = 16;
 pub const thumb_icache_size: usize = thumb_icache_pages * 2048;
 
 pub const ThumbOp = enum(u8) {
@@ -1495,14 +1495,64 @@ pub fn Arm1176(comptime Bus: type) type {
         last_inst: u32 = 0,
         last_dmb_pc: u32 = 0xffff_ffff,
 
-        /// Direct-mapped decoded instruction cache (`icache_size` entries)
-        icache: [icache_size]DecodedSlot = @splat(.{}),
+        /// Direct-mapped decoded instruction cache (`icache_size` entries, lazily cleared per 64-word block)
+        icache: [icache_size]DecodedSlot = undefined,
         /// Physical page base tags (`pbase`) for each 1024-word 4 KB page in `icache` (`0xffff_ffff` = untagged/invalid)
         icache_page_tags: [icache_pages]u32 = @splat(0xffff_ffff),
+        /// 16-bit dirty-block masks (1 bit per 64-word block) for each page in `icache`
+        icache_page_dirty: [icache_pages]u16 = @splat(0xffff),
         /// Direct-mapped pre-decoded Thumb/Thumb-2 instruction cache (`thumb_icache_size` entries)
-        thumb_icache: [thumb_icache_size]ThumbSlot = @splat(.{}),
+        thumb_icache: [thumb_icache_size]ThumbSlot = undefined,
         /// Physical page base tags (`pbase`) for each 2048-halfword 4 KB page in `thumb_icache`
         thumb_icache_page_tags: [thumb_icache_pages]u32 = @splat(0xffff_ffff),
+        /// 32-bit dirty-block masks (1 bit per 64-halfword block) for each page in `thumb_icache`
+        thumb_icache_page_dirty: [thumb_icache_pages]u32 = @splat(0xffff_ffff),
+
+        pub inline fn icachePageIdx(pbase: u32) usize {
+            return @as(usize, (pbase >> 12) ^ (pbase >> 18)) & (icache_pages - 1);
+        }
+
+        pub inline fn thumbIcachePageIdx(pbase: u32) usize {
+            return @as(usize, (pbase >> 12) ^ (pbase >> 16)) & (thumb_icache_pages - 1);
+        }
+
+        pub inline fn prepareIcachePage(self: *Self, page_idx: usize, pbase: u32) [*]DecodedSlot {
+            const page_slot = page_idx << 10;
+            if (self.icache_page_tags[page_idx] != pbase) {
+                var dirty = self.icache_page_dirty[page_idx];
+                while (dirty != 0) {
+                    const blk_idx: usize = @ctz(dirty);
+                    dirty &= dirty - 1;
+                    @memset(self.icache[page_slot + (blk_idx << 6) ..][0..64], .{});
+                }
+                self.icache_page_dirty[page_idx] = 0;
+                self.icache_page_tags[page_idx] = pbase;
+            }
+            return self.icache[page_slot..].ptr;
+        }
+
+        pub inline fn markIcacheDirty(self: *Self, page_idx: usize, page_word: usize) void {
+            self.icache_page_dirty[page_idx] |= (@as(u16, 1) << @intCast(page_word >> 6));
+        }
+
+        pub inline fn prepareThumbIcachePage(self: *Self, tpage_idx: usize, pbase: u32) [*]ThumbSlot {
+            const tpage_slot = tpage_idx << 11;
+            if (self.thumb_icache_page_tags[tpage_idx] != pbase) {
+                var dirty = self.thumb_icache_page_dirty[tpage_idx];
+                while (dirty != 0) {
+                    const blk_idx: usize = @ctz(dirty);
+                    dirty &= dirty - 1;
+                    @memset(self.thumb_icache[tpage_slot + (blk_idx << 6) ..][0..64], .{});
+                }
+                self.thumb_icache_page_dirty[tpage_idx] = 0;
+                self.thumb_icache_page_tags[tpage_idx] = pbase;
+            }
+            return self.thumb_icache[tpage_slot..].ptr;
+        }
+
+        pub inline fn markThumbIcacheDirty(self: *Self, tpage_idx: usize, page_hw: usize) void {
+            self.thumb_icache_page_dirty[tpage_idx] |= (@as(u32, 1) << @intCast(page_hw >> 6));
+        }
 
         pub inline fn invalidateIcache(self: *Self) void {
             @memset(&self.icache_page_tags, 0xffff_ffff);
@@ -1510,13 +1560,11 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         pub inline fn invalidateIcachePage(self: *Self, pbase: u32) void {
-            const ic_pages_mask = icache_pages - 1;
-            const page_idx: usize = @as(usize, (pbase >> 12) ^ (pbase >> 16) ^ (pbase >> 20)) & ic_pages_mask;
+            const page_idx = icachePageIdx(pbase);
             if (self.icache_page_tags[page_idx] == pbase) {
                 self.icache_page_tags[page_idx] = 0xffff_ffff;
             }
-            const tic_pages_mask = thumb_icache_pages - 1;
-            const tpage_idx: usize = @as(usize, (pbase >> 12) ^ (pbase >> 16) ^ (pbase >> 20)) & tic_pages_mask;
+            const tpage_idx = thumbIcachePageIdx(pbase);
             if (self.thumb_icache_page_tags[tpage_idx] == pbase) {
                 self.thumb_icache_page_tags[tpage_idx] = 0xffff_ffff;
             }
@@ -1554,10 +1602,10 @@ pub fn Arm1176(comptime Bus: type) type {
             self.cycles = 0;
             self.last_inst = 0;
             self.last_dmb_pc = 0xffff_ffff;
-            @memset(&self.icache, .{});
-            @memset(&self.icache_page_tags, 0xffff_ffff);
-            @memset(&self.thumb_icache, .{});
-            @memset(&self.thumb_icache_page_tags, 0xffff_ffff);
+            self.icache_page_tags = @splat(0xffff_ffff);
+            self.icache_page_dirty = @splat(0xffff);
+            self.thumb_icache_page_tags = @splat(0xffff_ffff);
+            self.thumb_icache_page_dirty = @splat(0xffff_ffff);
         }
 
         pub fn initReset(self: *Self, entry_pc: u32, r0: u32, r1: u32, r2: u32) void {
@@ -1988,15 +2036,15 @@ pub fn Arm1176(comptime Bus: type) type {
                 self.last_inst = cur_last_inst;
                 self.excl_valid = false;
             }
-            const ic_pages_mask = (icache_size >> 10) - 1;
-            const tic_pages_mask = thumb_icache_pages - 1;
             var priv: u1 = @intFromBool(self.isPrivileged());
             var code_vbase: u32 = 0xffff_ffff;
             var code_pbase: u32 = 0;
+            var code_page_idx: usize = 0;
             var code_page_ptr: [*]const u8 = bus.ram.ptr;
             var code_icache_ptr: [*]DecodedSlot = self.icache[0..].ptr;
             var thumb_vbase: u32 = 0xffff_ffff;
             var thumb_pbase: u32 = 0;
+            var thumb_page_idx: usize = 0;
             var thumb_page_ptr: [*]const u8 = bus.ram.ptr;
             var thumb_icache_ptr: [*]ThumbSlot = self.thumb_icache[0..].ptr;
             var data_r_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
@@ -2036,6 +2084,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
                                 td = decodeThumb16(inst16, next_hw);
                                 thumb_icache_ptr[page_hw] = td;
+                                self.markThumbIcacheDirty(thumb_page_idx, page_hw);
                             }
                         } else {
                             const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
@@ -2043,19 +2092,15 @@ pub fn Arm1176(comptime Bus: type) type {
                                 thumb_vbase = islot.x_vbase;
                                 thumb_pbase = islot.pbase;
                                 thumb_page_ptr = bus.ram.ptr + thumb_pbase;
-                                const tpage_idx = @as(usize, (thumb_pbase >> 12) ^ (thumb_pbase >> 16) ^ (thumb_pbase >> 20)) & tic_pages_mask;
-                                const tpage_slot = tpage_idx << 11;
-                                if (self.thumb_icache_page_tags[tpage_idx] != thumb_pbase) {
-                                    @memset(self.thumb_icache[tpage_slot..][0..2048], .{});
-                                    self.thumb_icache_page_tags[tpage_idx] = thumb_pbase;
-                                }
-                                thumb_icache_ptr = self.thumb_icache[tpage_slot..].ptr;
+                                thumb_page_idx = thumbIcachePageIdx(thumb_pbase);
+                                thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, thumb_pbase);
                                 td = thumb_icache_ptr[page_hw];
                                 if (td.raw == 0xffff) {
                                     const inst16 = std.mem.readInt(u16, thumb_page_ptr[page_hw * 2 ..][0..2], .little);
                                     const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
                                     td = decodeThumb16(inst16, next_hw);
                                     thumb_icache_ptr[page_hw] = td;
+                                    self.markThumbIcacheDirty(thumb_page_idx, page_hw);
                                 }
                             } else {
                                 const inst16 = self.fetch16(bus, pc) catch {
@@ -2073,25 +2118,19 @@ pub fn Arm1176(comptime Bus: type) type {
                                     thumb_vbase = islot2.x_vbase;
                                     thumb_pbase = islot2.pbase;
                                     thumb_page_ptr = bus.ram.ptr + thumb_pbase;
-                                    const tpage_idx = @as(usize, (thumb_pbase >> 12) ^ (thumb_pbase >> 16) ^ (thumb_pbase >> 20)) & tic_pages_mask;
-                                    const tpage_slot = tpage_idx << 11;
-                                    if (self.thumb_icache_page_tags[tpage_idx] != thumb_pbase) {
-                                        @memset(self.thumb_icache[tpage_slot..][0..2048], .{});
-                                        self.thumb_icache_page_tags[tpage_idx] = thumb_pbase;
-                                    }
-                                    thumb_icache_ptr = self.thumb_icache[tpage_slot..].ptr;
+                                    thumb_page_idx = thumbIcachePageIdx(thumb_pbase);
+                                    thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, thumb_pbase);
                                     const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
                                     td = decodeThumb16(inst16, next_hw);
                                     thumb_icache_ptr[page_hw] = td;
+                                    self.markThumbIcacheDirty(thumb_page_idx, page_hw);
                                 } else {
-                                    const tpage_idx = @as(usize, (pc >> 12) ^ (pc >> 16)) & tic_pages_mask;
-                                    self.thumb_icache_page_tags[tpage_idx] = 0xffff_ffff;
-                                    thumb_icache_ptr = self.thumb_icache[tpage_idx << 11 ..].ptr;
-                                    td = thumb_icache_ptr[page_hw];
-                                    if (td.raw != inst16 or td.op == .bl_pair or td.op == .blx_pair or td.op == .b_w_pair or td.op == .movw_pair or td.op == .movt_pair) {
-                                        td = decodeThumb16(inst16, null);
-                                        thumb_icache_ptr[page_hw] = td;
-                                    }
+                                    thumb_page_idx = thumbIcachePageIdx(pc);
+                                    thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, 0xffff_fffe);
+                                    self.thumb_icache_page_tags[thumb_page_idx] = 0xffff_ffff;
+                                    td = decodeThumb16(inst16, null);
+                                    thumb_icache_ptr[page_hw] = td;
+                                    self.markThumbIcacheDirty(thumb_page_idx, page_hw);
                                 }
                             }
                         }
@@ -2121,6 +2160,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
                             d = decodeAndFuseArm32(inst, code_page_ptr, page_word);
                             code_icache_ptr[page_word] = d;
+                            self.markIcacheDirty(code_page_idx, page_word);
                         }
                     } else {
                         const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
@@ -2128,13 +2168,8 @@ pub fn Arm1176(comptime Bus: type) type {
                             code_vbase = islot.x_vbase;
                             code_pbase = islot.pbase;
                             code_page_ptr = bus.ram.ptr + code_pbase;
-                            const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
-                            const page_slot = page_idx << 10;
-                            if (self.icache_page_tags[page_idx] != code_pbase) {
-                                @memset(self.icache[page_slot..][0..1024], .{});
-                                self.icache_page_tags[page_idx] = code_pbase;
-                            }
-                            code_icache_ptr = self.icache[page_slot..].ptr;
+                            code_page_idx = icachePageIdx(code_pbase);
+                            code_icache_ptr = self.prepareIcachePage(code_page_idx, code_pbase);
                             d = code_icache_ptr[page_word];
                             if (d.raw != 0xffff_ffff) {
                                 inst = d.raw;
@@ -2142,6 +2177,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
                                 d = decodeAndFuseArm32(inst, code_page_ptr, page_word);
                                 code_icache_ptr[page_word] = d;
+                                self.markIcacheDirty(code_page_idx, page_word);
                             }
                         } else {
                             inst = self.fetch32(bus, pc) catch {
@@ -2158,24 +2194,18 @@ pub fn Arm1176(comptime Bus: type) type {
                                 code_vbase = islot2.x_vbase;
                                 code_pbase = islot2.pbase;
                                 code_page_ptr = bus.ram.ptr + code_pbase;
-                                const page_idx = @as(usize, (code_pbase >> 12) ^ (code_pbase >> 16) ^ (code_pbase >> 20)) & ic_pages_mask;
-                                const page_slot = page_idx << 10;
-                                if (self.icache_page_tags[page_idx] != code_pbase) {
-                                    @memset(self.icache[page_slot..][0..1024], .{});
-                                    self.icache_page_tags[page_idx] = code_pbase;
-                                }
-                                code_icache_ptr = self.icache[page_slot..].ptr;
+                                code_page_idx = icachePageIdx(code_pbase);
+                                code_icache_ptr = self.prepareIcachePage(code_page_idx, code_pbase);
                                 d = decodeAndFuseArm32(inst, code_page_ptr, page_word);
                                 code_icache_ptr[page_word] = d;
+                                self.markIcacheDirty(code_page_idx, page_word);
                             } else {
-                                const page_idx = @as(usize, (pc >> 12) ^ (pc >> 16)) & ic_pages_mask;
-                                self.icache_page_tags[page_idx] = 0xffff_ffff;
-                                code_icache_ptr = self.icache[page_idx << 10 ..].ptr;
-                                d = code_icache_ptr[page_word];
-                                if (d.raw != inst) {
-                                    d = decodeArm32(inst);
-                                    code_icache_ptr[page_word] = d;
-                                }
+                                code_page_idx = icachePageIdx(pc);
+                                code_icache_ptr = self.prepareIcachePage(code_page_idx, 0xffff_fffe);
+                                self.icache_page_tags[code_page_idx] = 0xffff_ffff;
+                                d = decodeArm32(inst);
+                                code_icache_ptr[page_word] = d;
+                                self.markIcacheDirty(code_page_idx, page_word);
                             }
                         }
                     }
