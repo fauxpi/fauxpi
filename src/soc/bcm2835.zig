@@ -86,6 +86,65 @@ pub const Bcm2835 = struct {
     last_display_hash: u64 = 0,
     last_display_was_hvs: bool = false,
 
+    pub fn initInPlace(self: *Bcm2835, ram: []u8, display_width: u16, display_height: u16) void {
+        self.ram = ram;
+        self.is_bcm2837 = false;
+        self.intc = .{};
+        self.local_intc = .{};
+        self.timer = .{};
+        self.arm_timer = .{};
+        self.mailbox = .{};
+        self.cprman = .{};
+        self.pm = .{};
+        self.asb = .{};
+        self.rng = .{};
+        self.thermal = .{};
+        self.gpio = .{};
+        self.uart0 = .{};
+        self.aux_uart = .{};
+        self.bt = .{};
+        self.bt_uart = .none;
+        self.dma = .{};
+        self.sdhost = .{};
+        self.sdhci = .{};
+        self.bsc0 = i2c_mod.BscController.init(false, 1280, 720);
+        self.bsc1 = i2c_mod.BscController.init(false, 1280, 720);
+        self.bsc2 = i2c_mod.BscController.init(true, display_width, display_height);
+        self.usb = .{};
+        self.v3d.resetInPlace();
+        self.hvs = .{};
+        self.pv0 = .{};
+        self.pv1 = .{};
+        self.pv2 = .{};
+        self.hdmi = .{};
+        self.txp = .{};
+        self.audio_fifo = .{};
+        self.vchiq = .{};
+        self.pwm = .{};
+        self.i2s = .{};
+        self.spi0 = .{};
+        self.smi = .{};
+        self.smp = .{};
+        self.unmapped_pages = @splat(0);
+        self.unmapped_page_count = 0;
+        self.unmapped_mmio_used = false;
+        self.display_width = display_width;
+        self.display_height = display_height;
+        self.audio_connected = true;
+        self.act_led_hold_frames = 0;
+        self.last_display_hash = 0;
+        self.last_display_was_hvs = false;
+
+        self.mailbox.fb_width = display_width;
+        self.mailbox.fb_height = display_height;
+        self.mailbox.fb_virt_width = display_width;
+        self.mailbox.fb_virt_height = display_height;
+        self.usb.hid.guest_x = @divTrunc(@as(i32, display_width), 2);
+        self.usb.hid.guest_y = @divTrunc(@as(i32, display_height), 2);
+        self.usb.hid.target_x = self.usb.hid.guest_x;
+        self.usb.hid.target_y = self.usb.hid.guest_y;
+    }
+
     pub fn init(ram: []u8, display_width: u16, display_height: u16) Bcm2835 {
         var soc = Bcm2835{
             .ram = ram,

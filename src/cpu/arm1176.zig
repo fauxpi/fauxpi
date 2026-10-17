@@ -20,11 +20,11 @@ pub const Vfp = vfp_mod.Vfp;
 pub const PsrFlags = dec.PsrFlags;
 pub const PstateFlags = aarch64_mod.PstateFlags;
 
-pub const icache_size: usize = 65536;
+pub const icache_size: usize = 16384;
 pub const icache_mask: usize = icache_size - 1;
 pub const icache_pages: usize = icache_size >> 10;
 
-pub const thumb_icache_pages: usize = 16;
+pub const thumb_icache_pages: usize = 8;
 pub const thumb_icache_size: usize = thumb_icache_pages * 2048;
 
 pub const ThumbOp = enum(u8) {
@@ -1465,8 +1465,41 @@ pub fn Arm1176(comptime Bus: type) type {
             self.invalidateIcache();
         }
 
+        pub fn resetInPlace(self: *Self) void {
+            self.r = @splat(0);
+            self.cpsr = PsrFlags.I | PsrFlags.F | @intFromEnum(Mode.svc);
+            self.is_aarch64 = false;
+            self.x = @splat(0);
+            self.sp_el = @splat(0);
+            self.pc64 = 0;
+            self.pstate = PstateFlags.D | PstateFlags.A | PstateFlags.I | PstateFlags.F | PstateFlags.M_EL2h;
+            self.elr_el = @splat(0);
+            self.spsr_el = @splat(0);
+            self.usr_r8_12 = @splat(0);
+            self.fiq_r8_12 = @splat(0);
+            self.bank_r13 = @splat(0);
+            self.bank_r14 = @splat(0);
+            self.bank_spsr = @splat(0);
+            self.mmu = .{};
+            self.vfp = .{};
+            self.excl_valid = false;
+            self.excl_paddr = 0;
+            self.excl_val = 0;
+            self.excl_val_hi = 0;
+            self.fence_word = 0;
+            self.halted_spin = false;
+            self.yield_slice = false;
+            self.cycles = 0;
+            self.last_inst = 0;
+            self.last_dmb_pc = 0xffff_ffff;
+            @memset(&self.icache, .{});
+            @memset(&self.icache_page_tags, 0xffff_ffff);
+            @memset(&self.thumb_icache, .{});
+            @memset(&self.thumb_icache_page_tags, 0xffff_ffff);
+        }
+
         pub fn initReset(self: *Self, entry_pc: u32, r0: u32, r1: u32, r2: u32) void {
-            self.* = .{};
+            self.resetInPlace();
             self.r[0] = r0;
             self.r[1] = r1;
             self.r[2] = r2;
@@ -1475,7 +1508,7 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         pub fn initReset64(self: *Self, entry_pc: u64, x0_dtb: u64) void {
-            self.* = .{};
+            self.resetInPlace();
             self.is_aarch64 = true;
             self.mmu.is_cortex_a53 = true;
             self.vfp.is_vfpv4 = true;
@@ -1487,7 +1520,7 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         pub fn initSecondaryCore(self: *Self, core_id: u2) void {
-            self.* = .{};
+            self.resetInPlace();
             self.mmu.core_id = core_id;
             self.mmu.is_cortex_a53 = true;
             self.vfp.is_vfpv4 = true;
@@ -1496,7 +1529,7 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         pub fn initSecondaryCore64(self: *Self, core_id: u2) void {
-            self.* = .{};
+            self.resetInPlace();
             self.is_aarch64 = true;
             self.mmu.core_id = core_id;
             self.mmu.is_cortex_a53 = true;

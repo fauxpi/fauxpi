@@ -279,6 +279,64 @@ pub const V3d = struct {
     gl_initialized: bool = false,
     frame_dirty: bool = false,
 
+    pub fn resetInPlace(self: *V3d) void {
+        self.scratch = 0;
+        self.l2cactl = 0;
+        self.slcactl = 0;
+        self.intctl = 0;
+        self.int_mask = 0;
+        self.ct0cs = 0;
+        self.ct1cs = 0;
+        self.ct0ea = 0;
+        self.ct1ea = 0;
+        self.ct0ca = 0;
+        self.ct1ca = 0;
+        self.bfc = 0;
+        self.rfc = 0;
+        self.bpca = 0;
+        self.bpcs = 0x00100000;
+        self.bpoa = 0;
+        self.bpos = 0;
+        self.bxcf = 0;
+        self.sqrsv0 = 0;
+        self.sqrsv1 = 0;
+        self.sqcntl = 0;
+        self.srqpc = 0;
+        self.srqua = 0;
+        self.srqul = 0;
+        self.srqcs = 0;
+        self.vpmbase = 0;
+        self.draws_len = 0;
+        self.cur_shader_rec = 0;
+        self.cur_num_attrs = 0;
+        self.cur_vp_x = 0;
+        self.cur_vp_y = 0;
+        self.cur_clip_x = 0;
+        self.cur_clip_y = 0;
+        self.cur_clip_w = 4096;
+        self.cur_clip_h = 4096;
+        self.cur_cfg0 = 0x03;
+        self.cur_cfg1 = 0x70;
+        self.cur_cfg2 = 0x00;
+        self.multisample_bin = false;
+        @memset(&self.tile_color, 0);
+        @memset(&self.tile_depth, 1.0);
+        self.tile_color_solid = null;
+        self.tile_depth_valid = false;
+        self.tile_clear_zs = 1.0;
+        self.lazy_load = null;
+        self.loaded_from = null;
+        self.tile_modified = false;
+        self.prep_fs_insts_len = 0;
+        self.prep_fs_unifs_len = 0;
+        self.shaded_tris_len = 0;
+        self.overflow_draw_start = 0;
+        self.tile_nonempty = @splat(0);
+        self.gl = .{};
+        self.gl_initialized = false;
+        self.frame_dirty = false;
+    }
+
     pub fn takeFrameDirty(self: *V3d) bool {
         const d = self.frame_dirty;
         self.frame_dirty = false;

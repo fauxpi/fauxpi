@@ -233,7 +233,7 @@ fn loadGuestBoot(
     const saved_hdr_ext_level = soc.gpio.ext_level & gpio.Gpio.HEADER_PIN_MASK;
     soc.usb.hid.net.deinit();
     @memset(ram, 0);
-    soc.* = Bcm2835.init(ram, opts.width, opts.height);
+    soc.initInPlace(ram, opts.width, opts.height);
     soc.mailbox.fb_allocated = true;
     soc.gpio.ext_mask = (soc.gpio.ext_mask & ~gpio.Gpio.HEADER_PIN_MASK) | saved_hdr_ext_mask;
     soc.gpio.ext_level = (soc.gpio.ext_level & ~gpio.Gpio.HEADER_PIN_MASK) | saved_hdr_ext_level;
@@ -282,7 +282,6 @@ fn resetCpusForBoard(
     boot_res: loader.BootResult,
 ) void {
     const is_a53 = board_model.isBcm2837() or boot_res.is_aarch64;
-    cpus[0] = .{};
     if (boot_res.is_aarch64) {
         cpus[0].initReset64(boot_res.entry_pc, boot_res.r0);
     } else {
@@ -293,7 +292,6 @@ fn resetCpusForBoard(
     if (is_a53) {
         num_cores.* = 4;
         for (1..4) |i| {
-            cpus[i] = .{};
             if (boot_res.is_aarch64) {
                 cpus[i].initSecondaryCore64(@intCast(i));
             } else {
@@ -342,11 +340,15 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         }
     }
 
-    var soc = Bcm2835.init(ram, opts.width, opts.height);
+    const soc = try gpa.create(Bcm2835);
+    defer gpa.destroy(soc);
+    soc.initInPlace(ram, opts.width, opts.height);
     defer soc.usb.hid.net.deinit();
-    var cpus: [4]Cpu = @splat(.{});
+    const cpus = try gpa.create([4]Cpu);
+    defer gpa.destroy(cpus);
+    for (cpus) |*cpu| cpu.resetInPlace();
     var num_cores: usize = 1;
-    var runner = smp.Runner(Cpu, Bcm2835).init(&cpus, &soc);
+    var runner = smp.Runner(Cpu, Bcm2835).init(cpus, soc);
     if (!opts.sequential_cores) runner.start();
     defer runner.deinit();
     var guest_booted = false;
@@ -395,9 +397,9 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             &(headless_qcow2.?)
         else
             null;
-        if (loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, if (initial_sd) sd_image_buf else null, bm, serial, mac, wifi_mac)) |boot_res| {
-            if (wl_win) |w| syncWindowPeripheralsToSoc(w, &soc);
-            resetCpusForBoard(&cpus, &num_cores, bm, boot_res);
+        if (loadGuestBoot(gpa, opts, ram, soc, active_qcow2, if (initial_sd) sd_image_buf else null, bm, serial, mac, wifi_mac)) |boot_res| {
+            if (wl_win) |w| syncWindowPeripheralsToSoc(w, soc);
+            resetCpusForBoard(cpus, &num_cores, bm, boot_res);
             guest_booted = true;
         } else |err| {
             if (wl_win) |w| {
@@ -475,9 +477,9 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 const active_sd = if (w.status.sd_connected) sd_image_buf else null;
                 if (active_qcow2 != null or active_sd != null) {
                     if (host_audio) |ha| ha.setPaused(true);
-                    if (loadGuestBoot(gpa, opts, ram, &soc, active_qcow2, active_sd, w.status.board_model, w.status.serial_u64, w.status.mac_address, w.status.wifi_mac_address)) |reboot_res| {
-                        syncWindowPeripheralsToSoc(w, &soc);
-                        resetCpusForBoard(&cpus, &num_cores, w.status.board_model, reboot_res);
+                    if (loadGuestBoot(gpa, opts, ram, soc, active_qcow2, active_sd, w.status.board_model, w.status.serial_u64, w.status.mac_address, w.status.wifi_mac_address)) |reboot_res| {
+                        syncWindowPeripheralsToSoc(w, soc);
+                        resetCpusForBoard(cpus, &num_cores, w.status.board_model, reboot_res);
                         guest_booted = true;
                         boot_failed = false;
                         w.ui.dismissSnackbar();
