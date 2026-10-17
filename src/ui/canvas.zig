@@ -260,19 +260,17 @@ pub const Canvas = struct {
     }
 
     fn drawTextWithFont(c: *Canvas, f: *const Font, size: f32, x: f32, baseline: f32, str: []const u8, color: Color) f32 {
+        if (str.len == 0) return x;
         const sc = @max(c.scale, 1.0);
-        const logical_style: Style = .{
-            .font = f,
-            .size = size,
-            .color = color.toArgb(),
-        };
-        const logical_w = text_mod.measure(logical_style, str);
-        if (color.a <= 0 or str.len == 0) return x + logical_w;
+        const argb = color.toArgb();
+        if (color.a <= 0) {
+            return x + text_mod.measure(.{ .font = f, .size = size, .color = argb }, str);
+        }
 
         const phys_style: Style = .{
             .font = f,
             .size = size * sc,
-            .color = color.toArgb(),
+            .color = argb,
         };
         const ox = (x + c.origin[0]) * sc;
         const oy = (baseline + c.origin[1]) * sc;
@@ -283,24 +281,23 @@ pub const Canvas = struct {
             .height = c.height,
             .stride = c.stride,
         };
-        const end_phys = text_mod.draw(tc, c.cache, phys_style, ox, oy, str) catch (ox + logical_w * sc);
+        const end_phys = text_mod.draw(tc, c.cache, phys_style, ox, oy, str) catch
+            (ox + text_mod.measure(.{ .font = f, .size = size, .color = argb }, str) * sc);
         return (end_phys / sc) - c.origin[0];
     }
 
     fn drawTextRotated90WithFont(c: *Canvas, f: *const Font, size: f32, baseline_x: f32, y: f32, str: []const u8, color: Color) f32 {
+        if (str.len == 0) return y;
         const sc = @max(c.scale, 1.0);
-        const logical_style: Style = .{
-            .font = f,
-            .size = size,
-            .color = color.toArgb(),
-        };
-        const logical_w = text_mod.measure(logical_style, str);
-        if (color.a <= 0 or str.len == 0) return y - logical_w;
+        const argb = color.toArgb();
+        if (color.a <= 0) {
+            return y - text_mod.measure(.{ .font = f, .size = size, .color = argb }, str);
+        }
 
         const phys_style: Style = .{
             .font = f,
             .size = size * sc,
-            .color = color.toArgb(),
+            .color = argb,
         };
         const ox = (baseline_x + c.origin[0]) * sc;
         const oy = (y + c.origin[1]) * sc;
@@ -311,7 +308,8 @@ pub const Canvas = struct {
             .height = c.height,
             .stride = c.stride,
         };
-        const end_phys = text_mod.drawRotated90Ccw(tc, c.cache, phys_style, ox, oy, str) catch (oy - logical_w * sc);
+        const end_phys = text_mod.drawRotated90Ccw(tc, c.cache, phys_style, ox, oy, str) catch
+            (oy - text_mod.measure(.{ .font = f, .size = size, .color = argb }, str) * sc);
         return (end_phys / sc) - c.origin[1];
     }
 

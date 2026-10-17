@@ -127,10 +127,25 @@ pub const Rasterizer = struct {
 
     /// Writes the coverage of every pixel (0-255) to `out`, row by row.
     pub fn coverage(r: *const Rasterizer, out: []u8) void {
+        const len = @as(usize, r.width) * r.height;
+        const out_slice = out[0..len];
+        const acc_slice = r.acc[0..len];
         var sum: f32 = 0;
-        for (out[0 .. @as(usize, r.width) * r.height], r.acc[0 .. @as(usize, r.width) * r.height]) |*o, a| {
-            sum += a;
-            o.* = @intFromFloat(@min(@abs(sum), 1) * 255 + 0.5);
+        var i: usize = 0;
+        while (i + 4 <= len) : (i += 4) {
+            const s0 = sum + acc_slice[i + 0];
+            const s1 = s0 + acc_slice[i + 1];
+            const s2 = s1 + acc_slice[i + 2];
+            const s3 = s2 + acc_slice[i + 3];
+            sum = s3;
+            const v_sum = @Vector(4, f32){ s0, s1, s2, s3 };
+            const v_clamped = @min(@abs(v_sum), @as(@Vector(4, f32), @splat(1.0)));
+            const v_cov: @Vector(4, u8) = @intFromFloat(v_clamped * @as(@Vector(4, f32), @splat(255.0)) + @as(@Vector(4, f32), @splat(0.5)));
+            out_slice[i..][0..4].* = v_cov;
+        }
+        while (i < len) : (i += 1) {
+            sum += acc_slice[i];
+            out_slice[i] = @intFromFloat(@min(@abs(sum), 1.0) * 255.0 + 0.5);
         }
     }
 };

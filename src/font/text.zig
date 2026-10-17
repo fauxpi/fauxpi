@@ -31,24 +31,37 @@ pub const Canvas = struct {
     /// is at (x, y).
     pub fn blendMask(c: Canvas, x: i32, y: i32, mask: []const u8, mask_w: u32, mask_h: u32, color: u32) void {
         const color_alpha: u32 = color >> 24;
+        if (color_alpha == 0) return;
         // Clip the mask to the canvas once, not per pixel.
         const mx0: u32 = @intCast(std.math.clamp(-x, 0, @as(i32, @intCast(mask_w))));
         const mx1: u32 = @intCast(std.math.clamp(@as(i32, @intCast(c.width)) - x, 0, @as(i32, @intCast(mask_w))));
         const my0: u32 = @intCast(std.math.clamp(-y, 0, @as(i32, @intCast(mask_h))));
         const my1: u32 = @intCast(std.math.clamp(@as(i32, @intCast(c.height)) - y, 0, @as(i32, @intCast(mask_h))));
-        if (mx0 >= mx1) return;
+        if (mx0 >= mx1 or my0 >= my1) return;
+
+        const span_w: usize = mx1 - mx0;
+        const color_opaque: u32 = color | 0xff000000;
+        const v_src_rb: @Vector(4, u32) = @splat(color & 0x00ff00ff);
+        const v_src_g: @Vector(4, u32) = @splat(color & 0x0000ff00);
+
         for (my0..my1) |my| {
             const cy: usize = @intCast(y + @as(i32, @intCast(my)));
-            const row = c.pixels[cy * c.stride + @as(usize, @intCast(x + @as(i32, @intCast(mx0)))) ..][0 .. mx1 - mx0];
-            const covs = mask[my * mask_w + mx0 ..][0 .. mx1 - mx0];
+            const row = c.pixels[cy * c.stride + @as(usize, @intCast(x + @as(i32, @intCast(mx0)))) ..][0..span_w];
+            const covs = mask[my * mask_w + mx0 ..][0..span_w];
+            var i: usize = 0;
+            while (i + 4 <= span_w) : (i += 4) {
+                blendCov4(row[i..][0..4], covs[i..][0..4].*, color_opaque, color_alpha, v_src_rb, v_src_g);
+            }
             if (color_alpha == 255) {
-                for (row, covs) |*p, cov| if (cov != 0) {
-                    p.* = blend(p.*, color, cov);
-                };
+                while (i < span_w) : (i += 1) {
+                    const cov = covs[i];
+                    if (cov != 0) row[i] = blend(row[i], color, cov);
+                }
             } else {
-                for (row, covs) |*p, cov| if (cov != 0) {
-                    p.* = blend(p.*, color, div255(@as(u32, cov) * color_alpha));
-                };
+                while (i < span_w) : (i += 1) {
+                    const cov = covs[i];
+                    if (cov != 0) row[i] = blend(row[i], color, div255(@as(u32, cov) * color_alpha));
+                }
             }
         }
     }
@@ -68,6 +81,7 @@ pub const Canvas = struct {
         color: u32,
     ) void {
         const color_alpha: u32 = color >> 24;
+        if (color_alpha == 0) return;
         const x0: i32 = base_x + mask_top;
         const y_bottom: i32 = pen_y - mask_left;
 
@@ -77,7 +91,26 @@ pub const Canvas = struct {
         const mx1: u32 = @intCast(std.math.clamp(y_bottom + 1, 0, @as(i32, @intCast(mask_w))));
         if (mx0 >= mx1 or my0 >= my1) return;
 
-        for (my0..my1) |my| {
+        const color_opaque: u32 = color | 0xff000000;
+        const v_src_rb: @Vector(4, u32) = @splat(color & 0x00ff00ff);
+        const v_src_g: @Vector(4, u32) = @splat(color & 0x0000ff00);
+
+        var my: usize = my0;
+        while (my + 4 <= my1) : (my += 4) {
+            const cx: usize = @intCast(x0 + @as(i32, @intCast(my)));
+            const row0 = mask[(my + 0) * mask_w ..];
+            const row1 = mask[(my + 1) * mask_w ..];
+            const row2 = mask[(my + 2) * mask_w ..];
+            const row3 = mask[(my + 3) * mask_w ..];
+            for (mx0..mx1) |mx| {
+                const cov4 = [4]u8{ row0[mx], row1[mx], row2[mx], row3[mx] };
+                if (@as(u32, @bitCast(cov4)) != 0) {
+                    const cy: usize = @intCast(y_bottom - @as(i32, @intCast(mx)));
+                    blendCov4(c.pixels[cy * c.stride + cx ..][0..4], cov4, color_opaque, color_alpha, v_src_rb, v_src_g);
+                }
+            }
+        }
+        while (my < my1) : (my += 1) {
             const cx: usize = @intCast(x0 + @as(i32, @intCast(my)));
             const mask_row = mask[my * mask_w ..];
             if (color_alpha == 255) {
@@ -102,6 +135,43 @@ pub const Canvas = struct {
         }
     }
 };
+
+inline fn blendCov4(
+    dst_ptr: *[4]u32,
+    cov4: [4]u8,
+    color_opaque: u32,
+    color_alpha: u32,
+    v_src_rb: @Vector(4, u32),
+    v_src_g: @Vector(4, u32),
+) void {
+    const cov_bits: u32 = @bitCast(cov4);
+    if (cov_bits == 0) return;
+    if (color_alpha == 255 and cov_bits == 0xffffffff) {
+        dst_ptr.* = @splat(color_opaque);
+        return;
+    }
+    const v_cov8: @Vector(4, u8) = cov4;
+    var v_a: @Vector(4, u32) = v_cov8;
+    if (color_alpha != 255) {
+        const prod = v_a * @as(@Vector(4, u32), @splat(color_alpha)) + @as(@Vector(4, u32), @splat(128));
+        v_a = (prod + (prod >> @splat(8))) >> @splat(8);
+    }
+    const v_ia = @as(@Vector(4, u32), @splat(255)) - v_a;
+    const v_dst: @Vector(4, u32) = dst_ptr.*;
+    const v_mask_rb: @Vector(4, u32) = @splat(0x00ff00ff);
+    const v_mask_g: @Vector(4, u32) = @splat(0x0000ff00);
+    const v_bias_rb: @Vector(4, u32) = @splat(0x00800080);
+    const v_bias_g: @Vector(4, u32) = @splat(0x00008000);
+    const v_alpha: @Vector(4, u32) = @splat(0xff000000);
+    const v_shift8: @Vector(4, u5) = @splat(8);
+
+    const v_rb = v_src_rb * v_a + (v_dst & v_mask_rb) * v_ia + v_bias_rb;
+    const v_g = v_src_g * v_a + (v_dst & v_mask_g) * v_ia + v_bias_g;
+    const v_rb_out = ((v_rb + ((v_rb >> v_shift8) & v_mask_rb)) >> v_shift8) & v_mask_rb;
+    const v_g_out = ((v_g + ((v_g >> v_shift8) & v_mask_g)) >> v_shift8) & v_mask_g;
+    const v_blended = v_alpha | v_rb_out | v_g_out;
+    dst_ptr.* = @select(u32, v_a == @as(@Vector(4, u32), @splat(0)), v_dst, v_blended);
+}
 
 /// `src` over `dst` with alpha `a` (0-255), per colour channel. The result
 /// is opaque.
