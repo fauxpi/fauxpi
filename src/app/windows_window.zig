@@ -10,6 +10,7 @@ const host_posix = @import("../host/posix.zig");
 const UsbHidComposite = @import("../usb/hid.zig").UsbHidComposite;
 const Gpio = @import("../soc/gpio.zig").Gpio;
 const board_sheet = @import("../ui/board_sheet.zig");
+const window = @import("window.zig");
 
 const HWND = ?*anyopaque;
 const HINSTANCE = ?*anyopaque;
@@ -326,12 +327,7 @@ pub const WindowsWindow = struct {
     /// Physical window backbuffer (`(width * scale) * (height * scale)`)
     backbuffer: []u32 = &.{},
     hdmi_gen: u64 = 1,
-    backbuf_hdmi_gen: u64 = 0,
-    backbuf_had_sheet: bool = false,
-    backbuf_hdmi_state: u2 = 0,
-    backbuf_sheet_rect: board_sheet.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    backbuf_display_rect: board_sheet.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    backbuf_sheet_docked: bool = false,
+    buf_state: window.BufferState = .{},
 
     closed: bool = false,
     ui_dirty: bool = true,
@@ -344,12 +340,12 @@ pub const WindowsWindow = struct {
 
     last_mouse_x: ?f64 = null,
     last_mouse_y: ?f64 = null,
-    cursor_mode: enum { unknown, ui_arrow, hdmi_crosshair } = .unknown,
+    cursor_mode: window.CursorMode = .unknown,
 
     /// Client-side keyboard repeat state
     repeat_rate: u32 = 25,
     repeat_delay_ms: u32 = 500,
-    repeat: ?struct { key: u32, next_ns: u64 } = null,
+    repeat: ?window.KeyRepeat = null,
     keys_down: std.StaticBitSet(256) = .empty,
 
     hid: ?*UsbHidComposite = null,
@@ -365,25 +361,8 @@ pub const WindowsWindow = struct {
         hid: *UsbHidComposite,
         gpio: *Gpio,
     ) !*WindowsWindow {
-        var ui = try board_sheet.BoardUi.init(gpa);
-        errdefer ui.deinit();
-
-        const hdmi_fb = try gpa.alloc(u32, @as(usize, display_width) * @as(usize, display_height));
-        errdefer gpa.free(hdmi_fb);
-        @memset(hdmi_fb, 0xFF101418);
-
-        var status: board_sheet.SystemStatus = .{
-            .serial_u64 = ui.parsedSerial(),
-            .mac_address = ui.parsedMac(),
-            .wifi_mac_address = ui.parsedWifiMac(),
-            .hdmi_width = @intCast(display_width),
-            .hdmi_height = @intCast(display_height),
-        };
-        ui.configureXdgStorage(environ, &status);
-
-        const total_width = display_width;
-        const total_height = display_height + board_sheet.BoardUi.title_bar_height +
-            (if (status.gpio_connected) board_sheet.BoardUi.gpio_panel_height else 0);
+        var common = try window.initCommonResources(gpa, environ, display_width, display_height, hid, gpio);
+        errdefer common.deinit(gpa);
 
         const win = try gpa.create(WindowsWindow);
         errdefer gpa.destroy(win);
@@ -392,22 +371,14 @@ pub const WindowsWindow = struct {
             .gpa = gpa,
             .display_width = display_width,
             .display_height = display_height,
-            .width = total_width,
-            .height = total_height,
-            .hdmi_fb = hdmi_fb,
+            .width = common.width,
+            .height = common.height,
+            .hdmi_fb = common.hdmi_fb,
             .hid = hid,
             .gpio = gpio,
-            .ui = ui,
-            .status = status,
+            .ui = common.ui,
+            .status = common.status,
         };
-
-        gpio.setExternalPin(46, !win.status.hdmi_connected);
-        hid.setHubKind(win.status.board_model.hubKind());
-        hid.hub_connected = win.status.usb_hub_connected;
-        hid.keyboard_connected = win.status.usb_keyboard_connected;
-        hid.mouse_connected = win.status.usb_mouse_connected;
-        hid.ethernet_connected = win.status.ethernet_connected;
-        hid.net.dhcp_enabled = win.status.dhcp_enabled;
 
         active_windows_window = win;
         try win.initWin32Window();
@@ -421,9 +392,7 @@ pub const WindowsWindow = struct {
         }
         self.ui.saveSettings(self.status) catch {};
         self.ui.deinit();
-        if (self.backbuffer.len > 0) {
-            self.gpa.free(self.backbuffer);
-        }
+        window.freeSingleBackbuffer(self);
         self.gpa.free(self.hdmi_fb);
         if (win32_api) |*api| {
             if (self.crosshair_cursor) |cur| {
@@ -531,7 +500,7 @@ pub const WindowsWindow = struct {
         defer _ = api.DeleteObject(hbm_color);
         const bits = bits_ptr orelse return null;
         const pixels: []u32 = @as([*]u32, @ptrCast(@alignCast(bits)))[0 .. dim * dim];
-        @import("window.zig").paintFaintCrosshairCursor(pixels, 1);
+        window.paintFaintCrosshairCursor(pixels, 1);
 
         var mask_bytes: [dim * 4]u8 = @splat(0);
         const hbm_mask = api.CreateBitmap(@intCast(dim), @intCast(dim), 1, 1, &mask_bytes) orelse return null;
@@ -548,22 +517,7 @@ pub const WindowsWindow = struct {
     }
 
     fn initBackbuffer(self: *WindowsWindow) !void {
-        if (self.backbuffer.len > 0) {
-            self.gpa.free(self.backbuffer);
-            self.backbuffer = &.{};
-        }
-        const sc = @max(self.scale, 1);
-        const count = @as(usize, self.width * sc) * @as(usize, self.height * sc);
-        self.backbuffer = try self.gpa.alloc(u32, count);
-        @memset(self.backbuffer, 0xFF101418);
-        self.backbuf_hdmi_gen = 0;
-        self.backbuf_had_sheet = false;
-        self.backbuf_hdmi_state = 0;
-        self.backbuf_sheet_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        self.backbuf_display_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        self.backbuf_sheet_docked = false;
-        self.cursor_mode = .unknown;
-        self.ui_dirty = true;
+        try window.reallocSingleBackbuffer(self);
     }
 
     pub fn backbufferPixels(self: *WindowsWindow) []u32 {
@@ -575,12 +529,11 @@ pub const WindowsWindow = struct {
     }
 
     pub fn notifyHdmiUpdated(self: *WindowsWindow) void {
-        self.hdmi_gen +%= 1;
-        if (self.hdmi_gen == 0) self.hdmi_gen = 1;
+        window.notifyHdmiUpdated(self);
     }
 
     pub fn chosenSdPath(self: *const WindowsWindow) []const u8 {
-        return self.chosen_sd_path_buf[0..self.chosen_sd_path_len];
+        return window.chosenSdPath(self);
     }
 
     pub fn compositeUi(self: *WindowsWindow) void {
@@ -590,8 +543,7 @@ pub const WindowsWindow = struct {
         }
 
         const default_w = self.display_width;
-        const default_h = self.display_height + board_sheet.BoardUi.title_bar_height +
-            (if (self.status.gpio_connected) board_sheet.BoardUi.gpio_panel_height else 0);
+        const default_h = window.defaultWindowHeight(self.display_height, self.status);
         const desired_w = if (self.ui.maximized and self.configured_width > 0) self.configured_width else default_w;
         const desired_h = if (self.ui.maximized and self.configured_height > 0) self.configured_height else default_h;
         if ((self.pending_scale != self.scale and self.pending_scale >= 1) or self.width != desired_w or self.height != desired_h) {
@@ -618,62 +570,7 @@ pub const WindowsWindow = struct {
             self.ui_dirty = false;
         }
 
-        const sc = @max(self.scale, 1);
-        const full = self.backbufferPixels();
-        const buf_w: usize = @as(usize, self.width) * @as(usize, sc);
-        const dw: usize = self.display_width;
-        const dh: usize = self.display_height;
-
-        self.ui.updateLayout(self.width, self.height, self.status, self.gpio);
-        const disp_x: u32 = @intFromFloat(@max(0.0, @floor(self.ui.display_rect.x)));
-        const disp_y: u32 = @intFromFloat(@max(0.0, @floor(self.ui.display_rect.y)));
-        const left_phys_cols: usize = @as(usize, disp_x) * @as(usize, sc);
-        const top_phys_rows: usize = @as(usize, disp_y) * @as(usize, sc);
-
-        const has_overlay = self.ui.sheet_open or self.ui.hasSnackbar();
-        const has_popup = self.ui.sd_manage_open or self.ui.sd_card_menu_open or self.ui.board_menu_open;
-        const can_reuse_sheet_backdrop = self.ui.sheet_open and !self.ui.hasSnackbar() and !has_popup;
-        const hdmi_state: u2 = (@as(u2, @intFromBool(self.status.hdmi_connected)) |
-            (@as(u2, @intFromBool(self.status.hdmi_active)) << 1));
-        const same_display_layout = std.meta.eql(self.backbuf_display_rect, self.ui.display_rect) and
-            (self.backbuf_sheet_docked == self.ui.sheet_docked_above);
-        const same_sheet_backdrop = can_reuse_sheet_backdrop and
-            self.backbuf_had_sheet and
-            self.backbuf_hdmi_state == hdmi_state and
-            same_display_layout and
-            std.meta.eql(self.backbuf_sheet_rect, self.ui.sheet_rect);
-
-        var reuse_dimmed_backdrop = false;
-        if (self.status.hdmi_connected and self.status.hdmi_active) {
-            if (same_sheet_backdrop and self.backbuf_hdmi_gen == self.hdmi_gen) {
-                reuse_dimmed_backdrop = true;
-            } else {
-                const need_hdmi_blit = (self.backbuf_hdmi_gen != self.hdmi_gen) or
-                    !same_display_layout or
-                    has_overlay or
-                    self.backbuf_had_sheet or
-                    (self.backbuf_hdmi_state != hdmi_state);
-                if (need_hdmi_blit) {
-                    board_sheet.BoardUi.blitHdmiToBackbufferAt(full, buf_w, left_phys_cols, top_phys_rows, self.hdmi_fb, dw, dh, sc);
-                    self.backbuf_hdmi_gen = self.hdmi_gen;
-                }
-            }
-        } else {
-            self.backbuf_hdmi_gen = 0;
-            if (same_sheet_backdrop) {
-                reuse_dimmed_backdrop = true;
-            }
-        }
-        self.backbuf_had_sheet = has_overlay;
-        self.backbuf_hdmi_state = hdmi_state;
-        self.backbuf_display_rect = self.ui.display_rect;
-        self.backbuf_sheet_docked = self.ui.sheet_docked_above;
-        self.backbuf_sheet_rect = if (can_reuse_sheet_backdrop)
-            self.ui.sheet_rect
-        else
-            .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-
-        self.ui.paintWithBackdrop(full, self.width, self.height, sc, self.status, self.gpio, reuse_dimmed_backdrop);
+        _ = window.compositeToBuffer(self, self.backbufferPixels(), &self.buf_state);
     }
 
     pub fn present(self: *WindowsWindow) !void {
@@ -717,25 +614,9 @@ pub const WindowsWindow = struct {
 
     pub fn pollEvents(self: *WindowsWindow) !void {
         self.pumpWin32Messages();
-        self.pollAsyncSdCreation();
-        self.serviceRepeat(host_posix.monotonicNs());
-    }
-
-    fn pollAsyncSdCreation(self: *WindowsWindow) void {
-        switch (self.ui.pollAsyncSdCreation(host_posix.monotonicNs())) {
-            .idle => {},
-            .in_progress => {
-                self.ui_dirty = true;
-            },
-            .completed_ok => {
-                self.sd_image_chosen = true;
-                self.ui_dirty = true;
-                self.ui.saveSettings(self.status) catch {};
-            },
-            .completed_err => {
-                self.ui_dirty = true;
-            },
-        }
+        const now_ns = host_posix.monotonicNs();
+        window.pollAsyncSdCreation(self, now_ns);
+        self.serviceRepeat(now_ns);
     }
 
     pub fn waitEvents(self: *WindowsWindow, timeout_ms: i32) !void {
@@ -746,8 +627,8 @@ pub const WindowsWindow = struct {
     pub fn waitEventsUs(self: *WindowsWindow, timeout_us: ?u64) !void {
         const was_dirty = self.ui_dirty;
         self.pumpWin32Messages();
-        self.pollAsyncSdCreation();
         const now_ns = host_posix.monotonicNs();
+        window.pollAsyncSdCreation(self, now_ns);
         self.serviceRepeat(now_ns);
         if (self.closed or (!was_dirty and self.ui_dirty)) return;
         if (self.hid) |h| {
@@ -777,8 +658,9 @@ pub const WindowsWindow = struct {
             }
         }
         self.pumpWin32Messages();
-        self.pollAsyncSdCreation();
-        self.serviceRepeat(host_posix.monotonicNs());
+        const after_ns = host_posix.monotonicNs();
+        window.pollAsyncSdCreation(self, after_ns);
+        self.serviceRepeat(after_ns);
     }
 
     fn pumpWin32Messages(self: *WindowsWindow) void {
@@ -848,12 +730,12 @@ pub const WindowsWindow = struct {
                 return 0;
             },
             WM_KILLFOCUS => {
-                self.releaseAllHeldKeys();
+                window.releaseAllHeldKeys(self);
                 return 0;
             },
             WM_ACTIVATE => {
                 if ((wparam & 0xFFFF) == WA_INACTIVE) {
-                    self.releaseAllHeldKeys();
+                    window.releaseAllHeldKeys(self);
                 }
                 return 0;
             },
@@ -862,16 +744,7 @@ pub const WindowsWindow = struct {
                 if (pt.x >= 0.0 and pt.x < @as(f64, @floatFromInt(self.width)) and
                     pt.y >= 0.0 and pt.y < @as(f64, @floatFromInt(self.height)))
                 {
-                    const in_ui = self.ui.pointerMotion(@floatCast(pt.x), @floatCast(pt.y), self.status, self.gpio);
-                    self.updateCursorShape(in_ui);
-                    if (!in_ui) {
-                        self.updateGuestMouseTarget(pt.x, pt.y);
-                    }
-                    self.last_mouse_x = pt.x;
-                    self.last_mouse_y = pt.y;
-                    if (self.ui.takeHoverDirty()) {
-                        self.ui_dirty = true;
-                    }
+                    window.handlePointerMotion(self, pt.x, pt.y);
                 }
                 return 0;
             },
@@ -880,7 +753,7 @@ pub const WindowsWindow = struct {
                 const pt = self.clientCoordsToLogical(lparam);
                 self.last_mouse_x = pt.x;
                 self.last_mouse_y = pt.y;
-                self.handleMouseButton(1 << 0, pressed, pt.x, pt.y);
+                window.handlePointerButton(self, 1 << 0, pressed, pt.x, pt.y);
                 return 0;
             },
             WM_RBUTTONDOWN, WM_RBUTTONUP => {
@@ -888,7 +761,7 @@ pub const WindowsWindow = struct {
                 const pt = self.clientCoordsToLogical(lparam);
                 self.last_mouse_x = pt.x;
                 self.last_mouse_y = pt.y;
-                self.handleMouseButton(1 << 1, pressed, pt.x, pt.y);
+                window.handlePointerButton(self, 1 << 1, pressed, pt.x, pt.y);
                 return 0;
             },
             WM_MBUTTONDOWN, WM_MBUTTONUP => {
@@ -896,18 +769,13 @@ pub const WindowsWindow = struct {
                 const pt = self.clientCoordsToLogical(lparam);
                 self.last_mouse_x = pt.x;
                 self.last_mouse_y = pt.y;
-                self.handleMouseButton(1 << 2, pressed, pt.x, pt.y);
+                window.handlePointerButton(self, 1 << 2, pressed, pt.x, pt.y);
                 return 0;
             },
             WM_MOUSEWHEEL => {
                 const delta_raw: i16 = @bitCast(@as(u16, @truncate((wparam >> 16) & 0xFFFF)));
-                const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
-                const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
-                if (!self.ui.isPointInUi(sx, sy, self.status) and delta_raw != 0) {
-                    if (self.hid) |h| {
-                        const wheel: i8 = if (delta_raw > 0) 1 else -1;
-                        h.handleMouseMotion(0, 0, wheel);
-                    }
+                if (delta_raw != 0) {
+                    window.handleMouseWheel(self, if (delta_raw > 0) 1 else -1);
                 }
                 return 0;
             },
@@ -923,33 +791,12 @@ pub const WindowsWindow = struct {
                     if (pressed) {
                         self.updateKeymapFromWin32Key(api, vk, scancode, evdev_key);
                     }
-                    if (evdev_key < 256) {
-                        if (pressed) self.keys_down.set(evdev_key) else self.keys_down.unset(evdev_key);
-                    }
-                    if (pressed) {
-                        if (!isModifierKey(evdev_key) and self.repeat_rate > 0 and !is_repeat) {
-                            const delay_ns = @as(u64, self.repeat_delay_ms) * std.time.ns_per_ms;
-                            self.repeat = .{ .key = evdev_key, .next_ns = host_posix.monotonicNs() + delay_ns };
-                        }
-                    } else {
-                        if (self.repeat) |rep| {
-                            if (rep.key == evdev_key) self.repeat = null;
-                        }
-                    }
+                    window.recordKeyEvent(self, evdev_key, pressed, is_repeat, host_posix.monotonicNs());
                     self.dispatchKey(evdev_key, pressed, is_repeat);
                 }
                 return 0;
             },
             else => return null,
-        }
-    }
-
-    fn releaseAllHeldKeys(self: *WindowsWindow) void {
-        self.repeat = null;
-        self.keys_down = .empty;
-        self.ui.clearModifiers();
-        if (self.hid) |h| {
-            h.releaseAllKeys();
         }
     }
 
@@ -981,8 +828,8 @@ pub const WindowsWindow = struct {
         }
     }
 
-    fn updateCursorShape(self: *WindowsWindow, over_ui: bool) void {
-        const target: @TypeOf(self.cursor_mode) = if (over_ui) .ui_arrow else .hdmi_crosshair;
+    pub fn updateCursorShape(self: *WindowsWindow, over_ui: bool) void {
+        const target: window.CursorMode = if (over_ui) .ui_arrow else .hdmi_crosshair;
         if (self.cursor_mode == target) return;
         self.cursor_mode = target;
         if (win32_api) |*api| {
@@ -991,152 +838,16 @@ pub const WindowsWindow = struct {
         }
     }
 
-    fn updateGuestMouseTarget(self: *WindowsWindow, sx: f64, sy: f64) void {
-        const hid = self.hid orelse return;
-        const coords = self.ui.windowToHdmiCoords(sx, sy, self.display_width, self.display_height);
-        hid.setMouseTarget(coords.x, coords.y);
-    }
-
-    fn handleMouseButton(self: *WindowsWindow, button_bit: u8, pressed: bool, sx_f64: f64, sy_f64: f64) void {
-        const hid = self.hid orelse return;
-        self.ui_dirty = true;
-        const sx: f32 = @floatCast(sx_f64);
-        const sy: f32 = @floatCast(sy_f64);
-
-        if (button_bit == (1 << 0)) {
-            const prev_sheet = self.ui.sheet_open;
-            const action = self.ui.pointerButton(sx, sy, pressed, self.status, self.gpio);
-            if (!prev_sheet and self.ui.sheet_open and !self.ui.sheet_docked_above) {
-                hid.releaseAllKeys();
+    pub fn startWindowDrag(self: *WindowsWindow) void {
+        if (win32_api) |*api| {
+            if (self.hwnd) |hwnd| {
+                _ = api.ReleaseCapture();
+                _ = api.SendMessageA(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
             }
-            const over_ui = self.ui.isPointInUi(sx, sy, self.status);
-            self.updateCursorShape(over_ui);
-            switch (action) {
-                .start_drag => {
-                    if (win32_api) |*api| {
-                        if (self.hwnd) |hwnd| {
-                            _ = api.ReleaseCapture();
-                            _ = api.SendMessageA(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
-                        }
-                    }
-                    return;
-                },
-                .toggle_maximize => {
-                    self.toggleMaximized();
-                    return;
-                },
-                .toggle_hdmi => {
-                    self.status.hdmi_connected = !self.status.hdmi_connected;
-                    if (!self.status.hdmi_connected) {
-                        self.status.hdmi_active = false;
-                    }
-                    self.gpio.setExternalPin(46, !self.status.hdmi_connected);
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .toggle_audio => {
-                    self.status.audio_connected = !self.status.audio_connected;
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .toggle_power => {
-                    self.status.power_connected = !self.status.power_connected;
-                    if (self.status.power_connected) {
-                        self.power_reconnected = true;
-                    } else {
-                        self.status.hdmi_active = false;
-                        self.gpio.resetSocState();
-                    }
-                    return;
-                },
-                .toggle_sd => {
-                    self.status.sd_connected = !self.status.sd_connected;
-                    if (self.status.sd_connected) {
-                        self.sd_reconnected = true;
-                    } else {
-                        self.sd_disconnected = true;
-                    }
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .select_sd_image => {
-                    self.openSdImagePicker();
-                    return;
-                },
-                .select_sd_card => {
-                    if (self.ui.activeSdCard() == null) {
-                        self.status.sd_connected = false;
-                        self.sd_disconnected = true;
-                    } else {
-                        self.sd_image_chosen = true;
-                    }
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .toggle_usb_hub => {
-                    self.status.usb_hub_connected = !self.status.usb_hub_connected;
-                    hid.hub_connected = self.status.usb_hub_connected;
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .toggle_usb_keyboard => {
-                    self.status.usb_keyboard_connected = !self.status.usb_keyboard_connected;
-                    hid.keyboard_connected = self.status.usb_keyboard_connected;
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .toggle_usb_mouse => {
-                    self.status.usb_mouse_connected = !self.status.usb_mouse_connected;
-                    hid.mouse_connected = self.status.usb_mouse_connected;
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .toggle_ethernet => {
-                    self.status.ethernet_connected = !self.status.ethernet_connected;
-                    hid.ethernet_connected = self.status.ethernet_connected;
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .toggle_gpio => {
-                    self.status.gpio_connected = !self.status.gpio_connected;
-                    if (!self.status.gpio_connected) {
-                        self.gpio.clearHeaderExternalPins();
-                    }
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .select_board => {
-                    self.setBoardModel(self.ui.selected_board_model);
-                    return;
-                },
-                .toggle_dhcp => {
-                    self.status.dhcp_enabled = !self.status.dhcp_enabled;
-                    hid.net.dhcp_enabled = self.status.dhcp_enabled;
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .close => {
-                    self.closed = true;
-                    return;
-                },
-                .consumed => {
-                    self.status.serial_u64 = self.ui.parsedSerial();
-                    self.status.mac_address = self.ui.parsedMac();
-                    self.status.wifi_mac_address = self.ui.parsedWifiMac();
-                    self.ui.saveSettings(self.status) catch {};
-                    return;
-                },
-                .none => {},
-            }
-        } else if (self.ui.isPointInUi(sx, sy, self.status)) {
-            return;
         }
-
-        self.updateGuestMouseTarget(sx_f64, sy_f64);
-        hid.handleMouseButton(button_bit, pressed);
     }
 
-    fn toggleMaximized(self: *WindowsWindow) void {
+    pub fn toggleMaximized(self: *WindowsWindow) void {
         self.ui.maximized = !self.ui.maximized;
         if (!self.ui.maximized) {
             self.configured_width = 0;
@@ -1150,7 +861,7 @@ pub const WindowsWindow = struct {
         }
     }
 
-    fn openSdImagePicker(self: *WindowsWindow) void {
+    pub fn openSdImagePicker(self: *WindowsWindow) void {
         var comdlg = host_posix.DynLib.open("comdlg32.dll") catch return;
         defer comdlg.close();
         const get_open_file = comdlg.lookup(
@@ -1170,98 +881,24 @@ pub const WindowsWindow = struct {
         };
         if (get_open_file(&ofn) != 0) {
             const chosen = std.mem.sliceTo(&file_buf, 0);
-            if (chosen.len > 0 and chosen.len <= self.chosen_sd_path_buf.len) {
-                @memcpy(self.chosen_sd_path_buf[0..chosen.len], chosen);
-                self.chosen_sd_path_len = chosen.len;
-                const fsize = board_sheet.Qcow2Disk.getFileSizeLinux(chosen) catch 0;
-                self.ui.setPendingSdImageFile(chosen, fsize);
-                self.ui_dirty = true;
-            }
+            window.setChosenSdPath(self, chosen);
         }
     }
 
     pub fn repeatTimeoutMs(self: *const WindowsWindow, now_ns: u64) ?i32 {
-        const rep = self.repeat orelse return null;
-        if (self.repeat_rate == 0 or !self.ui.sheet_open) return null;
-        if (now_ns >= rep.next_ns) return 0;
-        const rem_ms = std.math.divCeil(u64, rep.next_ns - now_ns, std.time.ns_per_ms) catch 0;
-        return @intCast(@min(rem_ms, @as(u64, std.math.maxInt(i32))));
+        return window.repeatTimeoutMs(self, now_ns);
     }
 
     pub fn serviceRepeat(self: *WindowsWindow, now_ns: u64) void {
-        const rep = &(self.repeat orelse return);
-        if (self.repeat_rate == 0) {
-            self.repeat = null;
-            return;
-        }
-        if (now_ns < rep.next_ns) return;
-        const step = std.time.ns_per_s / @as(u64, self.repeat_rate);
-        rep.next_ns = if (now_ns - rep.next_ns < step) rep.next_ns + step else now_ns + step;
-        if (self.ui.sheet_open) {
-            self.dispatchKey(rep.key, true, true);
-        }
-    }
-
-    fn isModifierKey(evdev_key: u32) bool {
-        return switch (evdev_key) {
-            29, 97, 42, 54, 56, 100, 125, 126, 58, 69, 70 => true,
-            else => false,
-        };
+        window.serviceRepeat(self, now_ns);
     }
 
     pub fn dispatchKey(self: *WindowsWindow, key: u32, pressed: bool, is_repeat: bool) void {
-        self.ui.updateModifierKey(key, pressed);
-        if (self.ui.sheet_open) {
-            self.ui_dirty = true;
-            if (pressed and self.ui.handleKey(key)) {
-                self.status.serial_u64 = self.ui.parsedSerial();
-                self.status.mac_address = self.ui.parsedMac();
-                self.status.wifi_mac_address = self.ui.parsedWifiMac();
-                self.ui.saveSettings(self.status) catch {};
-                return;
-            }
-            if (key == 1 and pressed and !is_repeat) {
-                if (self.ui.sd_manage_open) {
-                    self.ui.sd_manage_open = false;
-                    self.ui.sd_create_open = false;
-                    return;
-                }
-                if (self.ui.sd_card_menu_open) {
-                    self.ui.sd_card_menu_open = false;
-                    return;
-                }
-                if (!self.ui.sheet_docked_above) {
-                    self.ui.sheet_open = false;
-                    const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
-                    const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
-                    self.updateCursorShape(self.ui.isPointInUi(sx, sy, self.status));
-                    return;
-                }
-            }
-            if (!self.ui.sheet_docked_above or self.ui.focused_field != .none or self.ui.sd_manage_open or self.ui.sd_card_menu_open) {
-                return;
-            }
-        }
-        if (self.hid) |h| {
-            h.handleEvdevKey(key, pressed);
-        }
+        window.dispatchKey(self, key, pressed, is_repeat);
     }
 
     pub fn setBoardModel(self: *WindowsWindow, bm: board_sheet.BoardModel) void {
-        self.status.board_model = bm;
-        self.status.serial_u64 = self.ui.parsedSerial();
-        self.status.mac_address = self.ui.parsedMac();
-        self.status.wifi_mac_address = self.ui.parsedWifiMac();
-        self.ui.title = bm.windowTitle();
-        if (!bm.usesExternalUsbHub()) {
-            self.status.usb_hub_connected = true;
-        }
-        if (self.hid) |h| {
-            h.setHubKind(bm.hubKind());
-            h.hub_connected = self.status.usb_hub_connected;
-        }
-        self.ui_dirty = true;
-        self.ui.saveSettings(self.status) catch {};
+        window.applyBoardModel(self, bm);
         if (win32_api) |*api| {
             if (self.hwnd) |hwnd| {
                 var title_z: [128]u8 = undefined;

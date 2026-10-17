@@ -1,11 +1,14 @@
+//! Common desktop window state, compositing, input routing, and platform dispatch
+//! shared across `WaylandWindow`, `MacosWindow`, and `WindowsWindow`.
+
 const std = @import("std");
 const builtin = @import("builtin");
-const linux = std.os.linux;
-const client = @import("../wayland/client.zig");
-const protocol = @import("../wayland/protocol.zig");
+const host_posix = @import("../host/posix.zig");
 const UsbHidComposite = @import("../usb/hid.zig").UsbHidComposite;
 const Gpio = @import("../soc/gpio.zig").Gpio;
 const board_sheet = @import("../ui/board_sheet.zig");
+
+pub const wayland_window = @import("wayland_window.zig");
 pub const macos_window = @import("macos_window.zig");
 pub const windows_window = @import("windows_window.zig");
 
@@ -13,14 +16,90 @@ pub const windows_window = @import("windows_window.zig");
 pub const Window = switch (builtin.os.tag) {
     .macos => macos_window.MacosWindow,
     .windows => windows_window.WindowsWindow,
-    else => WaylandWindow,
+    else => wayland_window.WaylandWindow,
 };
-
-extern "c" fn execvp(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) c_int;
-extern "c" fn _exit(status: c_int) noreturn;
 
 pub const cursor_logical_dim: u32 = 24;
 pub const crosshair_logical_hot: i32 = 12;
+
+pub const CursorMode = enum {
+    unknown,
+    ui_arrow,
+    hdmi_crosshair,
+};
+
+pub const KeyRepeat = struct {
+    key: u32,
+    next_ns: u64,
+};
+
+pub const BufferState = struct {
+    hdmi_gen: u64 = 0,
+    had_sheet: bool = false,
+    hdmi_state: u2 = 0,
+    sheet_rect: board_sheet.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    display_rect: board_sheet.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    sheet_docked: bool = false,
+};
+
+pub const CommonResources = struct {
+    ui: board_sheet.BoardUi,
+    status: board_sheet.SystemStatus,
+    hdmi_fb: []u32,
+    width: u32,
+    height: u32,
+
+    pub fn deinit(self: *CommonResources, gpa: std.mem.Allocator) void {
+        self.ui.deinit();
+        gpa.free(self.hdmi_fb);
+    }
+};
+
+pub fn defaultWindowHeight(display_height: u32, status: board_sheet.SystemStatus) u32 {
+    return display_height + board_sheet.BoardUi.title_bar_height +
+        (if (status.gpio_connected) board_sheet.BoardUi.gpio_panel_height else 0);
+}
+
+pub fn initCommonResources(
+    gpa: std.mem.Allocator,
+    environ: std.process.Environ,
+    display_width: u32,
+    display_height: u32,
+    hid: *UsbHidComposite,
+    gpio: *Gpio,
+) !CommonResources {
+    var ui = try board_sheet.BoardUi.init(gpa);
+    errdefer ui.deinit();
+
+    const hdmi_fb = try gpa.alloc(u32, @as(usize, display_width) * @as(usize, display_height));
+    errdefer gpa.free(hdmi_fb);
+    @memset(hdmi_fb, 0xFF101418);
+
+    var status: board_sheet.SystemStatus = .{
+        .serial_u64 = ui.parsedSerial(),
+        .mac_address = ui.parsedMac(),
+        .wifi_mac_address = ui.parsedWifiMac(),
+        .hdmi_width = @intCast(display_width),
+        .hdmi_height = @intCast(display_height),
+    };
+    ui.configureXdgStorage(environ, &status);
+
+    gpio.setExternalPin(46, !status.hdmi_connected);
+    hid.setHubKind(status.board_model.hubKind());
+    hid.hub_connected = status.usb_hub_connected;
+    hid.keyboard_connected = status.usb_keyboard_connected;
+    hid.mouse_connected = status.usb_mouse_connected;
+    hid.ethernet_connected = status.ethernet_connected;
+    hid.net.dhcp_enabled = status.dhcp_enabled;
+
+    return .{
+        .ui = ui,
+        .status = status,
+        .hdmi_fb = hdmi_fb,
+        .width = display_width,
+        .height = defaultWindowHeight(display_height, status),
+    };
+}
 
 pub fn paintFaintCrosshairCursor(pixels: []u32, sc: u32) void {
     const dim: usize = @as(usize, cursor_logical_dim) * @as(usize, sc);
@@ -49,6 +128,40 @@ pub fn paintFaintCrosshairCursor(pixels: []u32, sc: u32) void {
     fillScaledCursorPixel(pixels, dim, sc, c, c, core_px);
 }
 
+pub fn paintArrowCursor(pixels: []u32, sc: u32) void {
+    const dim: usize = @as(usize, cursor_logical_dim) * @as(usize, sc);
+    @memset(pixels, 0x00000000);
+    const arrow_rows = [_][]const u8{
+        "X",
+        "XX",
+        "X.X",
+        "X..X",
+        "X...X",
+        "X....X",
+        "X.....X",
+        "X......X",
+        "X.......X",
+        "X........X",
+        "X.....XXXXX",
+        "X..X..X",
+        "X.X X..X",
+        "XX  X..X",
+        "X    X..X",
+        "     X..X",
+        "      XX",
+    };
+    for (arrow_rows, 0..) |row, ly| {
+        for (row, 0..) |ch, lx| {
+            const color: u32 = switch (ch) {
+                'X' => 0xFF000000,
+                '.' => 0xFFFFFFFF,
+                else => continue,
+            };
+            fillScaledCursorPixel(pixels, dim, sc, @intCast(lx + 1), @intCast(ly + 1), color);
+        }
+    }
+}
+
 fn fillScaledCursorPixel(pixels: []u32, dim: usize, sc: u32, lx: i32, ly: i32, color: u32) void {
     if (lx < 0 or ly < 0) return;
     const x0: usize = @as(usize, @intCast(lx)) * @as(usize, sc);
@@ -67,1468 +180,486 @@ fn fillScaledCursorPixel(pixels: []u32, dim: usize, sc: u32, lx: i32, ly: i32, c
     }
 }
 
-/// Wayland XDG-Shell desktop window with client-side TitleBar (`44px` logical),
-/// drop-down Board & GPIO Status Sheet, HiDPI buffer scale support (`1x`, `2x`, ...),
-/// pixel-multiplied HDMI display output, and USB HID keyboard & mouse forwarding.
-pub const WaylandWindow = struct {
-    gpa: std.mem.Allocator,
-    display: *client.Display,
-    registry: client.Proxy,
-    compositor: client.Proxy,
-    shm: client.Proxy,
-    wm_base: client.Proxy,
-    seat: ?client.Proxy = null,
-    pointer: ?client.Proxy = null,
-    keyboard: ?client.Proxy = null,
-    cursor_shape_mgr: ?client.Proxy = null,
-    cursor_shape_dev: ?client.Proxy = null,
+pub fn notifyHdmiUpdated(win: anytype) void {
+    win.hdmi_gen +%= 1;
+    if (win.hdmi_gen == 0) win.hdmi_gen = 1;
+}
 
-    surface: client.Proxy,
-    cursor_surface: client.Proxy,
-    xdg_surface: client.Proxy,
-    toplevel: client.Proxy,
+pub fn chosenSdPath(win: anytype) []const u8 {
+    return win.chosen_sd_path_buf[0..win.chosen_sd_path_len];
+}
 
-    /// Logical HDMI display size (e.g. 1280 x 720)
-    display_width: u32,
-    display_height: u32,
-    /// Logical window size (`display_width` x `display_height + 44` when unmaximized, or compositor-configured size when maximized)
-    width: u32,
-    height: u32,
-    configured_width: u32 = 0,
-    configured_height: u32 = 0,
-    pending_toplevel_width: u32 = 0,
-    pending_toplevel_height: u32 = 0,
-    pending_maximized: bool = false,
-    has_pending_toplevel_configure: bool = false,
-    /// HiDPI buffer scale factor (`1` on standard displays, `2` on 2x2 scaled outputs)
-    scale: u32 = 1,
-    pending_scale: u32 = 1,
+pub fn setChosenSdPath(win: anytype, path: []const u8) void {
+    if (path.len == 0 or path.len > win.chosen_sd_path_buf.len) return;
+    @memcpy(win.chosen_sd_path_buf[0..path.len], path);
+    win.chosen_sd_path_len = path.len;
+    const fsize = board_sheet.Qcow2Disk.getFileSizeLinux(path) catch 0;
+    win.ui.setPendingSdImageFile(path, fsize);
+    win.ui_dirty = true;
+}
 
-    /// 1x simulated HDMI framebuffer (`display_width * display_height`)
-    hdmi_fb: []u32,
+/// Non-blocking child process pipe reader used by Linux (`zenity`/`kdialog`) and macOS (`osascript`)
+/// file chooser dialogs.
+pub const PosixFilePicker = struct {
+    fd: host_posix.fd_t = -1,
+    pid: host_posix.pid_t = -1,
+    buf: [std.fs.max_path_bytes]u8 = undefined,
+    len: usize = 0,
 
-    shm_fd: linux.fd_t = -1,
-    shm_map: []align(std.heap.page_size_min) u8 = &.{},
-    buffers: [2]client.Proxy = undefined,
-    cursor_buffers: [2]client.Proxy = undefined,
-    has_buffers: bool = false,
-    cur_buf: u1 = 0,
-    hdmi_gen: u64 = 1,
-    buf_hdmi_gen: [2]u64 = .{ 0, 0 },
-    buf_had_sheet: [2]bool = .{ false, false },
-    buf_hdmi_state: [2]u2 = .{ 0, 0 },
-    buf_sheet_rect: [2]board_sheet.Rect = .{ .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 } },
-    buf_display_rect: [2]board_sheet.Rect = .{ .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 } },
-    buf_sheet_docked: [2]bool = .{ false, false },
-    last_composite_damaged_hdmi: bool = true,
-
-    configured: bool = false,
-    closed: bool = false,
-    ui_dirty: bool = true,
-    power_reconnected: bool = false,
-    sd_disconnected: bool = false,
-    sd_reconnected: bool = false,
-    sd_image_chosen: bool = false,
-    chosen_sd_path_buf: [std.fs.max_path_bytes]u8 = undefined,
-    chosen_sd_path_len: usize = 0,
-
-    picker_fd: linux.fd_t = -1,
-    picker_pid: linux.pid_t = -1,
-    picker_buf: [std.fs.max_path_bytes]u8 = undefined,
-    picker_len: usize = 0,
-
-    last_mouse_x: ?f64 = null,
-    last_mouse_y: ?f64 = null,
-    last_button_serial: u32 = 0,
-    pointer_enter_serial: u32 = 0,
-    cursor_mode: enum { unknown, ui_arrow, hdmi_crosshair } = .unknown,
-
-    /// Keyboard repeat configuration (`wl_keyboard.repeat_info`, 0 disables repeat) and repeat state.
-    repeat_rate: u32 = 25,
-    repeat_delay_ms: u32 = 600,
-    repeat: ?struct { key: u32, next_ns: u64 } = null,
-    keys_down: std.StaticBitSet(256) = .empty,
-
-    hid: ?*UsbHidComposite = null,
-    gpio: *Gpio,
-    ui: board_sheet.BoardUi,
-    status: board_sheet.SystemStatus = .{},
-
-    pub fn create(
-        gpa: std.mem.Allocator,
-        environ: std.process.Environ,
-        display_width: u32,
-        display_height: u32,
-        hid: *UsbHidComposite,
-        gpio: *Gpio,
-    ) !*WaylandWindow {
-        var ui = try board_sheet.BoardUi.init(gpa);
-        errdefer ui.deinit();
-
-        const hdmi_fb = try gpa.alloc(u32, @as(usize, display_width) * @as(usize, display_height));
-        errdefer gpa.free(hdmi_fb);
-        @memset(hdmi_fb, 0xFF101418);
-
-        const display = try client.Display.connectEnviron(gpa, environ);
-        errdefer display.disconnect();
-
-        const win = try gpa.create(WaylandWindow);
-        errdefer gpa.destroy(win);
-
-        var globals: client.Globals = .{};
-        const registry = try globals.fetch(display);
-
-        const compositor = (try globals.bind(registry, protocol.wl_compositor.name, protocol.wl_compositor.version, null)) orelse return error.MissingCompositor;
-        const shm = (try globals.bind(registry, protocol.wl_shm.name, protocol.wl_shm.version, null)) orelse return error.MissingShm;
-        const wm_base = (try globals.bind(registry, protocol.xdg_wm_base.name, protocol.xdg_wm_base.version, .{ .ptr = win, .handler = wmBaseEvent })) orelse return error.MissingXdgWmBase;
-
-        var status: board_sheet.SystemStatus = .{
-            .serial_u64 = ui.parsedSerial(),
-            .mac_address = ui.parsedMac(),
-            .wifi_mac_address = ui.parsedWifiMac(),
-            .hdmi_width = @intCast(display_width),
-            .hdmi_height = @intCast(display_height),
-        };
-        ui.configureXdgStorage(environ, &status);
-
-        const total_width = display_width;
-        const total_height = display_height + board_sheet.BoardUi.title_bar_height +
-            (if (status.gpio_connected) board_sheet.BoardUi.gpio_panel_height else 0);
-
-        win.* = .{
-            .gpa = gpa,
-            .display = display,
-            .registry = registry,
-            .compositor = compositor,
-            .shm = shm,
-            .wm_base = wm_base,
-            .surface = undefined,
-            .cursor_surface = undefined,
-            .xdg_surface = undefined,
-            .toplevel = undefined,
-            .display_width = display_width,
-            .display_height = display_height,
-            .width = total_width,
-            .height = total_height,
-            .hdmi_fb = hdmi_fb,
-            .hid = hid,
-            .gpio = gpio,
-            .ui = ui,
-            .status = status,
-        };
-        gpio.setExternalPin(46, !win.status.hdmi_connected);
-        hid.setHubKind(win.status.board_model.hubKind());
-        hid.hub_connected = win.status.usb_hub_connected;
-        hid.keyboard_connected = win.status.usb_keyboard_connected;
-        hid.mouse_connected = win.status.usb_mouse_connected;
-        hid.ethernet_connected = win.status.ethernet_connected;
-        hid.net.dhcp_enabled = win.status.dhcp_enabled;
-
-        // Bind all wl_output globals to receive output scale factor events
-        for (globals.list[0..globals.len]) |gl| {
-            if (std.mem.eql(u8, gl.interface[0..gl.interface_len], protocol.wl_output.name)) {
-                const out_proxy = try display.newObject(.{ .ptr = win, .handler = outputEvent });
-                var m = try registry.request(protocol.wl_registry.request.bind);
-                m.uint(gl.name)
-                    .string(protocol.wl_output.name)
-                    .uint(@min(protocol.wl_output.version, gl.version))
-                    .uint(out_proxy.id)
-                    .end();
-            }
+    pub fn close(self: *PosixFilePicker) void {
+        if (self.fd >= 0) {
+            host_posix.close(self.fd);
+            self.fd = -1;
         }
-
-        win.cursor_shape_mgr = try globals.bind(
-            registry,
-            protocol.wp_cursor_shape_manager_v1.name,
-            protocol.wp_cursor_shape_manager_v1.version,
-            null,
-        );
-        win.seat = try globals.bind(registry, protocol.wl_seat.name, protocol.wl_seat.version, .{ .ptr = win, .handler = seatEvent });
-
-        win.surface = try display.newObject(.{ .ptr = win, .handler = surfaceEvent });
-        {
-            var m = try compositor.request(protocol.wl_compositor.request.create_surface);
-            m.uint(win.surface.id).end();
-        }
-        win.cursor_surface = try display.newObject(null);
-        {
-            var m = try compositor.request(protocol.wl_compositor.request.create_surface);
-            m.uint(win.cursor_surface.id).end();
-        }
-
-        win.xdg_surface = try display.newObject(.{ .ptr = win, .handler = xdgSurfaceEvent });
-        {
-            var m = try wm_base.request(protocol.xdg_wm_base.request.get_xdg_surface);
-            m.uint(win.xdg_surface.id).uint(win.surface.id).end();
-        }
-
-        win.toplevel = try display.newObject(.{ .ptr = win, .handler = toplevelEvent });
-        {
-            var m = try win.xdg_surface.request(protocol.xdg_surface.request.get_toplevel);
-            m.uint(win.toplevel.id).end();
-        }
-        {
-            var m = try win.toplevel.request(protocol.xdg_toplevel.request.set_title);
-            m.string(win.ui.title).end();
-        }
-        {
-            var m = try win.toplevel.request(protocol.xdg_toplevel.request.set_app_id);
-            m.string("fauxpi").end();
-        }
-        {
-            var m = try win.surface.request(protocol.wl_surface.request.commit);
-            m.end();
-        }
-
-        // Wait for initial xdg_surface.configure and wl_output.scale / preferred_buffer_scale
-        try display.roundtrip();
-        if (!win.configured) {
-            try display.roundtrip();
-        }
-
-        win.scale = @max(win.pending_scale, 1);
-        if (win.ui.maximized and win.configured_width > 0 and win.configured_height > 0) {
-            win.width = win.configured_width;
-            win.height = win.configured_height;
-        }
-        try win.initShmBuffers();
-
-        return win;
+        self.pid = -1;
+        self.len = 0;
     }
 
-    pub fn destroy(self: *WaylandWindow) void {
-        if (self.picker_fd >= 0) {
-            _ = linux.close(self.picker_fd);
-            self.picker_fd = -1;
-        }
-        self.ui.saveSettings(self.status) catch {};
-        self.ui.deinit();
-        self.gpa.free(self.hdmi_fb);
-        self.freeShmBuffers();
-        self.display.disconnect();
-        self.gpa.destroy(self);
-    }
+    pub fn spawn(self: *PosixFilePicker, comptime childFn: fn () noreturn) void {
+        if (self.fd >= 0) return;
 
-    pub fn chosenSdPath(self: *const WaylandWindow) []const u8 {
-        return self.chosen_sd_path_buf[0..self.chosen_sd_path_len];
-    }
+        var fds: [2]host_posix.fd_t = undefined;
+        if (!host_posix.pipeNonBlockCloexec(&fds)) return;
 
-    fn openSdImagePicker(self: *WaylandWindow) void {
-        if (self.picker_fd >= 0) return;
-
-        var fds: [2]linux.fd_t = undefined;
-        if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true, .NONBLOCK = true })) != .SUCCESS) {
+        const pid = host_posix.forkProcess() orelse {
+            host_posix.close(fds[0]);
+            host_posix.close(fds[1]);
             return;
-        }
-
-        const fork_rc = linux.fork();
-        if (linux.errno(fork_rc) != .SUCCESS) {
-            _ = linux.close(fds[0]);
-            _ = linux.close(fds[1]);
-            return;
-        }
-
-        if (fork_rc == 0) {
-            // Child process: redirect stdout to pipe and exec native file chooser
-            _ = linux.dup2(fds[1], linux.STDOUT_FILENO);
-            _ = linux.close(fds[0]);
-            _ = linux.close(fds[1]);
-
-            const zenity_argv = [_:null]?[*:0]const u8{
-                "zenity",
-                "--file-selection",
-                "--title=Select SD Card Image",
-                "--file-filter=Disk Images (*.img, *.img.xz, *.iso, *.bin, *.raw) | *.img *.img.xz *.xz *.iso *.bin *.raw",
-                "--file-filter=All files | *",
-            };
-            _ = execvp("zenity", &zenity_argv);
-
-            const kdialog_argv = [_:null]?[*:0]const u8{
-                "kdialog",
-                "--title",
-                "Select SD Card Image",
-                "--getopenfilename",
-                ".",
-                "*.img *.img.xz *.xz *.iso *.bin *.raw|Disk Images (*.img, *.img.xz, *.iso, *.bin, *.raw)\n*|All Files",
-            };
-            _ = execvp("kdialog", &kdialog_argv);
-
-            _exit(127);
-        }
-
-        _ = linux.close(fds[1]);
-        self.picker_fd = fds[0];
-        self.picker_pid = @intCast(fork_rc);
-        self.picker_len = 0;
-    }
-
-    fn pollSdImagePicker(self: *WaylandWindow) void {
-        if (self.picker_fd < 0) return;
-
-        while (self.picker_len < self.picker_buf.len) {
-            const rc = linux.read(
-                self.picker_fd,
-                self.picker_buf[self.picker_len..].ptr,
-                self.picker_buf.len - self.picker_len,
-            );
-            const err = linux.errno(rc);
-            if (err == .AGAIN) return;
-            if (err != .SUCCESS) break;
-            if (rc == 0) {
-                // EOF: dialog closed
-                var wstatus: i32 = 0;
-                if (self.picker_pid > 0) {
-                    _ = linux.waitpid(self.picker_pid, &wstatus, 0);
-                }
-                _ = linux.close(self.picker_fd);
-                self.picker_fd = -1;
-                self.picker_pid = -1;
-
-                const trimmed = std.mem.trim(u8, self.picker_buf[0..self.picker_len], " \t\r\n");
-                if (trimmed.len > 0 and trimmed.len <= self.chosen_sd_path_buf.len) {
-                    @memcpy(self.chosen_sd_path_buf[0..trimmed.len], trimmed);
-                    self.chosen_sd_path_len = trimmed.len;
-                    const fsize = board_sheet.Qcow2Disk.getFileSizeLinux(trimmed) catch 0;
-                    self.ui.setPendingSdImageFile(trimmed, fsize);
-                }
-                self.picker_len = 0;
-                self.ui_dirty = true;
-                return;
-            }
-            self.picker_len += rc;
-        }
-    }
-
-    fn freeShmBuffers(self: *WaylandWindow) void {
-        if (self.has_buffers) {
-            for (0..2) |i| {
-                if (self.buffers[i].request(protocol.wl_buffer.request.destroy)) |req| {
-                    var m = req;
-                    m.end();
-                } else |_| {}
-                self.display.forget(self.buffers[i].id);
-                if (self.cursor_buffers[i].request(protocol.wl_buffer.request.destroy)) |req| {
-                    var m = req;
-                    m.end();
-                } else |_| {}
-                self.display.forget(self.cursor_buffers[i].id);
-            }
-            self.has_buffers = false;
-        }
-        if (self.shm_map.len > 0) {
-            _ = linux.munmap(self.shm_map.ptr, self.shm_map.len);
-            self.shm_map = &.{};
-        }
-        if (self.shm_fd >= 0) {
-            _ = linux.close(self.shm_fd);
-            self.shm_fd = -1;
-        }
-    }
-
-    fn paintArrowCursor(pixels: []u32, sc: u32) void {
-        const dim: usize = @as(usize, cursor_logical_dim) * @as(usize, sc);
-        @memset(pixels, 0x00000000);
-        const arrow_rows = [_][]const u8{
-            "X",
-            "XX",
-            "X.X",
-            "X..X",
-            "X...X",
-            "X....X",
-            "X.....X",
-            "X......X",
-            "X.......X",
-            "X........X",
-            "X.....XXXXX",
-            "X..X..X",
-            "X.X X..X",
-            "XX  X..X",
-            "X    X..X",
-            "     X..X",
-            "      XX",
         };
-        for (arrow_rows, 0..) |row, ly| {
-            for (row, 0..) |ch, lx| {
-                const color: u32 = switch (ch) {
-                    'X' => 0xFF000000,
-                    '.' => 0xFFFFFFFF,
-                    else => continue,
-                };
-                fillScaledCursorPixel(pixels, dim, sc, @intCast(lx + 1), @intCast(ly + 1), color);
-            }
+
+        if (pid == 0) {
+            host_posix.dup2Stdout(fds[1]);
+            host_posix.close(fds[0]);
+            host_posix.close(fds[1]);
+            childFn();
         }
+
+        host_posix.close(fds[1]);
+        self.fd = fds[0];
+        self.pid = pid;
+        self.len = 0;
     }
 
-    fn initShmBuffers(self: *WaylandWindow) !void {
-        self.freeShmBuffers();
+    pub fn poll(self: *PosixFilePicker, win: anytype) void {
+        if (self.fd < 0) return;
 
-        const sc = @max(self.scale, 1);
-        const buf_w = self.width * sc;
-        const buf_h = self.height * sc;
-        const stride = buf_w * 4;
-        const single_size = @as(usize, stride) * @as(usize, buf_h);
+        while (self.len < self.buf.len) {
+            switch (host_posix.readNonBlock(self.fd, self.buf[self.len..])) {
+                .again => return,
+                .err => break,
+                .bytes => |rc| {
+                    if (rc == 0) {
+                        host_posix.waitpidBlocking(self.pid);
+                        host_posix.close(self.fd);
+                        self.fd = -1;
+                        self.pid = -1;
 
-        const cur_dim = cursor_logical_dim * sc;
-        const cur_stride = cur_dim * 4;
-        const cur_size = @as(usize, cur_stride) * @as(usize, cur_dim);
-        const pool_size = single_size * 2 + cur_size * 2;
-
-        const fd_rc = linux.memfd_create("fauxpi-hdmi-shm", linux.MFD.CLOEXEC);
-        if (linux.errno(fd_rc) != .SUCCESS) return error.SystemError;
-        self.shm_fd = @intCast(fd_rc);
-
-        if (linux.errno(linux.ftruncate(self.shm_fd, @intCast(pool_size))) != .SUCCESS) return error.SystemError;
-
-        const map_rc = linux.mmap(null, pool_size, .{ .READ = true, .WRITE = true }, .{ .TYPE = .SHARED }, self.shm_fd, 0);
-        if (linux.errno(map_rc) != .SUCCESS) return error.SystemError;
-        self.shm_map = @as([*]align(std.heap.page_size_min) u8, @ptrFromInt(map_rc))[0..pool_size];
-
-        const dup_rc = linux.dup(self.shm_fd);
-        if (linux.errno(dup_rc) != .SUCCESS) return error.SystemError;
-        const send_fd: linux.fd_t = @intCast(dup_rc);
-
-        const pool = try self.display.newObject(null);
-        {
-            var m = try self.shm.request(protocol.wl_shm.request.create_pool);
-            m.uint(pool.id).fd(send_fd).int(@intCast(pool_size)).end();
-        }
-
-        for (0..2) |i| {
-            self.buffers[i] = try self.display.newObject(null);
-            var m = try pool.request(protocol.wl_shm_pool.request.create_buffer);
-            m.uint(self.buffers[i].id)
-                .int(@intCast(i * single_size))
-                .int(@intCast(buf_w))
-                .int(@intCast(buf_h))
-                .int(@intCast(stride))
-                .uint(protocol.wl_shm.format.xrgb8888)
-                .end();
-        }
-
-        for (0..2) |i| {
-            const byte_off = single_size * 2 + i * cur_size;
-            const cur_px: []u32 = @alignCast(std.mem.bytesAsSlice(u32, self.shm_map[byte_off .. byte_off + cur_size]));
-            if (i == 0) {
-                paintFaintCrosshairCursor(cur_px, sc);
-            } else {
-                paintArrowCursor(cur_px, sc);
-            }
-            self.cursor_buffers[i] = try self.display.newObject(null);
-            var m = try pool.request(protocol.wl_shm_pool.request.create_buffer);
-            m.uint(self.cursor_buffers[i].id)
-                .int(@intCast(byte_off))
-                .int(@intCast(cur_dim))
-                .int(@intCast(cur_dim))
-                .int(@intCast(cur_stride))
-                .uint(protocol.wl_shm.format.argb8888)
-                .end();
-        }
-
-        self.has_buffers = true;
-        self.cur_buf = 0;
-        self.buf_hdmi_gen = .{ 0, 0 };
-        self.buf_had_sheet = .{ false, false };
-        self.buf_hdmi_state = .{ 0, 0 };
-        self.buf_sheet_rect = .{ .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 } };
-        self.buf_display_rect = .{ .{ .x = 0, .y = 0, .w = 0, .h = 0 }, .{ .x = 0, .y = 0, .w = 0, .h = 0 } };
-        self.buf_sheet_docked = .{ false, false };
-        self.last_composite_damaged_hdmi = true;
-        self.cursor_mode = .unknown;
-        self.ui_dirty = true;
-
-        {
-            var m = try pool.request(protocol.wl_shm_pool.request.destroy);
-            m.end();
-        }
-        self.display.forget(pool.id);
-    }
-
-    /// Returns the full physical window backbuffer (`(width * scale) * (height * scale)`).
-    pub fn backbufferPixels(self: *WaylandWindow) []u32 {
-        const sc = @max(self.scale, 1);
-        const count = @as(usize, self.width * sc) * @as(usize, self.height * sc);
-        const byte_off = @as(usize, self.cur_buf) * count * 4;
-        return @alignCast(std.mem.bytesAsSlice(u32, self.shm_map[byte_off .. byte_off + count * 4]));
-    }
-
-    /// Returns the 1x simulated HDMI framebuffer (`display_width * display_height`).
-    pub fn displayPixels(self: *WaylandWindow) []u32 {
-        return self.hdmi_fb;
-    }
-
-    pub fn notifyHdmiUpdated(self: *WaylandWindow) void {
-        self.hdmi_gen +%= 1;
-        if (self.hdmi_gen == 0) self.hdmi_gen = 1;
-    }
-
-    /// Blits the 1x `hdmi_fb` (`display_width * display_height`) into the physical
-    /// backbuffer (pixel-doubling `scale x scale` when `scale > 1`) and renders
-    /// `BoardUi` at native HiDPI resolution (`scale`).
-    pub fn compositeUi(self: *WaylandWindow) void {
-        self.ui_dirty = false;
-        const default_w = self.display_width;
-        const default_h = self.display_height + board_sheet.BoardUi.title_bar_height +
-            (if (self.status.gpio_connected) board_sheet.BoardUi.gpio_panel_height else 0);
-        const desired_w = if (self.ui.maximized and self.configured_width > 0) self.configured_width else default_w;
-        const desired_h = if (self.ui.maximized and self.configured_height > 0) self.configured_height else default_h;
-        if ((self.pending_scale != self.scale and self.pending_scale >= 1) or self.width != desired_w or self.height != desired_h) {
-            if (self.pending_scale >= 1) self.scale = self.pending_scale;
-            self.width = desired_w;
-            self.height = desired_h;
-            self.initShmBuffers() catch {};
-            self.ui_dirty = false;
-        }
-
-        const sc = @max(self.scale, 1);
-        const full = self.backbufferPixels();
-        const buf_w: usize = @as(usize, self.width) * @as(usize, sc);
-        const dw: usize = self.display_width;
-        const dh: usize = self.display_height;
-        const b_idx: usize = self.cur_buf;
-
-        self.ui.updateLayout(self.width, self.height, self.status, self.gpio);
-        const disp_x: u32 = @intFromFloat(@max(0.0, @floor(self.ui.display_rect.x)));
-        const disp_y: u32 = @intFromFloat(@max(0.0, @floor(self.ui.display_rect.y)));
-        const left_phys_cols: usize = @as(usize, disp_x) * @as(usize, sc);
-        const top_phys_rows: usize = @as(usize, disp_y) * @as(usize, sc);
-
-        const has_overlay = self.ui.sheet_open or self.ui.hasSnackbar();
-        const has_popup = self.ui.sd_manage_open or self.ui.sd_card_menu_open or self.ui.board_menu_open;
-        const can_reuse_sheet_backdrop = self.ui.sheet_open and !self.ui.hasSnackbar() and !has_popup;
-        const hdmi_state: u2 = (@as(u2, @intFromBool(self.status.hdmi_connected)) |
-            (@as(u2, @intFromBool(self.status.hdmi_active)) << 1));
-        const same_display_layout = std.meta.eql(self.buf_display_rect[b_idx], self.ui.display_rect) and
-            (self.buf_sheet_docked[b_idx] == self.ui.sheet_docked_above);
-        const same_sheet_backdrop = can_reuse_sheet_backdrop and
-            self.buf_had_sheet[b_idx] and
-            self.buf_hdmi_state[b_idx] == hdmi_state and
-            same_display_layout and
-            std.meta.eql(self.buf_sheet_rect[b_idx], self.ui.sheet_rect);
-
-        var reuse_dimmed_backdrop = false;
-        if (self.status.hdmi_connected and self.status.hdmi_active) {
-            if (same_sheet_backdrop and self.buf_hdmi_gen[b_idx] == self.hdmi_gen) {
-                reuse_dimmed_backdrop = true;
-                self.last_composite_damaged_hdmi = false;
-            } else {
-                const need_hdmi_blit = (self.buf_hdmi_gen[b_idx] != self.hdmi_gen) or
-                    !same_display_layout or
-                    has_overlay or
-                    self.buf_had_sheet[b_idx] or
-                    (self.buf_hdmi_state[b_idx] != hdmi_state);
-                if (need_hdmi_blit) {
-                    board_sheet.BoardUi.blitHdmiToBackbufferAt(full, buf_w, left_phys_cols, top_phys_rows, self.hdmi_fb, dw, dh, sc);
-                    self.buf_hdmi_gen[b_idx] = self.hdmi_gen;
-                    self.last_composite_damaged_hdmi = true;
-                } else {
-                    self.last_composite_damaged_hdmi = false;
-                }
-            }
-        } else {
-            self.buf_hdmi_gen[b_idx] = 0;
-            if (same_sheet_backdrop) {
-                reuse_dimmed_backdrop = true;
-                self.last_composite_damaged_hdmi = false;
-            } else {
-                self.last_composite_damaged_hdmi = (self.buf_hdmi_state[b_idx] != hdmi_state) or
-                    !same_display_layout or
-                    has_overlay or
-                    self.buf_had_sheet[b_idx];
-            }
-        }
-        self.buf_had_sheet[b_idx] = has_overlay;
-        self.buf_hdmi_state[b_idx] = hdmi_state;
-        self.buf_display_rect[b_idx] = self.ui.display_rect;
-        self.buf_sheet_docked[b_idx] = self.ui.sheet_docked_above;
-        self.buf_sheet_rect[b_idx] = if (can_reuse_sheet_backdrop)
-            self.ui.sheet_rect
-        else
-            .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-
-        self.ui.paintWithBackdrop(full, self.width, self.height, sc, self.status, self.gpio, reuse_dimmed_backdrop);
-    }
-
-    pub fn present(self: *WaylandWindow) !void {
-        const sc = @max(self.scale, 1);
-        const buf = self.buffers[self.cur_buf];
-        self.cur_buf ^= 1;
-
-        {
-            var m = try self.surface.request(protocol.wl_surface.request.set_buffer_scale);
-            m.int(@intCast(sc)).end();
-        }
-        {
-            var m = try self.surface.request(protocol.wl_surface.request.attach);
-            m.uint(buf.id).int(0).int(0).end();
-        }
-        if (self.last_composite_damaged_hdmi) {
-            var m = try self.surface.request(protocol.wl_surface.request.damage);
-            m.int(0).int(0).int(@intCast(self.width)).int(@intCast(self.height)).end();
-        } else {
-            {
-                var m = try self.surface.request(protocol.wl_surface.request.damage);
-                m.int(0).int(0).int(@intCast(self.width)).int(@intCast(board_sheet.BoardUi.title_bar_height)).end();
-            }
-            if (self.ui.sheet_open) {
-                const sr = self.ui.sheet_rect;
-                const sx: i32 = @intFromFloat(@max(0.0, @floor(sr.x)));
-                const sy: i32 = @intFromFloat(@max(0.0, @floor(sr.y)));
-                const sw: i32 = @intFromFloat(@ceil(sr.w + 2.0));
-                const sh: i32 = @intFromFloat(@ceil(sr.h + 2.0));
-                var m = try self.surface.request(protocol.wl_surface.request.damage);
-                m.int(sx).int(sy).int(sw).int(sh).end();
-            }
-            if (self.status.gpio_connected and self.height > board_sheet.BoardUi.gpio_panel_height) {
-                const gpio_y = self.height - board_sheet.BoardUi.gpio_panel_height;
-                var m = try self.surface.request(protocol.wl_surface.request.damage);
-                m.int(0).int(@intCast(gpio_y)).int(@intCast(self.width)).int(@intCast(board_sheet.BoardUi.gpio_panel_height)).end();
-            }
-        }
-        {
-            var m = try self.surface.request(protocol.wl_surface.request.commit);
-            m.end();
-        }
-        try self.display.pollAndDispatch();
-        self.pollSdImagePicker();
-        self.pollAsyncSdCreation();
-        self.serviceRepeat(monotonicNs());
-    }
-
-    pub fn pollEvents(self: *WaylandWindow) !void {
-        try self.display.pollAndDispatch();
-        self.pollSdImagePicker();
-        self.pollAsyncSdCreation();
-        self.serviceRepeat(monotonicNs());
-    }
-
-    fn pollAsyncSdCreation(self: *WaylandWindow) void {
-        switch (self.ui.pollAsyncSdCreation(monotonicNs())) {
-            .idle => {},
-            .in_progress => {
-                self.ui_dirty = true;
-            },
-            .completed_ok => {
-                self.sd_image_chosen = true;
-                self.ui_dirty = true;
-                self.ui.saveSettings(self.status) catch {};
-            },
-            .completed_err => {
-                self.ui_dirty = true;
-            },
-        }
-    }
-
-    pub fn waitEvents(self: *WaylandWindow, timeout_ms: i32) !void {
-        const timeout_us: ?u64 = if (timeout_ms < 0) null else @as(u64, @intCast(timeout_ms)) * 1000;
-        return self.waitEventsUs(timeout_us);
-    }
-
-    pub fn waitEventsUs(self: *WaylandWindow, timeout_us: ?u64) !void {
-        const was_dirty = self.ui_dirty;
-        const had_pending_in = if (self.hid) |h| h.hasPendingInterruptIn() else false;
-        try self.display.pollAndDispatch();
-        self.pollSdImagePicker();
-        self.pollAsyncSdCreation();
-        const now_ns = monotonicNs();
-        self.serviceRepeat(now_ns);
-        if (self.closed or (!was_dirty and self.ui_dirty)) return;
-        if (timeout_us != null) {
-            if (self.hid) |h| {
-                if (!had_pending_in and h.hasPendingInterruptIn()) return;
-            }
-        }
-
-        var fds: [2 + 32]linux.pollfd = undefined;
-        var nfds: usize = 1;
-        fds[0] = .{ .fd = self.display.conn.fd, .events = linux.POLL.IN, .revents = 0 };
-        if (self.picker_fd >= 0) {
-            fds[nfds] = .{ .fd = self.picker_fd, .events = linux.POLL.IN, .revents = 0 };
-            nfds += 1;
-        }
-        if (self.hid) |h| {
-            if (h.isEthernetLinkUp()) {
-                nfds += h.net.fillPollFds(fds[nfds..]);
-            }
-        }
-
-        var eff_timeout_ms: i32 = if (timeout_us) |us|
-            @intCast(@min((us + 999) / 1000, @as(u64, std.math.maxInt(i32))))
-        else
-            -1;
-        if (self.ui.isCreatingSdCard()) {
-            if (eff_timeout_ms < 0 or eff_timeout_ms > 16) {
-                eff_timeout_ms = 16;
-            }
-        }
-        if (self.repeatTimeoutMs(now_ns)) |rep_ms| {
-            if (eff_timeout_ms < 0 or rep_ms < eff_timeout_ms) {
-                eff_timeout_ms = rep_ms;
-            }
-        }
-        const rc = linux.poll(&fds, @intCast(nfds), eff_timeout_ms);
-        if (linux.errno(rc) == .SUCCESS and rc > 0) {
-            try self.display.pollAndDispatch();
-            self.pollSdImagePicker();
-        }
-        self.pollAsyncSdCreation();
-        self.serviceRepeat(monotonicNs());
-    }
-
-    pub fn repeatTimeoutMs(self: *const WaylandWindow, now_ns: u64) ?i32 {
-        const rep = self.repeat orelse return null;
-        if (self.repeat_rate == 0 or !self.ui.sheet_open) return null;
-        if (now_ns >= rep.next_ns) return 0;
-        const rem_ms = std.math.divCeil(u64, rep.next_ns - now_ns, std.time.ns_per_ms) catch 0;
-        return @intCast(@min(rem_ms, @as(u64, std.math.maxInt(i32))));
-    }
-
-    pub fn serviceRepeat(self: *WaylandWindow, now_ns: u64) void {
-        const rep = &(self.repeat orelse return);
-        if (self.repeat_rate == 0) {
-            self.repeat = null;
-            return;
-        }
-        if (now_ns < rep.next_ns) return;
-        const step = std.time.ns_per_s / @as(u64, self.repeat_rate);
-        rep.next_ns = if (now_ns - rep.next_ns < step) rep.next_ns + step else now_ns + step;
-        if (self.ui.sheet_open) {
-            self.dispatchKey(rep.key, true, true);
-        }
-    }
-
-    fn startMove(self: *WaylandWindow) void {
-        const seat = self.seat orelse return;
-        var m = self.toplevel.request(protocol.xdg_toplevel.request.move) catch return;
-        m.uint(seat.id).uint(self.last_button_serial).end();
-    }
-
-    pub fn setBoardModel(self: *WaylandWindow, bm: board_sheet.BoardModel) void {
-        self.status.board_model = bm;
-        self.status.serial_u64 = self.ui.parsedSerial();
-        self.status.mac_address = self.ui.parsedMac();
-        self.status.wifi_mac_address = self.ui.parsedWifiMac();
-        self.ui.title = bm.windowTitle();
-        if (!bm.usesExternalUsbHub()) {
-            self.status.usb_hub_connected = true;
-        }
-        if (self.hid) |h| {
-            h.setHubKind(bm.hubKind());
-            h.hub_connected = self.status.usb_hub_connected;
-        }
-        self.ui_dirty = true;
-        self.ui.saveSettings(self.status) catch {};
-        var m = self.toplevel.request(protocol.xdg_toplevel.request.set_title) catch return;
-        m.string(self.ui.title).end();
-    }
-
-    fn toggleMaximized(self: *WaylandWindow) void {
-        self.ui.maximized = !self.ui.maximized;
-        if (!self.ui.maximized) {
-            self.configured_width = 0;
-            self.configured_height = 0;
-        }
-        self.ui_dirty = true;
-        const op: u16 = if (self.ui.maximized)
-            protocol.xdg_toplevel.request.set_maximized
-        else
-            protocol.xdg_toplevel.request.unset_maximized;
-        var m = self.toplevel.request(op) catch return;
-        m.end();
-    }
-
-    fn surfaceEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
-        const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
-        if (opcode == protocol.wl_surface.event.preferred_buffer_scale) {
-            const factor = r.int() catch return;
-            if (factor >= 1 and factor <= 4) {
-                const new_scale: u32 = @intCast(factor);
-                if (self.pending_scale != new_scale) {
-                    self.pending_scale = new_scale;
-                    self.ui_dirty = true;
-                }
-            }
-        }
-    }
-
-    fn outputEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
-        const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
-        if (opcode == protocol.wl_output.event.scale) {
-            const factor = r.int() catch return;
-            if (factor >= 1 and factor <= 4) {
-                const new_scale: u32 = @intCast(factor);
-                if (self.pending_scale != new_scale) {
-                    self.pending_scale = new_scale;
-                    self.ui_dirty = true;
-                }
-            }
-        }
-    }
-
-    fn wmBaseEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
-        const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
-        if (opcode == protocol.xdg_wm_base.event.ping) {
-            const serial = r.uint() catch return;
-            var m = self.wm_base.request(protocol.xdg_wm_base.request.pong) catch return;
-            m.uint(serial).end();
-        }
-    }
-
-    fn xdgSurfaceEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
-        const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
-        if (opcode == protocol.xdg_surface.event.configure) {
-            const serial = r.uint() catch return;
-            var m = self.xdg_surface.request(protocol.xdg_surface.request.ack_configure) catch return;
-            m.uint(serial).end();
-            if (self.has_pending_toplevel_configure) {
-                self.has_pending_toplevel_configure = false;
-                self.ui.maximized = self.pending_maximized;
-                if (self.pending_maximized and self.pending_toplevel_width > 0 and self.pending_toplevel_height > 0) {
-                    self.configured_width = self.pending_toplevel_width;
-                    self.configured_height = self.pending_toplevel_height;
-                } else if (!self.pending_maximized) {
-                    self.configured_width = 0;
-                    self.configured_height = 0;
-                }
-            }
-            self.configured = true;
-            self.ui_dirty = true;
-        }
-    }
-
-    fn toplevelEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
-        const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
-        if (opcode == protocol.xdg_toplevel.event.configure) {
-            const w = r.int() catch return;
-            const h = r.int() catch return;
-            const states = r.array() catch return;
-            var is_max = false;
-            var i: usize = 0;
-            while (i + 4 <= states.len) : (i += 4) {
-                const st = std.mem.readInt(u32, states[i..][0..4], .little);
-                if (st == protocol.xdg_toplevel.state.maximized or st == protocol.xdg_toplevel.state.fullscreen) {
-                    is_max = true;
-                }
-            }
-            self.pending_toplevel_width = if (w > 0) @intCast(w) else 0;
-            self.pending_toplevel_height = if (h > 0) @intCast(h) else 0;
-            self.pending_maximized = is_max;
-            self.has_pending_toplevel_configure = true;
-        } else if (opcode == protocol.xdg_toplevel.event.close) {
-            self.closed = true;
-            self.ui_dirty = true;
-        }
-    }
-
-    fn seatEvent(ptr: ?*anyopaque, d: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
-        const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
-        if (opcode == protocol.wl_seat.event.capabilities) {
-            const caps = r.uint() catch return;
-            const seat = self.seat orelse return;
-            if ((caps & protocol.wl_seat.capability.pointer) != 0 and self.pointer == null) {
-                if (d.newObject(.{ .ptr = self, .handler = pointerEvent })) |p| {
-                    self.pointer = p;
-                    if (seat.request(protocol.wl_seat.request.get_pointer)) |req| {
-                        var m = req;
-                        m.uint(p.id).end();
-                    } else |_| {}
-                    if (self.cursor_shape_mgr) |mgr| {
-                        if (d.newObject(null)) |dev| {
-                            self.cursor_shape_dev = dev;
-                            if (mgr.request(protocol.wp_cursor_shape_manager_v1.request.get_pointer)) |sreq| {
-                                var sm = sreq;
-                                sm.uint(dev.id).uint(p.id).end();
-                            } else |_| {}
-                        } else |_| {}
+                        const trimmed = std.mem.trim(u8, self.buf[0..self.len], " \t\r\n");
+                        setChosenSdPath(win, trimmed);
+                        self.len = 0;
+                        win.ui_dirty = true;
+                        return;
                     }
-                } else |_| {}
+                    self.len += rc;
+                },
             }
-            if ((caps & protocol.wl_seat.capability.keyboard) != 0 and self.keyboard == null) {
-                if (d.newObject(.{ .ptr = self, .handler = keyboardEvent })) |k| {
-                    self.keyboard = k;
-                    if (seat.request(protocol.wl_seat.request.get_keyboard)) |req| {
-                        var m = req;
-                        m.uint(k.id).end();
-                    } else |_| {}
-                } else |_| {}
-            }
-        }
-    }
-
-    fn updateCursorShape(self: *WaylandWindow, over_ui: bool) void {
-        const ptr = self.pointer orelse return;
-        if (!self.has_buffers) return;
-        const target: @TypeOf(self.cursor_mode) = if (over_ui) .ui_arrow else .hdmi_crosshair;
-        if (self.cursor_mode == target) return;
-        self.cursor_mode = target;
-
-        if (over_ui) {
-            if (self.cursor_shape_dev) |dev| {
-                if (dev.request(protocol.wp_cursor_shape_device_v1.request.set_shape)) |req| {
-                    var m = req;
-                    m.uint(self.pointer_enter_serial).uint(protocol.wp_cursor_shape_device_v1.shape.default).end();
-                    return;
-                } else |_| {}
-            }
-        }
-
-        const sc = @max(self.scale, 1);
-        const buf_idx: usize = if (over_ui) 1 else 0;
-        const hot_x: i32 = if (over_ui) 1 else crosshair_logical_hot;
-        const hot_y: i32 = if (over_ui) 1 else crosshair_logical_hot;
-
-        if (self.cursor_surface.request(protocol.wl_surface.request.set_buffer_scale)) |req| {
-            var m = req;
-            m.int(@intCast(sc)).end();
-        } else |_| {}
-        if (self.cursor_surface.request(protocol.wl_surface.request.attach)) |req| {
-            var m = req;
-            m.uint(self.cursor_buffers[buf_idx].id).int(0).int(0).end();
-        } else |_| {}
-        if (self.cursor_surface.request(protocol.wl_surface.request.damage)) |req| {
-            var m = req;
-            m.int(0).int(0).int(@intCast(cursor_logical_dim)).int(@intCast(cursor_logical_dim)).end();
-        } else |_| {}
-        if (self.cursor_surface.request(protocol.wl_surface.request.commit)) |req| {
-            var m = req;
-            m.end();
-        } else |_| {}
-        if (ptr.request(protocol.wl_pointer.request.set_cursor)) |req| {
-            var m = req;
-            m.uint(self.pointer_enter_serial).uint(self.cursor_surface.id).int(hot_x).int(hot_y).end();
-        } else |_| {}
-    }
-
-    fn updateGuestMouseTarget(self: *WaylandWindow, sx: f64, sy: f64) void {
-        const hid = self.hid orelse return;
-        const coords = self.ui.windowToHdmiCoords(sx, sy, self.display_width, self.display_height);
-        hid.setMouseTarget(coords.x, coords.y);
-    }
-
-    fn pointerEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
-        const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
-        const hid = self.hid orelse return;
-
-        switch (opcode) {
-            protocol.wl_pointer.event.enter => {
-                const serial = r.uint() catch return;
-                _ = r.uint() catch return; // surface
-                const sx = r.fixed() catch return;
-                const sy = r.fixed() catch return;
-                self.pointer_enter_serial = serial;
-                self.cursor_mode = .unknown;
-                self.last_mouse_x = sx;
-                self.last_mouse_y = sy;
-                const in_ui = self.ui.pointerMotion(@floatCast(sx), @floatCast(sy), self.status, self.gpio);
-                self.updateCursorShape(in_ui);
-                if (!in_ui) {
-                    self.updateGuestMouseTarget(sx, sy);
-                }
-                if (self.ui.takeHoverDirty()) {
-                    self.ui_dirty = true;
-                }
-            },
-            protocol.wl_pointer.event.leave => {
-                self.last_mouse_x = null;
-                self.last_mouse_y = null;
-                self.cursor_mode = .unknown;
-                self.ui.pointerLeave();
-                if (self.ui.takeHoverDirty()) {
-                    self.ui_dirty = true;
-                }
-            },
-            protocol.wl_pointer.event.motion => {
-                _ = r.uint() catch return; // time
-                const sx = r.fixed() catch return;
-                const sy = r.fixed() catch return;
-                const in_ui = self.ui.pointerMotion(@floatCast(sx), @floatCast(sy), self.status, self.gpio);
-                self.updateCursorShape(in_ui);
-                if (!in_ui) {
-                    self.updateGuestMouseTarget(sx, sy);
-                }
-                self.last_mouse_x = sx;
-                self.last_mouse_y = sy;
-                if (self.ui.takeHoverDirty()) {
-                    self.ui_dirty = true;
-                }
-            },
-            protocol.wl_pointer.event.button => {
-                const serial = r.uint() catch return;
-                _ = r.uint() catch return; // time
-                const button = r.uint() catch return;
-                const state = r.uint() catch return;
-                const pressed = (state == protocol.wl_pointer.button_state.pressed);
-                self.last_button_serial = serial;
-                self.ui_dirty = true;
-
-                const sx_f64 = self.last_mouse_x orelse 0.0;
-                const sy_f64 = self.last_mouse_y orelse 0.0;
-                const sx: f32 = @floatCast(sx_f64);
-                const sy: f32 = @floatCast(sy_f64);
-
-                if (button == protocol.input.btn_left) {
-                    const prev_sheet = self.ui.sheet_open;
-                    const action = self.ui.pointerButton(sx, sy, pressed, self.status, self.gpio);
-                    if (!prev_sheet and self.ui.sheet_open and !self.ui.sheet_docked_above) {
-                        hid.releaseAllKeys();
-                    }
-                    const over_ui = self.ui.isPointInUi(sx, sy, self.status);
-                    self.updateCursorShape(over_ui);
-                    switch (action) {
-                        .start_drag => {
-                            self.startMove();
-                            return;
-                        },
-                        .toggle_maximize => {
-                            self.toggleMaximized();
-                            return;
-                        },
-                        .toggle_hdmi => {
-                            self.status.hdmi_connected = !self.status.hdmi_connected;
-                            if (!self.status.hdmi_connected) {
-                                self.status.hdmi_active = false;
-                            }
-                            self.gpio.setExternalPin(46, !self.status.hdmi_connected);
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .toggle_audio => {
-                            self.status.audio_connected = !self.status.audio_connected;
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .toggle_power => {
-                            self.status.power_connected = !self.status.power_connected;
-                            if (self.status.power_connected) {
-                                self.power_reconnected = true;
-                            } else {
-                                self.status.hdmi_active = false;
-                                self.gpio.resetSocState();
-                            }
-                            return;
-                        },
-                        .toggle_sd => {
-                            self.status.sd_connected = !self.status.sd_connected;
-                            if (self.status.sd_connected) {
-                                self.sd_reconnected = true;
-                            } else {
-                                self.sd_disconnected = true;
-                            }
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .select_sd_image => {
-                            self.openSdImagePicker();
-                            return;
-                        },
-                        .select_sd_card => {
-                            if (self.ui.activeSdCard() == null) {
-                                self.status.sd_connected = false;
-                                self.sd_disconnected = true;
-                            } else {
-                                self.sd_image_chosen = true;
-                            }
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .toggle_usb_hub => {
-                            self.status.usb_hub_connected = !self.status.usb_hub_connected;
-                            hid.hub_connected = self.status.usb_hub_connected;
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .toggle_usb_keyboard => {
-                            self.status.usb_keyboard_connected = !self.status.usb_keyboard_connected;
-                            hid.keyboard_connected = self.status.usb_keyboard_connected;
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .toggle_usb_mouse => {
-                            self.status.usb_mouse_connected = !self.status.usb_mouse_connected;
-                            hid.mouse_connected = self.status.usb_mouse_connected;
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .toggle_ethernet => {
-                            self.status.ethernet_connected = !self.status.ethernet_connected;
-                            hid.ethernet_connected = self.status.ethernet_connected;
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .toggle_gpio => {
-                            self.status.gpio_connected = !self.status.gpio_connected;
-                            if (!self.status.gpio_connected) {
-                                self.gpio.clearHeaderExternalPins();
-                            }
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .select_board => {
-                            self.setBoardModel(self.ui.selected_board_model);
-                            return;
-                        },
-                        .toggle_dhcp => {
-                            self.status.dhcp_enabled = !self.status.dhcp_enabled;
-                            hid.net.dhcp_enabled = self.status.dhcp_enabled;
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .close => {
-                            self.closed = true;
-                            return;
-                        },
-                        .consumed => {
-                            self.status.serial_u64 = self.ui.parsedSerial();
-                            self.status.mac_address = self.ui.parsedMac();
-                            self.status.wifi_mac_address = self.ui.parsedWifiMac();
-                            self.ui.saveSettings(self.status) catch {};
-                            return;
-                        },
-                        .none => {},
-                    }
-                } else if (self.ui.isPointInUi(sx, sy, self.status)) {
-                    return;
-                }
-
-                const bit: u8 = switch (button) {
-                    protocol.input.btn_left => 1 << 0,
-                    protocol.input.btn_right => 1 << 1,
-                    protocol.input.btn_middle => 1 << 2,
-                    else => 0,
-                };
-                if (bit != 0) {
-                    self.updateGuestMouseTarget(sx_f64, sy_f64);
-                    hid.handleMouseButton(bit, pressed);
-                }
-            },
-            protocol.wl_pointer.event.axis => {
-                _ = r.uint() catch return; // time
-                const axis = r.uint() catch return;
-                const value = r.fixed() catch return;
-                const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
-                const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
-                if (self.ui.isPointInUi(sx, sy, self.status)) {
-                    return;
-                }
-                if (axis == protocol.wl_pointer.axis.vertical_scroll and value != 0) {
-                    const wheel: i8 = if (value < 0) 1 else -1;
-                    hid.handleMouseMotion(0, 0, wheel);
-                }
-            },
-            else => {},
-        }
-    }
-
-    fn isModifierKey(evdev_key: u32) bool {
-        return switch (evdev_key) {
-            29, 97, 42, 54, 56, 100, 125, 126, 58, 69, 70 => true,
-            else => false,
-        };
-    }
-
-    pub fn dispatchKey(self: *WaylandWindow, key: u32, pressed: bool, is_repeat: bool) void {
-        self.ui.updateModifierKey(key, pressed);
-        if (self.ui.sheet_open) {
-            self.ui_dirty = true;
-            if (pressed and self.ui.handleKey(key)) {
-                self.status.serial_u64 = self.ui.parsedSerial();
-                self.status.mac_address = self.ui.parsedMac();
-                self.status.wifi_mac_address = self.ui.parsedWifiMac();
-                self.ui.saveSettings(self.status) catch {};
-                return;
-            }
-            // Escape (evdev key 1) closes any open SD popup/menu first, then the board sheet (when overlaying)
-            if (key == 1 and pressed and !is_repeat) {
-                if (self.ui.sd_manage_open) {
-                    self.ui.sd_manage_open = false;
-                    self.ui.sd_create_open = false;
-                    return;
-                }
-                if (self.ui.sd_card_menu_open) {
-                    self.ui.sd_card_menu_open = false;
-                    return;
-                }
-                if (!self.ui.sheet_docked_above) {
-                    self.ui.sheet_open = false;
-                    const sx: f32 = @floatCast(self.last_mouse_x orelse 0.0);
-                    const sy: f32 = @floatCast(self.last_mouse_y orelse 0.0);
-                    self.updateCursorShape(self.ui.isPointInUi(sx, sy, self.status));
-                    return;
-                }
-            }
-            if (!self.ui.sheet_docked_above or self.ui.focused_field != .none or self.ui.sd_manage_open or self.ui.sd_card_menu_open) {
-                return;
-            }
-        }
-        if (self.hid) |hid| {
-            hid.handleEvdevKey(key, pressed);
-        }
-    }
-
-    fn keyboardEvent(ptr: ?*anyopaque, _: *client.Display, _: u32, opcode: u16, r: *client.Reader) void {
-        const self: *WaylandWindow = @ptrCast(@alignCast(ptr.?));
-
-        switch (opcode) {
-            protocol.wl_keyboard.event.keymap => {
-                const format = r.uint() catch return;
-                const fd = r.fd() catch return;
-                defer _ = linux.close(fd);
-                const size = r.uint() catch return;
-                if (format == protocol.wl_keyboard.keymap_format.xkb_v1 and size > 0 and size <= 4 * 1024 * 1024) {
-                    const map = linux.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
-                    if (linux.errno(map) == .SUCCESS) {
-                        defer _ = linux.munmap(@ptrFromInt(map), size);
-                        const bytes: [*]const u8 = @ptrFromInt(map);
-                        const len = if (bytes[size - 1] == 0) size - 1 else size;
-                        self.ui.loadXkbKeymap(bytes[0..len]);
-                    }
-                }
-            },
-            protocol.wl_keyboard.event.enter => {
-                _ = r.uint() catch return; // serial
-                _ = r.uint() catch return; // surface
-                const keys = r.array() catch return;
-                self.repeat = null;
-                self.keys_down = .empty;
-                self.ui.clearModifiers();
-                var i: usize = 0;
-                while (i + 4 <= keys.len) : (i += 4) {
-                    const key = std.mem.readInt(u32, keys[i..][0..4], .little);
-                    if (key < 256) self.keys_down.set(key);
-                    self.ui.updateModifierKey(key, true);
-                    if (!self.ui.sheet_open or (self.ui.sheet_docked_above and self.ui.focused_field == .none and !self.ui.sd_manage_open)) {
-                        if (self.hid) |hid| {
-                            hid.handleEvdevKey(key, true);
-                        }
-                    }
-                }
-            },
-            protocol.wl_keyboard.event.leave => {
-                _ = r.uint() catch return; // serial
-                _ = r.uint() catch return; // surface
-                self.repeat = null;
-                self.keys_down = .empty;
-                self.ui.clearModifiers();
-                if (self.hid) |hid| {
-                    hid.releaseAllKeys();
-                }
-            },
-            protocol.wl_keyboard.event.key => {
-                _ = r.uint() catch return; // serial
-                _ = r.uint() catch return; // time
-                const key = r.uint() catch return;
-                const state = r.uint() catch return;
-                const pressed = switch (state) {
-                    protocol.wl_keyboard.key_state.released => false,
-                    protocol.wl_keyboard.key_state.pressed, protocol.wl_keyboard.key_state.repeated => true,
-                    else => return,
-                };
-                const is_repeat = (state == protocol.wl_keyboard.key_state.repeated);
-                if (key < 256) {
-                    if (pressed) self.keys_down.set(key) else self.keys_down.unset(key);
-                }
-                if (pressed) {
-                    if (!isModifierKey(key) and self.repeat_rate > 0 and !is_repeat) {
-                        const delay_ns = @as(u64, self.repeat_delay_ms) * std.time.ns_per_ms;
-                        self.repeat = .{ .key = key, .next_ns = monotonicNs() + delay_ns };
-                    }
-                } else {
-                    if (self.repeat) |rep| {
-                        if (rep.key == key) self.repeat = null;
-                    }
-                }
-                self.dispatchKey(key, pressed, is_repeat);
-            },
-            protocol.wl_keyboard.event.modifiers => {
-                _ = r.uint() catch return; // serial
-                const mods_depressed = r.uint() catch return;
-                const mods_latched = r.uint() catch return;
-                const mods_locked = r.uint() catch return;
-                _ = r.uint() catch return; // group
-                self.ui.updateModifiersFromXkb(mods_depressed, mods_latched, mods_locked);
-            },
-            protocol.wl_keyboard.event.repeat_info => {
-                const rate = r.int() catch return;
-                const delay = r.int() catch return;
-                self.repeat_rate = if (rate > 0) @intCast(rate) else 0;
-                self.repeat_delay_ms = if (delay > 0) @intCast(delay) else 0;
-                if (self.repeat_rate == 0) self.repeat = null;
-            },
-            else => {},
         }
     }
 };
 
-fn monotonicNs() u64 {
-    var ts: linux.timespec = .{ .sec = 0, .nsec = 0 };
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    const sec: u64 = if (ts.sec > 0) @intCast(ts.sec) else 0;
-    const nsec: u64 = if (ts.nsec > 0) @intCast(ts.nsec) else 0;
-    return sec * std.time.ns_per_s + nsec;
+/// Composites `win.hdmi_fb` and `win.ui` into `full` backbuffer, tracking incremental backdrop state
+/// in `buf_state` and returning whether the HDMI display region was damaged.
+pub fn compositeToBuffer(win: anytype, full: []u32, buf_state: *BufferState) bool {
+    const sc = @max(win.scale, 1);
+    const buf_w: usize = @as(usize, win.width) * @as(usize, sc);
+    const dw: usize = win.display_width;
+    const dh: usize = win.display_height;
+
+    win.ui.updateLayout(win.width, win.height, win.status, win.gpio);
+    const disp_x: u32 = @intFromFloat(@max(0.0, @floor(win.ui.display_rect.x)));
+    const disp_y: u32 = @intFromFloat(@max(0.0, @floor(win.ui.display_rect.y)));
+    const left_phys_cols: usize = @as(usize, disp_x) * @as(usize, sc);
+    const top_phys_rows: usize = @as(usize, disp_y) * @as(usize, sc);
+
+    const has_overlay = win.ui.sheet_open or win.ui.hasSnackbar();
+    const has_popup = win.ui.sd_manage_open or win.ui.sd_card_menu_open or win.ui.board_menu_open;
+    const can_reuse_sheet_backdrop = win.ui.sheet_open and !win.ui.hasSnackbar() and !has_popup;
+    const hdmi_state: u2 = (@as(u2, @intFromBool(win.status.hdmi_connected)) |
+        (@as(u2, @intFromBool(win.status.hdmi_active)) << 1));
+    const same_display_layout = std.meta.eql(buf_state.display_rect, win.ui.display_rect) and
+        (buf_state.sheet_docked == win.ui.sheet_docked_above);
+    const same_sheet_backdrop = can_reuse_sheet_backdrop and
+        buf_state.had_sheet and
+        buf_state.hdmi_state == hdmi_state and
+        same_display_layout and
+        std.meta.eql(buf_state.sheet_rect, win.ui.sheet_rect);
+
+    var reuse_dimmed_backdrop = false;
+    var damaged_hdmi = false;
+    if (win.status.hdmi_connected and win.status.hdmi_active) {
+        if (same_sheet_backdrop and buf_state.hdmi_gen == win.hdmi_gen) {
+            reuse_dimmed_backdrop = true;
+            damaged_hdmi = false;
+        } else {
+            const need_hdmi_blit = (buf_state.hdmi_gen != win.hdmi_gen) or
+                !same_display_layout or
+                has_overlay or
+                buf_state.had_sheet or
+                (buf_state.hdmi_state != hdmi_state);
+            if (need_hdmi_blit) {
+                board_sheet.BoardUi.blitHdmiToBackbufferAt(full, buf_w, left_phys_cols, top_phys_rows, win.hdmi_fb, dw, dh, sc);
+                buf_state.hdmi_gen = win.hdmi_gen;
+                damaged_hdmi = true;
+            } else {
+                damaged_hdmi = false;
+            }
+        }
+    } else {
+        buf_state.hdmi_gen = 0;
+        if (same_sheet_backdrop) {
+            reuse_dimmed_backdrop = true;
+            damaged_hdmi = false;
+        } else {
+            damaged_hdmi = (buf_state.hdmi_state != hdmi_state) or
+                !same_display_layout or
+                has_overlay or
+                buf_state.had_sheet;
+        }
+    }
+    buf_state.had_sheet = has_overlay;
+    buf_state.hdmi_state = hdmi_state;
+    buf_state.display_rect = win.ui.display_rect;
+    buf_state.sheet_docked = win.ui.sheet_docked_above;
+    buf_state.sheet_rect = if (can_reuse_sheet_backdrop)
+        win.ui.sheet_rect
+    else
+        .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+
+    win.ui.paintWithBackdrop(full, win.width, win.height, sc, win.status, win.gpio, reuse_dimmed_backdrop);
+    return damaged_hdmi;
 }
 
-test "WaylandWindow keyboard repeat_info, serviceRepeat, keymap fd mmap, and leave release" {
-    if (builtin.os.tag != .linux) return;
-    const testing = std.testing;
-    var gpio: Gpio = .{};
-    var hid: UsbHidComposite = .{};
-    var ui = try board_sheet.BoardUi.init(testing.allocator);
-    defer ui.deinit();
+pub fn reallocSingleBackbuffer(win: anytype) !void {
+    freeSingleBackbuffer(win);
+    const sc = @max(win.scale, 1);
+    const count = @as(usize, win.width * sc) * @as(usize, win.height * sc);
+    win.backbuffer = try win.gpa.alloc(u32, count);
+    @memset(win.backbuffer, 0xFF101418);
+    win.buf_state = .{};
+    win.cursor_mode = .unknown;
+    win.ui_dirty = true;
+}
 
-    var win: WaylandWindow = .{
-        .gpa = testing.allocator,
-        .display = undefined,
-        .registry = undefined,
-        .compositor = undefined,
-        .surface = undefined,
-        .cursor_surface = undefined,
-        .xdg_surface = undefined,
-        .toplevel = undefined,
-        .wm_base = undefined,
-        .shm = undefined,
-        .width = 1280,
-        .height = 764,
-        .display_width = 1280,
-        .display_height = 720,
-        .hdmi_fb = &.{},
-        .gpio = &gpio,
-        .hid = &hid,
-        .ui = ui,
-    };
+pub fn freeSingleBackbuffer(win: anytype) void {
+    if (win.backbuffer.len > 0) {
+        win.gpa.free(win.backbuffer);
+        win.backbuffer = &.{};
+    }
+}
 
-    var conn: client.Connection = .{ .fd = -1 };
+pub fn pollAsyncSdCreation(win: anytype, now_ns: u64) void {
+    switch (win.ui.pollAsyncSdCreation(now_ns)) {
+        .idle => {},
+        .in_progress => {
+            win.ui_dirty = true;
+        },
+        .completed_ok => {
+            win.sd_image_chosen = true;
+            win.ui_dirty = true;
+            win.ui.saveSettings(win.status) catch {};
+        },
+        .completed_err => {
+            win.ui_dirty = true;
+        },
+    }
+}
 
-    // 1. Test repeat_info event (rate = 25 Hz -> 40ms step, delay = 200ms)
-    var repeat_payload: [8]u8 = undefined;
-    std.mem.writeInt(i32, repeat_payload[0..4], 25, .little);
-    std.mem.writeInt(i32, repeat_payload[4..8], 200, .little);
-    var r_info: client.Reader = .{ .data = &repeat_payload, .c = &conn };
-    WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.repeat_info, &r_info);
-    try testing.expectEqual(@as(u32, 25), win.repeat_rate);
-    try testing.expectEqual(@as(u32, 200), win.repeat_delay_ms);
+pub fn updateGuestMouseTarget(win: anytype, sx: f64, sy: f64) void {
+    const hid = win.hid orelse return;
+    const coords = win.ui.windowToHdmiCoords(sx, sy, win.display_width, win.display_height);
+    hid.setMouseTarget(coords.x, coords.y);
+}
 
-    // 2. Test keymap event via memfd
-    const keymap_str =
-        \\xkb_keymap {
-        \\xkb_keycodes "evdev" { <AD01> = 24; };
-        \\xkb_symbols "pc" { key <AD01> { [ z, Z ] }; };
-        \\};
-    ;
-    const mfd_rc = linux.memfd_create("test-keymap", 0);
-    if (linux.errno(mfd_rc) == .SUCCESS) {
-        const mfd: linux.fd_t = @intCast(mfd_rc);
-        _ = linux.write(mfd, keymap_str.ptr, keymap_str.len);
-        var km_payload: [8]u8 = undefined;
-        std.mem.writeInt(u32, km_payload[0..4], protocol.wl_keyboard.keymap_format.xkb_v1, .little);
-        std.mem.writeInt(u32, km_payload[4..8], @intCast(keymap_str.len), .little);
-        conn.in_fds[0] = mfd;
-        conn.in_fds_start = 0;
-        conn.in_fds_end = 1;
-        var r_km: client.Reader = .{ .data = &km_payload, .c = &conn };
-        WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.keymap, &r_km);
-        try testing.expectEqual(@as(?u8, 'z'), win.ui.lookupKeyChar(16));
+pub fn handlePointerMotion(win: anytype, sx: f64, sy: f64) void {
+    const in_ui = win.ui.pointerMotion(@floatCast(sx), @floatCast(sy), win.status, win.gpio);
+    win.updateCursorShape(in_ui);
+    if (!in_ui) {
+        updateGuestMouseTarget(win, sx, sy);
+    }
+    win.last_mouse_x = sx;
+    win.last_mouse_y = sy;
+    if (win.ui.takeHoverDirty()) {
+        win.ui_dirty = true;
+    }
+}
+
+pub fn handlePointerLeave(win: anytype) void {
+    win.last_mouse_x = null;
+    win.last_mouse_y = null;
+    win.cursor_mode = .unknown;
+    win.ui.pointerLeave();
+    if (win.ui.takeHoverDirty()) {
+        win.ui_dirty = true;
+    }
+}
+
+pub fn handleMouseWheel(win: anytype, wheel: i8) void {
+    if (wheel == 0) return;
+    const sx: f32 = @floatCast(win.last_mouse_x orelse 0.0);
+    const sy: f32 = @floatCast(win.last_mouse_y orelse 0.0);
+    if (!win.ui.isPointInUi(sx, sy, win.status)) {
+        if (win.hid) |h| {
+            h.handleMouseMotion(0, 0, wheel);
+        }
+    }
+}
+
+pub fn handlePointerButton(win: anytype, button_bit: u8, pressed: bool, sx_f64: f64, sy_f64: f64) void {
+    const hid = win.hid orelse return;
+    win.ui_dirty = true;
+    const sx: f32 = @floatCast(sx_f64);
+    const sy: f32 = @floatCast(sy_f64);
+
+    if (button_bit == (1 << 0)) {
+        const prev_sheet = win.ui.sheet_open;
+        const action = win.ui.pointerButton(sx, sy, pressed, win.status, win.gpio);
+        if (!prev_sheet and win.ui.sheet_open and !win.ui.sheet_docked_above) {
+            hid.releaseAllKeys();
+        }
+        const over_ui = win.ui.isPointInUi(sx, sy, win.status);
+        win.updateCursorShape(over_ui);
+        switch (action) {
+            .start_drag => {
+                win.startWindowDrag();
+                return;
+            },
+            .toggle_maximize => {
+                win.toggleMaximized();
+                return;
+            },
+            .toggle_hdmi => {
+                win.status.hdmi_connected = !win.status.hdmi_connected;
+                if (!win.status.hdmi_connected) {
+                    win.status.hdmi_active = false;
+                }
+                win.gpio.setExternalPin(46, !win.status.hdmi_connected);
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .toggle_audio => {
+                win.status.audio_connected = !win.status.audio_connected;
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .toggle_power => {
+                win.status.power_connected = !win.status.power_connected;
+                if (win.status.power_connected) {
+                    win.power_reconnected = true;
+                } else {
+                    win.status.hdmi_active = false;
+                    win.gpio.resetSocState();
+                }
+                return;
+            },
+            .toggle_sd => {
+                win.status.sd_connected = !win.status.sd_connected;
+                if (win.status.sd_connected) {
+                    win.sd_reconnected = true;
+                } else {
+                    win.sd_disconnected = true;
+                }
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .select_sd_image => {
+                win.openSdImagePicker();
+                return;
+            },
+            .select_sd_card => {
+                if (win.ui.activeSdCard() == null) {
+                    win.status.sd_connected = false;
+                    win.sd_disconnected = true;
+                } else {
+                    win.sd_image_chosen = true;
+                }
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .toggle_usb_hub => {
+                win.status.usb_hub_connected = !win.status.usb_hub_connected;
+                hid.hub_connected = win.status.usb_hub_connected;
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .toggle_usb_keyboard => {
+                win.status.usb_keyboard_connected = !win.status.usb_keyboard_connected;
+                hid.keyboard_connected = win.status.usb_keyboard_connected;
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .toggle_usb_mouse => {
+                win.status.usb_mouse_connected = !win.status.usb_mouse_connected;
+                hid.mouse_connected = win.status.usb_mouse_connected;
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .toggle_ethernet => {
+                win.status.ethernet_connected = !win.status.ethernet_connected;
+                hid.ethernet_connected = win.status.ethernet_connected;
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .toggle_gpio => {
+                win.status.gpio_connected = !win.status.gpio_connected;
+                if (!win.status.gpio_connected) {
+                    win.gpio.clearHeaderExternalPins();
+                }
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .select_board => {
+                win.setBoardModel(win.ui.selected_board_model);
+                return;
+            },
+            .toggle_dhcp => {
+                win.status.dhcp_enabled = !win.status.dhcp_enabled;
+                hid.net.dhcp_enabled = win.status.dhcp_enabled;
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .close => {
+                win.closed = true;
+                return;
+            },
+            .consumed => {
+                win.status.serial_u64 = win.ui.parsedSerial();
+                win.status.mac_address = win.ui.parsedMac();
+                win.status.wifi_mac_address = win.ui.parsedWifiMac();
+                win.ui.saveSettings(win.status) catch {};
+                return;
+            },
+            .none => {},
+        }
+    } else if (win.ui.isPointInUi(sx, sy, win.status)) {
+        return;
     }
 
-    // 3. Open Manage SD Cards text field, press key 16 ('z' in our custom keymap), and verify key repeat
-    win.ui.sheet_open = true;
-    win.ui.sd_manage_open = true;
-    win.ui.focused_field = .sd_card_name;
-    win.ui.new_card_name_len = 0;
-
-    var key_down_payload: [16]u8 = undefined;
-    std.mem.writeInt(u32, key_down_payload[0..4], 1, .little); // serial
-    std.mem.writeInt(u32, key_down_payload[4..8], 100, .little); // time
-    std.mem.writeInt(u32, key_down_payload[8..12], 16, .little); // key AD01
-    std.mem.writeInt(u32, key_down_payload[12..16], protocol.wl_keyboard.key_state.pressed, .little);
-    var r_down: client.Reader = .{ .data = &key_down_payload, .c = &conn };
-    WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.key, &r_down);
-    try testing.expectEqualStrings("z", win.ui.newCardName());
-    try testing.expect(win.repeat != null);
-
-    const first_due = win.repeat.?.next_ns;
-    // Before delay expires: no repeat
-    win.serviceRepeat(first_due - 1);
-    try testing.expectEqualStrings("z", win.ui.newCardName());
-
-    // At delay expiry: 2nd 'z'
-    win.serviceRepeat(first_due);
-    try testing.expectEqualStrings("zz", win.ui.newCardName());
-
-    // 40ms later (25 Hz): 3rd 'z'
-    win.serviceRepeat(first_due + 40 * std.time.ns_per_ms);
-    try testing.expectEqualStrings("zzz", win.ui.newCardName());
-
-    // Release key 16 -> repeat stops
-    var key_up_payload = key_down_payload;
-    std.mem.writeInt(u32, key_up_payload[12..16], protocol.wl_keyboard.key_state.released, .little);
-    var r_up: client.Reader = .{ .data = &key_up_payload, .c = &conn };
-    WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.key, &r_up);
-    try testing.expect(win.repeat == null);
-
-    // 4. Test guest USB HID key press + wl_keyboard.leave releases held keys
-    win.ui.sheet_open = false;
-    r_down = .{ .data = &key_down_payload, .c = &conn };
-    WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.key, &r_down);
-    try testing.expectEqual(@as(u8, 0x14), hid.kbd_state[2]);
-
-    var leave_payload: [8]u8 = @splat(0);
-    var r_leave: client.Reader = .{ .data = &leave_payload, .c = &conn };
-    WaylandWindow.keyboardEvent(&win, undefined, 1, protocol.wl_keyboard.event.leave, &r_leave);
-    try testing.expectEqual(@as(u8, 0), hid.kbd_state[2]);
-
-    // 5. Test xdg_toplevel.configure + xdg_surface.configure for maximize and unmaximize
-    var disp: client.Display = .{
-        .gpa = testing.allocator,
-        .conn = .{ .fd = -1 },
-    };
-    win.display = &disp;
-    win.xdg_surface = .{ .display = &disp, .id = 10 };
-
-    // Build xdg_toplevel.configure payload: width=1920, height=1080, states=[maximized(1), activated(4)]
-    var tl_cfg_max: [20]u8 = undefined;
-    std.mem.writeInt(i32, tl_cfg_max[0..4], 1920, .little);
-    std.mem.writeInt(i32, tl_cfg_max[4..8], 1080, .little);
-    std.mem.writeInt(u32, tl_cfg_max[8..12], 8, .little); // array byte len = 8
-    std.mem.writeInt(u32, tl_cfg_max[12..16], protocol.xdg_toplevel.state.maximized, .little);
-    std.mem.writeInt(u32, tl_cfg_max[16..20], protocol.xdg_toplevel.state.activated, .little);
-    var r_tl_max: client.Reader = .{ .data = &tl_cfg_max, .c = &conn };
-    WaylandWindow.toplevelEvent(&win, &disp, 11, protocol.xdg_toplevel.event.configure, &r_tl_max);
-    try testing.expect(win.has_pending_toplevel_configure);
-    try testing.expect(win.pending_maximized);
-    try testing.expectEqual(@as(u32, 1920), win.pending_toplevel_width);
-    try testing.expectEqual(@as(u32, 1080), win.pending_toplevel_height);
-
-    var surf_cfg: [4]u8 = undefined;
-    std.mem.writeInt(u32, surf_cfg[0..4], 42, .little);
-    var r_surf: client.Reader = .{ .data = &surf_cfg, .c = &conn };
-    WaylandWindow.xdgSurfaceEvent(&win, &disp, 10, protocol.xdg_surface.event.configure, &r_surf);
-    try testing.expect(win.configured);
-    try testing.expect(win.ui.maximized);
-    try testing.expectEqual(@as(u32, 1920), win.configured_width);
-    try testing.expectEqual(@as(u32, 1080), win.configured_height);
-
-    // When sheet_docked_above is true (both sheet and display visible) and no text field is focused,
-    // typing forwards keys to guest USB HID
-    win.ui.sheet_open = true;
-    win.ui.sheet_docked_above = true;
-    win.ui.sd_manage_open = false;
-    win.ui.focused_field = .none;
-    win.dispatchKey(30, true, false); // KEY_A -> USB HID 0x04
-    try testing.expectEqual(@as(u8, 0x04), hid.kbd_state[2]);
-    win.dispatchKey(30, false, false);
-    try testing.expectEqual(@as(u8, 0), hid.kbd_state[2]);
-
-    // Unmaximize via xdg_toplevel.configure(0, 0, [activated])
-    var tl_cfg_unmax: [16]u8 = undefined;
-    std.mem.writeInt(i32, tl_cfg_unmax[0..4], 0, .little);
-    std.mem.writeInt(i32, tl_cfg_unmax[4..8], 0, .little);
-    std.mem.writeInt(u32, tl_cfg_unmax[8..12], 4, .little);
-    std.mem.writeInt(u32, tl_cfg_unmax[12..16], protocol.xdg_toplevel.state.activated, .little);
-    var r_tl_unmax: client.Reader = .{ .data = &tl_cfg_unmax, .c = &conn };
-    WaylandWindow.toplevelEvent(&win, &disp, 11, protocol.xdg_toplevel.event.configure, &r_tl_unmax);
-    r_surf = .{ .data = &surf_cfg, .c = &conn };
-    WaylandWindow.xdgSurfaceEvent(&win, &disp, 10, protocol.xdg_surface.event.configure, &r_surf);
-    try testing.expect(!win.ui.maximized);
-    try testing.expectEqual(@as(u32, 0), win.configured_width);
-    try testing.expectEqual(@as(u32, 0), win.configured_height);
+    updateGuestMouseTarget(win, sx_f64, sy_f64);
+    hid.handleMouseButton(button_bit, pressed);
 }
 
+pub fn applyBoardModel(win: anytype, bm: board_sheet.BoardModel) void {
+    win.status.board_model = bm;
+    win.status.serial_u64 = win.ui.parsedSerial();
+    win.status.mac_address = win.ui.parsedMac();
+    win.status.wifi_mac_address = win.ui.parsedWifiMac();
+    win.ui.title = bm.windowTitle();
+    if (!bm.usesExternalUsbHub()) {
+        win.status.usb_hub_connected = true;
+    }
+    if (win.hid) |h| {
+        h.setHubKind(bm.hubKind());
+        h.hub_connected = win.status.usb_hub_connected;
+    }
+    win.ui_dirty = true;
+    win.ui.saveSettings(win.status) catch {};
+}
+
+pub fn isModifierKey(evdev_key: u32) bool {
+    return switch (evdev_key) {
+        29, 97, 42, 54, 56, 100, 125, 126, 58, 69, 70 => true,
+        else => false,
+    };
+}
+
+pub fn repeatTimeoutMs(win: anytype, now_ns: u64) ?i32 {
+    const rep = win.repeat orelse return null;
+    if (win.repeat_rate == 0 or !win.ui.sheet_open) return null;
+    if (now_ns >= rep.next_ns) return 0;
+    const rem_ms = std.math.divCeil(u64, rep.next_ns - now_ns, std.time.ns_per_ms) catch 0;
+    return @intCast(@min(rem_ms, @as(u64, std.math.maxInt(i32))));
+}
+
+pub fn serviceRepeat(win: anytype, now_ns: u64) void {
+    const rep = &(win.repeat orelse return);
+    if (win.repeat_rate == 0) {
+        win.repeat = null;
+        return;
+    }
+    if (now_ns < rep.next_ns) return;
+    const step = std.time.ns_per_s / @as(u64, win.repeat_rate);
+    rep.next_ns = if (now_ns - rep.next_ns < step) rep.next_ns + step else now_ns + step;
+    if (win.ui.sheet_open) {
+        win.dispatchKey(rep.key, true, true);
+    }
+}
+
+pub fn recordKeyEvent(win: anytype, key: u32, pressed: bool, is_repeat: bool, now_ns: u64) void {
+    if (key < 256) {
+        if (pressed) win.keys_down.set(key) else win.keys_down.unset(key);
+    }
+    if (pressed) {
+        if (!isModifierKey(key) and win.repeat_rate > 0 and !is_repeat) {
+            const delay_ns = @as(u64, win.repeat_delay_ms) * std.time.ns_per_ms;
+            win.repeat = .{ .key = key, .next_ns = now_ns + delay_ns };
+        }
+    } else {
+        if (win.repeat) |rep| {
+            if (rep.key == key) win.repeat = null;
+        }
+    }
+}
+
+pub fn releaseAllHeldKeys(win: anytype) void {
+    win.repeat = null;
+    win.keys_down = .empty;
+    win.ui.clearModifiers();
+    if (win.hid) |h| {
+        h.releaseAllKeys();
+    }
+}
+
+pub fn dispatchKey(win: anytype, key: u32, pressed: bool, is_repeat: bool) void {
+    win.ui.updateModifierKey(key, pressed);
+    if (win.ui.sheet_open) {
+        win.ui_dirty = true;
+        if (pressed and win.ui.handleKey(key)) {
+            win.status.serial_u64 = win.ui.parsedSerial();
+            win.status.mac_address = win.ui.parsedMac();
+            win.status.wifi_mac_address = win.ui.parsedWifiMac();
+            win.ui.saveSettings(win.status) catch {};
+            return;
+        }
+        // Escape (evdev key 1) closes any open SD popup/menu first, then the board sheet (when overlaying)
+        if (key == 1 and pressed and !is_repeat) {
+            if (win.ui.sd_manage_open) {
+                win.ui.sd_manage_open = false;
+                win.ui.sd_create_open = false;
+                return;
+            }
+            if (win.ui.sd_card_menu_open) {
+                win.ui.sd_card_menu_open = false;
+                return;
+            }
+            if (!win.ui.sheet_docked_above) {
+                win.ui.sheet_open = false;
+                const sx: f32 = @floatCast(win.last_mouse_x orelse 0.0);
+                const sy: f32 = @floatCast(win.last_mouse_y orelse 0.0);
+                win.updateCursorShape(win.ui.isPointInUi(sx, sy, win.status));
+                return;
+            }
+        }
+        if (!win.ui.sheet_docked_above or win.ui.focused_field != .none or win.ui.sd_manage_open or win.ui.sd_card_menu_open) {
+            return;
+        }
+    }
+    if (win.hid) |hid| {
+        hid.handleEvdevKey(key, pressed);
+    }
+}
+
+test {
+    _ = wayland_window;
+    _ = macos_window;
+    _ = windows_window;
+}
