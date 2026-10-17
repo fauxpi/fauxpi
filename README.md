@@ -15,9 +15,9 @@ FauxPi is a Raspberry Pi hardware simulator application.
 - **Storage**: Manager multiple SD card images.
 - **Networking & Audio**: Ethernet, Wi-Fi and audio supported.
 
-## Building and Running
+## Running
 
-Build and launch FauxPi using the included Zig wrapper script:
+Launch FauxPi by running the included script. No dependencies required.
 
 ```sh
 ./scripts/zig build run
