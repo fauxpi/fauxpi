@@ -18,6 +18,7 @@ const hdmi_mod = @import("../vc4/hdmi.zig");
 const audio_mod = @import("audio.zig");
 const local_intc_mod = @import("local_intc.zig");
 const spi_mod = @import("spi.zig");
+const smi_mod = @import("smi.zig");
 const smp_mod = @import("smp.zig");
 
 /// Complete BCM2835 / BCM2837 SoC Bus & Peripherals.
@@ -70,6 +71,7 @@ pub const Bcm2835 = struct {
     pwm: audio_mod.PwmAudio = .{},
     i2s: audio_mod.I2sPcm = .{},
     spi0: spi_mod.Spi0 = .{},
+    smi: smi_mod.Smi = .{},
     smp: smp_mod.Smp = .{},
 
     /// Unemulated peripheral pages the guest touched (each is logged once per boot)
@@ -297,6 +299,7 @@ pub const Bcm2835 = struct {
         sdhost,
         i2s,
         spi0,
+        smi,
         bsc0,
         pv0,
         pv1,
@@ -334,6 +337,7 @@ pub const Bcm2835 = struct {
             .{ .base = sdhost_mod.SdHost.BASE_ADDR, .size = sdhost_mod.SdHost.SIZE, .tag = .sdhost },
             .{ .base = audio_mod.I2sPcm.BASE_ADDR, .size = audio_mod.I2sPcm.SIZE, .tag = .i2s },
             .{ .base = spi_mod.Spi0.BASE_ADDR, .size = spi_mod.Spi0.SIZE, .tag = .spi0 },
+            .{ .base = smi_mod.Smi.BASE_ADDR, .size = smi_mod.Smi.SIZE, .tag = .smi },
             .{ .base = i2c_mod.BscController.BSC0_BASE, .size = i2c_mod.BscController.SIZE, .tag = .bsc0 },
             .{ .base = pv_mod.PixelValve.PV0_BASE, .size = pv_mod.PixelValve.SIZE, .tag = .pv0 },
             .{ .base = pv_mod.PixelValve.PV1_BASE, .size = pv_mod.PixelValve.SIZE, .tag = .pv1 },
@@ -381,6 +385,7 @@ pub const Bcm2835 = struct {
             (@as(u32, @intFromBool(self.pv2.irqPending())) << 10) |
             (@as(u32, @intFromBool(self.pv0.irqPending())) << 13) |
             (@as(u32, @intFromBool(self.pv1.irqPending())) << 14) |
+            (@as(u32, @intFromBool(self.smi.irqPending())) << 16) |
             (@as(u32, @intFromBool(self.gpio.irqPending())) << 20) |
             (@as(u32, @intFromBool(self.bsc0.irqPending() or self.bsc1.irqPending() or self.bsc2.irqPending())) << 21) |
             (@as(u32, @intFromBool(self.spi0.irqPending())) << 22) |
@@ -402,6 +407,7 @@ pub const Bcm2835 = struct {
         self.pv0.triggerVblank();
         self.pv1.triggerVblank();
         self.pv2.triggerVblank();
+        self.smi.triggerVblank();
         self.hvs.notifyVblank();
         self.usb.hid.syncCursorFeedback(self.hvs.getCursorHotspot(self.ram));
         self.usb.tickSof(self.ram);
@@ -485,12 +491,13 @@ pub const Bcm2835 = struct {
         const fb_w = self.mailbox.fb_width;
         const fb_h = self.mailbox.fb_height;
         const bpp = self.mailbox.fb_depth / 8;
+        const pitch = self.mailbox.rowBytes();
         if (bpp < 2 or fb_w == 0 or fb_h == 0 or out_argb.len < width * height) return false;
 
         const fmt_mod = @import("../vc4/format.zig");
 
-        // Fast path: 1:1 unscaled Mailbox framebuffer (8-wide SIMD)
-        if (fb_w == width and fb_h == height) {
+        // Fast path: 1:1 unscaled, packed Mailbox framebuffer (8-wide SIMD)
+        if (fb_w == width and fb_h == height and pitch == fb_w * bpp) {
             const total_px: usize = @as(usize, width) * @as(usize, height);
             const total_bytes: usize = total_px * bpp;
             if (@as(usize, fb_phys) + total_bytes <= self.ram.len) {
@@ -525,7 +532,7 @@ pub const Bcm2835 = struct {
             const sy = (@as(u32, @intCast(y)) * fb_h) / height;
             for (0..width) |x| {
                 const sx = (@as(u32, @intCast(x)) * fb_w) / width;
-                const off = fb_phys + (sy * fb_w + sx) * bpp;
+                const off = fb_phys + sy * pitch + sx * bpp;
                 if (off + bpp <= self.ram.len) {
                     out_argb[y * width + x] = if (bpp == 2)
                         fmt_mod.fromRgb565(std.mem.readInt(u16, self.ram[off..][0..2], .little))
@@ -583,7 +590,7 @@ pub const Bcm2835 = struct {
             const fb_h = self.mailbox.fb_height;
             const bpp = self.mailbox.fb_depth / 8;
             if (bpp >= 2 and fb_w > 0 and fb_h > 0) {
-                const fb_bytes: usize = @as(usize, fb_w) * @as(usize, fb_h) * bpp;
+                const fb_bytes: usize = @as(usize, self.mailbox.rowBytes()) * @as(usize, fb_h);
                 var h: u64 = 0;
                 if (@as(usize, fb_phys) + fb_bytes <= self.ram.len) {
                     if (!force and !self.last_display_was_hvs and !v3d_dirty) {
@@ -733,6 +740,7 @@ pub const Bcm2835 = struct {
                 .sdhost => if (addr -% sdhost_mod.SdHost.BASE_ADDR < sdhost_mod.SdHost.SIZE) self.sdhost.read32(addr - sdhost_mod.SdHost.BASE_ADDR) else 0,
                 .i2s => if (addr -% audio_mod.I2sPcm.BASE_ADDR < audio_mod.I2sPcm.SIZE) self.i2s.read32(addr - audio_mod.I2sPcm.BASE_ADDR) else 0,
                 .spi0 => if (addr -% spi_mod.Spi0.BASE_ADDR < spi_mod.Spi0.SIZE) self.spi0.read32(addr - spi_mod.Spi0.BASE_ADDR) else 0,
+                .smi => if (addr -% smi_mod.Smi.BASE_ADDR < smi_mod.Smi.SIZE) self.smi.read32(addr - smi_mod.Smi.BASE_ADDR) else 0,
                 .bsc0 => if (addr -% i2c_mod.BscController.BSC0_BASE < i2c_mod.BscController.SIZE) self.bsc0.read32(addr - i2c_mod.BscController.BSC0_BASE) else 0,
                 .pv0 => if (addr -% pv_mod.PixelValve.PV0_BASE < pv_mod.PixelValve.SIZE) self.pv0.read32(addr - pv_mod.PixelValve.PV0_BASE) else 0,
                 .pv1 => if (addr -% pv_mod.PixelValve.PV1_BASE < pv_mod.PixelValve.SIZE) self.pv1.read32(addr - pv_mod.PixelValve.PV1_BASE) else 0,
@@ -868,6 +876,10 @@ pub const Bcm2835 = struct {
                         }
                         self.updateIrqsBank2();
                     }
+                },
+                .smi => if (addr -% smi_mod.Smi.BASE_ADDR < smi_mod.Smi.SIZE) {
+                    self.smi.write32(addr - smi_mod.Smi.BASE_ADDR, val);
+                    self.updateIrqsBank2();
                 },
                 .bsc0 => if (addr -% i2c_mod.BscController.BSC0_BASE < i2c_mod.BscController.SIZE) {
                     self.bsc0.write32(addr - i2c_mod.BscController.BSC0_BASE, val);

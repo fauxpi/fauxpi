@@ -29,6 +29,7 @@ pub const i2c = @import("soc/i2c.zig");
 pub const soc_audio = @import("soc/audio.zig");
 pub const bcm2835 = @import("soc/bcm2835.zig");
 pub const smp = @import("soc/smp.zig");
+pub const smi = @import("soc/smi.zig");
 
 pub const hid = @import("usb/hid.zig");
 pub const usb_net = @import("usb/net.zig");
@@ -118,6 +119,7 @@ fn printUsage() void {
         \\Options:
         \\  --sd <path>         Insert a Raspberry Pi SD card image (FAT32 + rootfs)
         \\  --power             Start with the 5V power supply connected
+        \\  --model <model>     Board to emulate: zero (default), zero-w, zero-2-w, 1a+, 1b+, 3a+, 3b+
         \\  --hdmi-size <WxH>   HDMI output size in pixels (default: 1280x720)
         \\  --headless          Run without opening a desktop window
         \\  --max-steps <n>     Stop simulation after <n> ARM instructions

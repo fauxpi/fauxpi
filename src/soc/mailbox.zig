@@ -44,6 +44,8 @@ pub const Mailbox = struct {
     fb_virt_x: u32 = 0,
     fb_virt_y: u32 = 0,
     fb_bus_addr: u32 = 0x5c100000, // Bus address in VC RAM region (phys 0x1c100000)
+    /// Bytes per row when it is not `fb_width * bytes per pixel` (a firmware KMS plane); 0 = packed
+    fb_pitch: u32 = 0,
     fb_allocated: bool = false,
 
     /// Bump allocator for VC GPU memory allocations (Property Tag 0x0003000c)
@@ -67,6 +69,34 @@ pub const Mailbox = struct {
 
     pub fn irqPending(self: *const Mailbox) bool {
         return (self.config & MBOX_IHAVEDATAIRQEN) != 0 and self.fifo_count > 0;
+    }
+
+    /// Shows the primary plane of display 0 (fauxpi's HDMI output) through the framebuffer. A plane with
+    /// no size or buffer is a blank. Other planes (overlays, cursor) are not composited.
+    fn setFirmwareKmsPlane(self: *Mailbox, plane: *const [60]u8) void {
+        const plane_id = plane[1];
+        if (plane_id != 0) return;
+        const width = std.mem.readInt(u16, plane[4..6], .little);
+        const height = std.mem.readInt(u16, plane[6..8], .little);
+        const row_bytes = std.mem.readInt(u16, plane[8..10], .little);
+        const num_planes = plane[37];
+        const buffer = std.mem.readInt(u32, plane[40..44], .little);
+        if (width == 0 or height == 0 or num_planes == 0 or row_bytes < width * 2) {
+            self.fb_allocated = false;
+            return;
+        }
+        // Bytes per pixel from the pitch (RGB565 or 32-bit XRGB/ARGB, as fbdev and DRM clients use)
+        self.fb_depth = if (row_bytes >= @as(u32, width) * 4) 32 else 16;
+        self.fb_width = width;
+        self.fb_height = height;
+        self.fb_pitch = row_bytes;
+        self.fb_bus_addr = buffer;
+        self.fb_allocated = true;
+    }
+
+    /// Bytes per framebuffer row.
+    pub fn rowBytes(self: *const Mailbox) u32 {
+        return if (self.fb_pitch != 0) self.fb_pitch else self.fb_width * (self.fb_depth / 8);
     }
 
     fn reportUnknownTag(self: *Mailbox, tag_id: u32) void {
@@ -147,6 +177,7 @@ pub const Mailbox = struct {
             self.fb_virt_height = if (vheight > 0) vheight else height;
             self.fb_depth = if (depth > 0) depth else 32;
             self.fb_allocated = true;
+            self.fb_pitch = 0;
             const pitch = self.fb_width * (self.fb_depth / 8);
             const size = pitch * self.fb_virt_height;
             std.mem.writeInt(u32, ram[phys + 16 ..][0..4], pitch, .little);
@@ -421,6 +452,7 @@ pub const Mailbox = struct {
                 },
                 0x00040001 => { // Allocate framebuffer
                     self.fb_allocated = true;
+                    self.fb_pitch = 0;
                     const pitch = self.fb_width * (self.fb_depth / 8);
                     const fb_size = pitch * self.fb_virt_height;
                     writeU32(ram, payload, 0, buf_size, self.fb_bus_addr);
@@ -537,6 +569,21 @@ pub const Mailbox = struct {
                 },
                 0x00030066 => { // Notify display done (KMS has taken over the display)
                     resp_len = 0;
+                },
+                0x00030048 => { // Notify reboot (the kernel is about to restart the SoC)
+                    resp_len = 0;
+                },
+                // Firmware KMS (vc4-fkms-v3d) display control. The HDMI output keeps fauxpi's size, so a
+                // mode set and display power are acknowledged; planes are shown through the framebuffer.
+                0x00048017 => { // Set display timing
+                    resp_len = 36;
+                },
+                0x00048019 => { // Set display power: u32 display, u32 state
+                    resp_len = 8;
+                },
+                0x00048015 => { // Set plane (struct set_plane, 60 bytes)
+                    if (buf_size >= 60) self.setFirmwareKmsPlane(ram[payload..][0..60]);
+                    resp_len = 60;
                 },
                 0x00048010 => { // RPI_FIRMWARE_VCHIQ_INIT
                     const channel_base = readU32(ram, payload, 0, buf_size);
@@ -665,4 +712,45 @@ test "Mailbox property tags: HDMI EDID block for display" {
     mbox.write32WithContext(0x20, base | 8, &ram, .{ .hdmi_connected = true, .hdmi_edid = &edid });
     try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, ram[base + 24 ..][0..4], .little)); // status ok
     try std.testing.expectEqualSlices(u8, edid[128..256], ram[base + 28 ..][0..128]);
+}
+
+test "Mailbox property tags: firmware KMS plane is shown through the framebuffer" {
+    var mbox = Mailbox{};
+    var ram: [1024]u8 = @splat(0);
+
+    const base: u32 = 0x100;
+    const setPlane = struct {
+        fn f(m: *Mailbox, mem: *[1024]u8, plane_id: u8, width: u16, height: u16, row_bytes: u16, buffer: u32) void {
+            @memset(mem[base..][0 .. 12 + 12 + 60 + 4], 0);
+            std.mem.writeInt(u32, mem[base + 0 ..][0..4], 12 + 12 + 60 + 4, .little);
+            std.mem.writeInt(u32, mem[base + 8 ..][0..4], 0x00048015, .little);
+            std.mem.writeInt(u32, mem[base + 12 ..][0..4], 60, .little);
+            const plane = mem[base + 20 ..][0..60];
+            plane[0] = 2; // display (HDMI0)
+            plane[1] = plane_id;
+            std.mem.writeInt(u16, plane[4..6], width, .little);
+            std.mem.writeInt(u16, plane[6..8], height, .little);
+            std.mem.writeInt(u16, plane[8..10], row_bytes, .little);
+            plane[37] = if (width != 0) 1 else 0; // num_planes
+            std.mem.writeInt(u32, plane[40..44], buffer, .little);
+            m.write32(0x20, base | 8, mem);
+        }
+    }.f;
+
+    setPlane(&mbox, &ram, 0, 1024, 768, 4096 + 64, 0xc800_0000);
+    try std.testing.expect(mbox.fb_allocated);
+    try std.testing.expectEqual(@as(u32, 1024), mbox.fb_width);
+    try std.testing.expectEqual(@as(u32, 768), mbox.fb_height);
+    try std.testing.expectEqual(@as(u32, 32), mbox.fb_depth);
+    try std.testing.expectEqual(@as(u32, 4096 + 64), mbox.rowBytes());
+    try std.testing.expectEqual(@as(u32, 0xc800_0000), mbox.fb_bus_addr);
+
+    // Overlay and cursor planes are not composited
+    setPlane(&mbox, &ram, 7, 64, 64, 256, 0xc900_0000);
+    try std.testing.expectEqual(@as(u32, 0xc800_0000), mbox.fb_bus_addr);
+
+    // Blanking the primary plane (all-zero plane apart from display and plane_id)
+    setPlane(&mbox, &ram, 0, 0, 0, 0, 0);
+    try std.testing.expect(!mbox.fb_allocated);
+    try std.testing.expect(!mbox.unsupported_used);
 }

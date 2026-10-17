@@ -534,7 +534,14 @@ pub const Tree = struct {
 
         // 4. Enable vc4-kms-v3d nodes (equivalent to dtoverlay=vc4-kms-v3d)
         if (enable_vc4_kms) {
-            const enable_targets = [_][]const u8{
+            // With firmware KMS (dtoverlay=vc4-fkms-v3d) the firmware drives the display pipeline, so its
+            // nodes stay disabled as on hardware; enabling them too gives vc4 a second set of CRTCs whose
+            // vblanks never arrive, and the first modeset never completes.
+            const firmware_kms = if (self.findNode("firmwarekms") orelse self.findNode("/soc/firmwarekms@7e600000")) |n|
+                std.mem.eql(u8, n.getStringProp("status") orelse "", "okay")
+            else
+                false;
+            const pipeline_targets = [_][]const u8{
                 "i2c2",
                 "/soc/i2c@7e805000",
                 "pixelvalve0",
@@ -547,17 +554,26 @@ pub const Tree = struct {
                 "/soc/hvs@7e400000",
                 "hdmi",
                 "/soc/hdmi@7e902000",
+                "txp",
+                "/soc/txp@7e004000",
+            };
+            const gpu_targets = [_][]const u8{
                 "v3d",
                 "/soc/v3d@7ec00000",
                 "vc4",
                 "/soc/gpu",
                 "/gpu",
-                "txp",
-                "/soc/txp@7e004000",
             };
-            for (enable_targets) |t| {
+            for (gpu_targets) |t| {
                 if (self.findNode(t)) |n| {
                     try n.setStringProp(self.allocator, "status", "okay");
+                }
+            }
+            if (!firmware_kms) {
+                for (pipeline_targets) |t| {
+                    if (self.findNode(t)) |n| {
+                        try n.setStringProp(self.allocator, "status", "okay");
+                    }
                 }
             }
             // Disable legacy bcm2708_fb
