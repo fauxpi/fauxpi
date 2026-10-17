@@ -12,6 +12,7 @@ const VecI = @Vector(lanes, i32);
 const VecF = @Vector(lanes, f32);
 const VecB = @Vector(lanes * 4, u8);
 const VecU16 = @Vector(lanes * 4, u16);
+const VecBool = @Vector(lanes, bool);
 
 pub fn splat(v: u32) Vec {
     return @splat(v);
@@ -80,8 +81,8 @@ const State = struct {
     rb_init: u32 = 0,
     /// Indices 0..5 are accumulators r0..r5; index 6 is mux .a; index 7 is mux .b.
     acc: [8]Vec = undefined,
-    zero: [lanes]bool = @splat(false),
-    neg: [lanes]bool = @splat(false),
+    zero: VecBool = @splat(false),
+    neg: VecBool = @splat(false),
     vpm_read_left: u32 = 16,
     uniforms_read: usize = 0,
     varyings_read: usize = 0,
@@ -94,7 +95,8 @@ const State = struct {
         coord_t: Vec = undefined,
         has_coord_t: bool = false,
         fifo: [4]Vec = undefined,
-        fifo_len: usize = 0,
+        fifo_head: u2 = 0,
+        fifo_len: u3 = 0,
     };
 };
 
@@ -144,10 +146,11 @@ fn unpackVec(v: Vec, mode: u3, float_input: bool) Vec {
     };
 }
 
-fn ftoi(x: f32) u32 {
-    if (std.math.isNan(x)) return 0;
-    const clamped = std.math.clamp(x, -2147483648.0, 2147483520.0);
-    return @bitCast(@as(i32, @intFromFloat(@trunc(clamped))));
+inline fn ftoiVec(af: VecF) Vec {
+    const non_nan = @select(f32, af == af, af, @as(VecF, @splat(0.0)));
+    const clamped = @min(@max(non_nan, @as(VecF, @splat(-2147483648.0))), @as(VecF, @splat(2147483520.0)));
+    const vi: VecI = @intFromFloat(clamped);
+    return @bitCast(vi);
 }
 
 inline fn v8muldVec(au: VecU, bu: VecU) Vec {
@@ -174,11 +177,7 @@ fn addOpVec(op: qpu.AddOp, a: Vec, b: Vec) Vec {
         .fmax => @bitCast(@max(af, bf)),
         .fminabs => @bitCast(@min(@abs(af), @abs(bf))),
         .fmaxabs => @bitCast(@max(@abs(af), @abs(bf))),
-        .ftoi => blk: {
-            var res: Vec = undefined;
-            for (0..lanes) |l| res[l] = ftoi(f(a[l]));
-            break :blk res;
-        },
+        .ftoi => ftoiVec(af),
         .itof => blk: {
             const vf: VecF = @floatFromInt(ai);
             break :blk @bitCast(vf);
@@ -238,22 +237,49 @@ fn unorm8(x: f32) u8 {
     return @intFromFloat(@round(c * 255.0));
 }
 
-inline fn unorm8Vec(v: Vec) VecU {
+inline fn unorm8Vec(v: VecU) VecU {
     const vf: VecF = @bitCast(v);
-    const clamped = @min(@max(vf, @as(VecF, @splat(0.0))), @as(VecF, @splat(1.0)));
+    const non_nan = @select(f32, vf == vf, vf, @as(VecF, @splat(0.0)));
+    const clamped = @min(@max(non_nan, @as(VecF, @splat(0.0))), @as(VecF, @splat(1.0)));
     const scaled = @round(clamped * @as(VecF, @splat(255.0)));
     return @intFromFloat(scaled);
 }
 
-fn condPasses(cond: qpu.Cond, s: *const State, lane: usize) bool {
+inline fn condMask(cond: qpu.Cond, s: *const State) VecBool {
     return switch (cond) {
-        .never => false,
-        .always => true,
-        .zs => s.zero[lane],
-        .zc => !s.zero[lane],
-        .ns => s.neg[lane],
-        .nc => !s.neg[lane],
-        .cs, .cc => false,
+        .never => @splat(false),
+        .always => @splat(true),
+        .zs => s.zero,
+        .zc => !s.zero,
+        .ns => s.neg,
+        .nc => !s.neg,
+        .cs, .cc => @splat(false),
+    };
+}
+
+inline fn packVec(dv: VecU, vv: VecU, a_pack: u4, mul_pack: u4) VecU {
+    if (a_pack == 0) {
+        return switch (mul_pack) {
+            0 => vv,
+            3 => unorm8Vec(vv) *% @as(VecU, @splat(0x01010101)),
+            4, 5, 6, 7 => blk: {
+                const shift: u5 = @as(u5, @intCast(mul_pack - 4)) * 8;
+                const mask: VecU = @splat(@as(u32, 0xff) << shift);
+                break :blk (dv & ~mask) | (unorm8Vec(vv) << @as(@Vector(lanes, u5), @splat(shift)));
+            },
+            else => vv,
+        };
+    }
+    return switch (a_pack) {
+        1, 9 => (dv & @as(VecU, @splat(0xffff0000))) | (vv & @as(VecU, @splat(0x0000ffff))),
+        2, 10 => (dv & @as(VecU, @splat(0x0000ffff))) | (vv << @as(@Vector(lanes, u5), @splat(16))),
+        3, 11 => (vv & @as(VecU, @splat(0xff))) *% @as(VecU, @splat(0x01010101)),
+        4, 5, 6, 7, 12, 13, 14, 15 => blk: {
+            const shift: u5 = @as(u5, @intCast((a_pack & 7) - 4)) * 8;
+            const mask: VecU = @splat(@as(u32, 0xff) << shift);
+            break :blk (dv & ~mask) | ((vv & @as(VecU, @splat(0xff))) << @as(@Vector(lanes, u5), @splat(shift)));
+        },
+        else => vv,
     };
 }
 
@@ -442,12 +468,12 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
             if ((d.flags & DecodedInst.FLAG_HAS_UNPACK) == 0) {
                 if (d.add_op != .nop) {
                     add_result = addOpVec(d.add_op, s.acc[@intFromEnum(d.mux0)], s.acc[@intFromEnum(d.mux1)]);
-                } else {
+                } else if (d.waddr_add != qpu.W.nop) {
                     add_result = splat(0);
                 }
                 if (d.mul_op != .nop) {
                     mul_result = mulOpVec(d.mul_op, s.acc[@intFromEnum(d.mux2)], s.acc[@intFromEnum(d.mux3)]);
-                } else {
+                } else if (d.waddr_mul != qpu.W.nop or (d.flags & DecodedInst.FLAG_SF) != 0) {
                     mul_result = splat(0);
                 }
             } else {
@@ -456,7 +482,7 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                     const in0 = resolveMuxSlow(d.mux0, &s, d.unpack_r4, d.unpack_a, flt_add);
                     const in1 = if (d.mux1 == d.mux0) in0 else resolveMuxSlow(d.mux1, &s, d.unpack_r4, d.unpack_a, flt_add);
                     add_result = addOpVec(d.add_op, in0, in1);
-                } else {
+                } else if (d.waddr_add != qpu.W.nop) {
                     add_result = splat(0);
                 }
 
@@ -465,7 +491,7 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                     const in2 = resolveMuxSlow(d.mux2, &s, d.unpack_r4, d.unpack_a, flt_mul);
                     const in3 = if (d.mux3 == d.mux2) in2 else resolveMuxSlow(d.mux3, &s, d.unpack_r4, d.unpack_a, flt_mul);
                     mul_result = mulOpVec(d.mul_op, in2, in3);
-                } else {
+                } else if (d.waddr_mul != qpu.W.nop or (d.flags & DecodedInst.FLAG_SF) != 0) {
                     mul_result = splat(0);
                 }
             }
@@ -489,8 +515,8 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
             .load_tmu0, .load_tmu1 => {
                 const t = &s.tmu[if (d.sig == .load_tmu0) 0 else 1];
                 if (t.fifo_len > 0) {
-                    s.acc[4] = t.fifo[0];
-                    std.mem.copyForwards(Vec, t.fifo[0 .. t.fifo_len - 1], t.fifo[1..t.fifo_len]);
+                    s.acc[4] = t.fifo[t.fifo_head];
+                    t.fifo_head +%= 1;
                     t.fifo_len -= 1;
                 } else {
                     s.acc[4] = splat(0xff000000);
@@ -581,82 +607,12 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
         else => null,
     };
     if (dst) |d| {
+        const dv: VecU = d.*;
+        const packed_vec = packVec(dv, value, a_pack, mul_pack);
         if (cond == .always) {
-            if (a_pack == 0) {
-                switch (mul_pack) {
-                    0 => {
-                        d.* = value;
-                        return;
-                    },
-                    3 => {
-                        d.* = unorm8Vec(value) *% @as(VecU, @splat(0x01010101));
-                        return;
-                    },
-                    4, 5, 6, 7 => {
-                        const shift: u5 = @as(u5, @intCast(mul_pack - 4)) * 8;
-                        const mask: VecU = @splat(@as(u32, 0xff) << shift);
-                        const dv: VecU = d.*;
-                        d.* = (dv & ~mask) | (unorm8Vec(value) << @as(@Vector(lanes, u5), @splat(shift)));
-                        return;
-                    },
-                    else => {
-                        d.* = value;
-                        return;
-                    },
-                }
-            }
-            const dv: VecU = d.*;
-            const vv: VecU = value;
-            switch (a_pack) {
-                1, 9 => {
-                    d.* = (dv & @as(VecU, @splat(0xffff0000))) | (vv & @as(VecU, @splat(0x0000ffff)));
-                    return;
-                },
-                2, 10 => {
-                    d.* = (dv & @as(VecU, @splat(0x0000ffff))) | (vv << @as(@Vector(lanes, u5), @splat(16)));
-                    return;
-                },
-                3, 11 => {
-                    d.* = (vv & @as(VecU, @splat(0xff))) *% @as(VecU, @splat(0x01010101));
-                    return;
-                },
-                4, 5, 6, 7, 12, 13, 14, 15 => {
-                    const shift: u5 = @as(u5, @intCast((a_pack & 7) - 4)) * 8;
-                    const mask: VecU = @splat(@as(u32, 0xff) << shift);
-                    d.* = (dv & ~mask) | ((vv & @as(VecU, @splat(0xff))) << @as(@Vector(lanes, u5), @splat(shift)));
-                    return;
-                },
-                else => {
-                    d.* = value;
-                    return;
-                },
-            }
-        }
-        for (0..lanes) |lane| {
-            if (!condPasses(cond, s, lane)) continue;
-            const v = value[lane];
-            d[lane] = switch (a_pack) {
-                0 => switch (mul_pack) {
-                    0 => v,
-                    4, 5, 6, 7 => blk: {
-                        const shift: u5 = @as(u5, @intCast(mul_pack - 4)) * 8;
-                        const mask = @as(u32, 0xff) << shift;
-                        break :blk (d[lane] & ~mask) | (@as(u32, unorm8(f(v))) << shift);
-                    },
-                    3 => @as(u32, unorm8(f(v))) * 0x01010101,
-                    else => v,
-                },
-                1, 9 => (d[lane] & 0xffff0000) | (v & 0xffff),
-                2, 10 => (d[lane] & 0x0000ffff) | (v << 16),
-                3, 11 => (v & 0xff) * 0x01010101,
-                4, 5, 6, 7, 12, 13, 14, 15 => blk: {
-                    const idx: u5 = @intCast((a_pack & 7) - 4);
-                    const shift: u5 = idx * 8;
-                    const mask = @as(u32, 0xff) << shift;
-                    break :blk (d[lane] & ~mask) | ((v & 0xff) << shift);
-                },
-                else => v,
-            };
+            d.* = packed_vec;
+        } else {
+            d.* = @select(u32, condMask(cond, s), packed_vec, dv);
         }
         return;
     }
@@ -687,12 +643,14 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
         },
         qpu.W.tlb_z => r.tlb_z = value,
         qpu.W.sfu_recip, qpu.W.sfu_recipsqrt, qpu.W.sfu_exp, qpu.W.sfu_log => {
-            for (&s.acc[4], value) |*o, v| o.* = u(switch (waddr) {
-                qpu.W.sfu_recip => 1.0 / f(v),
-                qpu.W.sfu_recipsqrt => 1.0 / @sqrt(f(v)),
-                qpu.W.sfu_exp => std.math.exp2(f(v)),
-                else => std.math.log2(f(v)),
-            });
+            const vf: VecF = @bitCast(value);
+            const res_f: VecF = switch (waddr) {
+                qpu.W.sfu_recip => @as(VecF, @splat(1.0)) / vf,
+                qpu.W.sfu_recipsqrt => @as(VecF, @splat(1.0)) / @sqrt(vf),
+                qpu.W.sfu_exp => @exp2(vf),
+                else => @log2(vf),
+            };
+            s.acc[4] = @bitCast(res_f);
         },
         qpu.W.tmu0_s, qpu.W.tmu0_t, qpu.W.tmu0_r, qpu.W.tmu0_b, qpu.W.tmu1_s, qpu.W.tmu1_t, qpu.W.tmu1_r, qpu.W.tmu1_b => {
             const unit: usize = if (waddr <= qpu.W.tmu0_b) 0 else 1;
@@ -721,9 +679,10 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
                     p0 -= i * texture_base;
                 }
             }
+            const write_idx: u2 = t.fifo_head +% @as(u2, @truncate(t.fifo_len));
             const cfg = texture.decodeConfig(p0, t.params[1]);
             const pt = PrecomputedTex.init(cfg) catch {
-                t.fifo[t.fifo_len] = splat(0xff000000);
+                t.fifo[write_idx] = splat(0xff000000);
                 t.fifo_len += 1;
                 t.param_count = 0;
                 t.has_coord_t = false;
@@ -748,7 +707,7 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
                 prev_tc = tc;
                 prev_out = sampled;
             }
-            t.fifo[t.fifo_len] = texel;
+            t.fifo[write_idx] = texel;
             t.fifo_len += 1;
             t.param_count = 0;
             t.has_coord_t = false;
@@ -1133,3 +1092,41 @@ test "QPU vectorized v8muld, v8min, v8max, v8adds, v8subs, and shifts" {
     try std.testing.expectEqual(@as(u32, 0xf090_1010), mulOpVec(.v8max, va, vb)[0]);
     try std.testing.expectEqual(@as(u32, 0x05f0_8010), addOpVec(.ror, va, splat(8))[0]);
 }
+
+test "QPU vectorized ftoi, predicated writes, and TMU FIFO ring wrap-around" {
+    var f_in: Vec = splatF(0.0);
+    f_in[0] = u(42.9);
+    f_in[1] = u(-17.8);
+    f_in[2] = u(std.math.nan(f32));
+    f_in[3] = u(1e12);
+    f_in[4] = u(-1e12);
+    const i_out = addOpVec(.ftoi, f_in, f_in);
+    try std.testing.expectEqual(@as(i32, 42), @as(i32, @bitCast(i_out[0])));
+    try std.testing.expectEqual(@as(i32, -17), @as(i32, @bitCast(i_out[1])));
+    try std.testing.expectEqual(@as(i32, 0), @as(i32, @bitCast(i_out[2])));
+    try std.testing.expectEqual(@as(i32, 2147483520), @as(i32, @bitCast(i_out[3])));
+    try std.testing.expectEqual(@as(i32, -2147483648), @as(i32, @bitCast(i_out[4])));
+
+    // Predicated writes (.zs, .zc, .ns, .nc) across 16 lanes using elem_qpu - 4
+    var p: qpu.Program(16) = .{};
+    p.emit(try qpu.alu(.{
+        .add = .{ .op = .sub, .dst = qpu.wr(0), .a = qpu.ra(qpu.R.elem_qpu), .b = qpu.smallImmInt(4) },
+        .sf = true,
+    }));
+    p.emit(try qpu.loadImm(.{ .add_dst = qpu.wr(1), .value = 0x1111_1111 }));
+    p.emit(try qpu.alu(.{
+        .add = .{ .op = .@"or", .dst = qpu.wr(1), .a = qpu.smallImmInt(2), .b = qpu.smallImmInt(2), .cond = .zs },
+    }));
+    p.emit(try qpu.alu(.{
+        .add = .{ .op = .@"or", .dst = qpu.wr(1), .a = qpu.smallImmInt(3), .b = qpu.smallImmInt(3), .cond = .ns },
+    }));
+    p.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(1)));
+    p.end(.fragment);
+
+    const res = try run(p.code(), .{});
+    const out = res.tlb_color.?;
+    for (0..4) |lane| try std.testing.expectEqual(@as(u32, 3), out[lane]); // elem < 4 -> .ns
+    try std.testing.expectEqual(@as(u32, 2), out[4]); // elem == 4 -> .zs
+    for (5..16) |lane| try std.testing.expectEqual(@as(u32, 0x1111_1111), out[lane]); // elem > 4 -> untouched
+}
+
