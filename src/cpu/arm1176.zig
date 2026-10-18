@@ -2027,7 +2027,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.yield_slice = false;
             self.last_dmb_pc = 0xffff_ffff;
 
-            const limit = if (max_steps == 4096 or max_steps == 16384) max_steps + 256 else max_steps;
+            const limit = if (max_steps >= 4096) max_steps + 256 else max_steps;
             var executed: usize = 0;
             var cur_last_inst: u32 = self.last_inst;
             defer {

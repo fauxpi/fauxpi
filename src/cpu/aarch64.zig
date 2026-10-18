@@ -1927,7 +1927,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             cpu.last_dmb_pc = 0xffff_ffff;
             defer cpu.excl_valid = false;
 
-            const limit = if (max_steps == 4096 or max_steps == 16384) max_steps + 256 else max_steps;
+            const limit = if (max_steps >= 4096) max_steps + 256 else max_steps;
             const SlotType = @TypeOf(cpu.icache[0]);
             var executed: usize = 0;
             var cur_last_inst: u32 = cpu.last_inst;
