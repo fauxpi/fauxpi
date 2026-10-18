@@ -1642,7 +1642,9 @@ pub fn Arm1176(comptime Bus: type) type {
         pub inline fn invalidateIcache(self: *Self) void {
             @memset(&self.icache_page_tags, 0xffff_ffff);
             @memset(&self.thumb_icache_page_tags, 0xffff_ffff);
-            self.jit_buf.reset();
+            if (self.jit_buf.used + 65536 > jit_mod.JitCodeBuffer.capacity) {
+                self.jit_buf.reset();
+            }
         }
 
         pub inline fn invalidateIcachePage(self: *Self, pbase: u32) void {
@@ -1658,7 +1660,6 @@ pub fn Arm1176(comptime Bus: type) type {
 
         pub inline fn invalidateInlineTlb(self: *Self) void {
             self.mmu.flushTlb();
-            self.invalidateIcache();
         }
 
         pub fn resetInPlace(self: *Self) void {
@@ -2150,11 +2151,41 @@ pub fn Arm1176(comptime Bus: type) type {
             end_word_req: u16,
         ) void {
             if (code_icache_ptr[start_word].op == @intFromEnum(ArmOp.jit_trace)) return;
+            const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdx(code_page_ptr, start_word, end_word_req);
+            const code_hash = jit_mod.JitCodeBuffer.hashLoopWords(code_page_ptr, start_word, end_word_req);
+            const entry = &self.jit_buf.trace_cache[tc_idx];
+            if (entry.page_ptr == @intFromPtr(code_page_ptr) and
+                entry.start_word == start_word and
+                entry.end_word_req == end_word_req and
+                entry.code_hash == code_hash)
+            {
+                if (entry.failed) return;
+                if (entry.fn_ptr) |fn_ptr| {
+                    const inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
+                    code_icache_ptr[start_word] = .{
+                        .raw = inst,
+                        .op = @intFromEnum(ArmOp.jit_trace),
+                        .rd = entry.trace_len,
+                        .imm = @intFromPtr(fn_ptr),
+                    };
+                    self.markIcacheDirty(code_page_idx, start_word);
+                    return;
+                }
+            }
             const Jit32 = jit_mod.Arm32Jit(Self, Bus);
             var end_word: u16 = 0;
             if (Jit32.compileTrace(&self.jit_buf, self.mmu.core_id, code_page_ptr, start_word, end_word_req, &end_word)) |fn_ptr| {
                 const inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
                 const trace_len: u8 = @intCast(end_word - @as(u16, start_word));
+                entry.* = .{
+                    .page_ptr = @intFromPtr(code_page_ptr),
+                    .start_word = start_word,
+                    .end_word_req = end_word_req,
+                    .trace_len = trace_len,
+                    .failed = false,
+                    .code_hash = code_hash,
+                    .fn_ptr = fn_ptr,
+                };
                 code_icache_ptr[start_word] = .{
                     .raw = inst,
                     .op = @intFromEnum(ArmOp.jit_trace),
@@ -2162,6 +2193,16 @@ pub fn Arm1176(comptime Bus: type) type {
                     .imm = @intFromPtr(fn_ptr),
                 };
                 self.markIcacheDirty(code_page_idx, start_word);
+            } else {
+                entry.* = .{
+                    .page_ptr = @intFromPtr(code_page_ptr),
+                    .start_word = start_word,
+                    .end_word_req = end_word_req,
+                    .trace_len = 0,
+                    .failed = true,
+                    .code_hash = code_hash,
+                    .fn_ptr = null,
+                };
             }
         }
 
@@ -2177,18 +2218,17 @@ pub fn Arm1176(comptime Bus: type) type {
         ) void {
             if (target_pc <= cur_pc and (target_pc & ~@as(u32, 0xffc)) == code_vbase) {
                 const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
+                if (code_icache_ptr[start_word].op == @intFromEnum(ArmOp.jit_trace)) return;
                 if (end_word_req > @as(u16, start_word) + 1 and end_word_req - @as(u16, start_word) <= 64) {
                     if (end_word_req < 1024 and end_word_req - @as(u16, start_word) <= 8) {
                         const next_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, end_word_req) * 4 ..][0..4], .little);
                         if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) return;
                     }
                     const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
-                    const c = self.jit_buf.loop_counts[h];
-                    if (c < 8) {
-                        self.jit_buf.loop_counts[h] = c + 1;
-                        if (c + 1 == 8) {
-                            self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req);
-                        }
+                    const c = self.jit_buf.loop_counts[h] +% 1;
+                    self.jit_buf.loop_counts[h] = c;
+                    if ((c & 7) == 0) {
+                        self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req);
                     }
                 }
             }
@@ -4292,6 +4332,16 @@ pub fn Arm1176(comptime Bus: type) type {
                                 data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             }
+                        } else if (batch_end < max_steps and (max_steps - executed) + 1 >= d.rd) {
+                            self.r[15] = pc;
+                            executed -= 1;
+                            if (self.checkInterrupts(bus)) {
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                            break;
                         } else {
                             self.executeArm(bus, pc, inst);
                             if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
@@ -4552,7 +4602,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        noinline fn executeGroup000(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
+        pub noinline fn executeGroup000(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
             const bit4 = (inst & (1 << 4)) != 0;
             const bit7 = (inst & (1 << 7)) != 0;
 
@@ -4594,7 +4644,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.applyDataProc(op, s, rd, rn_val, shift_res.val, shift_res.carry);
         }
 
-        noinline fn executeGroup001(self: *Self, inst_pc: u32, inst: u32) void {
+        pub noinline fn executeGroup001(self: *Self, inst_pc: u32, inst: u32) void {
             const op: u4 = @truncate((inst >> 21) & 0xf);
             const s = (inst & (1 << 20)) != 0;
 

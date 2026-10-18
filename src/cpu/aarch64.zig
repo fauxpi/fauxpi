@@ -963,11 +963,41 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             end_word_req: u16,
         ) void {
             if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) return;
+            const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdx(code_page_ptr, start_word, end_word_req);
+            const code_hash = jit_mod.JitCodeBuffer.hashLoopWords(code_page_ptr, start_word, end_word_req);
+            const entry = &cpu.jit_buf.trace_cache[tc_idx];
+            if (entry.page_ptr == @intFromPtr(code_page_ptr) and
+                entry.start_word == start_word and
+                entry.end_word_req == end_word_req and
+                entry.code_hash == code_hash)
+            {
+                if (entry.failed) return;
+                if (entry.fn_ptr) |fn_ptr| {
+                    const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
+                    code_icache_ptr[start_word] = .{
+                        .raw = raw_inst,
+                        .op = @intFromEnum(A64Op.jit_trace),
+                        .rd = entry.trace_len,
+                        .imm = @intFromPtr(fn_ptr),
+                    };
+                    cpu.markIcacheDirty(code_page_idx, start_word);
+                    return;
+                }
+            }
             const Jit64 = jit_mod.A64Jit(CpuType, Bus);
             var end_word: u16 = 0;
             if (Jit64.compileTrace(SlotType, &cpu.jit_buf, cpu.mmu.core_id, code_page_ptr, start_word, end_word_req, &end_word)) |fn_ptr| {
                 const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
                 const trace_len: u8 = @intCast(end_word - @as(u16, start_word));
+                entry.* = .{
+                    .page_ptr = @intFromPtr(code_page_ptr),
+                    .start_word = start_word,
+                    .end_word_req = end_word_req,
+                    .trace_len = trace_len,
+                    .failed = false,
+                    .code_hash = code_hash,
+                    .fn_ptr = fn_ptr,
+                };
                 code_icache_ptr[start_word] = .{
                     .raw = raw_inst,
                     .op = @intFromEnum(A64Op.jit_trace),
@@ -975,6 +1005,16 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .imm = @intFromPtr(fn_ptr),
                 };
                 cpu.markIcacheDirty(code_page_idx, start_word);
+            } else {
+                entry.* = .{
+                    .page_ptr = @intFromPtr(code_page_ptr),
+                    .start_word = start_word,
+                    .end_word_req = end_word_req,
+                    .trace_len = 0,
+                    .failed = true,
+                    .code_hash = code_hash,
+                    .fn_ptr = null,
+                };
             }
         }
 
@@ -991,14 +1031,13 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
         ) void {
             if (target_pc <= cur_pc and (target_pc & ~@as(u64, 0xfff)) == code_vbase) {
                 const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
+                if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) return;
                 if (end_word_req > @as(u16, start_word) + 1 and end_word_req - @as(u16, start_word) <= 64) {
                     const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
-                    const c = cpu.jit_buf.loop_counts[h];
-                    if (c < 8) {
-                        cpu.jit_buf.loop_counts[h] = c + 1;
-                        if (c + 1 == 8) {
-                            compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req);
-                        }
+                    const c = cpu.jit_buf.loop_counts[h] +% 1;
+                    cpu.jit_buf.loop_counts[h] = c;
+                    if ((c & 7) == 0) {
+                        compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req);
                     }
                 }
             }
@@ -5165,6 +5204,16 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                 data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                             }
+                        } else if (batch_end < max_steps and (max_steps - executed) + 1 >= d.rd) {
+                            cpu.pc64 = cur_pc;
+                            executed -= 1;
+                            if (checkInterrupts64(cpu, bus)) {
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                            }
+                            break;
                         } else {
                             executeSingleA64(cpu, bus, cur_pc, inst) catch {
                                 handleAbort64(cpu, cur_pc);

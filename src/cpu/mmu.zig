@@ -260,6 +260,22 @@ pub const Mmu = struct {
         self.soft_tlb64[1][s_idx] = .{};
     }
 
+    pub inline fn lookupPbase32NoFault(self: *const Mmu, vaddr: u32) ?u32 {
+        if (!self.isMmuEnabled()) return vaddr & 0xffff_f000;
+        const vpn: u52 = @truncate(vaddr >> 12);
+        const entry = &self.tlb[@as(usize, @truncate(vpn)) & tlb_mask];
+        if (entry.gen == self.tlb_gen and entry.vpn == vpn) return entry.ppn_base;
+        return null;
+    }
+
+    pub inline fn lookupPbase64NoFault(self: *const Mmu, vaddr: u64) ?u32 {
+        if ((self.sctlr_el1 & 1) == 0 and (self.sctlr_el2 & 1) == 0) return @as(u32, @truncate(vaddr)) & 0xffff_f000;
+        const vpn: u52 = @truncate((vaddr & 0x00ff_ffff_ffff_ffff) >> 12);
+        const entry = &self.tlb[@as(usize, @truncate(vpn)) & tlb_mask];
+        if (entry.gen == self.tlb_gen and entry.vpn == vpn) return entry.ppn_base;
+        return null;
+    }
+
     pub inline fn populateSoftTlb32(self: *Mmu, ram_len: usize, vaddr: u32, pbase: u32, perms: u8) void {
         if (@as(usize, pbase) + 4096 <= ram_len) {
             const vbase = vaddr & 0xffff_f000;
