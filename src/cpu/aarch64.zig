@@ -11,6 +11,7 @@
 const std = @import("std");
 const mmu_mod = @import("mmu.zig");
 const atomic_ram = @import("atomic_ram.zig");
+const jit_mod = @import("jit.zig");
 
 pub const PstateFlags = struct {
     pub const N: u32 = 1 << 31;
@@ -690,8 +691,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             fcmpz_f64,
             fcmp_f32,
             fcmpz_f32,
-            simd_movi_q,
-            simd_movi_d,
+            simd_movi,
             simd_and,
             simd_bic,
             simd_orr,
@@ -757,6 +757,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             branch_sys_other,
             fp_simd,
             nop,
+            jit_trace,
         };
 
         pub inline fn tryFusePairA64(comptime SlotType: type, d: SlotType, next_inst: u32) ?SlotType {
@@ -950,6 +951,57 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
         ) void {
             const raw_inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
             _ = decodeAndFuseA64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, page_word, raw_inst, true);
+        }
+
+        noinline fn compileHotLoop64(
+            cpu: *CpuType,
+            comptime SlotType: type,
+            code_page_idx: usize,
+            code_icache_ptr: [*]SlotType,
+            code_page_ptr: [*]const u8,
+            start_word: u10,
+            end_word_req: u16,
+        ) void {
+            if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) return;
+            const Jit64 = jit_mod.A64Jit(CpuType, Bus);
+            var end_word: u16 = 0;
+            if (Jit64.compileTrace(SlotType, &cpu.jit_buf, cpu.mmu.core_id, code_page_ptr, start_word, end_word_req, &end_word)) |fn_ptr| {
+                const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
+                const trace_len: u8 = @intCast(end_word - @as(u16, start_word));
+                code_icache_ptr[start_word] = .{
+                    .raw = raw_inst,
+                    .op = @intFromEnum(A64Op.jit_trace),
+                    .rd = trace_len,
+                    .imm = @intFromPtr(fn_ptr),
+                };
+                cpu.markIcacheDirty(code_page_idx, start_word);
+            }
+        }
+
+        inline fn noteBackwardBranch64(
+            cpu: *CpuType,
+            comptime SlotType: type,
+            code_vbase: u64,
+            code_page_idx: usize,
+            code_icache_ptr: [*]SlotType,
+            code_page_ptr: [*]const u8,
+            cur_pc: u64,
+            target_pc: u64,
+            end_word_req: u16,
+        ) void {
+            if (target_pc <= cur_pc and (target_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
+                if (end_word_req > @as(u16, start_word) + 1 and end_word_req - @as(u16, start_word) <= 64) {
+                    const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
+                    const c = cpu.jit_buf.loop_counts[h];
+                    if (c < 8) {
+                        cpu.jit_buf.loop_counts[h] = c + 1;
+                        if (c + 1 == 8) {
+                            compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req);
+                        }
+                    }
+                }
+            }
         }
 
         pub noinline fn decodeA64(comptime SlotType: type, inst: u32) SlotType {
@@ -1744,7 +1796,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             } else if ((inst & 0xffa0_1fe0) == 0x1e20_1000) {
                                 const imm8: u8 = @truncate(inst >> 13);
                                 const val64: u64 = if (is_dbl) expandFpImm64(imm8) else expandFpImm32(imm8);
-                                return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_movi_d), .rd = rd, .imm = val64 };
+                                return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_movi), .rd = rd, .rn = 0, .imm = val64 };
                             } else if ((inst & 0xffe0_0c00) == 0x1e20_0800 or (inst & 0xffe0_0c00) == 0x1e60_0800) {
                                 const opc: u4 = @truncate(inst >> 12);
                                 const fp2_op: ?A64Op = switch (opc) {
@@ -1851,8 +1903,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             }
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(if (q) A64Op.simd_movi_q else A64Op.simd_movi_d),
+                                .op = @intFromEnum(A64Op.simd_movi),
                                 .rd = rd,
+                                .rn = @intFromBool(q),
                                 .imm = val64,
                             };
                         }
@@ -2226,7 +2279,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             executed += 1;
                             if (evalCond(cpu.pstate, @truncate(d.rd))) {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
-                                cpu.pc64 = cur_pc +% @as(u64, @bitCast(target_off));
+                                const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }
@@ -2240,7 +2295,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             executed += 1;
                             if (evalCond(cpu.pstate, @truncate(d.rd))) {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
-                                cpu.pc64 = cur_pc +% @as(u64, @bitCast(target_off));
+                                const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }
@@ -2255,7 +2312,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             executed += 1;
                             if (evalCond(cpu.pstate, @truncate(d.rd))) {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
-                                cpu.pc64 = cur_pc +% @as(u64, @bitCast(target_off));
+                                const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }
@@ -2276,7 +2335,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             executed += 1;
                             if (evalCond(cpu.pstate, @truncate(d.rd))) {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
-                                cpu.pc64 = cur_pc +% @as(u64, @bitCast(target_off));
+                                const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }
@@ -2338,7 +2399,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const take = if ((d.rm & 1) != 0) (test_val != 0) else (test_val == 0);
                             if (take) {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
-                                cpu.pc64 = cur_pc +% @as(u64, @bitCast(target_off));
+                                const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }
@@ -4417,33 +4480,63 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             }
                         }
                     },
-                    .b_imm => cpu.pc64 = cur_pc +% d.imm,
+                    .b_imm => {
+                        const target_pc = cur_pc +% d.imm;
+                        cpu.pc64 = target_pc;
+                        noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                    },
                     .bl_imm => {
                         cpu.x[30] = cur_pc +% 4;
                         cpu.pc64 = cur_pc +% d.imm;
                     },
                     .b_cond => {
                         if (evalCond(cpu.pstate, @truncate(d.rd))) {
-                            cpu.pc64 = cur_pc +% d.imm;
+                            const target_pc = cur_pc +% d.imm;
+                            cpu.pc64 = target_pc;
+                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
                         }
                     },
                     .cbz64 => {
-                        if (getX(cpu, @truncate(d.rd)) == 0) cpu.pc64 = cur_pc +% d.imm;
+                        if (getX(cpu, @truncate(d.rd)) == 0) {
+                            const target_pc = cur_pc +% d.imm;
+                            cpu.pc64 = target_pc;
+                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                        }
                     },
                     .cbnz64 => {
-                        if (getX(cpu, @truncate(d.rd)) != 0) cpu.pc64 = cur_pc +% d.imm;
+                        if (getX(cpu, @truncate(d.rd)) != 0) {
+                            const target_pc = cur_pc +% d.imm;
+                            cpu.pc64 = target_pc;
+                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                        }
                     },
                     .cbz32 => {
-                        if (getW(cpu, @truncate(d.rd)) == 0) cpu.pc64 = cur_pc +% d.imm;
+                        if (getW(cpu, @truncate(d.rd)) == 0) {
+                            const target_pc = cur_pc +% d.imm;
+                            cpu.pc64 = target_pc;
+                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                        }
                     },
                     .cbnz32 => {
-                        if (getW(cpu, @truncate(d.rd)) != 0) cpu.pc64 = cur_pc +% d.imm;
+                        if (getW(cpu, @truncate(d.rd)) != 0) {
+                            const target_pc = cur_pc +% d.imm;
+                            cpu.pc64 = target_pc;
+                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                        }
                     },
                     .tbz => {
-                        if (((getX(cpu, @truncate(d.rd)) >> @intCast(d.rm)) & 1) == 0) cpu.pc64 = cur_pc +% d.imm;
+                        if (((getX(cpu, @truncate(d.rd)) >> @intCast(d.rm)) & 1) == 0) {
+                            const target_pc = cur_pc +% d.imm;
+                            cpu.pc64 = target_pc;
+                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                        }
                     },
                     .tbnz => {
-                        if (((getX(cpu, @truncate(d.rd)) >> @intCast(d.rm)) & 1) != 0) cpu.pc64 = cur_pc +% d.imm;
+                        if (((getX(cpu, @truncate(d.rd)) >> @intCast(d.rm)) & 1) != 0) {
+                            const target_pc = cur_pc +% d.imm;
+                            cpu.pc64 = target_pc;
+                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                        }
                     },
                     .br_reg => cpu.pc64 = getX(cpu, @truncate(d.rn)),
                     .blr_reg => {
@@ -4704,8 +4797,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             setNzcv(cpu, false, false, true, false);
                         }
                     },
-                    .simd_movi_q => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, d.imm) | (@as(u128, d.imm) << 64),
-                    .simd_movi_d => cpu.vfp.v[@as(u5, @truncate(d.rd))] = d.imm,
+                    .simd_movi => cpu.vfp.v[@as(u5, @truncate(d.rd))] = if (d.rn != 0) (@as(u128, d.imm) | (@as(u128, d.imm) << 64)) else d.imm,
                     .simd_and => {
                         const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
                         cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] & cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
@@ -5057,6 +5149,40 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     },
                     .fp_simd => executeFpSimd(cpu, inst),
                     .nop => {},
+                    .jit_trace => {
+                        const max_jit: usize = (batch_end - executed) + 1;
+                        if (max_jit >= d.rd) {
+                            cpu.pc64 = code_vbase;
+                            const fn_ptr: jit_mod.JitFn = @ptrFromInt(@as(usize, @truncate(d.imm)));
+                            const sp_ptr = &cpu.sp_el[spIndex(cpu)];
+                            const tlb_ptr = &cpu.mmu.soft_tlb64[priv][0];
+                            const ran = fn_ptr(cpu, bus, bus.ram.ptr, tlb_ptr, max_jit, sp_ptr);
+                            executed += ran - 1;
+                            const new_priv: u1 = @intFromBool(currentEl(cpu) != 0);
+                            if (new_priv != priv or (cpu.pc64 & ~@as(u64, 0xfff)) != code_vbase) {
+                                priv = new_priv;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                            }
+                        } else {
+                            executeSingleA64(cpu, bus, cur_pc, inst) catch {
+                                handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                continue;
+                            };
+                            if (checkInterrupts64(cpu, bus)) {
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                continue;
+                            }
+                        }
+                    },
                 }
                 }
             }
@@ -5068,7 +5194,19 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return executed;
         }
 
-        noinline fn handleAbort64(cpu: *CpuType, cur_pc: u64) void {
+        noinline fn executeSingleA64(cpu: *CpuType, bus: *Bus, cur_pc: u64, inst: u32) error{Abort}!void {
+            const top4: u4 = @truncate(inst >> 25);
+            switch (top4) {
+                0b1000, 0b1001 => executeDpImm(cpu, inst, cur_pc),
+                0b1010, 0b1011 => try executeBranchSys(cpu, bus, inst, cur_pc),
+                0b0100, 0b0110, 0b1100, 0b1110 => try executeLoadStore(cpu, bus, inst, cur_pc),
+                0b0101, 0b1101 => executeDpReg(cpu, inst),
+                0b0111, 0b1111 => executeFpSimd(cpu, inst),
+                else => {},
+            }
+        }
+
+        pub noinline fn handleAbort64(cpu: *CpuType, cur_pc: u64) void {
             const target_el: u2 = @max(currentEl(cpu), 1);
             const esr = if (target_el >= 2) cpu.mmu.esr_el2 else cpu.mmu.esr_el1;
             const far = if (target_el >= 2) cpu.mmu.far_el2 else cpu.mmu.far_el1;
@@ -8207,7 +8345,7 @@ test "AArch64 pre-decoded scalar FP and NEON vector fast-paths" {
     try std.testing.expectEqual(Exec.A64Op.fmul_f64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[3]).op)));
     try std.testing.expectEqual(Exec.A64Op.fcmp_f64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[4]).op)));
     try std.testing.expectEqual(Exec.A64Op.fmov_x_d, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[5]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_movi_q, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[6]).op)));
+    try std.testing.expectEqual(Exec.A64Op.simd_movi, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[6]).op)));
     try std.testing.expectEqual(Exec.A64Op.simd_dup_gpr, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[7]).op)));
     try std.testing.expectEqual(Exec.A64Op.simd_add_8, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[8]).op)));
     try std.testing.expectEqual(Exec.A64Op.simd_cmeq_8, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[9]).op)));
@@ -8683,4 +8821,33 @@ test "AArch64 superinstruction fusion (ADRP+ADD, ADRP+LDR, STP+MOV FP, CMP+B.con
     cpu.pc64 = 0x103c;
     _ = cpu.runSteps(&bus, 16);
     try std.testing.expectEqual(@as(u64, 123), cpu.x[5]);
+
+    // Verify hot backward-branch loop triggers baseline x86-64 JIT compilation (.jit_trace)
+    // 0x1100: add x10, x10, #3       (0x91000d4a)
+    // 0x1104: sub x11, x11, #1       (0xd100056b)
+    // 0x1108: cbnz x11, 0x1100 (-8)  (0xb5ffffcb)
+    // 0x110c: wfi                    (0xd503207f)
+    const jit_loop = [_]u32{
+        0x91000d4a,
+        0xd100056b,
+        0xb5ffffcb,
+        0xd503207f,
+    };
+    for (jit_loop, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1100 + i * 4 ..][0..4], inst, .little);
+    }
+    cpu.invalidateIcache();
+    cpu.mmu.halted_wfi = false;
+    cpu.pc64 = 0x1100;
+    cpu.x[10] = 0;
+    cpu.x[11] = 100;
+    const jit_ran = cpu.runSteps(&bus, 500);
+    try std.testing.expectEqual(@as(usize, 301), jit_ran);
+    try std.testing.expectEqual(@as(u64, 300), cpu.x[10]);
+    try std.testing.expectEqual(@as(u64, 0), cpu.x[11]);
+    if (jit_mod.is_x86_64_linux) {
+        const Exec = Aarch64Exec(Cpu, TestBus);
+        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1100 & 0xfff) >> 2)].op)));
+    }
 }
+
