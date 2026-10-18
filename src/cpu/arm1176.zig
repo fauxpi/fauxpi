@@ -341,7 +341,7 @@ pub const ArmOp = enum(u8) {
     unconditional,
 };
 
-pub fn decodeArm32(inst: u32) DecodedSlot {
+pub noinline fn decodeArm32(inst: u32) DecodedSlot {
     const cond: u4 = @truncate(inst >> 28);
     if (cond == 0xf) {
         if ((inst & 0x0f00_0000) == 0x0500_0000 or (inst & 0x0f00_0000) == 0x0700_0000) {
@@ -1241,7 +1241,7 @@ pub noinline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_w
     return d;
 }
 
-pub fn decodeThumb16(inst: u16, next_hw: ?u16) ThumbSlot {
+pub noinline fn decodeThumb16(inst: u16, next_hw: ?u16) ThumbSlot {
     const top3: u3 = @truncate(inst >> 13);
     switch (top3) {
         0b000 => {
@@ -1588,16 +1588,20 @@ pub fn Arm1176(comptime Bus: type) type {
         pub inline fn prepareIcachePage(self: *Self, page_idx: usize, pbase: u32) [*]DecodedSlot {
             const page_slot = page_idx << 10;
             if (self.icache_page_tags[page_idx] != pbase) {
-                var dirty = self.icache_page_dirty[page_idx];
-                while (dirty != 0) {
-                    const blk_idx: usize = @ctz(dirty);
-                    dirty &= dirty - 1;
-                    @memset(self.icache[page_slot + (blk_idx << 6) ..][0..64], .{});
-                }
-                self.icache_page_dirty[page_idx] = 0;
-                self.icache_page_tags[page_idx] = pbase;
+                self.clearIcachePageDirty(page_idx, page_slot, pbase);
             }
             return self.icache[page_slot..].ptr;
+        }
+
+        noinline fn clearIcachePageDirty(self: *Self, page_idx: usize, page_slot: usize, pbase: u32) void {
+            var dirty = self.icache_page_dirty[page_idx];
+            while (dirty != 0) {
+                const blk_idx: usize = @ctz(dirty);
+                dirty &= dirty - 1;
+                @memset(self.icache[page_slot + (blk_idx << 6) ..][0..64], .{});
+            }
+            self.icache_page_dirty[page_idx] = 0;
+            self.icache_page_tags[page_idx] = pbase;
         }
 
         pub inline fn markIcacheDirty(self: *Self, page_idx: usize, page_word: usize) void {
@@ -1607,16 +1611,20 @@ pub fn Arm1176(comptime Bus: type) type {
         pub inline fn prepareThumbIcachePage(self: *Self, tpage_idx: usize, pbase: u32) [*]ThumbSlot {
             const tpage_slot = tpage_idx << 11;
             if (self.thumb_icache_page_tags[tpage_idx] != pbase) {
-                var dirty = self.thumb_icache_page_dirty[tpage_idx];
-                while (dirty != 0) {
-                    const blk_idx: usize = @ctz(dirty);
-                    dirty &= dirty - 1;
-                    @memset(self.thumb_icache[tpage_slot + (blk_idx << 6) ..][0..64], .{});
-                }
-                self.thumb_icache_page_dirty[tpage_idx] = 0;
-                self.thumb_icache_page_tags[tpage_idx] = pbase;
+                self.clearThumbIcachePageDirty(tpage_idx, tpage_slot, pbase);
             }
             return self.thumb_icache[tpage_slot..].ptr;
+        }
+
+        noinline fn clearThumbIcachePageDirty(self: *Self, tpage_idx: usize, tpage_slot: usize, pbase: u32) void {
+            var dirty = self.thumb_icache_page_dirty[tpage_idx];
+            while (dirty != 0) {
+                const blk_idx: usize = @ctz(dirty);
+                dirty &= dirty - 1;
+                @memset(self.thumb_icache[tpage_slot + (blk_idx << 6) ..][0..64], .{});
+            }
+            self.thumb_icache_page_dirty[tpage_idx] = 0;
+            self.thumb_icache_page_tags[tpage_idx] = pbase;
         }
 
         pub inline fn markThumbIcacheDirty(self: *Self, tpage_idx: usize, page_hw: usize) void {
@@ -1762,7 +1770,7 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         /// Changes processor mode, swapping banked `r8..r14` registers.
-        pub fn switchMode(self: *Self, new_mode_bits: u5) void {
+        pub noinline fn switchMode(self: *Self, new_mode_bits: u5) void {
             const old_mode_bits: u5 = @truncate(self.cpsr & 0x1f);
             if (old_mode_bits == new_mode_bits) return;
 
@@ -1785,7 +1793,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.cpsr = (self.cpsr & ~@as(u32, 0x1f)) | new_mode_bits;
         }
 
-        pub fn setCpsr(self: *Self, new_cpsr: u32) void {
+        pub noinline fn setCpsr(self: *Self, new_cpsr: u32) void {
             const new_mode: u5 = @truncate(new_cpsr & 0x1f);
             self.switchMode(new_mode);
             self.cpsr = new_cpsr;
@@ -1821,7 +1829,7 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         /// Enters an ARM exception vector (`UND`, `SVC`, `PABT`, `DABT`, `IRQ`, `FIQ`).
-        pub fn enterException(self: *Self, target_mode: Mode, vector_offset: u32, lr_val: u32, disable_fiq: bool) void {
+        pub noinline fn enterException(self: *Self, target_mode: Mode, vector_offset: u32, lr_val: u32, disable_fiq: bool) void {
             const saved_cpsr = self.cpsr;
             self.switchMode(@intFromEnum(target_mode));
             self.setSpsr(saved_cpsr);
@@ -1840,7 +1848,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.excl_valid = false;
         }
 
-        pub inline fn checkInterrupts(self: *Self, bus: *const Bus) bool {
+        pub noinline fn checkInterrupts(self: *Self, bus: *const Bus) bool {
             const halted = self.mmu.halted_wfi;
             if (halted or (self.cpsr & PsrFlags.F) == 0) {
                 const pending_fiq = if (@hasDecl(Bus, "hasPendingFiqForCore"))
@@ -1880,6 +1888,10 @@ pub fn Arm1176(comptime Bus: type) type {
                 const paddr = slot.pbase | (vaddr & 0xfff);
                 return std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
             }
+            return self.read64Slow(bus, vaddr);
+        }
+
+        noinline fn read64Slow(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u64 {
             const lo: u64 = try self.read32(bus, vaddr);
             const hi: u64 = try self.read32(bus, vaddr +% 4);
             return lo | (hi << 32);
@@ -1887,7 +1899,7 @@ pub fn Arm1176(comptime Bus: type) type {
 
         /// Completes a store-exclusive of `val` at `vaddr` and returns the `STREX` status (0 = stored).
         /// RAM stores are a compare-and-swap against the value the load-exclusive returned.
-        fn storeExclusive(self: *Self, bus: *Bus, comptime T: type, vaddr: u32, val: T, privileged: bool) error{Abort}!u32 {
+        noinline fn storeExclusive(self: *Self, bus: *Bus, comptime T: type, vaddr: u32, val: T, privileged: bool) error{Abort}!u32 {
             const paddr = try self.mmu.translate(bus.ram, vaddr, .write, privileged);
             if (!self.excl_valid) return 1;
             self.excl_valid = false;
@@ -1912,7 +1924,7 @@ pub fn Arm1176(comptime Bus: type) type {
             if (is_dsb) bus.smp.broadcastTlb(self.mmu.core_id, &self.mmu);
         }
 
-        fn syncCoreTimerLines(self: *Self, bus: *Bus) void {
+        noinline fn syncCoreTimerLines(self: *Self, bus: *Bus) void {
             if (@hasDecl(Bus, "setCoreTimerLines")) {
                 bus.setCoreTimerLines(self.mmu.core_id, self.mmu.timer_irq_lines);
             } else if (@hasField(Bus, "local_intc")) {
@@ -1928,6 +1940,10 @@ pub fn Arm1176(comptime Bus: type) type {
                 std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
                 return;
             }
+            return self.write64Slow(bus, vaddr, val);
+        }
+
+        noinline fn write64Slow(self: *Self, bus: *Bus, vaddr: u32, val: u64) error{Abort}!void {
             try self.write32(bus, vaddr, @truncate(val));
             try self.write32(bus, vaddr +% 4, @truncate(val >> 32));
         }
@@ -1939,6 +1955,10 @@ pub fn Arm1176(comptime Bus: type) type {
                 const paddr = slot.pbase | (vaddr & 0xfff);
                 return std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
             }
+            return self.read32Slow(bus, vaddr, priv);
+        }
+
+        noinline fn read32Slow(self: *Self, bus: *Bus, vaddr: u32, priv: u1) error{Abort}!u32 {
             const paddr = try self.mmu.translate(bus.ram, vaddr, .read, priv != 0);
             if (paddr < bus.ram.len and (vaddr & 3) == 0) {
                 return std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
@@ -1968,6 +1988,10 @@ pub fn Arm1176(comptime Bus: type) type {
                 std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
                 return;
             }
+            return self.write32Slow(bus, vaddr, val, priv);
+        }
+
+        noinline fn write32Slow(self: *Self, bus: *Bus, vaddr: u32, val: u32, priv: u1) error{Abort}!void {
             if ((vaddr & 3) != 0 and (self.mmu.sctlr & (1 << 22)) != 0) {
                 try self.write8(bus, vaddr, @truncate(val));
                 try self.write8(bus, vaddr +% 1, @truncate(val >> 8));
@@ -1990,6 +2014,10 @@ pub fn Arm1176(comptime Bus: type) type {
                 const paddr = slot.pbase | (vaddr & 0xfff);
                 return std.mem.readInt(u16, bus.ram[paddr..][0..2], .little);
             }
+            return self.read16Slow(bus, vaddr, priv);
+        }
+
+        noinline fn read16Slow(self: *Self, bus: *Bus, vaddr: u32, priv: u1) error{Abort}!u16 {
             if ((vaddr & 1) != 0 and (self.mmu.sctlr & (1 << 22)) != 0) {
                 const b0: u16 = try self.read8(bus, vaddr);
                 const b1: u16 = try self.read8(bus, vaddr +% 1);
@@ -2010,6 +2038,10 @@ pub fn Arm1176(comptime Bus: type) type {
                 std.mem.writeInt(u16, bus.ram[paddr..][0..2], val, .little);
                 return;
             }
+            return self.write16Slow(bus, vaddr, val, priv);
+        }
+
+        noinline fn write16Slow(self: *Self, bus: *Bus, vaddr: u32, val: u16, priv: u1) error{Abort}!void {
             if ((vaddr & 1) != 0 and (self.mmu.sctlr & (1 << 22)) != 0) {
                 try self.write8(bus, vaddr, @truncate(val));
                 try self.write8(bus, vaddr +% 1, @truncate(val >> 8));
@@ -2029,6 +2061,10 @@ pub fn Arm1176(comptime Bus: type) type {
             if ((vaddr & 0xffff_f000) == slot.r_vbase) {
                 return bus.ram[slot.pbase | (vaddr & 0xfff)];
             }
+            return self.read8Slow(bus, vaddr, priv);
+        }
+
+        noinline fn read8Slow(self: *Self, bus: *Bus, vaddr: u32, priv: u1) error{Abort}!u8 {
             const paddr = try self.mmu.translate(bus.ram, vaddr, .read, priv != 0);
             if (paddr < bus.ram.len) {
                 return bus.ram[paddr];
@@ -2043,6 +2079,10 @@ pub fn Arm1176(comptime Bus: type) type {
                 bus.ram[slot.pbase | (vaddr & 0xfff)] = val;
                 return;
             }
+            return self.write8Slow(bus, vaddr, val, priv);
+        }
+
+        noinline fn write8Slow(self: *Self, bus: *Bus, vaddr: u32, val: u8, priv: u1) error{Abort}!void {
             const paddr = try self.mmu.translate(bus.ram, vaddr, .write, priv != 0);
             if (paddr < bus.ram.len) {
                 bus.ram[paddr] = val;
@@ -2051,7 +2091,7 @@ pub fn Arm1176(comptime Bus: type) type {
             bus.write8(paddr, val);
         }
 
-        inline fn fetch32(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u32 {
+        noinline fn fetch32(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u32 {
             const priv: u1 = @intFromBool(self.isPrivileged());
             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
             if ((vaddr & 0xffff_f000) == slot.x_vbase) {
@@ -2065,7 +2105,7 @@ pub fn Arm1176(comptime Bus: type) type {
             return bus.read32(paddr);
         }
 
-        inline fn fetch16(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u16 {
+        noinline fn fetch16(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u16 {
             const priv: u1 = @intFromBool(self.isPrivileged());
             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
             if ((vaddr & 0xffff_f000) == slot.x_vbase) {
@@ -2077,6 +2117,31 @@ pub fn Arm1176(comptime Bus: type) type {
                 return std.mem.readInt(u16, bus.ram[paddr..][0..2], .little);
             }
             return bus.read16(paddr);
+        }
+
+        noinline fn populateIcacheSlot32(
+            self: *Self,
+            code_page_idx: usize,
+            code_icache_ptr: [*]DecodedSlot,
+            code_page_ptr: [*]const u8,
+            page_word: usize,
+        ) void {
+            const inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
+            code_icache_ptr[page_word] = decodeAndFuseArm32(inst, code_page_ptr, page_word);
+            self.markIcacheDirty(code_page_idx, page_word);
+        }
+
+        noinline fn populateThumbIcacheSlot(
+            self: *Self,
+            thumb_page_idx: usize,
+            thumb_icache_ptr: [*]ThumbSlot,
+            thumb_page_ptr: [*]const u8,
+            page_hw: usize,
+        ) void {
+            const inst16 = std.mem.readInt(u16, thumb_page_ptr[page_hw * 2 ..][0..2], .little);
+            const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
+            thumb_icache_ptr[page_hw] = decodeThumb16(inst16, next_hw);
+            self.markThumbIcacheDirty(thumb_page_idx, page_hw);
         }
 
         // --- Execution Step ---
@@ -2098,11 +2163,9 @@ pub fn Arm1176(comptime Bus: type) type {
 
             const limit = if (max_steps >= 4096) max_steps + 256 else max_steps;
             var executed: usize = 0;
-            var cur_last_inst: u32 = self.last_inst;
             defer {
                 self.cycles +%= executed;
                 self.mmu.pmccntr +%= @truncate(executed);
-                self.last_inst = cur_last_inst;
                 self.excl_valid = false;
             }
             var priv: u1 = @intFromBool(self.isPrivileged());
@@ -2111,11 +2174,6 @@ pub fn Arm1176(comptime Bus: type) type {
             var code_page_idx: usize = 0;
             var code_page_ptr: [*]const u8 = bus.ram.ptr;
             var code_icache_ptr: [*]DecodedSlot = self.icache[0..].ptr;
-            var thumb_vbase: u32 = 0xffff_ffff;
-            var thumb_pbase: u32 = 0;
-            var thumb_page_idx: usize = 0;
-            var thumb_page_ptr: [*]const u8 = bus.ram.ptr;
-            var thumb_icache_ptr: [*]ThumbSlot = self.thumb_icache[0..].ptr;
             var data_r_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
             var data_w_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
             var data_r_page_ptr: [2][*]const u8 = .{ bus.ram.ptr, bus.ram.ptr };
@@ -2129,7 +2187,6 @@ pub fn Arm1176(comptime Bus: type) type {
                     // Apply TLB invalidations other cores broadcast while this slice runs
                     if (bus.smp.serviceTlb(self.mmu.core_id, &self.mmu)) {
                         code_vbase = 0xffff_ffff;
-                        thumb_vbase = 0xffff_ffff;
                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     }
@@ -2142,146 +2199,67 @@ pub fn Arm1176(comptime Bus: type) type {
                     max_steps;
 
                 while (executed < batch_end) {
-                    var pc = self.r[15];
-                    var page_word: usize = (pc >> 2) & 0x3ff;
-                    var d: DecodedSlot = undefined;
-                    var inst: u32 = undefined;
-                    if ((pc & ~@as(u32, 0xffc)) == code_vbase) {
-                        d = code_icache_ptr[page_word];
-                        if (d.raw != 0xffff_ffff) {
-                            inst = d.raw;
-                        } else {
-                            inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
-                            d = decodeAndFuseArm32(inst, code_page_ptr, page_word);
-                            code_icache_ptr[page_word] = d;
-                            self.markIcacheDirty(code_page_idx, page_word);
-                        }
-                    } else {
+                    const pc = self.r[15];
+                    if ((pc & ~@as(u32, 0xffc)) != code_vbase) {
                         if (self.isThumb()) {
-                            pc &= ~@as(u32, 1);
-                            const page_hw: usize = (pc >> 1) & 0x7ff;
-                            var td: ThumbSlot = undefined;
-                            if ((pc & 0xffff_f000) == thumb_vbase) {
-                                td = thumb_icache_ptr[page_hw];
-                                if (td.raw == 0xffff) {
-                                    const inst16 = std.mem.readInt(u16, thumb_page_ptr[page_hw * 2 ..][0..2], .little);
-                                    const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
-                                    td = decodeThumb16(inst16, next_hw);
-                                    thumb_icache_ptr[page_hw] = td;
-                                    self.markThumbIcacheDirty(thumb_page_idx, page_hw);
-                                }
-                            } else {
-                                const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
-                                if ((pc & 0xffff_f000) == islot.x_vbase) {
-                                    thumb_vbase = islot.x_vbase;
-                                    thumb_pbase = islot.pbase;
-                                    thumb_page_ptr = bus.ram.ptr + thumb_pbase;
-                                    thumb_page_idx = thumbIcachePageIdx(thumb_pbase);
-                                    thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, thumb_pbase);
-                                    td = thumb_icache_ptr[page_hw];
-                                    if (td.raw == 0xffff) {
-                                        const inst16 = std.mem.readInt(u16, thumb_page_ptr[page_hw * 2 ..][0..2], .little);
-                                        const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
-                                        td = decodeThumb16(inst16, next_hw);
-                                        thumb_icache_ptr[page_hw] = td;
-                                        self.markThumbIcacheDirty(thumb_page_idx, page_hw);
-                                    }
-                                } else {
-                                    const inst16 = self.fetch16(bus, pc) catch {
-                                        self.enterException(.abt, 0x0c, pc +% 4, false);
-                                        priv = 1;
-                                        code_vbase = 0xffff_ffff;
-                                        thumb_vbase = 0xffff_ffff;
-                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                        executed += 1;
-                                        continue;
-                                    };
-                                    const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
-                                    if ((pc & 0xffff_f000) == islot2.x_vbase) {
-                                        thumb_vbase = islot2.x_vbase;
-                                        thumb_pbase = islot2.pbase;
-                                        thumb_page_ptr = bus.ram.ptr + thumb_pbase;
-                                        thumb_page_idx = thumbIcachePageIdx(thumb_pbase);
-                                        thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, thumb_pbase);
-                                        const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
-                                        td = decodeThumb16(inst16, next_hw);
-                                        thumb_icache_ptr[page_hw] = td;
-                                        self.markThumbIcacheDirty(thumb_page_idx, page_hw);
-                                    } else {
-                                        thumb_page_idx = thumbIcachePageIdx(pc);
-                                        thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, 0xffff_fffe);
-                                        self.thumb_icache_page_tags[thumb_page_idx] = 0xffff_ffff;
-                                        td = decodeThumb16(inst16, null);
-                                        thumb_icache_ptr[page_hw] = td;
-                                        self.markThumbIcacheDirty(thumb_page_idx, page_hw);
-                                    }
-                                }
-                            }
-                            self.r[15] = pc +% 2;
-                            executed += 1;
-                            if (self.executeThumbDecoded(bus, pc, td, &executed, batch_end, priv, thumb_vbase, thumb_pbase, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
-                                if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
-                                _ = self.checkInterrupts(bus);
-                                priv = @intFromBool(self.isPrivileged());
-                                code_vbase = 0xffff_ffff;
-                                thumb_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            }
-                            continue;
+                            executed = self.runThumbLoops(bus, executed, max_steps, limit);
+                            if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            continue :step_loop;
                         }
-                        pc &= ~@as(u32, 3);
-                        page_word = (pc >> 2) & 0x3ff;
-                        const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
-                        if ((pc & 0xffff_f000) == islot.x_vbase) {
+                        const aligned_pc = pc & ~@as(u32, 3);
+                        self.r[15] = aligned_pc;
+                        const islot = self.mmu.soft_tlb32[priv][(aligned_pc >> 12) & Mmu.soft_tlb_mask];
+                        if ((aligned_pc & 0xffff_f000) == islot.x_vbase) {
                             code_vbase = islot.x_vbase;
                             code_pbase = islot.pbase;
                             code_page_ptr = bus.ram.ptr + code_pbase;
                             code_page_idx = icachePageIdx(code_pbase);
                             code_icache_ptr = self.prepareIcachePage(code_page_idx, code_pbase);
-                            d = code_icache_ptr[page_word];
-                            if (d.raw != 0xffff_ffff) {
-                                inst = d.raw;
-                            } else {
-                                inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
-                                d = decodeAndFuseArm32(inst, code_page_ptr, page_word);
-                                code_icache_ptr[page_word] = d;
-                                self.markIcacheDirty(code_page_idx, page_word);
-                            }
-                        } else {
-                            inst = self.fetch32(bus, pc) catch {
-                                self.enterException(.abt, 0x0c, pc +% 4, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                executed += 1;
-                                continue;
-                            };
-                            const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
-                            if ((pc & 0xffff_f000) == islot2.x_vbase) {
-                                code_vbase = islot2.x_vbase;
-                                code_pbase = islot2.pbase;
-                                code_page_ptr = bus.ram.ptr + code_pbase;
-                                code_page_idx = icachePageIdx(code_pbase);
-                                code_icache_ptr = self.prepareIcachePage(code_page_idx, code_pbase);
-                                d = decodeAndFuseArm32(inst, code_page_ptr, page_word);
-                                code_icache_ptr[page_word] = d;
-                                self.markIcacheDirty(code_page_idx, page_word);
-                            } else {
-                                code_page_idx = icachePageIdx(pc);
-                                code_icache_ptr = self.prepareIcachePage(code_page_idx, 0xffff_fffe);
-                                self.icache_page_tags[code_page_idx] = 0xffff_ffff;
-                                d = decodeArm32(inst);
-                                code_icache_ptr[page_word] = d;
-                                self.markIcacheDirty(code_page_idx, page_word);
-                            }
+                            continue;
                         }
+                        const fetched = self.fetch32(bus, aligned_pc) catch {
+                            self.enterException(.abt, 0x0c, aligned_pc +% 4, false);
+                            priv = 1;
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            executed += 1;
+                            continue;
+                        };
+                        const islot2 = self.mmu.soft_tlb32[priv][(aligned_pc >> 12) & Mmu.soft_tlb_mask];
+                        if ((aligned_pc & 0xffff_f000) == islot2.x_vbase) {
+                            code_vbase = islot2.x_vbase;
+                            code_pbase = islot2.pbase;
+                            code_page_ptr = bus.ram.ptr + code_pbase;
+                            code_page_idx = icachePageIdx(code_pbase);
+                            code_icache_ptr = self.prepareIcachePage(code_page_idx, code_pbase);
+                            continue;
+                        }
+                        self.r[15] = aligned_pc +% 4;
+                        executed += 1;
+                        self.executeArm(bus, aligned_pc, fetched);
+                        if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
+                        _ = self.checkInterrupts(bus);
+                        priv = @intFromBool(self.isPrivileged());
+                        code_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        continue;
                     }
 
+                    const page_word: usize = (pc >> 2) & 0x3ff;
+                    const d = code_icache_ptr[page_word];
+                    if (d.raw == 0xffff_ffff) {
+                        self.populateIcacheSlot32(code_page_idx, code_icache_ptr, code_page_ptr, page_word);
+                        continue;
+                    }
+
+                    const inst = d.raw;
                     self.r[15] = pc +% 4;
-                    cur_last_inst = inst;
                     executed += 1;
 
                     if (inst < 0xe000_0000) {
@@ -4242,7 +4220,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn exceptionReturn(self: *Self, new_pc: u32) void {
+        noinline fn exceptionReturn(self: *Self, new_pc: u32) void {
             const spsr = self.getSpsr();
             self.setCpsr(spsr);
             if ((self.cpsr & PsrFlags.T) != 0) {
@@ -4315,7 +4293,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn executeUnconditional(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
+        noinline fn executeUnconditional(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
             // 1. BLX (immediate): 1111 101H imm24
             if ((inst & 0x0e00_0000) == 0x0a00_0000) {
                 const h: u32 = (inst >> 23) & 2;
@@ -4442,7 +4420,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn executeGroup000(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
+        noinline fn executeGroup000(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
             const bit4 = (inst & (1 << 4)) != 0;
             const bit7 = (inst & (1 << 7)) != 0;
 
@@ -4484,7 +4462,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.applyDataProc(op, s, rd, rn_val, shift_res.val, shift_res.carry);
         }
 
-        fn executeGroup001(self: *Self, inst_pc: u32, inst: u32) void {
+        noinline fn executeGroup001(self: *Self, inst_pc: u32, inst: u32) void {
             const op: u4 = @truncate((inst >> 21) & 0xf);
             const s = (inst & (1 << 20)) != 0;
 
@@ -4681,7 +4659,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn executeMisc000(self: *Self, inst_pc: u32, inst: u32) void {
+        noinline fn executeMisc000(self: *Self, inst_pc: u32, inst: u32) void {
             const op2: u4 = @truncate((inst >> 4) & 0xf);
             const op1: u2 = @truncate((inst >> 21) & 3);
             const rd: u4 = @truncate((inst >> 12) & 0xf);
@@ -4798,7 +4776,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn writePsrByMask(self: *Self, write_spsr: bool, mask: u4, val: u32) void {
+        noinline fn writePsrByMask(self: *Self, write_spsr: bool, mask: u4, val: u32) void {
             var byte_mask: u32 = 0;
             if ((mask & 0b1000) != 0) byte_mask |= 0xff00_0000; // f (flags)
             if ((mask & 0b0100) != 0) byte_mask |= 0x00ff_0000; // s (status / GE)
@@ -4815,7 +4793,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn executeMultipliesAndExtraLoadStore(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
+        noinline fn executeMultipliesAndExtraLoadStore(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
             const sh: u2 = @truncate((inst >> 5) & 3);
             if (sh == 0b00) {
                 const op: u4 = @truncate((inst >> 20) & 0xf);
@@ -5073,7 +5051,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn executeLoadStoreWordByte(self: *Self, bus: *Bus, inst_pc: u32, inst: u32, reg_offset: bool) void {
+        noinline fn executeLoadStoreWordByte(self: *Self, bus: *Bus, inst_pc: u32, inst: u32, reg_offset: bool) void {
             const p = (inst & (1 << 24)) != 0;
             const u = (inst & (1 << 23)) != 0;
             const b = (inst & (1 << 22)) != 0;
@@ -5147,7 +5125,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn executeLoadStoreMultiple(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
+        noinline fn executeLoadStoreMultiple(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
             const p = (inst & (1 << 24)) != 0;
             const u = (inst & (1 << 23)) != 0;
             const s = (inst & (1 << 22)) != 0;
@@ -5295,7 +5273,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn executeMediaGroup(self: *Self, inst_pc: u32, inst: u32) void {
+        noinline fn executeMediaGroup(self: *Self, inst_pc: u32, inst: u32) void {
             // Check for architecturally undefined instruction `0xe7f...f.` (used by Linux BUG() / ptrace / kprobes!)
             const op1: u5 = @truncate((inst >> 20) & 0x1f);
             const op2: u3 = @truncate((inst >> 5) & 7);
@@ -5332,7 +5310,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn executeCoprocOrSvc(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
+        noinline fn executeCoprocOrSvc(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
             // 1. SVC / SWI: 1111 (bit 27..24 == 0b1111)
             if ((inst & 0x0f00_0000) == 0x0f00_0000) {
                 self.enterException(.svc, 0x08, inst_pc +% 4, false);
@@ -5430,7 +5408,7 @@ pub fn Arm1176(comptime Bus: type) type {
             return self.vfp.isEnabled() and (cp10_acc >= 2 or (cp10_acc == 1 and priv != 0));
         }
 
-        fn executeVfp(self: *Self, bus: *Bus, inst_pc: u32, inst: u32, is_double: bool) void {
+        noinline fn executeVfp(self: *Self, bus: *Bus, inst_pc: u32, inst: u32, is_double: bool) void {
             // Check CPACR bits [21:20] for CP10 access permission
             const cp10_acc: u2 = @truncate((self.mmu.cpacr >> 20) & 3);
             if (cp10_acc == 0b00 or (cp10_acc == 0b01 and !self.isPrivileged())) {
@@ -5626,7 +5604,107 @@ pub fn Arm1176(comptime Bus: type) type {
 
         // --- 16-bit Thumb & 32-bit Thumb-2 Pre-Decoded Execution ---
 
-        fn executeThumbDecoded(
+        noinline fn runThumbLoops(
+            self: *Self,
+            bus: *Bus,
+            executed_in: usize,
+            max_steps: usize,
+            limit: usize,
+        ) usize {
+            var executed = executed_in;
+            var priv: u1 = @intFromBool(self.isPrivileged());
+            var thumb_vbase: u32 = 0xffff_ffff;
+            var thumb_pbase: u32 = 0;
+            var thumb_page_idx: usize = 0;
+            var thumb_page_ptr: [*]const u8 = bus.ram.ptr;
+            var thumb_icache_ptr: [*]ThumbSlot = self.thumb_icache[0..].ptr;
+            var data_r_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
+            var data_w_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
+            var data_r_page_ptr: [2][*]const u8 = .{ bus.ram.ptr, bus.ram.ptr };
+            var data_w_page_ptr: [2][*]u8 = .{ bus.ram.ptr, bus.ram.ptr };
+
+            while (self.isThumb()) {
+                if (executed >= max_steps) {
+                    if (executed >= limit or (self.cpsr & PsrFlags.I) == 0) break;
+                }
+                if (atomic_ram.busParallel(bus)) {
+                    if (bus.smp.serviceTlb(self.mmu.core_id, &self.mmu)) {
+                        thumb_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                    }
+                }
+                const batch_end = if (executed >= max_steps)
+                    (executed + 1)
+                else if (atomic_ram.busParallel(bus))
+                    @min(max_steps, executed + 256)
+                else
+                    max_steps;
+
+                while (executed < batch_end and self.isThumb()) {
+                    const pc = self.r[15] & ~@as(u32, 1);
+                    if ((pc & 0xffff_f000) != thumb_vbase) {
+                        const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
+                        if ((pc & 0xffff_f000) == islot.x_vbase) {
+                            thumb_vbase = islot.x_vbase;
+                            thumb_pbase = islot.pbase;
+                            thumb_page_ptr = bus.ram.ptr + thumb_pbase;
+                            thumb_page_idx = thumbIcachePageIdx(thumb_pbase);
+                            thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, thumb_pbase);
+                            continue;
+                        }
+                        const inst16 = self.fetch16(bus, pc) catch {
+                            self.enterException(.abt, 0x0c, pc +% 4, false);
+                            priv = 1;
+                            thumb_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            executed += 1;
+                            continue;
+                        };
+                        const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
+                        if ((pc & 0xffff_f000) == islot2.x_vbase) {
+                            thumb_vbase = islot2.x_vbase;
+                            thumb_pbase = islot2.pbase;
+                            thumb_page_ptr = bus.ram.ptr + thumb_pbase;
+                            thumb_page_idx = thumbIcachePageIdx(thumb_pbase);
+                            thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, thumb_pbase);
+                            continue;
+                        }
+                        self.r[15] = pc +% 2;
+                        executed += 1;
+                        if (self.executeThumb(bus, pc, inst16, priv, 0xffff_ffff, 0, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
+                            if (self.mmu.halted_wfi or self.yield_slice) return executed;
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            thumb_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        }
+                        continue;
+                    }
+                    const page_hw: usize = (pc >> 1) & 0x7ff;
+                    const td = thumb_icache_ptr[page_hw];
+                    if (td.raw == 0xffff) {
+                        self.populateThumbIcacheSlot(thumb_page_idx, thumb_icache_ptr, thumb_page_ptr, page_hw);
+                        continue;
+                    }
+                    self.r[15] = pc +% 2;
+                    executed += 1;
+                    if (self.executeThumbDecoded(bus, pc, td, &executed, batch_end, priv, thumb_vbase, thumb_pbase, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
+                        if (self.mmu.halted_wfi or self.yield_slice) return executed;
+                        _ = self.checkInterrupts(bus);
+                        priv = @intFromBool(self.isPrivileged());
+                        thumb_vbase = 0xffff_ffff;
+                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                    }
+                }
+            }
+            return executed;
+        }
+
+        inline fn executeThumbDecoded(
             self: *Self,
             bus: *Bus,
             inst_pc: u32,
@@ -6231,7 +6309,7 @@ pub fn Arm1176(comptime Bus: type) type {
 
         /// Executes a 16-bit Thumb instruction. Returns `true` if privilege/mode changed,
         /// `WFI`/`YIELD` was executed, or an MMIO store occurred that may have raised an IRQ.
-        fn executeThumb(
+        noinline fn executeThumb(
             self: *Self,
             bus: *Bus,
             inst_pc: u32,

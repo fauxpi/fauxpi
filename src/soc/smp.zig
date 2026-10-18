@@ -107,9 +107,13 @@ pub const Smp = struct {
     }
 
     /// Applies any invalidations posted to `core`. Returns true if `mmu` was flushed.
-    pub fn serviceTlb(self: *Smp, core: u2, mmu: *Mmu) bool {
+    pub inline fn serviceTlb(self: *Smp, core: u2, mmu: *Mmu) bool {
+        if (self.tlb[core].pending.load(.acquire) == 0) return false;
+        return self.serviceTlbSlow(core, mmu);
+    }
+
+    noinline fn serviceTlbSlow(self: *Smp, core: u2, mmu: *Mmu) bool {
         const box = &self.tlb[core];
-        if (box.pending.load(.acquire) == 0) return false;
         box.acquire();
         if (box.full) {
             mmu.flushTlb();

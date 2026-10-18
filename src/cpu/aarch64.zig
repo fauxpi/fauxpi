@@ -160,7 +160,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             cpu.pstate = (cpu.pstate & 0x0fff_ffff) | flags;
         }
 
-        pub fn takeException64(
+        pub noinline fn takeException64(
             cpu: *CpuType,
             target_el: u2,
             vec_offset_same_sp0: u64,
@@ -202,13 +202,17 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             if ((from_el >= 2) != (target_el >= 2)) cpu.mmu.flushTlb();
         }
 
-        pub fn readData8(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u8 {
+        pub inline fn readData8(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u8 {
             const vbase = vaddr & ~@as(u64, 0xfff);
             const priv: u1 = @intFromBool(currentEl(cpu) != 0);
             const slot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((vaddr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
             if (vbase == slot.r_vbase) {
                 return bus.ram[slot.pbase | @as(u32, @truncate(vaddr & 0xfff))];
             }
+            return readData8Slow(cpu, bus, vaddr);
+        }
+
+        noinline fn readData8Slow(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u8 {
             const paddr = try cpu.mmu.translate64AtEl(bus.ram, vaddr, .read, currentEl(cpu));
             if (paddr < bus.ram.len) {
                 return bus.ram[paddr];
@@ -216,7 +220,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return bus.read8(paddr);
         }
 
-        pub fn readData16(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u16 {
+        pub inline fn readData16(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u16 {
             if ((vaddr & 0xfff) <= 0xffe) {
                 const vbase = vaddr & ~@as(u64, 0xfff);
                 const priv: u1 = @intFromBool(currentEl(cpu) != 0);
@@ -225,6 +229,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     const paddr = slot.pbase | @as(u32, @truncate(vaddr & 0xfff));
                     return std.mem.readInt(u16, bus.ram[paddr..][0..2], .little);
                 }
+            }
+            return readData16Slow(cpu, bus, vaddr);
+        }
+
+        noinline fn readData16Slow(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u16 {
+            if ((vaddr & 0xfff) <= 0xffe) {
                 const paddr = try cpu.mmu.translate64AtEl(bus.ram, vaddr, .read, currentEl(cpu));
                 if (@as(usize, paddr) + 2 <= bus.ram.len) {
                     return std.mem.readInt(u16, bus.ram[paddr..][0..2], .little);
@@ -236,7 +246,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return b0 | (b1 << 8);
         }
 
-        pub fn readData32(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u32 {
+        pub inline fn readData32(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u32 {
             if ((vaddr & 0xfff) <= 0xffc) {
                 const vbase = vaddr & ~@as(u64, 0xfff);
                 const priv: u1 = @intFromBool(currentEl(cpu) != 0);
@@ -245,6 +255,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     const paddr = slot.pbase | @as(u32, @truncate(vaddr & 0xfff));
                     return std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
                 }
+            }
+            return readData32Slow(cpu, bus, vaddr);
+        }
+
+        noinline fn readData32Slow(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u32 {
+            if ((vaddr & 0xfff) <= 0xffc) {
                 const paddr = try cpu.mmu.translate64AtEl(bus.ram, vaddr, .read, currentEl(cpu));
                 if (@as(usize, paddr) + 4 <= bus.ram.len) {
                     return std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
@@ -256,7 +272,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return lo | (hi << 16);
         }
 
-        pub fn readData64(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u64 {
+        pub inline fn readData64(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u64 {
             if ((vaddr & 0xfff) <= 0xff8) {
                 const vbase = vaddr & ~@as(u64, 0xfff);
                 const priv: u1 = @intFromBool(currentEl(cpu) != 0);
@@ -265,6 +281,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     const paddr = slot.pbase | @as(u32, @truncate(vaddr & 0xfff));
                     return std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
                 }
+            }
+            return readData64Slow(cpu, bus, vaddr);
+        }
+
+        noinline fn readData64Slow(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u64 {
+            if ((vaddr & 0xfff) <= 0xff8) {
                 const paddr = try cpu.mmu.translate64AtEl(bus.ram, vaddr, .read, currentEl(cpu));
                 if (@as(usize, paddr) + 8 <= bus.ram.len) {
                     return std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
@@ -275,7 +297,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return lo | (hi << 32);
         }
 
-        pub fn writeData8(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u8) error{Abort}!void {
+        pub inline fn writeData8(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u8) error{Abort}!void {
             const vbase = vaddr & ~@as(u64, 0xfff);
             const priv: u1 = @intFromBool(currentEl(cpu) != 0);
             const slot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((vaddr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
@@ -283,6 +305,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 bus.ram[slot.pbase | @as(u32, @truncate(vaddr & 0xfff))] = val;
                 return;
             }
+            return writeData8Slow(cpu, bus, vaddr, val);
+        }
+
+        noinline fn writeData8Slow(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u8) error{Abort}!void {
             const paddr = try cpu.mmu.translate64AtEl(bus.ram, vaddr, .write, currentEl(cpu));
             if (paddr < bus.ram.len) {
                 bus.ram[paddr] = val;
@@ -291,7 +317,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             bus.write8(paddr, val);
         }
 
-        pub fn writeData16(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u16) error{Abort}!void {
+        pub inline fn writeData16(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u16) error{Abort}!void {
             if ((vaddr & 0xfff) <= 0xffe) {
                 const vbase = vaddr & ~@as(u64, 0xfff);
                 const priv: u1 = @intFromBool(currentEl(cpu) != 0);
@@ -301,6 +327,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     std.mem.writeInt(u16, bus.ram[paddr..][0..2], val, .little);
                     return;
                 }
+            }
+            return writeData16Slow(cpu, bus, vaddr, val);
+        }
+
+        noinline fn writeData16Slow(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u16) error{Abort}!void {
+            if ((vaddr & 0xfff) <= 0xffe) {
                 const paddr = try cpu.mmu.translate64AtEl(bus.ram, vaddr, .write, currentEl(cpu));
                 if (@as(usize, paddr) + 2 <= bus.ram.len) {
                     std.mem.writeInt(u16, bus.ram[paddr..][0..2], val, .little);
@@ -313,7 +345,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             try writeData8(cpu, bus, vaddr +% 1, @truncate(val >> 8));
         }
 
-        pub fn writeData32(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u32) error{Abort}!void {
+        pub inline fn writeData32(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u32) error{Abort}!void {
             if ((vaddr & 0xfff) <= 0xffc) {
                 const vbase = vaddr & ~@as(u64, 0xfff);
                 const priv: u1 = @intFromBool(currentEl(cpu) != 0);
@@ -323,6 +355,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
                     return;
                 }
+            }
+            return writeData32Slow(cpu, bus, vaddr, val);
+        }
+
+        noinline fn writeData32Slow(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u32) error{Abort}!void {
+            if ((vaddr & 0xfff) <= 0xffc) {
                 const paddr = try cpu.mmu.translate64AtEl(bus.ram, vaddr, .write, currentEl(cpu));
                 if (@as(usize, paddr) + 4 <= bus.ram.len) {
                     std.mem.writeInt(u32, bus.ram[paddr..][0..4], val, .little);
@@ -335,7 +373,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             try writeData16(cpu, bus, vaddr +% 2, @truncate(val >> 16));
         }
 
-        pub fn readData128(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u128 {
+        pub inline fn readData128(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u128 {
             if ((vaddr & 0xfff) <= 0xff0) {
                 const vbase = vaddr & ~@as(u64, 0xfff);
                 const priv: u1 = @intFromBool(currentEl(cpu) != 0);
@@ -344,6 +382,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     const paddr = slot.pbase | @as(u32, @truncate(vaddr & 0xfff));
                     return std.mem.readInt(u128, bus.ram[paddr..][0..16], .little);
                 }
+            }
+            return readData128Slow(cpu, bus, vaddr);
+        }
+
+        noinline fn readData128Slow(cpu: *CpuType, bus: *Bus, vaddr: u64) error{Abort}!u128 {
+            if ((vaddr & 0xfff) <= 0xff0) {
                 const paddr = try cpu.mmu.translate64AtEl(bus.ram, vaddr, .read, currentEl(cpu));
                 if (@as(usize, paddr) + 16 <= bus.ram.len) {
                     return std.mem.readInt(u128, bus.ram[paddr..][0..16], .little);
@@ -354,7 +398,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return lo | (hi << 64);
         }
 
-        pub fn writeData64(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u64) error{Abort}!void {
+        pub inline fn writeData64(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u64) error{Abort}!void {
             if ((vaddr & 0xfff) <= 0xff8) {
                 const vbase = vaddr & ~@as(u64, 0xfff);
                 const priv: u1 = @intFromBool(currentEl(cpu) != 0);
@@ -364,6 +408,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
                     return;
                 }
+            }
+            return writeData64Slow(cpu, bus, vaddr, val);
+        }
+
+        noinline fn writeData64Slow(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u64) error{Abort}!void {
+            if ((vaddr & 0xfff) <= 0xff8) {
                 const paddr = try cpu.mmu.translate64AtEl(bus.ram, vaddr, .write, currentEl(cpu));
                 if (@as(usize, paddr) + 8 <= bus.ram.len) {
                     std.mem.writeInt(u64, bus.ram[paddr..][0..8], val, .little);
@@ -374,7 +424,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             try writeData32(cpu, bus, vaddr +% 4, @truncate(val >> 32));
         }
 
-        pub fn writeData128(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u128) error{Abort}!void {
+        pub inline fn writeData128(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u128) error{Abort}!void {
             if ((vaddr & 0xfff) <= 0xff0) {
                 const vbase = vaddr & ~@as(u64, 0xfff);
                 const priv: u1 = @intFromBool(currentEl(cpu) != 0);
@@ -384,6 +434,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     std.mem.writeInt(u128, bus.ram[paddr..][0..16], val, .little);
                     return;
                 }
+            }
+            return writeData128Slow(cpu, bus, vaddr, val);
+        }
+
+        noinline fn writeData128Slow(cpu: *CpuType, bus: *Bus, vaddr: u64, val: u128) error{Abort}!void {
+            if ((vaddr & 0xfff) <= 0xff0) {
                 const paddr = try cpu.mmu.translate64AtEl(bus.ram, vaddr, .write, currentEl(cpu));
                 if (@as(usize, paddr) + 16 <= bus.ram.len) {
                     std.mem.writeInt(u128, bus.ram[paddr..][0..16], val, .little);
@@ -394,12 +450,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             try writeData64(cpu, bus, vaddr +% 8, @truncate(val >> 64));
         }
 
-        pub fn fetchInst64(cpu: *CpuType, bus: *Bus, pc: u64) error{Abort}!u32 {
+        pub noinline fn fetchInst64(cpu: *CpuType, bus: *Bus, pc: u64) error{Abort}!u32 {
             const vbase = pc & ~@as(u64, 0xfff);
             const priv: u1 = @intFromBool(currentEl(cpu) != 0);
             const slot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
             if (vbase == slot.x_vbase) {
-                const paddr = slot.pbase | @as(u32, @truncate(pc & 0xffc));
+                const paddr = slot.pbase | @as(u32, @truncate(pc & 0xfff));
                 return std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
             }
             const paddr = try cpu.mmu.translate64AtEl(bus.ram, pc, .fetch, currentEl(cpu));
@@ -409,7 +465,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return bus.read32(paddr);
         }
 
-        pub inline fn checkInterrupts64(cpu: *CpuType, bus: *const Bus) bool {
+        pub noinline fn checkInterrupts64(cpu: *CpuType, bus: *const Bus) bool {
             const halted = cpu.mmu.halted_wfi;
             const cid = cpu.mmu.core_id;
             if (halted or (cpu.pstate & PstateFlags.F) == 0) {
@@ -884,7 +940,19 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return d;
         }
 
-        pub fn decodeA64(comptime SlotType: type, inst: u32) SlotType {
+        noinline fn populateIcacheSlot64(
+            cpu: *CpuType,
+            comptime SlotType: type,
+            code_page_idx: usize,
+            code_icache_ptr: [*]SlotType,
+            code_page_ptr: [*]const u8,
+            page_word: usize,
+        ) void {
+            const raw_inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
+            _ = decodeAndFuseA64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, page_word, raw_inst, true);
+        }
+
+        pub noinline fn decodeA64(comptime SlotType: type, inst: u32) SlotType {
             const top4: u4 = @truncate(inst >> 25);
             switch (top4) {
                 0b1000, 0b1001 => {
@@ -2002,7 +2070,6 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             const limit = if (max_steps >= 4096) max_steps + 256 else max_steps;
             const SlotType = @TypeOf(cpu.icache[0]);
             var executed: usize = 0;
-            var cur_last_inst: u32 = cpu.last_inst;
             var priv: u1 = @intFromBool(currentEl(cpu) != 0);
             var code_vbase: u64 = 0xffff_ffff_ffff_ffff;
             var code_pbase: u32 = 0;
@@ -2035,18 +2102,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
 
                 while (executed < batch_end) {
                     const cur_pc = cpu.pc64;
-                    const page_word: usize = @truncate((cur_pc >> 2) & 0x3ff);
-                    var d: SlotType = undefined;
-                    var inst: u32 = undefined;
-                    if ((cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                        d = code_icache_ptr[page_word];
-                        if (d.raw != 0xffff_ffff) {
-                            inst = d.raw;
-                        } else {
-                            inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
-                            d = decodeAndFuseA64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, page_word, inst, true);
-                        }
-                    } else {
+                    if ((cur_pc & ~@as(u64, 0xfff)) != code_vbase) {
                         const islot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
                         if ((cur_pc & ~@as(u64, 0xfff)) == islot.x_vbase) {
                             code_vbase = islot.x_vbase;
@@ -2054,45 +2110,43 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             code_page_ptr = bus.ram.ptr + code_pbase;
                             code_page_idx = CpuType.icachePageIdx(code_pbase);
                             code_icache_ptr = cpu.prepareIcachePage(code_page_idx, code_pbase);
-                            d = code_icache_ptr[page_word];
-                            if (d.raw != 0xffff_ffff) {
-                                inst = d.raw;
-                            } else {
-                                inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
-                                d = decodeAndFuseA64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, page_word, inst, true);
-                            }
-                        } else {
-                            inst = fetchInst64(cpu, bus, cur_pc) catch {
-                                const target_el: u2 = @max(currentEl(cpu), 1);
-                                const esr = if (target_el >= 2) cpu.mmu.esr_el2 else cpu.mmu.esr_el1;
-                                takeException64(cpu, target_el, 0x000, esr, cur_pc, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                executed += 1;
-                                continue;
-                            };
-                            const islot2 = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((cur_pc & ~@as(u64, 0xfff)) == islot2.x_vbase) {
-                                code_vbase = islot2.x_vbase;
-                                code_pbase = islot2.pbase;
-                                code_page_ptr = bus.ram.ptr + code_pbase;
-                                code_page_idx = CpuType.icachePageIdx(code_pbase);
-                                code_icache_ptr = cpu.prepareIcachePage(code_page_idx, code_pbase);
-                            } else {
-                                code_page_idx = CpuType.icachePageIdx(@truncate(cur_pc));
-                                code_icache_ptr = cpu.prepareIcachePage(code_page_idx, 0xffff_fffe);
-                                cpu.icache_page_tags[code_page_idx] = 0xffff_ffff;
-                            }
-                            d = code_icache_ptr[page_word];
-                            if (d.raw != inst) {
-                                d = decodeAndFuseA64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, page_word, inst, (cur_pc & ~@as(u64, 0xfff)) == code_vbase);
-                            }
+                            continue;
                         }
+                        const fetched = fetchInst64(cpu, bus, cur_pc) catch {
+                            const target_el: u2 = @max(currentEl(cpu), 1);
+                            const esr = if (target_el >= 2) cpu.mmu.esr_el2 else cpu.mmu.esr_el1;
+                            takeException64(cpu, target_el, 0x000, esr, cur_pc, cur_pc);
+                            priv = 1;
+                            code_vbase = 0xffff_ffff_ffff_ffff;
+                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                            executed += 1;
+                            continue;
+                        };
+                        const islot2 = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                        if ((cur_pc & ~@as(u64, 0xfff)) == islot2.x_vbase) {
+                            code_vbase = islot2.x_vbase;
+                            code_pbase = islot2.pbase;
+                            code_page_ptr = bus.ram.ptr + code_pbase;
+                            code_page_idx = CpuType.icachePageIdx(code_pbase);
+                            code_icache_ptr = cpu.prepareIcachePage(code_page_idx, code_pbase);
+                            continue;
+                        }
+                        const pword: usize = @truncate((cur_pc >> 2) & 0x3ff);
+                        code_page_idx = CpuType.icachePageIdx(@truncate(cur_pc));
+                        code_icache_ptr = cpu.prepareIcachePage(code_page_idx, 0xffff_fffe);
+                        cpu.icache_page_tags[code_page_idx] = 0xffff_ffff;
+                        _ = decodeAndFuseA64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, pword, fetched, false);
                     }
 
-                    cur_last_inst = inst;
+                    const page_word: usize = @truncate((cur_pc >> 2) & 0x3ff);
+                    const d = code_icache_ptr[page_word];
+                    if (d.raw == 0xffff_ffff) {
+                        populateIcacheSlot64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, page_word);
+                        continue;
+                    }
+
+                    const inst = d.raw;
                     cpu.pc64 = cur_pc +% 4;
                     executed += 1;
 
@@ -5007,7 +5061,6 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 }
             }
 
-            cpu.last_inst = cur_last_inst;
             cpu.cycles +%= executed;
             cpu.mmu.pmccntr +%= @truncate(executed);
             cpu.r[15] = @truncate(cpu.pc64);
@@ -5015,14 +5068,14 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return executed;
         }
 
-        inline fn handleAbort64(cpu: *CpuType, cur_pc: u64) void {
+        noinline fn handleAbort64(cpu: *CpuType, cur_pc: u64) void {
             const target_el: u2 = @max(currentEl(cpu), 1);
             const esr = if (target_el >= 2) cpu.mmu.esr_el2 else cpu.mmu.esr_el1;
             const far = if (target_el >= 2) cpu.mmu.far_el2 else cpu.mmu.far_el1;
             takeException64(cpu, target_el, 0x000, esr, far, cur_pc);
         }
 
-        fn executeDpImm(cpu: *CpuType, inst: u32, cur_pc: u64) void {
+        noinline fn executeDpImm(cpu: *CpuType, inst: u32, cur_pc: u64) void {
             const op0: u3 = @truncate(inst >> 23);
             const rd: u5 = @truncate(inst);
             const sf: u1 = @truncate(inst >> 31);
@@ -5189,7 +5242,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             }
         }
 
-        fn executeBranchSys(cpu: *CpuType, bus: *Bus, inst: u32, cur_pc: u64) error{Abort}!void {
+        noinline fn executeBranchSys(cpu: *CpuType, bus: *Bus, inst: u32, cur_pc: u64) error{Abort}!void {
             const op0: u3 = @truncate(inst >> 29);
             const op1: u4 = @truncate(inst >> 22);
 
@@ -5425,7 +5478,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return (@as(u16, op0) << 14) | (@as(u16, op1) << 11) | (@as(u16, crn) << 7) | (@as(u16, crm) << 3) | @as(u16, op2);
         }
 
-        pub fn readSysReg(cpu: *CpuType, op0: u2, op1: u3, crn: u4, crm: u4, op2: u3) u64 {
+        pub noinline fn readSysReg(cpu: *CpuType, op0: u2, op1: u3, crn: u4, crm: u4, op2: u3) u64 {
             return switch (sysRegId(op0, op1, crn, crm, op2)) {
                 // Special Purpose Registers (op0=3)
                 sysRegId(3, 0, 4, 2, 2) => @as(u64, currentEl(cpu)) << 2, // CurrentEL
@@ -5540,7 +5593,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             };
         }
 
-        pub fn writeSysReg(cpu: *CpuType, op0: u2, op1: u3, crn: u4, crm: u4, op2: u3, val: u64) void {
+        pub noinline fn writeSysReg(cpu: *CpuType, op0: u2, op1: u3, crn: u4, crm: u4, op2: u3, val: u64) void {
             switch (sysRegId(op0, op1, crn, crm, op2)) {
                 sysRegId(3, 0, 4, 2, 0) => cpu.pstate = (cpu.pstate & ~@as(u32, 1)) | @as(u32, @truncate(val & 1)), // SPSel
                 sysRegId(3, 3, 4, 2, 0) => cpu.pstate = (cpu.pstate & 0x0fff_ffff) | (@as(u32, @truncate(val)) & 0xf000_0000), // NZCV
@@ -5685,7 +5738,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             }
         }
 
-        fn executeLoadStore(cpu: *CpuType, bus: *Bus, inst: u32, cur_pc: u64) error{Abort}!void {
+        noinline fn executeLoadStore(cpu: *CpuType, bus: *Bus, inst: u32, cur_pc: u64) error{Abort}!void {
             // 1. Load/Store Exclusive & Load-Acquire/Store-Release (`0x0800_0000`)
             if ((inst & 0x3f00_0000) == 0x0800_0000) {
                 try executeLoadStoreExcl(cpu, bus, inst);
@@ -6286,7 +6339,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             }
         }
 
-        fn executeDpReg(cpu: *CpuType, inst: u32) void {
+        noinline fn executeDpReg(cpu: *CpuType, inst: u32) void {
             const sf: u1 = @truncate(inst >> 31);
             const op0: u1 = @truncate(inst >> 30);
             const s: u1 = @truncate(inst >> 29);
@@ -6521,7 +6574,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return sign | (exp << 52) | frac;
         }
 
-        fn executeFpSimd(cpu: *CpuType, inst: u32) void {
+        noinline fn executeFpSimd(cpu: *CpuType, inst: u32) void {
             const rd: u5 = @truncate(inst);
             const rn: u5 = @truncate(inst >> 5);
             const rm: u5 = @truncate(inst >> 16);
