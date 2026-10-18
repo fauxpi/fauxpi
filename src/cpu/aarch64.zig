@@ -1066,6 +1066,65 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             }
         }
 
+        inline fn noteCallTarget64(
+            cpu: *CpuType,
+            comptime SlotType: type,
+            bus: *Bus,
+            priv: u1,
+            code_vbase: u64,
+            code_page_idx: usize,
+            code_icache_ptr: [*]SlotType,
+            code_page_ptr: [*]const u8,
+            target_pc: u64,
+            return_pc: u64,
+        ) void {
+            if ((target_pc & 3) != 0) return;
+            const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
+            const c = cpu.jit_buf.call_counts[h] +% 1;
+            cpu.jit_buf.call_counts[h] = c;
+            if ((c & 0x1f) == 0) {
+                compileCallTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target_pc, return_pc, h);
+            }
+        }
+
+        noinline fn compileCallTarget64(
+            cpu: *CpuType,
+            comptime SlotType: type,
+            bus: *Bus,
+            priv: u1,
+            code_vbase: u64,
+            code_page_idx: usize,
+            code_icache_ptr: [*]SlotType,
+            code_page_ptr: [*]const u8,
+            target_pc: u64,
+            return_pc: u64,
+            h: u8,
+        ) void {
+            const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
+            if ((target_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                if (code_icache_ptr[start_word].op != @intFromEnum(A64Op.jit_trace)) {
+                    _ = compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, 0, h, 0x20);
+                }
+            } else {
+                const tslot = cpu.mmu.soft_tlb64[priv][(target_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask];
+                if ((target_pc & ~@as(u64, 0xfff)) == tslot.x_vbase) {
+                    const t_pbase = tslot.pbase;
+                    const t_page_idx = CpuType.icachePageIdx(t_pbase);
+                    const t_icache_ptr = cpu.prepareIcachePage(t_page_idx, t_pbase);
+                    if (t_icache_ptr[start_word].op != @intFromEnum(A64Op.jit_trace)) {
+                        _ = compileHotLoop64(cpu, SlotType, t_page_idx, t_icache_ptr, bus.ram.ptr + t_pbase, start_word, 0, h, 0x20);
+                    }
+                }
+            }
+            if ((return_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                const ret_word: u10 = @truncate((return_pc >> 2) & 0x3ff);
+                if (code_icache_ptr[ret_word].op != @intFromEnum(A64Op.jit_trace)) {
+                    const rh: u8 = @truncate((return_pc >> 2) ^ (return_pc >> 10));
+                    _ = compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, ret_word, 0, rh, 0x20);
+                }
+            }
+        }
+
         pub noinline fn decodeA64(comptime SlotType: type, inst: u32) SlotType {
             const top4: u4 = @truncate(inst >> 25);
             switch (top4) {
@@ -4554,8 +4613,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (cpu.yield_slice) break :step_loop;
                     },
                     .bl_imm => {
+                        const target_pc = cur_pc +% d.imm;
                         cpu.x[30] = cur_pc +% 4;
-                        cpu.pc64 = cur_pc +% d.imm;
+                        cpu.pc64 = target_pc;
+                        noteCallTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target_pc, cur_pc +% 4);
                     },
                     .b_cond => {
                         if (evalCond(cpu.pstate, @truncate(d.rd))) {
@@ -4618,6 +4679,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const target = getX(cpu, @truncate(d.rn));
                         cpu.x[30] = cur_pc +% 4;
                         cpu.pc64 = target;
+                        noteCallTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target, cur_pc +% 4);
                     },
                     .ret => cpu.pc64 = getX(cpu, @truncate(d.rn)),
                     .dp_imm_other => executeDpImm(cpu, inst, cur_pc),
@@ -5225,20 +5287,55 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .fp_simd => executeFpSimd(cpu, inst),
                     .nop => {},
                     .jit_trace => {
-                        const max_jit: usize = (batch_end - executed) + 1;
-                        if (max_jit >= d.rd) {
-                            cpu.pc64 = code_vbase;
-                            const fn_ptr: jit_mod.JitFn = @ptrFromInt(@as(usize, @truncate(d.imm)));
-                            const sp_ptr = &cpu.sp_el[spIndex(cpu)];
-                            const tlb_ptr = &cpu.mmu.soft_tlb64[priv][0];
-                            const ran = fn_ptr(cpu, bus, bus.ram.ptr, tlb_ptr, max_jit, sp_ptr);
-                            executed += ran - 1;
-                            const new_priv: u1 = @intFromBool(currentEl(cpu) != 0);
-                            if (new_priv != priv or (cpu.pc64 & ~@as(u64, 0xfff)) != code_vbase) {
-                                priv = new_priv;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                        const max_jit_first: usize = (batch_end - executed) + 1;
+                        if (max_jit_first >= d.rd) {
+                            var cur_d = d;
+                            var cur_entry_pc = cur_pc;
+                            var chain_count: u8 = 0;
+                            while (true) {
+                                const max_jit: usize = (batch_end - executed) + 1;
+                                cpu.pc64 = code_vbase;
+                                const fn_ptr: jit_mod.JitFn = @ptrFromInt(@as(usize, @truncate(cur_d.imm)));
+                                const sp_ptr = &cpu.sp_el[spIndex(cpu)];
+                                const tlb_ptr = &cpu.mmu.soft_tlb64[priv][0];
+                                const ran = fn_ptr(cpu, bus, bus.ram.ptr, tlb_ptr, max_jit, sp_ptr);
+                                executed += ran - 1;
+                                const new_priv: u1 = @intFromBool(currentEl(cpu) != 0);
+                                if (new_priv != priv or cpu.mmu.halted_wfi or cpu.yield_slice) {
+                                    priv = new_priv;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    break;
+                                }
+                                const next_pc = cpu.pc64;
+                                if ((next_pc & ~@as(u64, 0xfff)) != code_vbase) {
+                                    if ((next_pc & 3) != 0) {
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        break;
+                                    }
+                                    const islot = cpu.mmu.soft_tlb64[priv][(next_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask];
+                                    if ((next_pc & ~@as(u64, 0xfff)) == islot.x_vbase) {
+                                        code_vbase = islot.x_vbase;
+                                        code_pbase = islot.pbase;
+                                        code_page_ptr = bus.ram.ptr + code_pbase;
+                                        code_page_idx = CpuType.icachePageIdx(code_pbase);
+                                        code_icache_ptr = cpu.prepareIcachePage(code_page_idx, code_pbase);
+                                    } else {
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        break;
+                                    }
+                                }
+                                if (chain_count >= 16 or next_pc == cur_entry_pc or executed >= batch_end) break;
+                                const next_d = code_icache_ptr[(next_pc >> 2) & 0x3ff];
+                                if (next_d.op == @intFromEnum(A64Op.jit_trace) and (batch_end - executed) >= next_d.rd) {
+                                    executed += 1;
+                                    cur_d = next_d;
+                                    cur_entry_pc = next_pc;
+                                    chain_count += 1;
+                                    continue;
+                                }
+                                break;
                             }
                         } else if (batch_end < max_steps and (max_steps - executed) + 1 >= d.rd) {
                             cpu.pc64 = cur_pc;
@@ -8933,6 +9030,55 @@ test "AArch64 superinstruction fusion (ADRP+ADD, ADRP+LDR, STP+MOV FP, CMP+B.con
     if (jit_mod.is_x86_64_linux) {
         const Exec = Aarch64Exec(Cpu, TestBus);
         try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1100 & 0xfff) >> 2)].op)));
+    }
+
+    // Verify hot function (BL/RET) compilation and direct trace chaining
+    // Callee at 0x1200 (4 instructions: add x0, x0, #5; add x0, x0, #3; sub x0, x0, #1; ret):
+    // 0x1200: add x0, x0, #5         (0x91001400)
+    // 0x1204: add x0, x0, #3         (0x91000c00)
+    // 0x1208: sub x0, x0, #1         (0xd1000400)
+    // 0x120c: ret                    (0xd65f03c0)
+    // Caller loop at 0x1140:
+    // 0x1140: bl 0x1200 (+0xc0)      (0x94000030)
+    // 0x1144: add x0, x0, #1         (0x91000400)
+    // 0x1148: add x0, x0, #2         (0x91000800)
+    // 0x114c: sub x11, x11, #1       (0xd100056b)
+    // 0x1150: cbnz x11, 0x1140 (-16) (0xb5ffff8b)
+    // 0x1154: wfi                    (0xd503207f)
+    const callee_prog = [_]u32{
+        0x91001400,
+        0x91000c00,
+        0xd1000400,
+        0xd65f03c0,
+    };
+    for (callee_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1200 + i * 4 ..][0..4], inst, .little);
+    }
+    const caller_prog = [_]u32{
+        0x94000030,
+        0x91000400,
+        0x91000800,
+        0xd100056b,
+        0xb5ffff8b,
+        0xd503207f,
+    };
+    for (caller_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1140 + i * 4 ..][0..4], inst, .little);
+    }
+    cpu.invalidateIcache();
+    cpu.mmu.halted_wfi = false;
+    cpu.pc64 = 0x1140;
+    cpu.x[0] = 0;
+    cpu.x[11] = 40;
+    const call_ran = cpu.runSteps(&bus, 500);
+    try std.testing.expectEqual(@as(usize, 40 * 9 + 1), call_ran);
+    try std.testing.expectEqual(@as(u64, 400), cpu.x[0]);
+    try std.testing.expectEqual(@as(u64, 0), cpu.x[11]);
+    if (jit_mod.is_x86_64_linux) {
+        const Exec = Aarch64Exec(Cpu, TestBus);
+        // Both callee (0x1200) and caller return continuation (0x1144) should be compiled into .jit_trace
+        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1200 & 0xfff) >> 2)].op)));
+        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1144 & 0xfff) >> 2)].op)));
     }
 }
 

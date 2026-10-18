@@ -2253,6 +2253,63 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
+        inline fn noteCallTarget32(
+            self: *Self,
+            bus: *Bus,
+            priv: u1,
+            code_vbase: u32,
+            code_page_idx: usize,
+            code_icache_ptr: [*]DecodedSlot,
+            code_page_ptr: [*]const u8,
+            target_pc: u32,
+            return_pc: u32,
+        ) void {
+            if ((target_pc & 3) != 0) return;
+            const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
+            const c = self.jit_buf.call_counts[h] +% 1;
+            self.jit_buf.call_counts[h] = c;
+            if ((c & 0x1f) == 0) {
+                self.compileCallTarget32(bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target_pc, return_pc, h);
+            }
+        }
+
+        noinline fn compileCallTarget32(
+            self: *Self,
+            bus: *Bus,
+            priv: u1,
+            code_vbase: u32,
+            code_page_idx: usize,
+            code_icache_ptr: [*]DecodedSlot,
+            code_page_ptr: [*]const u8,
+            target_pc: u32,
+            return_pc: u32,
+            h: u8,
+        ) void {
+            const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
+            if ((target_pc & ~@as(u32, 0xffc)) == code_vbase) {
+                if (code_icache_ptr[start_word].op != @intFromEnum(ArmOp.jit_trace)) {
+                    _ = self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, start_word, 0, h, 0x20);
+                }
+            } else {
+                const tslot = self.mmu.soft_tlb32[priv][(target_pc >> 12) & Mmu.soft_tlb_mask];
+                if ((target_pc & 0xffff_f000) == tslot.x_vbase) {
+                    const t_pbase = tslot.pbase;
+                    const t_page_idx = icachePageIdx(t_pbase);
+                    const t_icache_ptr = self.prepareIcachePage(t_page_idx, t_pbase);
+                    if (t_icache_ptr[start_word].op != @intFromEnum(ArmOp.jit_trace)) {
+                        _ = self.compileHotLoop32(t_page_idx, t_icache_ptr, bus.ram.ptr + t_pbase, start_word, 0, h, 0x20);
+                    }
+                }
+            }
+            if ((return_pc & ~@as(u32, 0xffc)) == code_vbase) {
+                const ret_word: u10 = @truncate((return_pc >> 2) & 0x3ff);
+                if (code_icache_ptr[ret_word].op != @intFromEnum(ArmOp.jit_trace)) {
+                    const rh: u8 = @truncate((return_pc >> 2) ^ (return_pc >> 10));
+                    _ = self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, ret_word, 0, rh, 0x20);
+                }
+            }
+        }
+
         noinline fn populateThumbIcacheSlot(
             self: *Self,
             thumb_page_idx: usize,
@@ -3694,6 +3751,7 @@ pub fn Arm1176(comptime Bus: type) type {
                         }
                         self.r[15] = target_pc;
                         if (self.yield_slice) break :step_loop;
+                        self.noteCallTarget32(bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target_pc, pc +% 4);
                     },
                     .bx_lr_al => {
                         const target = self.r[14];
@@ -3709,7 +3767,11 @@ pub fn Arm1176(comptime Bus: type) type {
                         const target = self.r[d.rm];
                         self.r[14] = pc +% 4;
                         self.setPcWithInterworking(target);
-                        if ((target & 1) != 0) code_vbase = 0xffff_ffff;
+                        if ((target & 1) != 0) {
+                            code_vbase = 0xffff_ffff;
+                        } else {
+                            self.noteCallTarget32(bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target, pc +% 4);
+                        }
                     },
                     .dp_imm_general => {
                         self.executeGroup001(pc, inst);
@@ -4337,19 +4399,54 @@ pub fn Arm1176(comptime Bus: type) type {
                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                     },
                     .jit_trace => {
-                        const max_jit: usize = (batch_end - executed) + 1;
-                        if (max_jit >= d.rd) {
-                            self.r[15] = code_vbase;
-                            const fn_ptr: jit_mod.JitFn = @ptrFromInt(@as(usize, @truncate(d.imm)));
-                            const tlb_ptr = &self.mmu.soft_tlb32[priv][0];
-                            const ran = fn_ptr(self, bus, bus.ram.ptr, tlb_ptr, max_jit, bus.ram.ptr);
-                            executed += ran - 1;
-                            const new_priv: u1 = @intFromBool(self.isPrivileged());
-                            if (new_priv != priv or (self.r[15] & ~@as(u32, 0xffc)) != code_vbase or self.isThumb()) {
-                                priv = new_priv;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        const max_jit_first: usize = (batch_end - executed) + 1;
+                        if (max_jit_first >= d.rd) {
+                            var cur_d = d;
+                            var cur_entry_pc = pc;
+                            var chain_count: u8 = 0;
+                            while (true) {
+                                const max_jit: usize = (batch_end - executed) + 1;
+                                self.r[15] = code_vbase;
+                                const fn_ptr: jit_mod.JitFn = @ptrFromInt(@as(usize, @truncate(cur_d.imm)));
+                                const tlb_ptr = &self.mmu.soft_tlb32[priv][0];
+                                const ran = fn_ptr(self, bus, bus.ram.ptr, tlb_ptr, max_jit, bus.ram.ptr);
+                                executed += ran - 1;
+                                const new_priv: u1 = @intFromBool(self.isPrivileged());
+                                if (new_priv != priv or self.isThumb() or self.mmu.halted_wfi or self.yield_slice) {
+                                    priv = new_priv;
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    break;
+                                }
+                                const next_pc = self.r[15];
+                                if ((next_pc & ~@as(u32, 0xffc)) != code_vbase) {
+                                    if ((next_pc & 3) != 0) {
+                                        code_vbase = 0xffff_ffff;
+                                        break;
+                                    }
+                                    const islot = self.mmu.soft_tlb32[priv][(next_pc >> 12) & Mmu.soft_tlb_mask];
+                                    if ((next_pc & 0xffff_f000) == islot.x_vbase) {
+                                        code_vbase = islot.x_vbase;
+                                        code_pbase = islot.pbase;
+                                        code_page_ptr = bus.ram.ptr + code_pbase;
+                                        code_page_idx = icachePageIdx(code_pbase);
+                                        code_icache_ptr = self.prepareIcachePage(code_page_idx, code_pbase);
+                                    } else {
+                                        code_vbase = 0xffff_ffff;
+                                        break;
+                                    }
+                                }
+                                if (chain_count >= 16 or next_pc == cur_entry_pc or executed >= batch_end) break;
+                                const next_d = code_icache_ptr[(next_pc >> 2) & 0x3ff];
+                                if (next_d.op == @intFromEnum(ArmOp.jit_trace) and (batch_end - executed) >= next_d.rd) {
+                                    executed += 1;
+                                    cur_d = next_d;
+                                    cur_entry_pc = next_pc;
+                                    chain_count += 1;
+                                    continue;
+                                }
+                                break;
                             }
                         } else if (batch_end < max_steps and (max_steps - executed) + 1 >= d.rd) {
                             self.r[15] = pc;
@@ -7934,6 +8031,51 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     if (jit_mod.is_x86_64_linux) {
         const page_idx: usize = ((0x1000 >> 12) ^ (0x1000 >> 16) ^ (0x1000 >> 20)) & (icache_pages - 1);
         try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1c00 & 0xfff) >> 2)].op)));
+    }
+
+    // Verify ARM32 hot function (BL/BX LR) compilation and return continuation compilation
+    // Callee at 0x1d00 (4 instructions):
+    // 0x1d00: add r1, r1, #5         (0xe2811005)
+    // 0x1d04: add r1, r1, #4         (0xe2811004)
+    // 0x1d08: sub r1, r1, #2         (0xe2411002)
+    // 0x1d0c: bx lr                  (0xe12fff1e)
+    // Caller at 0x1c40:
+    // 0x1c40: bl 0x1d00              (0xeb00002e)
+    // 0x1c44: subs r0, r0, #1        (0xe2500001)
+    // 0x1c48: bne 0x1c40             (0x1afffffc)
+    // 0x1c4c: add r2, r1, #1         (0xe2812001)
+    const callee32_prog = [_]u32{
+        0xe2811005,
+        0xe2811004,
+        0xe2411002,
+        0xe12fff1e,
+    };
+    for (callee32_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1d00 + i * 4 ..][0..4], inst, .little);
+    }
+    const caller32_prog = [_]u32{
+        0xeb00002e,
+        0xe2500001,
+        0x1afffffc,
+        0xe2812001,
+    };
+    for (caller32_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1c40 + i * 4 ..][0..4], inst, .little);
+    }
+    cpu.invalidateIcache();
+    cpu.r[15] = 0x1c40;
+    cpu.r[0] = 40;
+    cpu.r[1] = 0;
+    cpu.r[2] = 0;
+    const call32_ran = cpu.runSteps(&bus, 40 * 7 + 1);
+    try std.testing.expectEqual(@as(usize, 281), call32_ran);
+    try std.testing.expectEqual(@as(u32, 0), cpu.r[0]);
+    try std.testing.expectEqual(@as(u32, 280), cpu.r[1]);
+    try std.testing.expectEqual(@as(u32, 281), cpu.r[2]);
+    if (jit_mod.is_x86_64_linux) {
+        const page_idx: usize = ((0x1000 >> 12) ^ (0x1000 >> 16) ^ (0x1000 >> 20)) & (icache_pages - 1);
+        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1d00 & 0xfff) >> 2)].op)));
+        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1c44 & 0xfff) >> 2)].op)));
     }
 }
 

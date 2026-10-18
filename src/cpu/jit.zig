@@ -43,6 +43,7 @@ pub const JitCodeBuffer = struct {
 
     used: usize = 0,
     loop_counts: [256]u8 = @splat(0),
+    call_counts: [256]u8 = @splat(0),
     spin_hashes: [4]u64 = @splat(0),
     trace_cache: [trace_cache_size]TraceCacheEntry = @splat(.{}),
 
@@ -93,6 +94,7 @@ pub const JitCodeBuffer = struct {
     pub fn reset(self: *JitCodeBuffer) void {
         self.used = 0;
         self.loop_counts = @splat(0);
+        self.call_counts = @splat(0);
         self.spin_hashes = @splat(0);
         self.trace_cache = @splat(.{});
     }
@@ -1820,16 +1822,35 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                         useReg(&read_before_write, written, d.rn);
                         defReg(&written, d.rd);
                     },
+                    .ldr64_reg_lsl, .ldr32_reg_lsl, .ldr8_reg_lsl => {
+                        has_load = true;
+                        useReg(&read_before_write, written, d.rn);
+                        useReg(&read_before_write, written, d.rm);
+                        defReg(&written, d.rd);
+                    },
                     .ldr_lit32, .ldr_lit64, .ldrsw_lit => {
                         has_load = true;
                         defReg(&written, d.rd);
                     },
-                    .adr, .adrp, .mov_wide, .mrs_tpidr_el0 => defReg(&written, d.rd),
-                    .add_imm64, .sub_imm64, .adds_imm64, .subs_imm64, .add_imm32, .sub_imm32, .adds_imm32, .subs_imm32, .and_imm64, .orr_imm64, .eor_imm64, .ands_imm64, .and_imm32, .orr_imm32, .eor_imm32, .ands_imm32, .ubfm_r, .ubfm_l, .sbfm64_r, .sbfm32_r => {
+                    .adr, .adrp, .mov_wide, .mrs_tpidr_el0, .mrs_sys => defReg(&written, d.rd),
+                    .movk64, .movk32 => {
+                        useReg(&read_before_write, written, d.rd);
+                        defReg(&written, d.rd);
+                    },
+                    .add_imm64, .sub_imm64, .adds_imm64, .subs_imm64, .add_imm32, .sub_imm32, .adds_imm32, .subs_imm32, .and_imm64, .orr_imm64, .eor_imm64, .ands_imm64, .and_imm32, .orr_imm32, .eor_imm32, .ands_imm32, .ubfm_r, .ubfm_l, .sbfm64_r, .sbfm32_r, .clz64, .clz32, .rev64, .rev32 => {
                         useReg(&read_before_write, written, d.rn);
                         defReg(&written, d.rd);
                     },
-                    .orr_reg64, .orr_reg32, .orn_reg64, .orn_reg32, .add_reg64, .add_reg32, .adds_reg64, .adds_reg32, .sub_reg64, .sub_reg32, .subs_reg64, .subs_reg32, .and_reg64, .and_reg32, .bic_reg64, .bic_reg32, .eor_reg64, .eor_reg32, .ands_reg64, .ands_reg32, .add_lsl64, .add_lsl32, .sub_lsl64, .sub_lsl32, .orr_lsl64, .orr_lsr64, .extr64, .extr32, .add_ext64, .sub_ext64, .add_sub_ext, .dp_shift_reg, .lslv64, .lsrv64, .asrv64, .lslv32, .lsrv32, .asrv32, .csel => {
+                    .bfm_r, .bfm_l => {
+                        useReg(&read_before_write, written, d.rn);
+                        useReg(&read_before_write, written, d.rd);
+                        defReg(&written, d.rd);
+                    },
+                    .ccmp => {
+                        useReg(&read_before_write, written, d.rn);
+                        if (((d.imm >> 8) & 1) == 0) useReg(&read_before_write, written, d.rm);
+                    },
+                    .orr_reg64, .orr_reg32, .orn_reg64, .orn_reg32, .add_reg64, .add_reg32, .adds_reg64, .adds_reg32, .sub_reg64, .sub_reg32, .subs_reg64, .subs_reg32, .and_reg64, .and_reg32, .bic_reg64, .bic_reg32, .eor_reg64, .eor_reg32, .ands_reg64, .ands_reg32, .add_lsl64, .add_lsl32, .sub_lsl64, .sub_lsl32, .orr_lsl64, .orr_lsr64, .extr64, .extr32, .add_ext64, .sub_ext64, .add_sub_ext, .dp_shift_reg, .lslv64, .lsrv64, .asrv64, .lslv32, .lsrv32, .asrv32, .csel, .udiv64, .sdiv64, .udiv32, .sdiv32 => {
                         useReg(&read_before_write, written, d.rn);
                         useReg(&read_before_write, written, d.rm);
                         defReg(&written, d.rd);
@@ -1885,6 +1906,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
             } else {
                 const limit_word: u16 = @min(@as(u16, 1024), @as(u16, start_word) + 64);
                 var target_mask: u64 = 0;
+                var has_backward_branch = false;
                 while (start_word + trace_len < limit_word) {
                     const w = start_word + trace_len;
                     const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
@@ -1899,6 +1921,15 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                                 if (tw > @as(i32, w) and tw < @as(i32, limit_word)) {
                                     const tidx: u6 = @intCast(tw - @as(i32, start_word));
                                     target_mask |= (@as(u64, 1) << tidx);
+                                } else if (tw >= @as(i32, start_word) and tw <= @as(i32, w)) {
+                                    const loop_start: u10 = @intCast(tw);
+                                    if (isSpinLoop(SlotType, code_page_ptr, loop_start, w + 1)) return null;
+                                    if (w + 1 - @as(u16, loop_start) <= 8) {
+                                        for (loop_start - start_word..trace_len) |li| {
+                                            if (decoded[li].op == @intFromEnum(A64Op.load_store_other) and (decoded[li].raw & 0x3f40_7c00) == 0x0840_7c00) return null;
+                                        }
+                                    }
+                                    has_backward_branch = true;
                                 }
                             }
                         },
@@ -1907,7 +1938,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                     decoded[trace_len] = d;
                     trace_len += 1;
                     if (isTerminator(op)) {
-                        if (trace_len < 64 and (target_mask & (@as(u64, 1) << @intCast(trace_len))) != 0) {
+                        if (trace_len < 64 and (target_mask >> @intCast(trace_len)) != 0) {
                             continue;
                         }
                         if (op == .b_imm) {
@@ -1919,7 +1950,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                         break;
                     }
                 }
-                if (trace_len < 2) return null;
+                if (trace_len < 4 and (!has_backward_branch or trace_len < 2)) return null;
             }
 
             const end_word: u16 = start_word + trace_len;
@@ -3193,12 +3224,15 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                 .udiv_al,
                 .sdiv_al,
                 .b_al,
+                .bx_lr_al,
+                .bx_reg_al,
+                .ldm_pc_al,
+                .ldr_wb_al,
                 .mrs_cpsr_al,
                 .mrc_tpidruro_al,
                 .mrc_tpidrurw_al,
                 .mrc_tpidrprw_al,
                 => true,
-                .ldr_wb_al => d.rd != 15,
                 else => false,
             };
         }
@@ -3411,18 +3445,36 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                     .mcr_barrier_al, .yield_wfe_al, .dmb_dsb_v7_al,
                     .ldrex_al, .strex_al, .ldrexd_al, .strexd_al, .ldrexb_al, .strexb_al, .ldrexh_al, .strexh_al,
                     => return true,
-                    .nop_al, .b_al, .bx_lr_al, .bx_reg_al => {},
+                    .nop_al, .b_al, .bx_lr_al, .bx_reg_al, .ldm_pc_al => {},
+                    .ldr_wb_al => if (d.rd != 15) {
+                        has_side_effect = true;
+                    },
                     .ldr_imm_al, .ldrb_imm_al, .ldrh_imm_al, .ldrsb_imm_al, .ldrsh_imm_al => {
                         has_load = true;
                         useReg(&read_before_write, written, d.rn);
+                        if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
+                    },
+                    .ldr_reg_lsl_al, .ldrb_reg_lsl_al, .ldr_reg_sub_lsl_al, .ldrb_reg_sub_lsl_al, .ldr_reg_lsr_al, .ldrh_reg_al, .ldrsb_reg_al, .ldrsh_reg_al => {
+                        has_load = true;
+                        useReg(&read_before_write, written, d.rn);
+                        useReg(&read_before_write, written, d.rm);
                         if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
                     },
                     .ldr_lit_al => {
                         has_load = true;
                         if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
                     },
-                    .mov_imm_al, .mvn_imm_al, .movw_al => {
+                    .mov_imm_al, .mvn_imm_al, .movw_al, .mrs_cpsr_al, .mrc_tpidruro_al, .mrc_tpidrurw_al, .mrc_tpidrprw_al => {
                         if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
+                    },
+                    .movt_al, .bfc_al => {
+                        useReg(&read_before_write, written, d.rd);
+                        defReg(&written, d.rd);
+                    },
+                    .bfi_al => {
+                        useReg(&read_before_write, written, d.rd);
+                        useReg(&read_before_write, written, d.rm);
+                        defReg(&written, d.rd);
                     },
                     .cmp_imm_al, .cmn_imm_al, .tst_imm_al, .teq_imm_al => {
                         useReg(&read_before_write, written, d.rn);
@@ -3431,15 +3483,15 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                         useReg(&read_before_write, written, d.rn);
                         useReg(&read_before_write, written, d.rm);
                     },
-                    .add_imm_al, .sub_imm_al, .rsb_imm_al, .and_imm_al, .orr_imm_al, .eor_imm_al, .bic_imm_al, .adds_imm_al, .subs_imm_al, .ubfx_al, .sbfx_al => {
+                    .add_imm_al, .sub_imm_al, .rsb_imm_al, .adc_imm_al, .sbc_imm_al, .rsc_imm_al, .and_imm_al, .orr_imm_al, .eor_imm_al, .bic_imm_al, .adds_imm_al, .subs_imm_al, .adcs_imm_al, .sbcs_imm_al, .ubfx_al, .sbfx_al => {
                         useReg(&read_before_write, written, d.rn);
                         if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
                     },
-                    .mov_reg_al, .mvn_reg_al, .lsl_imm_al, .lsr_imm_al, .asr_imm_al, .uxtb_al, .uxth_al, .sxtb_al, .sxth_al => {
+                    .mov_reg_al, .mvn_reg_al, .lsl_imm_al, .lsr_imm_al, .asr_imm_al, .mvn_lsl_imm_al, .mvn_lsr_imm_al, .uxtb_al, .uxth_al, .sxtb_al, .sxth_al, .rev_al, .rev16_al, .clz_al => {
                         useReg(&read_before_write, written, d.rm);
                         if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
                     },
-                    .add_reg_al, .sub_reg_al, .rsb_reg_al, .and_reg_al, .orr_reg_al, .eor_reg_al, .bic_reg_al, .adds_reg_al, .subs_reg_al => {
+                    .add_reg_al, .sub_reg_al, .rsb_reg_al, .adc_reg_al, .sbc_reg_al, .rsc_reg_al, .and_reg_al, .orr_reg_al, .eor_reg_al, .bic_reg_al, .adds_reg_al, .subs_reg_al, .adcs_reg_al, .sbcs_reg_al, .add_lsl_reg_al, .sub_lsl_reg_al, .rsb_lsl_reg_al, .orr_lsl_reg_al, .eor_lsl_reg_al, .and_lsl_reg_al, .bic_lsl_reg_al, .add_lsr_reg_al, .sub_lsr_reg_al, .rsb_lsr_reg_al, .orr_lsr_reg_al, .eor_lsr_reg_al, .and_lsr_reg_al, .bic_lsr_reg_al, .add_asr_reg_al, .sub_asr_reg_al, .orr_asr_reg_al, .and_asr_reg_al, .bic_asr_reg_al, .uxtab_al, .uxtah_al, .sxtab_al, .sxtah_al, .mul_al, .udiv_al, .sdiv_al => {
                         useReg(&read_before_write, written, d.rn);
                         useReg(&read_before_write, written, d.rm);
                         if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
@@ -3533,6 +3585,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
             } else {
                 const limit_word: u16 = @min(@as(u16, 1024), @as(u16, start_word) + 64);
                 var target_mask: u64 = 0;
+                var has_backward_branch = false;
                 while (start_word + trace_len < limit_word) {
                     const w = start_word + trace_len;
                     const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
@@ -3549,18 +3602,22 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                         if (tw > @as(i32, w) and tw < @as(i32, limit_word)) {
                             const tidx: u6 = @intCast(tw - @as(i32, start_word));
                             target_mask |= (@as(u64, 1) << tidx);
+                        } else if (op == .b_al and tw >= @as(i32, start_word) and tw <= @as(i32, w)) {
+                            const loop_start: u10 = @intCast(tw);
+                            if (isSpinLoop(code_page_ptr, loop_start, w + 1)) return null;
+                            has_backward_branch = true;
                         }
                     }
                     decoded[trace_len] = d;
                     trace_len += 1;
                     if (isTerminator(op, raw_inst)) {
-                        if (trace_len < 64 and (target_mask & (@as(u64, 1) << @intCast(trace_len))) != 0) {
+                        if (trace_len < 64 and (target_mask >> @intCast(trace_len)) != 0) {
                             continue;
                         }
                         break;
                     }
                 }
-                if (trace_len < 2) return null;
+                if (trace_len < 4 and (!has_backward_branch or trace_len < 2)) return null;
             }
 
             const end_word: u16 = start_word + trace_len;
