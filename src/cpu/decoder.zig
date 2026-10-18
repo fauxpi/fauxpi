@@ -173,25 +173,14 @@ pub const AddSubResult = struct {
 };
 
 pub inline fn addWithCarry(a: u32, b: u32, carry_in: u1) AddSubResult {
-    const ua: u64 = a;
-    const ub: u64 = b;
-    const uc: u64 = carry_in;
-    const usum: u64 = ua + ub + uc;
+    const usum: u64 = @as(u64, a) + @as(u64, b) + @as(u64, carry_in);
     const res: u32 = @truncate(usum);
-    const c_out: u1 = @truncate(usum >> 32);
-
-    const sa: i64 = @as(i32, @bitCast(a));
-    const sb: i64 = @as(i32, @bitCast(b));
-    const ssum: i64 = sa + sb + @as(i64, carry_in);
-    const sres: i64 = @as(i32, @bitCast(res));
-    const v_out: u1 = if (ssum != sres) 1 else 0;
-
     return .{
         .val = res,
         .n = @truncate(res >> 31),
-        .z = if (res == 0) 1 else 0,
-        .c = c_out,
-        .v = v_out,
+        .z = @intFromBool(res == 0),
+        .c = @truncate(usum >> 32),
+        .v = @truncate(((~(a ^ b)) & (a ^ res)) >> 31),
     };
 }
 

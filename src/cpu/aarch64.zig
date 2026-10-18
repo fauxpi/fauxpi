@@ -125,7 +125,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
         }
 
         pub inline fn getX(cpu: *const CpuType, reg: u5) u64 {
-            return if (reg == 31) 0 else cpu.x[reg];
+            return cpu.x[reg];
         }
 
         pub inline fn getXOrSp(cpu: *const CpuType, reg: u5) u64 {
@@ -141,7 +141,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
         }
 
         pub inline fn getW(cpu: *const CpuType, reg: u5) u32 {
-            return if (reg == 31) 0 else @truncate(cpu.x[reg]);
+            return @truncate(cpu.x[reg]);
         }
 
         pub inline fn setW(cpu: *CpuType, reg: u5, val: u32) void {
@@ -153,11 +153,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
         }
 
         pub inline fn setNzcv(cpu: *CpuType, n: bool, z: bool, c: bool, v: bool) void {
-            var flags: u32 = 0;
-            if (n) flags |= PstateFlags.N;
-            if (z) flags |= PstateFlags.Z;
-            if (c) flags |= PstateFlags.C;
-            if (v) flags |= PstateFlags.V;
+            const flags: u32 = (@as(u32, @intFromBool(n)) << 31) |
+                (@as(u32, @intFromBool(z)) << 30) |
+                (@as(u32, @intFromBool(c)) << 29) |
+                (@as(u32, @intFromBool(v)) << 28);
             cpu.pstate = (cpu.pstate & 0x0fff_ffff) | flags;
         }
 
@@ -694,6 +693,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             cmp_reg_bcond,
             tst_imm_bcond,
             tst_reg_bcond,
+            ldr_cbz,
+            ldr64_pair_uimm,
             dp_imm_other,
             dp_reg_other,
             load_store_other,
@@ -807,9 +808,80 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         return fused;
                     }
                 },
+                .ldr64_uimm => {
+                    if ((next_inst & 0x7e00_0000) == 0x3400_0000 and d.rd != 31 and (next_inst & 0x1f) == d.rd and (d.imm >> 32) == 0) {
+                        const imm19: i32 = @as(i19, @bitCast(@as(u19, @truncate(next_inst >> 5))));
+                        const target_off: u32 = @bitCast((imm19 << 2) + 4);
+                        const is_cbnz: u8 = @truncate((next_inst >> 24) & 1);
+                        const is_32: u8 = if ((next_inst >> 31) == 0) 2 else 0;
+                        return .{
+                            .raw = d.raw,
+                            .op = @intFromEnum(A64Op.ldr_cbz),
+                            .rd = d.rd,
+                            .rn = d.rn,
+                            .rm = is_cbnz | is_32,
+                            .imm = (@as(u64, target_off) << 32) | @as(u32, @truncate(d.imm)),
+                        };
+                    } else if ((next_inst & 0xffc0_0000) == 0xf940_0000) {
+                        const rt2: u8 = @truncate(next_inst & 0x1f);
+                        const rn2: u8 = @truncate((next_inst >> 5) & 0x1f);
+                        const imm2: u64 = ((next_inst >> 10) & 0xfff) << 3;
+                        if (rn2 == d.rn and d.rd != d.rn and d.rd != rt2 and (d.imm >> 32) == 0) {
+                            return .{
+                                .raw = d.raw,
+                                .op = @intFromEnum(A64Op.ldr64_pair_uimm),
+                                .rd = d.rd,
+                                .rn = d.rn,
+                                .rm = rt2,
+                                .imm = (imm2 << 32) | @as(u32, @truncate(d.imm)),
+                            };
+                        }
+                    }
+                },
+                .ldr32_uimm => {
+                    if ((next_inst & 0xfe00_0000) == 0x3400_0000 and d.rd != 31 and (next_inst & 0x1f) == d.rd and (d.imm >> 32) == 0) {
+                        const imm19: i32 = @as(i19, @bitCast(@as(u19, @truncate(next_inst >> 5))));
+                        const target_off: u32 = @bitCast((imm19 << 2) + 4);
+                        const is_cbnz: u8 = @truncate((next_inst >> 24) & 1);
+                        return .{
+                            .raw = d.raw,
+                            .op = @intFromEnum(A64Op.ldr_cbz),
+                            .rd = d.rd,
+                            .rn = d.rn,
+                            .rm = is_cbnz | 4,
+                            .imm = (@as(u64, target_off) << 32) | @as(u32, @truncate(d.imm)),
+                        };
+                    }
+                },
                 else => {},
             }
             return null;
+        }
+
+        noinline fn decodeAndFuseA64(
+            cpu: *CpuType,
+            comptime SlotType: type,
+            code_page_idx: usize,
+            code_icache_ptr: [*]SlotType,
+            code_page_ptr: [*]const u8,
+            page_word: usize,
+            raw_inst: u32,
+            has_next: bool,
+        ) SlotType {
+            var d = decodeA64(SlotType, raw_inst);
+            if (has_next and page_word < 1023) {
+                const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
+                if (tryFusePairA64(SlotType, d, next_inst)) |fused| {
+                    d = fused;
+                    if (code_icache_ptr[page_word + 1].raw != next_inst) {
+                        code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
+                        cpu.markIcacheDirty(code_page_idx, page_word + 1);
+                    }
+                }
+            }
+            code_icache_ptr[page_word] = d;
+            cpu.markIcacheDirty(code_page_idx, page_word);
+            return d;
         }
 
         pub fn decodeA64(comptime SlotType: type, inst: u32) SlotType {
@@ -1972,19 +2044,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             inst = d.raw;
                         } else {
                             inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
-                            d = decodeA64(SlotType, inst);
-                            if (page_word < 1023) {
-                                const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
-                                if (tryFusePairA64(SlotType, d, next_inst)) |fused| {
-                                    d = fused;
-                                    if (code_icache_ptr[page_word + 1].raw != next_inst) {
-                                        code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
-                                        cpu.markIcacheDirty(code_page_idx, page_word + 1);
-                                    }
-                                }
-                            }
-                            code_icache_ptr[page_word] = d;
-                            cpu.markIcacheDirty(code_page_idx, page_word);
+                            d = decodeAndFuseA64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, page_word, inst, true);
                         }
                     } else {
                         const islot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((cur_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
@@ -1999,19 +2059,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 inst = d.raw;
                             } else {
                                 inst = std.mem.readInt(u32, code_page_ptr[page_word * 4 ..][0..4], .little);
-                                d = decodeA64(SlotType, inst);
-                                if (page_word < 1023) {
-                                    const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
-                                    if (tryFusePairA64(SlotType, d, next_inst)) |fused| {
-                                        d = fused;
-                                        if (code_icache_ptr[page_word + 1].raw != next_inst) {
-                                            code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
-                                            cpu.markIcacheDirty(code_page_idx, page_word + 1);
-                                        }
-                                    }
-                                }
-                                code_icache_ptr[page_word] = d;
-                                cpu.markIcacheDirty(code_page_idx, page_word);
+                                d = decodeAndFuseA64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, page_word, inst, true);
                             }
                         } else {
                             inst = fetchInst64(cpu, bus, cur_pc) catch {
@@ -2039,19 +2087,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             }
                             d = code_icache_ptr[page_word];
                             if (d.raw != inst) {
-                                d = decodeA64(SlotType, inst);
-                                if (page_word < 1023 and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                                    const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
-                                    if (tryFusePairA64(SlotType, d, next_inst)) |fused| {
-                                        d = fused;
-                                        if (code_icache_ptr[page_word + 1].raw != next_inst) {
-                                            code_icache_ptr[page_word + 1] = decodeA64(SlotType, next_inst);
-                                            cpu.markIcacheDirty(code_page_idx, page_word + 1);
-                                        }
-                                    }
-                                }
-                                code_icache_ptr[page_word] = d;
-                                cpu.markIcacheDirty(code_page_idx, page_word);
+                                d = decodeAndFuseA64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, page_word, inst, (cur_pc & ~@as(u64, 0xfff)) == code_vbase);
                             }
                         }
                     }
@@ -2189,6 +2225,105 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 cpu.pc64 = cur_pc +% @as(u64, @bitCast(target_off));
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
+                            }
+                        }
+                    },
+                    .ldr_cbz => {
+                        const rn: u5 = @truncate(d.rn);
+                        const bank: usize = @intFromBool(rn >= 29);
+                        const addr = getXOrSp(cpu, rn) +% @as(u32, @truncate(d.imm));
+                        var val: u64 = undefined;
+                        if ((d.rm & 4) == 0) {
+                            if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
+                                val = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    val = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                                } else {
+                                    val = readData64(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                }
+                            }
+                            setX(cpu, @truncate(d.rd), val);
+                        } else {
+                            var val32: u32 = undefined;
+                            if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank]) {
+                                val32 = std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    val32 = std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
+                                } else {
+                                    val32 = readData32(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                }
+                            }
+                            setW(cpu, @truncate(d.rd), val32);
+                            val = val32;
+                        }
+                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                            executed += 1;
+                            const test_val: u64 = if ((d.rm & 2) != 0) @as(u32, @truncate(val)) else val;
+                            const take = if ((d.rm & 1) != 0) (test_val != 0) else (test_val == 0);
+                            if (take) {
+                                const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
+                                cpu.pc64 = cur_pc +% @as(u64, @bitCast(target_off));
+                            } else {
+                                cpu.pc64 = cur_pc +% 8;
+                            }
+                        }
+                    },
+                    .ldr64_pair_uimm => {
+                        const rn: u5 = @truncate(d.rn);
+                        const bank: usize = @intFromBool(rn >= 29);
+                        const base = getXOrSp(cpu, rn);
+                        const addr1 = base +% @as(u32, @truncate(d.imm));
+                        const addr2 = base +% (d.imm >> 32);
+                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase and
+                            (addr1 & ~@as(u64, 0xff8)) == data_r_vbase[bank] and
+                            (addr2 & ~@as(u64, 0xff8)) == data_r_vbase[bank])
+                        {
+                            setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr1 & 0xff8))..][0..8], .little));
+                            setX(cpu, @truncate(d.rm), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr2 & 0xff8))..][0..8], .little));
+                            cpu.pc64 = cur_pc +% 8;
+                            executed += 1;
+                        } else {
+                            if ((addr1 & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
+                                setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr1 & 0xff8))..][0..8], .little));
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr1 >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr1 & 0xfff) <= 0xff8 and (addr1 & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr1 & 0xfff))..][0..8], .little));
+                                } else {
+                                    const val = readData64(cpu, bus, addr1) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    setX(cpu, @truncate(d.rd), val);
+                                }
                             }
                         }
                     },
@@ -5016,7 +5151,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             }
         }
 
-        fn addSub(
+        inline fn addSub(
             cpu: *CpuType,
             sf: u1,
             is_sub: bool,

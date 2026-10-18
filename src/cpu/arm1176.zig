@@ -152,7 +152,7 @@ pub const ArmOp = enum(u8) {
     // MOVW / MOVT (rd != 15)
     movw_al,
     movt_al,
-    // Fused 2-instruction superinstructions (unconditional first instruction + branch / movt)
+    // Fused 2-instruction superinstructions (unconditional first instruction + branch / movt / load / store)
     cmp_imm_bcond_al,
     cmp_reg_bcond_al,
     tst_imm_bcond_al,
@@ -160,6 +160,10 @@ pub const ArmOp = enum(u8) {
     subs_imm_bcond_al,
     adds_imm_bcond_al,
     movw_movt_al,
+    mov_pair_reg_al,
+    ldr_pair_imm_al,
+    str_pair_imm_al,
+    ldr_imm_cmp0_al,
     // Unshifted Register Data Processing (S == 0, shift == 0, rd != 15, rn != 15, rm != 15)
     add_reg_al,
     sub_reg_al,
@@ -1118,7 +1122,7 @@ pub fn decodeArm32(inst: u32) DecodedSlot {
     }
 }
 
-pub inline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_word: usize) DecodedSlot {
+pub noinline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_word: usize) DecodedSlot {
     const d = decodeArm32(inst);
     if (inst < 0xe000_0000 or page_word >= 1022) return d;
     const op: ArmOp = @enumFromInt(d.op);
@@ -1163,6 +1167,71 @@ pub inline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_wor
                         .op = @intFromEnum(ArmOp.movw_movt_al),
                         .rd = d.rd,
                         .imm = (@as(u32, @truncate(d.imm)) & 0xffff) | (imm16_hi << 16),
+                    };
+                }
+            }
+        },
+        .mov_reg_al => {
+            const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
+            if ((next_inst & 0xfff0_0ff0) == 0xe1a0_0000) {
+                const rd2: u8 = @truncate((next_inst >> 12) & 0xf);
+                const rm2: u8 = @truncate(next_inst & 0xf);
+                if (rd2 != 15 and rm2 != 15 and rm2 != d.rd) {
+                    return .{
+                        .raw = inst,
+                        .op = @intFromEnum(ArmOp.mov_pair_reg_al),
+                        .rd = d.rd,
+                        .rm = d.rm,
+                        .rn = rd2,
+                        .imm = rm2,
+                    };
+                }
+            }
+        },
+        .ldr_imm_al => {
+            const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
+            if (d.rd != d.rn and (next_inst & 0xff70_0000) == 0xe510_0000) {
+                const rn2: u8 = @truncate((next_inst >> 16) & 0xf);
+                const rd2: u8 = @truncate((next_inst >> 12) & 0xf);
+                if (rn2 == d.rn and rd2 != 15 and rd2 != d.rd) {
+                    const u2_bit = (next_inst & (1 << 23)) != 0;
+                    const imm12_2: u32 = next_inst & 0xfff;
+                    const off2: u32 = if (u2_bit) imm12_2 else (0 -% imm12_2);
+                    return .{
+                        .raw = inst,
+                        .op = @intFromEnum(ArmOp.ldr_pair_imm_al),
+                        .rd = d.rd,
+                        .rn = d.rn,
+                        .rm = rd2,
+                        .imm = (@as(u64, off2) << 32) | (d.imm & 0xffff_ffff),
+                    };
+                }
+            } else if (next_inst == (0xe350_0000 | (@as(u32, d.rd) << 16))) {
+                return .{
+                    .raw = inst,
+                    .op = @intFromEnum(ArmOp.ldr_imm_cmp0_al),
+                    .rd = d.rd,
+                    .rn = d.rn,
+                    .imm = d.imm,
+                };
+            }
+        },
+        .str_imm_al => {
+            const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
+            if ((next_inst & 0xff70_0000) == 0xe500_0000) {
+                const rn2: u8 = @truncate((next_inst >> 16) & 0xf);
+                const rd2: u8 = @truncate((next_inst >> 12) & 0xf);
+                if (rn2 == d.rn and rd2 != 15) {
+                    const u2_bit = (next_inst & (1 << 23)) != 0;
+                    const imm12_2: u32 = next_inst & 0xfff;
+                    const off2: u32 = if (u2_bit) imm12_2 else (0 -% imm12_2);
+                    return .{
+                        .raw = inst,
+                        .op = @intFromEnum(ArmOp.str_pair_imm_al),
+                        .rd = d.rd,
+                        .rn = d.rn,
+                        .rm = rd2,
+                        .imm = (@as(u64, off2) << 32) | (d.imm & 0xffff_ffff),
                     };
                 }
             }
@@ -1448,8 +1517,8 @@ pub fn Arm1176(comptime Bus: type) type {
 
         /// True when executing in 64-bit ARMv8 AArch64 (A64) state (`EL3` / `EL2` / `EL1` / `EL0`)
         is_aarch64: bool = false,
-        /// AArch64 64-bit general-purpose registers `X0..X30` (`X30` = LR; `XZR`/`WZR` is reg 31)
-        x: [31]u64 = @splat(0),
+        /// AArch64 64-bit general-purpose registers `X0..X30` plus `X31` (`XZR`/`WZR` == 0)
+        x: [32]u64 = @splat(0),
         /// AArch64 Stack Pointers `SP_EL0`, `SP_EL1`, `SP_EL2`, `SP_EL3`
         sp_el: [4]u64 = @splat(0),
         /// AArch64 64-bit Program Counter
@@ -2073,86 +2142,11 @@ pub fn Arm1176(comptime Bus: type) type {
                     max_steps;
 
                 while (executed < batch_end) {
-                    if (self.isThumb()) {
-                        const pc = self.r[15] & ~@as(u32, 1);
-                        const page_hw: usize = (pc >> 1) & 0x7ff;
-                        var td: ThumbSlot = undefined;
-                        if ((pc & 0xffff_f000) == thumb_vbase) {
-                            td = thumb_icache_ptr[page_hw];
-                            if (td.raw == 0xffff) {
-                                const inst16 = std.mem.readInt(u16, thumb_page_ptr[page_hw * 2 ..][0..2], .little);
-                                const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
-                                td = decodeThumb16(inst16, next_hw);
-                                thumb_icache_ptr[page_hw] = td;
-                                self.markThumbIcacheDirty(thumb_page_idx, page_hw);
-                            }
-                        } else {
-                            const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
-                            if ((pc & 0xffff_f000) == islot.x_vbase) {
-                                thumb_vbase = islot.x_vbase;
-                                thumb_pbase = islot.pbase;
-                                thumb_page_ptr = bus.ram.ptr + thumb_pbase;
-                                thumb_page_idx = thumbIcachePageIdx(thumb_pbase);
-                                thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, thumb_pbase);
-                                td = thumb_icache_ptr[page_hw];
-                                if (td.raw == 0xffff) {
-                                    const inst16 = std.mem.readInt(u16, thumb_page_ptr[page_hw * 2 ..][0..2], .little);
-                                    const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
-                                    td = decodeThumb16(inst16, next_hw);
-                                    thumb_icache_ptr[page_hw] = td;
-                                    self.markThumbIcacheDirty(thumb_page_idx, page_hw);
-                                }
-                            } else {
-                                const inst16 = self.fetch16(bus, pc) catch {
-                                    self.enterException(.abt, 0x0c, pc +% 4, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    thumb_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    executed += 1;
-                                    continue;
-                                };
-                                const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
-                                if ((pc & 0xffff_f000) == islot2.x_vbase) {
-                                    thumb_vbase = islot2.x_vbase;
-                                    thumb_pbase = islot2.pbase;
-                                    thumb_page_ptr = bus.ram.ptr + thumb_pbase;
-                                    thumb_page_idx = thumbIcachePageIdx(thumb_pbase);
-                                    thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, thumb_pbase);
-                                    const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
-                                    td = decodeThumb16(inst16, next_hw);
-                                    thumb_icache_ptr[page_hw] = td;
-                                    self.markThumbIcacheDirty(thumb_page_idx, page_hw);
-                                } else {
-                                    thumb_page_idx = thumbIcachePageIdx(pc);
-                                    thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, 0xffff_fffe);
-                                    self.thumb_icache_page_tags[thumb_page_idx] = 0xffff_ffff;
-                                    td = decodeThumb16(inst16, null);
-                                    thumb_icache_ptr[page_hw] = td;
-                                    self.markThumbIcacheDirty(thumb_page_idx, page_hw);
-                                }
-                            }
-                        }
-                        self.r[15] = pc +% 2;
-                        executed += 1;
-                        if (self.executeThumbDecoded(bus, pc, td, &executed, batch_end, priv, thumb_vbase, thumb_pbase, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
-                            if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
-                            _ = self.checkInterrupts(bus);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            thumb_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                        continue;
-                    }
-
-                    const pc = self.r[15] & ~@as(u32, 3);
-                    const page_word: usize = (pc >> 2) & 0x3ff;
+                    var pc = self.r[15];
+                    var page_word: usize = (pc >> 2) & 0x3ff;
                     var d: DecodedSlot = undefined;
                     var inst: u32 = undefined;
-                    if ((pc & 0xffff_f000) == code_vbase) {
+                    if ((pc & ~@as(u32, 0xffc)) == code_vbase) {
                         d = code_icache_ptr[page_word];
                         if (d.raw != 0xffff_ffff) {
                             inst = d.raw;
@@ -2163,6 +2157,82 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.markIcacheDirty(code_page_idx, page_word);
                         }
                     } else {
+                        if (self.isThumb()) {
+                            pc &= ~@as(u32, 1);
+                            const page_hw: usize = (pc >> 1) & 0x7ff;
+                            var td: ThumbSlot = undefined;
+                            if ((pc & 0xffff_f000) == thumb_vbase) {
+                                td = thumb_icache_ptr[page_hw];
+                                if (td.raw == 0xffff) {
+                                    const inst16 = std.mem.readInt(u16, thumb_page_ptr[page_hw * 2 ..][0..2], .little);
+                                    const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
+                                    td = decodeThumb16(inst16, next_hw);
+                                    thumb_icache_ptr[page_hw] = td;
+                                    self.markThumbIcacheDirty(thumb_page_idx, page_hw);
+                                }
+                            } else {
+                                const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
+                                if ((pc & 0xffff_f000) == islot.x_vbase) {
+                                    thumb_vbase = islot.x_vbase;
+                                    thumb_pbase = islot.pbase;
+                                    thumb_page_ptr = bus.ram.ptr + thumb_pbase;
+                                    thumb_page_idx = thumbIcachePageIdx(thumb_pbase);
+                                    thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, thumb_pbase);
+                                    td = thumb_icache_ptr[page_hw];
+                                    if (td.raw == 0xffff) {
+                                        const inst16 = std.mem.readInt(u16, thumb_page_ptr[page_hw * 2 ..][0..2], .little);
+                                        const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
+                                        td = decodeThumb16(inst16, next_hw);
+                                        thumb_icache_ptr[page_hw] = td;
+                                        self.markThumbIcacheDirty(thumb_page_idx, page_hw);
+                                    }
+                                } else {
+                                    const inst16 = self.fetch16(bus, pc) catch {
+                                        self.enterException(.abt, 0x0c, pc +% 4, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        thumb_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        executed += 1;
+                                        continue;
+                                    };
+                                    const islot2 = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
+                                    if ((pc & 0xffff_f000) == islot2.x_vbase) {
+                                        thumb_vbase = islot2.x_vbase;
+                                        thumb_pbase = islot2.pbase;
+                                        thumb_page_ptr = bus.ram.ptr + thumb_pbase;
+                                        thumb_page_idx = thumbIcachePageIdx(thumb_pbase);
+                                        thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, thumb_pbase);
+                                        const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
+                                        td = decodeThumb16(inst16, next_hw);
+                                        thumb_icache_ptr[page_hw] = td;
+                                        self.markThumbIcacheDirty(thumb_page_idx, page_hw);
+                                    } else {
+                                        thumb_page_idx = thumbIcachePageIdx(pc);
+                                        thumb_icache_ptr = self.prepareThumbIcachePage(thumb_page_idx, 0xffff_fffe);
+                                        self.thumb_icache_page_tags[thumb_page_idx] = 0xffff_ffff;
+                                        td = decodeThumb16(inst16, null);
+                                        thumb_icache_ptr[page_hw] = td;
+                                        self.markThumbIcacheDirty(thumb_page_idx, page_hw);
+                                    }
+                                }
+                            }
+                            self.r[15] = pc +% 2;
+                            executed += 1;
+                            if (self.executeThumbDecoded(bus, pc, td, &executed, batch_end, priv, thumb_vbase, thumb_pbase, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
+                                if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
+                                _ = self.checkInterrupts(bus);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                thumb_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                            continue;
+                        }
+                        pc &= ~@as(u32, 3);
+                        page_word = (pc >> 2) & 0x3ff;
                         const islot = self.mmu.soft_tlb32[priv][(pc >> 12) & Mmu.soft_tlb_mask];
                         if ((pc & 0xffff_f000) == islot.x_vbase) {
                             code_vbase = islot.x_vbase;
@@ -2234,20 +2304,12 @@ pub fn Arm1176(comptime Bus: type) type {
                     .bic_imm_al => self.r[d.rd] = self.r[d.rn] & ~imm32,
                     .mov_imm_al => self.r[d.rd] = imm32,
                     .mvn_imm_al => self.r[d.rd] = ~imm32,
-                    .cmp_imm_al => self.setNZCV(dec.addWithCarry(self.r[d.rn], ~imm32, 1)),
-                    .cmn_imm_al => self.setNZCV(dec.addWithCarry(self.r[d.rn], imm32, 0)),
+                    .cmp_imm_al => _ = self.setSubNZCV(self.r[d.rn], imm32),
+                    .cmn_imm_al => _ = self.setAddNZCV(self.r[d.rn], imm32),
                     .tst_imm_al => self.setNZ(self.r[d.rn] & imm32),
                     .teq_imm_al => self.setNZ(self.r[d.rn] ^ imm32),
-                    .adds_imm_al => {
-                        const res = dec.addWithCarry(self.r[d.rn], imm32, 0);
-                        self.r[d.rd] = res.val;
-                        self.setNZCV(res);
-                    },
-                    .subs_imm_al => {
-                        const res = dec.addWithCarry(self.r[d.rn], ~imm32, 1);
-                        self.r[d.rd] = res.val;
-                        self.setNZCV(res);
-                    },
+                    .adds_imm_al => self.r[d.rd] = self.setAddNZCV(self.r[d.rn], imm32),
+                    .subs_imm_al => self.r[d.rd] = self.setSubNZCV(self.r[d.rn], imm32),
                     .adcs_imm_al => {
                         const res = dec.addWithCarry(self.r[d.rn], imm32, @truncate((self.cpsr >> 29) & 1));
                         self.r[d.rd] = res.val;
@@ -2261,13 +2323,13 @@ pub fn Arm1176(comptime Bus: type) type {
                     .movw_al => self.r[d.rd] = imm32,
                     .movt_al => self.r[d.rd] = (self.r[d.rd] & 0x0000_ffff) | (imm32 << 16),
                     .cmp_imm_bcond_al => {
-                        self.setNZCV(dec.addWithCarry(self.r[d.rn], ~imm32, 1));
+                        _ = self.setSubNZCV(self.r[d.rn], imm32);
                         executed += 1;
                         const target_off: u32 = @truncate(d.imm >> 32);
                         self.r[15] = if (dec.checkCond(@truncate(d.rd), self.cpsr)) (pc +% target_off) else (pc +% 8);
                     },
                     .cmp_reg_bcond_al => {
-                        self.setNZCV(dec.addWithCarry(self.r[d.rn], ~self.r[d.rm], 1));
+                        _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm]);
                         executed += 1;
                         const target_off: u32 = @truncate(d.imm >> 32);
                         self.r[15] = if (dec.checkCond(@truncate(d.rd), self.cpsr)) (pc +% target_off) else (pc +% 8);
@@ -2285,23 +2347,122 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.r[15] = if (dec.checkCond(@truncate(d.rd), self.cpsr)) (pc +% target_off) else (pc +% 8);
                     },
                     .subs_imm_bcond_al => {
-                        const res = dec.addWithCarry(self.r[d.rn], ~imm32, 1);
-                        self.r[d.rd] = res.val;
-                        self.setNZCV(res);
+                        self.r[d.rd] = self.setSubNZCV(self.r[d.rn], imm32);
                         executed += 1;
                         const target_off: u32 = @truncate(d.imm >> 32);
                         self.r[15] = if (dec.checkCond(@truncate(d.rm), self.cpsr)) (pc +% target_off) else (pc +% 8);
                     },
                     .adds_imm_bcond_al => {
-                        const res = dec.addWithCarry(self.r[d.rn], imm32, 0);
-                        self.r[d.rd] = res.val;
-                        self.setNZCV(res);
+                        self.r[d.rd] = self.setAddNZCV(self.r[d.rn], imm32);
                         executed += 1;
                         const target_off: u32 = @truncate(d.imm >> 32);
                         self.r[15] = if (dec.checkCond(@truncate(d.rm), self.cpsr)) (pc +% target_off) else (pc +% 8);
                     },
                     .movw_movt_al => {
                         self.r[d.rd] = imm32;
+                        self.r[15] = pc +% 8;
+                        executed += 1;
+                    },
+                    .mov_pair_reg_al => {
+                        self.r[d.rd] = self.r[d.rm];
+                        self.r[d.rn] = self.r[@as(u4, @truncate(imm32))];
+                        self.r[15] = pc +% 8;
+                        executed += 1;
+                    },
+                    .ldr_pair_imm_al => {
+                        const base_val = self.r[d.rn];
+                        const vaddr1 = base_val +% imm32;
+                        const vaddr2 = base_val +% @as(u32, @truncate(d.imm >> 32));
+                        if ((vaddr1 & ~@as(u32, 0xffc)) == data_r_vbase[bank] and (vaddr2 & ~@as(u32, 0xffc)) == data_r_vbase[bank]) {
+                            self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr1 & 0xffc ..][0..4], .little);
+                            self.r[d.rm] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr2 & 0xffc ..][0..4], .little);
+                            self.r[15] = pc +% 8;
+                            executed += 1;
+                        } else {
+                            const slot = self.mmu.soft_tlb32[priv][(vaddr1 >> 12) & Mmu.soft_tlb_mask];
+                            if ((vaddr1 & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr1 & 0xffc ..][0..4], .little);
+                                if ((vaddr2 & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                    self.r[d.rm] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr2 & 0xffc ..][0..4], .little);
+                                    self.r[15] = pc +% 8;
+                                    executed += 1;
+                                }
+                            } else {
+                                self.r[d.rd] = self.read32(bus, vaddr1) catch {
+                                    self.enterException(.abt, 0x10, pc +% 8, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    continue;
+                                };
+                            }
+                        }
+                    },
+                    .str_pair_imm_al => {
+                        const base_val = self.r[d.rn];
+                        const vaddr1 = base_val +% imm32;
+                        const vaddr2 = base_val +% @as(u32, @truncate(d.imm >> 32));
+                        if ((vaddr1 & ~@as(u32, 0xffc)) == data_w_vbase[bank] and (vaddr2 & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
+                            std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr1 & 0xffc ..][0..4], self.r[d.rd], .little);
+                            std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr2 & 0xffc ..][0..4], self.r[d.rm], .little);
+                            self.r[15] = pc +% 8;
+                            executed += 1;
+                        } else {
+                            const slot = self.mmu.soft_tlb32[priv][(vaddr1 >> 12) & Mmu.soft_tlb_mask];
+                            if ((vaddr1 & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                                data_w_vbase[bank] = slot.w_vbase;
+                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr1 & 0xffc ..][0..4], self.r[d.rd], .little);
+                                if ((vaddr2 & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr2 & 0xffc ..][0..4], self.r[d.rm], .little);
+                                    self.r[15] = pc +% 8;
+                                    executed += 1;
+                                }
+                            } else {
+                                self.write32(bus, vaddr1, self.r[d.rd]) catch {
+                                    self.enterException(.abt, 0x10, pc +% 8, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    continue;
+                                };
+                                if ((vaddr1 & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr1 >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                    if (self.checkInterrupts(bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    .ldr_imm_cmp0_al => {
+                        const vaddr = self.r[d.rn] +% imm32;
+                        const val: u32 = if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
+                            std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little)
+                        else blk: {
+                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                            if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                data_r_vbase[bank] = slot.r_vbase;
+                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                break :blk std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
+                            }
+                            break :blk self.read32(bus, vaddr) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                continue;
+                            };
+                        };
+                        self.r[d.rd] = val;
+                        self.cpsr = (self.cpsr & 0x0fff_ffff) | (val & 0x8000_0000) | (@as(u32, @intFromBool(val == 0)) << 30) | (1 << 29);
                         self.r[15] = pc +% 8;
                         executed += 1;
                     },
@@ -2317,16 +2478,8 @@ pub fn Arm1176(comptime Bus: type) type {
                     .bic_reg_al => self.r[d.rd] = self.r[d.rn] & ~self.r[d.rm],
                     .mov_reg_al => self.r[d.rd] = self.r[d.rm],
                     .mvn_reg_al => self.r[d.rd] = ~self.r[d.rm],
-                    .adds_reg_al => {
-                        const res = dec.addWithCarry(self.r[d.rn], self.r[d.rm], 0);
-                        self.r[d.rd] = res.val;
-                        self.setNZCV(res);
-                    },
-                    .subs_reg_al => {
-                        const res = dec.addWithCarry(self.r[d.rn], ~self.r[d.rm], 1);
-                        self.r[d.rd] = res.val;
-                        self.setNZCV(res);
-                    },
+                    .adds_reg_al => self.r[d.rd] = self.setAddNZCV(self.r[d.rn], self.r[d.rm]),
+                    .subs_reg_al => self.r[d.rd] = self.setSubNZCV(self.r[d.rn], self.r[d.rm]),
                     .adcs_reg_al => {
                         const res = dec.addWithCarry(self.r[d.rn], self.r[d.rm], @truncate((self.cpsr >> 29) & 1));
                         self.r[d.rd] = res.val;
@@ -2337,8 +2490,8 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.r[d.rd] = res.val;
                         self.setNZCV(res);
                     },
-                    .cmp_reg_al => self.setNZCV(dec.addWithCarry(self.r[d.rn], ~self.r[d.rm], 1)),
-                    .cmn_reg_al => self.setNZCV(dec.addWithCarry(self.r[d.rn], self.r[d.rm], 0)),
+                    .cmp_reg_al => _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm]),
+                    .cmn_reg_al => _ = self.setAddNZCV(self.r[d.rn], self.r[d.rm]),
                     .tst_reg_al => self.setNZ(self.r[d.rn] & self.r[d.rm]),
                     .teq_reg_al => self.setNZ(self.r[d.rn] ^ self.r[d.rm]),
                     .lsl_imm_al => self.r[d.rd] = self.r[d.rm] << @as(u5, @truncate(imm32)),
@@ -2365,8 +2518,8 @@ pub fn Arm1176(comptime Bus: type) type {
                     .orr_asr_reg_al => self.r[d.rd] = self.r[d.rn] | @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
                     .and_asr_reg_al => self.r[d.rd] = self.r[d.rn] & @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
                     .bic_asr_reg_al => self.r[d.rd] = self.r[d.rn] & ~@as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
-                    .cmp_lsl_reg_al => self.setNZCV(dec.addWithCarry(self.r[d.rn], ~(self.r[d.rm] << @as(u5, @truncate(imm32))), 1)),
-                    .cmp_lsr_reg_al => self.setNZCV(dec.addWithCarry(self.r[d.rn], ~(self.r[d.rm] >> @as(u5, @truncate(imm32))), 1)),
+                    .cmp_lsl_reg_al => _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm] << @as(u5, @truncate(imm32))),
+                    .cmp_lsr_reg_al => _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm] >> @as(u5, @truncate(imm32))),
                     .tst_lsl_reg_al => {
                         const sh: u5 = @truncate(imm32);
                         const inv: u5 = @truncate(@as(u6, 32) -% sh);
@@ -3019,6 +3172,7 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.r[d.rn] = base_val +% wb_off;
                         if (d.rd == 15) {
                             self.setPcWithInterworking(val);
+                            if ((val & 1) != 0) code_vbase = 0xffff_ffff;
                         } else {
                             self.r[d.rd] = val;
                         }
@@ -3287,6 +3441,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             if (op == .ldm_pc_al) {
                                 const pc_val = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
                                 self.setPcWithInterworking(pc_val);
+                                if ((pc_val & 1) != 0) code_vbase = 0xffff_ffff;
                             }
                         } else {
                             self.executeLoadStoreMultiple(bus, pc, inst);
@@ -3397,15 +3552,20 @@ pub fn Arm1176(comptime Bus: type) type {
                         if (self.yield_slice) break :step_loop;
                     },
                     .bx_lr_al => {
-                        self.setPcWithInterworking(self.r[14]);
+                        const target = self.r[14];
+                        self.setPcWithInterworking(target);
+                        if ((target & 1) != 0) code_vbase = 0xffff_ffff;
                     },
                     .bx_reg_al => {
-                        self.setPcWithInterworking(self.r[d.rm]);
+                        const target = self.r[d.rm];
+                        self.setPcWithInterworking(target);
+                        if ((target & 1) != 0) code_vbase = 0xffff_ffff;
                     },
                     .blx_reg_al => {
                         const target = self.r[d.rm];
                         self.r[14] = pc +% 4;
                         self.setPcWithInterworking(target);
+                        if ((target & 1) != 0) code_vbase = 0xffff_ffff;
                     },
                     .dp_imm_general => {
                         self.executeGroup001(pc, inst);
@@ -6947,6 +7107,26 @@ pub fn Arm1176(comptime Bus: type) type {
                 (@as(u32, res.c) << 29) |
                 (@as(u32, res.v) << 28);
             self.cpsr = (self.cpsr & 0x0fff_ffff) | nzcv;
+        }
+
+        inline fn setSubNZCV(self: *Self, a: u32, b: u32) u32 {
+            const res = a -% b;
+            const nzcv: u32 = (res & 0x8000_0000) |
+                (@as(u32, @intFromBool(res == 0)) << 30) |
+                (@as(u32, @intFromBool(a >= b)) << 29) |
+                ((((a ^ b) & (a ^ res)) >> 3) & 0x1000_0000);
+            self.cpsr = (self.cpsr & 0x0fff_ffff) | nzcv;
+            return res;
+        }
+
+        inline fn setAddNZCV(self: *Self, a: u32, b: u32) u32 {
+            const res = a +% b;
+            const nzcv: u32 = (res & 0x8000_0000) |
+                (@as(u32, @intFromBool(res == 0)) << 30) |
+                (@as(u32, @intFromBool(res < a)) << 29) |
+                ((((~(a ^ b)) & (a ^ res)) >> 3) & 0x1000_0000);
+            self.cpsr = (self.cpsr & 0x0fff_ffff) | nzcv;
+            return res;
         }
     };
 }
