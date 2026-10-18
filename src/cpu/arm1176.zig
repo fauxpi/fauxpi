@@ -2149,8 +2149,10 @@ pub fn Arm1176(comptime Bus: type) type {
             code_page_ptr: [*]const u8,
             start_word: u10,
             end_word_req: u16,
-        ) void {
-            if (code_icache_ptr[start_word].op == @intFromEnum(ArmOp.jit_trace)) return;
+            h: u8,
+            count: u8,
+        ) bool {
+            if (code_icache_ptr[start_word].op == @intFromEnum(ArmOp.jit_trace)) return false;
             const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdx(code_page_ptr, start_word, end_word_req);
             const code_hash = jit_mod.JitCodeBuffer.hashLoopWords(code_page_ptr, start_word, end_word_req);
             const entry = &self.jit_buf.trace_cache[tc_idx];
@@ -2159,7 +2161,7 @@ pub fn Arm1176(comptime Bus: type) type {
                 entry.end_word_req == end_word_req and
                 entry.code_hash == code_hash)
             {
-                if (entry.failed) return;
+                if (entry.failed) return entry.is_spin;
                 if (entry.fn_ptr) |fn_ptr| {
                     const inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
                     code_icache_ptr[start_word] = .{
@@ -2169,10 +2171,25 @@ pub fn Arm1176(comptime Bus: type) type {
                         .imm = @intFromPtr(fn_ptr),
                     };
                     self.markIcacheDirty(code_page_idx, start_word);
-                    return;
+                    return false;
                 }
             }
+            if ((count & 0x1f) != 0) return false;
             const Jit32 = jit_mod.Arm32Jit(Self, Bus);
+            if (self.mmu.is_cortex_a53 and Jit32.isSpinLoop(code_page_ptr, start_word, end_word_req)) {
+                self.jit_buf.setSpinHash(h);
+                entry.* = .{
+                    .page_ptr = @intFromPtr(code_page_ptr),
+                    .start_word = start_word,
+                    .end_word_req = end_word_req,
+                    .trace_len = 0,
+                    .failed = true,
+                    .is_spin = true,
+                    .code_hash = code_hash,
+                    .fn_ptr = null,
+                };
+                return true;
+            }
             var end_word: u16 = 0;
             if (Jit32.compileTrace(&self.jit_buf, self.mmu.core_id, code_page_ptr, start_word, end_word_req, &end_word)) |fn_ptr| {
                 const inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
@@ -2183,6 +2200,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     .end_word_req = end_word_req,
                     .trace_len = trace_len,
                     .failed = false,
+                    .is_spin = false,
                     .code_hash = code_hash,
                     .fn_ptr = fn_ptr,
                 };
@@ -2200,10 +2218,12 @@ pub fn Arm1176(comptime Bus: type) type {
                     .end_word_req = end_word_req,
                     .trace_len = 0,
                     .failed = true,
+                    .is_spin = false,
                     .code_hash = code_hash,
                     .fn_ptr = null,
                 };
             }
+            return false;
         }
 
         inline fn noteBackwardBranch32(
@@ -2220,15 +2240,14 @@ pub fn Arm1176(comptime Bus: type) type {
                 const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
                 if (code_icache_ptr[start_word].op == @intFromEnum(ArmOp.jit_trace)) return;
                 if (end_word_req > @as(u16, start_word) + 1 and end_word_req - @as(u16, start_word) <= 64) {
-                    if (end_word_req < 1024 and end_word_req - @as(u16, start_word) <= 8) {
-                        const next_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, end_word_req) * 4 ..][0..4], .little);
-                        if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) return;
-                    }
                     const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
                     const c = self.jit_buf.loop_counts[h] +% 1;
                     self.jit_buf.loop_counts[h] = c;
-                    if ((c & 7) == 0) {
-                        self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req);
+                    const mask: u8 = if (self.jit_buf.isSpinHash(h)) 7 else 0x1f;
+                    if ((c & mask) == 0) {
+                        if (self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req, h, c)) {
+                            self.yield_slice = true;
+                        }
                     }
                 }
             }

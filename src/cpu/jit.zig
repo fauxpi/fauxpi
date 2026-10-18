@@ -32,6 +32,7 @@ pub const TraceCacheEntry = struct {
     end_word_req: u16 = 0,
     trace_len: u8 = 0,
     failed: bool = false,
+    is_spin: bool = false,
     code_hash: u64 = 0,
     fn_ptr: ?JitFn = null,
 };
@@ -42,7 +43,16 @@ pub const JitCodeBuffer = struct {
 
     used: usize = 0,
     loop_counts: [256]u8 = @splat(0),
+    spin_hashes: [4]u64 = @splat(0),
     trace_cache: [trace_cache_size]TraceCacheEntry = @splat(.{}),
+
+    pub inline fn isSpinHash(self: *const JitCodeBuffer, h: u8) bool {
+        return ((self.spin_hashes[h >> 6] >> @intCast(h & 63)) & 1) != 0;
+    }
+
+    pub inline fn setSpinHash(self: *JitCodeBuffer, h: u8) void {
+        self.spin_hashes[h >> 6] |= (@as(u64, 1) << @intCast(h & 63));
+    }
 
     pub inline fn traceCacheIdx(code_page_ptr: [*]const u8, start_word: u10, end_word_req: u16) usize {
         const p = @intFromPtr(code_page_ptr);
@@ -52,7 +62,8 @@ pub const JitCodeBuffer = struct {
     pub inline fn hashLoopWords(code_page_ptr: [*]const u8, start_word: u10, end_word_req: u16) u64 {
         var h: u64 = 0xcbf29ce484222325;
         var w: usize = start_word;
-        while (w < end_word_req) : (w += 1) {
+        const limit: usize = if (end_word_req != 0) end_word_req else @min(@as(usize, 1024), @as(usize, start_word) + 16);
+        while (w < limit) : (w += 1) {
             const inst = std.mem.readInt(u32, code_page_ptr[w * 4 ..][0..4], .little);
             h = (h ^ inst) *% 0x100000001b3;
         }
@@ -82,6 +93,7 @@ pub const JitCodeBuffer = struct {
     pub fn reset(self: *JitCodeBuffer) void {
         self.used = 0;
         self.loop_counts = @splat(0);
+        self.spin_hashes = @splat(0);
         self.trace_cache = @splat(.{});
     }
 
@@ -163,11 +175,11 @@ pub const RegPinSet = struct {
 };
 
 pub const X64Emitter = struct {
-    buf: [16384]u8 = undefined,
+    buf: [32768]u8 = undefined,
     len: usize = 0,
-    labels: [512]i32 = @splat(-1),
+    labels: [1024]i32 = @splat(-1),
     label_count: u16 = 0,
-    fixups: [1024]Fixup = undefined,
+    fixups: [2048]Fixup = undefined,
     fixup_count: usize = 0,
     pins: RegPinSet = .{},
 
@@ -1762,6 +1774,76 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
             return true;
         }
 
+        pub fn isSpinLoop(
+            comptime SlotType: type,
+            code_page_ptr: [*]const u8,
+            start_word: u10,
+            end_word_req: u16,
+        ) bool {
+            if (end_word_req <= start_word + 1 or end_word_req - start_word > 64 or end_word_req > 1024) return false;
+            const trace_len: u16 = end_word_req - start_word;
+            var read_before_write: u32 = 0;
+            var written: u32 = 0;
+            var has_side_effect = false;
+            var has_load = false;
+
+            const useReg = struct {
+                inline fn r(rbw: *u32, wr: u32, reg: u8) void {
+                    const idx = reg & 0x1f;
+                    if (idx < 31 and (wr & (@as(u32, 1) << @intCast(idx))) == 0) {
+                        rbw.* |= (@as(u32, 1) << @intCast(idx));
+                    }
+                }
+            }.r;
+            const defReg = struct {
+                inline fn w(wr: *u32, reg: u8) void {
+                    const idx = reg & 0x1f;
+                    if (idx < 31) wr.* |= (@as(u32, 1) << @intCast(idx));
+                }
+            }.w;
+
+            for (0..trace_len) |i| {
+                const w = start_word + @as(u16, @intCast(i));
+                const raw = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
+                if ((raw & 0x3f00_0000) == 0x0800_0000) return true;
+                const d = A64.decodeA64(SlotType, raw);
+                const op: A64Op = @enumFromInt(d.op);
+                switch (op) {
+                    .msr_safe => if (d.rn == 1 or d.rn == 2) return true else {
+                        has_side_effect = true;
+                    },
+                    .ldxr64, .stxr64, .ldxr32, .stxr32 => return true,
+                    .nop, .b_imm, .b_cond, .ret, .br_reg => {},
+                    .cbz64, .cbnz64, .cbz32, .cbnz32, .tbz, .tbnz => useReg(&read_before_write, written, d.rd),
+                    .ldr64_uimm, .ldr32_uimm, .ldrsw_uimm, .ldr16_uimm, .ldr8_uimm, .ldrsb64_uimm, .ldrsb32_uimm, .ldrsh64_uimm, .ldrsh32_uimm => {
+                        has_load = true;
+                        useReg(&read_before_write, written, d.rn);
+                        defReg(&written, d.rd);
+                    },
+                    .ldr_lit32, .ldr_lit64, .ldrsw_lit => {
+                        has_load = true;
+                        defReg(&written, d.rd);
+                    },
+                    .adr, .adrp, .mov_wide, .mrs_tpidr_el0 => defReg(&written, d.rd),
+                    .add_imm64, .sub_imm64, .adds_imm64, .subs_imm64, .add_imm32, .sub_imm32, .adds_imm32, .subs_imm32, .and_imm64, .orr_imm64, .eor_imm64, .ands_imm64, .and_imm32, .orr_imm32, .eor_imm32, .ands_imm32, .ubfm_r, .ubfm_l, .sbfm64_r, .sbfm32_r => {
+                        useReg(&read_before_write, written, d.rn);
+                        defReg(&written, d.rd);
+                    },
+                    .orr_reg64, .orr_reg32, .orn_reg64, .orn_reg32, .add_reg64, .add_reg32, .adds_reg64, .adds_reg32, .sub_reg64, .sub_reg32, .subs_reg64, .subs_reg32, .and_reg64, .and_reg32, .bic_reg64, .bic_reg32, .eor_reg64, .eor_reg32, .ands_reg64, .ands_reg32, .add_lsl64, .add_lsl32, .sub_lsl64, .sub_lsl32, .orr_lsl64, .orr_lsr64, .extr64, .extr32, .add_ext64, .sub_ext64, .add_sub_ext, .dp_shift_reg, .lslv64, .lsrv64, .asrv64, .lslv32, .lsrv32, .asrv32, .csel => {
+                        useReg(&read_before_write, written, d.rn);
+                        useReg(&read_before_write, written, d.rm);
+                        defReg(&written, d.rd);
+                    },
+                    else => has_side_effect = true,
+                }
+            }
+            if (end_word_req < 1024) {
+                const next_raw = std.mem.readInt(u32, code_page_ptr[@as(usize, end_word_req) * 4 ..][0..4], .little);
+                if ((next_raw & 0xffff_f09f) == 0xd503_309f) return true;
+            }
+            return !has_side_effect and has_load and (written & read_before_write) == 0;
+        }
+
         pub fn compileTrace(
             comptime SlotType: type,
             buf: *JitCodeBuffer,
@@ -1774,11 +1856,12 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
             if (!is_x86_64_linux) return null;
 
             const max_window: u16 = 64;
-            var decoded: [64]SlotType = undefined;
+            var decoded: [128]SlotType = undefined;
             var trace_len: u16 = 0;
 
             if (requested_end_word != 0) {
                 if (requested_end_word <= start_word + 1 or requested_end_word - start_word > max_window or requested_end_word > 1024) return null;
+                if (isSpinLoop(SlotType, code_page_ptr, start_word, requested_end_word)) return null;
                 trace_len = requested_end_word - start_word;
                 var can_bypass = false;
                 for (0..trace_len) |i| {
@@ -1787,6 +1870,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                     const d = A64.decodeA64(SlotType, raw_inst);
                     const op: A64Op = @enumFromInt(d.op);
                     if (!canCompileSlot(SlotType, d)) return null;
+                    if (trace_len <= 8 and op == .load_store_other and (raw_inst & 0x3f40_7c00) == 0x0840_7c00) return null;
                     if ((op == .bl_imm or op == .blr_reg or op == .ret or op == .br_reg) and !can_bypass) return null;
                     switch (op) {
                         .b_imm, .b_cond, .cbz64, .cbnz64, .cbz32, .cbnz32, .tbz, .tbnz => {
@@ -1799,16 +1883,33 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                     decoded[i] = d;
                 }
             } else {
-                const limit_word: u16 = @min(@as(u16, 1024), @as(u16, start_word) + max_window);
+                const limit_word: u16 = @min(@as(u16, 1024), @as(u16, start_word) + 64);
+                var target_mask: u64 = 0;
                 while (start_word + trace_len < limit_word) {
                     const w = start_word + trace_len;
                     const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
                     const d = A64.decodeA64(SlotType, raw_inst);
                     const op: A64Op = @enumFromInt(d.op);
                     if (!canCompileSlot(SlotType, d)) break;
+                    switch (op) {
+                        .b_imm, .b_cond, .cbz64, .cbnz64, .cbz32, .cbnz32, .tbz, .tbnz => {
+                            const jdelta: i32 = @as(i32, w) * 4 + @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
+                            if ((jdelta & 3) == 0) {
+                                const tw = @divExact(jdelta, 4);
+                                if (tw > @as(i32, w) and tw < @as(i32, limit_word)) {
+                                    const tidx: u6 = @intCast(tw - @as(i32, start_word));
+                                    target_mask |= (@as(u64, 1) << tidx);
+                                }
+                            }
+                        },
+                        else => {},
+                    }
                     decoded[trace_len] = d;
                     trace_len += 1;
                     if (isTerminator(op)) {
+                        if (trace_len < 64 and (target_mask & (@as(u64, 1) << @intCast(trace_len))) != 0) {
+                            continue;
+                        }
                         if (op == .b_imm) {
                             const target_byte: i32 = @as(i32, @intCast(w)) * 4 + @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
                             if (target_byte >= @as(i32, @intCast(w + 1)) * 4 and target_byte < @as(i32, @intCast(limit_word)) * 4 and (target_byte & 3) == 0) {
@@ -1832,12 +1933,12 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
 
             const epilogue_label = em.newLabel();
             const abort_epilogue_label = em.newLabel();
-            var inst_labels: [64]u16 = undefined;
+            var inst_labels: [128]u16 = undefined;
             for (0..trace_len) |i| {
                 inst_labels[i] = em.newLabel();
             }
 
-            var exit_stubs: [128]ExitStub = undefined;
+            var exit_stubs: [256]ExitStub = undefined;
             var exit_stub_count: usize = 0;
             var fused_flag_kind: FlagSetKind = .none;
 
@@ -3066,7 +3167,6 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                 .ldr_reg_lsr_al,
                 .str_reg_lsr_al,
                 .ldm_al,
-                .ldm_pc_al,
                 .stm_al,
                 .mul_al,
                 .mla_al,
@@ -3093,42 +3193,12 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                 .udiv_al,
                 .sdiv_al,
                 .b_al,
-                .bl_al,
-                .bx_lr_al,
-                .bx_reg_al,
-                .blx_reg_al,
                 .mrs_cpsr_al,
                 .mrc_tpidruro_al,
                 .mrc_tpidrurw_al,
                 .mrc_tpidrprw_al,
-                .ldr_wb_al,
                 => true,
-                .dp_imm_general => blk: {
-                    const op4: u4 = @truncate((raw >> 21) & 0xf);
-                    const s = (raw & (1 << 20)) != 0;
-                    const rd: u4 = @truncate((raw >> 12) & 0xf);
-                    break :blk s and (op4 == 0x0 or op4 == 0x1 or op4 == 0x8 or op4 == 0x9 or op4 == 0xc or op4 == 0xd or op4 == 0xe or op4 == 0xf) and (rd != 15 or op4 == 0x8 or op4 == 0x9);
-                },
-                .dp_reg_general => blk: {
-                    const bit4 = (raw & (1 << 4)) != 0;
-                    const bit7 = (raw & (1 << 7)) != 0;
-                    const op4: u4 = @truncate((raw >> 21) & 0xf);
-                    const s = (raw & (1 << 20)) != 0;
-                    const rn: u4 = @truncate((raw >> 16) & 0xf);
-                    const rd: u4 = @truncate((raw >> 12) & 0xf);
-                    const rm: u4 = @truncate(raw & 0xf);
-                    const shift_imm: u5 = @truncate((raw >> 7) & 0x1f);
-                    const shift_type: u2 = @truncate((raw >> 5) & 3);
-                    if ((op4 & 0b1100) == 0b1000 and !s) break :blk false;
-                    if (rd == 15 and !(op4 >= 0x8 and op4 <= 0xb)) break :blk false;
-                    if (bit4) {
-                        if (bit7 or s or shift_type == 3 or rn == 15 or rm == 15 or ((raw >> 8) & 0xf) == 15) break :blk false;
-                        break :blk op4 != 0x5 and op4 != 0x6 and op4 != 0x7;
-                    }
-                    if (shift_type == 3 and shift_imm == 0) break :blk false;
-                    if (s and (op4 == 0x3 or op4 == 0x5 or op4 == 0x6 or op4 == 0x7)) break :blk false;
-                    break :blk true;
-                },
+                .ldr_wb_al => d.rd != 15,
                 else => false,
             };
         }
@@ -3304,6 +3374,108 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
             return true;
         }
 
+        pub fn isSpinLoop(
+            code_page_ptr: [*]const u8,
+            start_word: u10,
+            end_word_req: u16,
+        ) bool {
+            if (end_word_req <= start_word + 1 or end_word_req - start_word > 64 or end_word_req > 1024) return false;
+            const trace_len: u16 = end_word_req - start_word;
+            var read_before_write: u32 = 0;
+            var written: u32 = 0;
+            var has_side_effect = false;
+            var has_load = false;
+
+            const useReg = struct {
+                inline fn r(rbw: *u32, wr: u32, reg: u8) void {
+                    const idx = reg & 0xf;
+                    if (idx < 15 and (wr & (@as(u32, 1) << @intCast(idx))) == 0) {
+                        rbw.* |= (@as(u32, 1) << @intCast(idx));
+                    }
+                }
+            }.r;
+            const defReg = struct {
+                inline fn w(wr: *u32, reg: u8) void {
+                    const idx = reg & 0xf;
+                    if (idx < 15) wr.* |= (@as(u32, 1) << @intCast(idx));
+                }
+            }.w;
+
+            for (0..trace_len) |i| {
+                const w = start_word + @as(u16, @intCast(i));
+                const raw = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
+                const d = arm1176_mod.decodeArm32(raw);
+                const op: ArmOp = @enumFromInt(d.op);
+                const cond: u4 = @truncate(raw >> 28);
+                switch (op) {
+                    .mcr_barrier_al, .yield_wfe_al, .dmb_dsb_v7_al,
+                    .ldrex_al, .strex_al, .ldrexd_al, .strexd_al, .ldrexb_al, .strexb_al, .ldrexh_al, .strexh_al,
+                    => return true,
+                    .nop_al, .b_al, .bx_lr_al, .bx_reg_al => {},
+                    .ldr_imm_al, .ldrb_imm_al, .ldrh_imm_al, .ldrsb_imm_al, .ldrsh_imm_al => {
+                        has_load = true;
+                        useReg(&read_before_write, written, d.rn);
+                        if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
+                    },
+                    .ldr_lit_al => {
+                        has_load = true;
+                        if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
+                    },
+                    .mov_imm_al, .mvn_imm_al, .movw_al => {
+                        if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
+                    },
+                    .cmp_imm_al, .cmn_imm_al, .tst_imm_al, .teq_imm_al => {
+                        useReg(&read_before_write, written, d.rn);
+                    },
+                    .cmp_reg_al, .cmn_reg_al, .tst_reg_al, .teq_reg_al, .cmp_lsl_reg_al, .cmp_lsr_reg_al, .tst_lsl_reg_al, .tst_lsr_reg_al => {
+                        useReg(&read_before_write, written, d.rn);
+                        useReg(&read_before_write, written, d.rm);
+                    },
+                    .add_imm_al, .sub_imm_al, .rsb_imm_al, .and_imm_al, .orr_imm_al, .eor_imm_al, .bic_imm_al, .adds_imm_al, .subs_imm_al, .ubfx_al, .sbfx_al => {
+                        useReg(&read_before_write, written, d.rn);
+                        if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
+                    },
+                    .mov_reg_al, .mvn_reg_al, .lsl_imm_al, .lsr_imm_al, .asr_imm_al, .uxtb_al, .uxth_al, .sxtb_al, .sxth_al => {
+                        useReg(&read_before_write, written, d.rm);
+                        if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
+                    },
+                    .add_reg_al, .sub_reg_al, .rsb_reg_al, .and_reg_al, .orr_reg_al, .eor_reg_al, .bic_reg_al, .adds_reg_al, .subs_reg_al => {
+                        useReg(&read_before_write, written, d.rn);
+                        useReg(&read_before_write, written, d.rm);
+                        if (cond == 0xe) defReg(&written, d.rd) else useReg(&read_before_write, written, d.rd);
+                    },
+                    .dp_imm_general => {
+                        const op4: u4 = @truncate((raw >> 21) & 0xf);
+                        const rn: u8 = @truncate((raw >> 16) & 0xf);
+                        const rd: u8 = @truncate((raw >> 12) & 0xf);
+                        if (op4 != 0xd and op4 != 0xf) useReg(&read_before_write, written, rn);
+                        if (op4 < 0x8 or op4 > 0xb) {
+                            if (cond == 0xe) defReg(&written, rd) else useReg(&read_before_write, written, rd);
+                        }
+                    },
+                    .dp_reg_general => {
+                        const bit4 = (raw & (1 << 4)) != 0;
+                        const op4: u4 = @truncate((raw >> 21) & 0xf);
+                        const rn: u8 = @truncate((raw >> 16) & 0xf);
+                        const rd: u8 = @truncate((raw >> 12) & 0xf);
+                        const rm: u8 = @truncate(raw & 0xf);
+                        if (op4 != 0xd and op4 != 0xf) useReg(&read_before_write, written, rn);
+                        useReg(&read_before_write, written, rm);
+                        if (bit4) useReg(&read_before_write, written, @truncate((raw >> 8) & 0xf));
+                        if (op4 < 0x8 or op4 > 0xb) {
+                            if (cond == 0xe) defReg(&written, rd) else useReg(&read_before_write, written, rd);
+                        }
+                    },
+                    else => has_side_effect = true,
+                }
+            }
+            if (end_word_req < 1024) {
+                const next_raw = std.mem.readInt(u32, code_page_ptr[@as(usize, end_word_req) * 4 ..][0..4], .little);
+                if ((next_raw & 0x0fff_ffe0) == 0x057f_f040) return true;
+            }
+            return !has_side_effect and has_load and (written & read_before_write) == 0;
+        }
+
         pub fn compileTrace(
             buf: *JitCodeBuffer,
             core_id: u2,
@@ -3315,11 +3487,12 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
             if (!is_x86_64_linux) return null;
 
             const max_window: u16 = 64;
-            var decoded: [64]DecodedSlot = undefined;
+            var decoded: [128]DecodedSlot = undefined;
             var trace_len: u16 = 0;
 
             if (requested_end_word != 0) {
                 if (requested_end_word <= start_word + 1 or requested_end_word - start_word > max_window or requested_end_word > 1024) return null;
+                if (isSpinLoop(code_page_ptr, start_word, requested_end_word)) return null;
                 trace_len = requested_end_word - start_word;
                 for (0..trace_len) |i| {
                     const w = start_word + @as(u16, @intCast(i));
@@ -3358,7 +3531,8 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                     decoded[i] = d;
                 }
             } else {
-                const limit_word: u16 = @min(@as(u16, 1024), @as(u16, start_word) + max_window);
+                const limit_word: u16 = @min(@as(u16, 1024), @as(u16, start_word) + 64);
+                var target_mask: u64 = 0;
                 while (start_word + trace_len < limit_word) {
                     const w = start_word + trace_len;
                     const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
@@ -3370,10 +3544,19 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                             const next_raw = std.mem.readInt(u32, code_page_ptr[@as(usize, w + 1) * 4 ..][0..4], .little);
                             if ((next_raw & 0x0fff_ffe0) == 0x057f_f040) break;
                         }
+                        const jdelta: i32 = @bitCast(@as(u32, @truncate(d.imm)));
+                        const tw = @as(i32, w) + 2 + @divExact(jdelta, 4);
+                        if (tw > @as(i32, w) and tw < @as(i32, limit_word)) {
+                            const tidx: u6 = @intCast(tw - @as(i32, start_word));
+                            target_mask |= (@as(u64, 1) << tidx);
+                        }
                     }
                     decoded[trace_len] = d;
                     trace_len += 1;
                     if (isTerminator(op, raw_inst)) {
+                        if (trace_len < 64 and (target_mask & (@as(u64, 1) << @intCast(trace_len))) != 0) {
+                            continue;
+                        }
                         break;
                     }
                 }
@@ -3391,12 +3574,12 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
 
             const epilogue_label = em.newLabel();
             const abort_epilogue_label = em.newLabel();
-            var inst_labels: [64]u16 = undefined;
+            var inst_labels: [128]u16 = undefined;
             for (0..trace_len) |i| {
                 inst_labels[i] = em.newLabel();
             }
 
-            var exit_stubs: [128]ExitStub = undefined;
+            var exit_stubs: [256]ExitStub = undefined;
             var exit_stub_count: usize = 0;
             var fused_flag_kind: FlagSetKind = .none;
 

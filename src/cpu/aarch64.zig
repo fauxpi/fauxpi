@@ -961,8 +961,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             code_page_ptr: [*]const u8,
             start_word: u10,
             end_word_req: u16,
-        ) void {
-            if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) return;
+            h: u8,
+            count: u8,
+        ) bool {
+            if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) return false;
             const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdx(code_page_ptr, start_word, end_word_req);
             const code_hash = jit_mod.JitCodeBuffer.hashLoopWords(code_page_ptr, start_word, end_word_req);
             const entry = &cpu.jit_buf.trace_cache[tc_idx];
@@ -971,7 +973,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 entry.end_word_req == end_word_req and
                 entry.code_hash == code_hash)
             {
-                if (entry.failed) return;
+                if (entry.failed) return entry.is_spin;
                 if (entry.fn_ptr) |fn_ptr| {
                     const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
                     code_icache_ptr[start_word] = .{
@@ -981,10 +983,25 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         .imm = @intFromPtr(fn_ptr),
                     };
                     cpu.markIcacheDirty(code_page_idx, start_word);
-                    return;
+                    return false;
                 }
             }
+            if ((count & 0x1f) != 0) return false;
             const Jit64 = jit_mod.A64Jit(CpuType, Bus);
+            if (Jit64.isSpinLoop(SlotType, code_page_ptr, start_word, end_word_req)) {
+                cpu.jit_buf.setSpinHash(h);
+                entry.* = .{
+                    .page_ptr = @intFromPtr(code_page_ptr),
+                    .start_word = start_word,
+                    .end_word_req = end_word_req,
+                    .trace_len = 0,
+                    .failed = true,
+                    .is_spin = true,
+                    .code_hash = code_hash,
+                    .fn_ptr = null,
+                };
+                return true;
+            }
             var end_word: u16 = 0;
             if (Jit64.compileTrace(SlotType, &cpu.jit_buf, cpu.mmu.core_id, code_page_ptr, start_word, end_word_req, &end_word)) |fn_ptr| {
                 const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
@@ -995,6 +1012,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .end_word_req = end_word_req,
                     .trace_len = trace_len,
                     .failed = false,
+                    .is_spin = false,
                     .code_hash = code_hash,
                     .fn_ptr = fn_ptr,
                 };
@@ -1012,10 +1030,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .end_word_req = end_word_req,
                     .trace_len = 0,
                     .failed = true,
+                    .is_spin = false,
                     .code_hash = code_hash,
                     .fn_ptr = null,
                 };
             }
+            return false;
         }
 
         inline fn noteBackwardBranch64(
@@ -1036,8 +1056,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
                     const c = cpu.jit_buf.loop_counts[h] +% 1;
                     cpu.jit_buf.loop_counts[h] = c;
-                    if ((c & 7) == 0) {
-                        compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req);
+                    const mask: u8 = if (cpu.jit_buf.isSpinHash(h)) 7 else 0x1f;
+                    if ((c & mask) == 0) {
+                        if (compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req, h, c)) {
+                            cpu.yield_slice = true;
+                        }
                     }
                 }
             }
@@ -2321,6 +2344,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
                                 cpu.pc64 = target_pc;
                                 noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                if (cpu.yield_slice) break :step_loop;
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }
@@ -2337,6 +2361,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
                                 cpu.pc64 = target_pc;
                                 noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                if (cpu.yield_slice) break :step_loop;
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }
@@ -2354,6 +2379,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
                                 cpu.pc64 = target_pc;
                                 noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                if (cpu.yield_slice) break :step_loop;
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }
@@ -2377,6 +2403,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
                                 cpu.pc64 = target_pc;
                                 noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                if (cpu.yield_slice) break :step_loop;
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }
@@ -2441,6 +2468,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
                                 cpu.pc64 = target_pc;
                                 noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                if (cpu.yield_slice) break :step_loop;
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
                             }
@@ -4523,6 +4551,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const target_pc = cur_pc +% d.imm;
                         cpu.pc64 = target_pc;
                         noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                        if (cpu.yield_slice) break :step_loop;
                     },
                     .bl_imm => {
                         cpu.x[30] = cur_pc +% 4;
@@ -4533,6 +4562,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
                             noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            if (cpu.yield_slice) break :step_loop;
                         }
                     },
                     .cbz64 => {
@@ -4540,6 +4570,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
                             noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            if (cpu.yield_slice) break :step_loop;
                         }
                     },
                     .cbnz64 => {
@@ -4547,6 +4578,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
                             noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            if (cpu.yield_slice) break :step_loop;
                         }
                     },
                     .cbz32 => {
@@ -4554,6 +4586,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
                             noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            if (cpu.yield_slice) break :step_loop;
                         }
                     },
                     .cbnz32 => {
@@ -4561,6 +4594,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
                             noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            if (cpu.yield_slice) break :step_loop;
                         }
                     },
                     .tbz => {
@@ -4568,6 +4602,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
                             noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            if (cpu.yield_slice) break :step_loop;
                         }
                     },
                     .tbnz => {
@@ -4575,6 +4610,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
                             noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            if (cpu.yield_slice) break :step_loop;
                         }
                     },
                     .br_reg => cpu.pc64 = getX(cpu, @truncate(d.rn)),
