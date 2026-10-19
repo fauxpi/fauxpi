@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mmu_mod = @import("mmu.zig");
+const vfp_mod = @import("vfp.zig");
 const aarch64_mod = @import("aarch64.zig");
 const arm1176_mod = @import("arm1176.zig");
 
@@ -63,9 +64,25 @@ pub const JitCodeBuffer = struct {
     pub inline fn hashLoopWords(code_page_ptr: [*]const u8, start_word: u10, end_word_req: u16) u64 {
         var h: u64 = 0xcbf29ce484222325;
         var w: usize = start_word;
-        const limit: usize = if (end_word_req != 0) end_word_req else @min(@as(usize, 1024), @as(usize, start_word) + 16);
+        const limit: usize = if (end_word_req != 0) end_word_req else @min(@as(usize, 1024), @as(usize, start_word) + 64);
         while (w < limit) : (w += 1) {
             const inst = std.mem.readInt(u32, code_page_ptr[w * 4 ..][0..4], .little);
+            h = (h ^ inst) *% 0x100000001b3;
+        }
+        return h;
+    }
+
+    pub inline fn traceCacheIdxThumb(code_page_ptr: [*]const u8, start_hw: u11, end_hw_req: u16) usize {
+        const p = @intFromPtr(code_page_ptr);
+        return ((p >> 12) ^ (p >> 20) ^ @as(usize, start_hw) ^ (@as(usize, end_hw_req) << 4) ^ 0x155) & (trace_cache_size - 1);
+    }
+
+    pub inline fn hashThumbHalfwords(code_page_ptr: [*]const u8, start_hw: u11, end_hw_req: u16) u64 {
+        var h: u64 = 0xcbf29ce484222325;
+        var hw: usize = start_hw;
+        const limit: usize = if (end_hw_req != 0) end_hw_req else @min(@as(usize, 2048), @as(usize, start_hw) + 64);
+        while (hw < limit) : (hw += 1) {
+            const inst = std.mem.readInt(u16, code_page_ptr[hw * 2 ..][0..2], .little);
             h = (h ^ inst) *% 0x100000001b3;
         }
         return h;
@@ -136,6 +153,17 @@ pub const Reg = enum(u4) {
     }
 };
 
+pub const Xmm = enum(u4) {
+    xmm0 = 0,
+    xmm1 = 1,
+    xmm2 = 2,
+    xmm3 = 3,
+
+    pub inline fn low3(self: Xmm) u8 {
+        return @intCast(@intFromEnum(self) & 7);
+    }
+};
+
 pub const Cond = enum(u4) {
     o = 0x0,
     no = 0x1,
@@ -147,6 +175,8 @@ pub const Cond = enum(u4) {
     a = 0x7, // nbe (unsigned >)
     s = 0x8,
     ns = 0x9,
+    p = 0xa, // parity / unordered NaN
+    np = 0xb,
     l = 0xc, // signed <
     ge = 0xd, // signed >=
     le = 0xe, // signed <=
@@ -720,6 +750,161 @@ pub const X64Emitter = struct {
         self.emit8(0x0f);
         self.emit8(0xc8 + dst.low3());
     }
+
+    pub fn movupsLoad(self: *X64Emitter, dst: Xmm, base: Reg, disp: i32) void {
+        self.emitRex(false, false, false, base.isExt(), false);
+        self.emit8(0x0f);
+        self.emit8(0x10);
+        self.emitModRmMem(dst.low3(), base, disp);
+    }
+
+    pub fn movupsStore(self: *X64Emitter, base: Reg, disp: i32, src: Xmm) void {
+        self.emitRex(false, false, false, base.isExt(), false);
+        self.emit8(0x0f);
+        self.emit8(0x11);
+        self.emitModRmMem(src.low3(), base, disp);
+    }
+
+    pub fn movupsLoadSib(self: *X64Emitter, dst: Xmm, base: Reg, index: Reg, scale_log2: u2, disp: i32) void {
+        self.emitRex(false, false, index.isExt(), base.isExt(), false);
+        self.emit8(0x0f);
+        self.emit8(0x10);
+        self.emitModRmSib(dst.low3(), base, index, scale_log2, disp);
+    }
+
+    pub fn movupsStoreSib(self: *X64Emitter, base: Reg, index: Reg, scale_log2: u2, disp: i32, src: Xmm) void {
+        self.emitRex(false, false, index.isExt(), base.isExt(), false);
+        self.emit8(0x0f);
+        self.emit8(0x11);
+        self.emitModRmSib(src.low3(), base, index, scale_log2, disp);
+    }
+
+    pub fn movsdLoad(self: *X64Emitter, dst: Xmm, base: Reg, disp: i32) void {
+        self.emit8(0xf2);
+        self.emitRex(false, false, false, base.isExt(), false);
+        self.emit8(0x0f);
+        self.emit8(0x10);
+        self.emitModRmMem(dst.low3(), base, disp);
+    }
+
+    pub fn movsdStore(self: *X64Emitter, base: Reg, disp: i32, src: Xmm) void {
+        self.emit8(0xf2);
+        self.emitRex(false, false, false, base.isExt(), false);
+        self.emit8(0x0f);
+        self.emit8(0x11);
+        self.emitModRmMem(src.low3(), base, disp);
+    }
+
+    pub fn movssLoad(self: *X64Emitter, dst: Xmm, base: Reg, disp: i32) void {
+        self.emit8(0xf3);
+        self.emitRex(false, false, false, base.isExt(), false);
+        self.emit8(0x0f);
+        self.emit8(0x10);
+        self.emitModRmMem(dst.low3(), base, disp);
+    }
+
+    pub fn movssStore(self: *X64Emitter, base: Reg, disp: i32, src: Xmm) void {
+        self.emit8(0xf3);
+        self.emitRex(false, false, false, base.isExt(), false);
+        self.emit8(0x0f);
+        self.emit8(0x11);
+        self.emitModRmMem(src.low3(), base, disp);
+    }
+
+    inline fn emitSseOp(self: *X64Emitter, prefix: u8, op: u8, dst: Xmm, src: Xmm) void {
+        self.emit8(prefix);
+        self.emit8(0x0f);
+        self.emit8(op);
+        self.emitModRmReg(dst.low3(), src.low3());
+    }
+
+    pub fn addsd(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0xf2, 0x58, dst, src);
+    }
+
+    pub fn subsd(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0xf2, 0x5c, dst, src);
+    }
+
+    pub fn mulsd(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0xf2, 0x59, dst, src);
+    }
+
+    pub fn divsd(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0xf2, 0x5e, dst, src);
+    }
+
+    pub fn addss(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0xf3, 0x58, dst, src);
+    }
+
+    pub fn subss(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0xf3, 0x5c, dst, src);
+    }
+
+    pub fn mulss(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0xf3, 0x59, dst, src);
+    }
+
+    pub fn divss(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0xf3, 0x5e, dst, src);
+    }
+
+    pub fn pand(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xdb, dst, src);
+    }
+
+    pub fn pandn(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xdf, dst, src);
+    }
+
+    pub fn por(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xeb, dst, src);
+    }
+
+    pub fn pxor(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xef, dst, src);
+    }
+
+    pub fn paddb(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xfc, dst, src);
+    }
+
+    pub fn paddw(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xfd, dst, src);
+    }
+
+    pub fn paddd(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xfe, dst, src);
+    }
+
+    pub fn paddq(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xd4, dst, src);
+    }
+
+    pub fn psubb(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xf8, dst, src);
+    }
+
+    pub fn psubw(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xf9, dst, src);
+    }
+
+    pub fn psubd(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xfa, dst, src);
+    }
+
+    pub fn psubq(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0xfb, dst, src);
+    }
+
+    pub fn pcmpeqb(self: *X64Emitter, dst: Xmm, src: Xmm) void {
+        self.emitSseOp(0x66, 0x74, dst, src);
+    }
+
+    pub fn ucomisd(self: *X64Emitter, a: Xmm, b: Xmm) void {
+        self.emitSseOp(0x66, 0x2e, a, b);
+    }
 };
 
 // ============================================================================
@@ -908,10 +1093,15 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
     const off_tpidrro_el0: i32 = @intCast(@offsetOf(CpuType, "mmu") + @offsetOf(mmu_mod.Mmu, "tpidrro_el0"));
     const off_tpidr_el1: i32 = @intCast(@offsetOf(CpuType, "mmu") + @offsetOf(mmu_mod.Mmu, "tpidr_el1"));
     const off_tpidr_el2: i32 = @intCast(@offsetOf(CpuType, "mmu") + @offsetOf(mmu_mod.Mmu, "tpidr_el2"));
+    const off_vfp_v: i32 = @intCast(@offsetOf(CpuType, "vfp") + @offsetOf(vfp_mod.Vfp, "v"));
 
     return struct {
         inline fn a64RegOff(reg: u5) i32 {
             return off_x + @as(i32, reg) * 8;
+        }
+
+        inline fn a64VfpOff(reg: u8) i32 {
+            return off_vfp_v + @as(i32, reg & 0x1f) * 16;
         }
 
         inline fn sysRegId(op0: u2, op1: u3, crn: u4, crm: u4, op2: u3) u16 {
@@ -1444,6 +1634,433 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
             em.bindLabel(done_label);
         }
 
+        pub fn jitSlowLoadFp64(
+            cpu_opaque: *anyopaque,
+            bus_opaque: *anyopaque,
+            vaddr: u64,
+            pc_and_wb: u64,
+            info: u32,
+        ) callconv(.c) u64 {
+            const cpu: *CpuType = @ptrCast(@alignCast(cpu_opaque));
+            const bus: *Bus = @ptrCast(@alignCast(bus_opaque));
+            const pc_page_off: u32 = @truncate(pc_and_wb);
+            const cur_pc = cpu.pc64 +% pc_page_off;
+            const size: u5 = @intCast(info & 0x1f);
+            const do_wb = (info & 0x20) != 0;
+            const rd: u5 = @intCast((info >> 8) & 0x1f);
+            const rn: u5 = @intCast((info >> 16) & 0x1f);
+            const wb_disp: i32 = @bitCast(@as(u32, @truncate(pc_and_wb >> 32)));
+
+            const val: u128 = switch (size) {
+                4 => A64.readData32(cpu, bus, vaddr) catch {
+                    A64.handleAbort64(cpu, cur_pc);
+                    return 1;
+                },
+                8 => A64.readData64(cpu, bus, vaddr) catch {
+                    A64.handleAbort64(cpu, cur_pc);
+                    return 1;
+                },
+                16 => A64.readData128(cpu, bus, vaddr) catch {
+                    A64.handleAbort64(cpu, cur_pc);
+                    return 1;
+                },
+                else => unreachable,
+            };
+            cpu.vfp.v[rd] = val;
+            if (do_wb) {
+                A64.setXOrSp(cpu, rn, vaddr +% @as(u64, @bitCast(@as(i64, wb_disp))));
+            }
+            return 0;
+        }
+
+        pub fn jitSlowStoreFp64(
+            cpu_opaque: *anyopaque,
+            bus_opaque: *anyopaque,
+            vaddr: u64,
+            pc_and_wb: u64,
+            info: u32,
+        ) callconv(.c) u64 {
+            const cpu: *CpuType = @ptrCast(@alignCast(cpu_opaque));
+            const bus: *Bus = @ptrCast(@alignCast(bus_opaque));
+            const pc_page_off: u32 = @truncate(pc_and_wb);
+            const cur_pc = cpu.pc64 +% pc_page_off;
+            const size: u5 = @intCast(info & 0x1f);
+            const do_wb = (info & 0x20) != 0;
+            const rd: u5 = @intCast((info >> 8) & 0x1f);
+            const rn: u5 = @intCast((info >> 16) & 0x1f);
+            const wb_disp: i32 = @bitCast(@as(u32, @truncate(pc_and_wb >> 32)));
+            const val = cpu.vfp.v[rd];
+
+            switch (size) {
+                4 => A64.writeData32(cpu, bus, vaddr, @truncate(val)) catch {
+                    A64.handleAbort64(cpu, cur_pc);
+                    return 1;
+                },
+                8 => A64.writeData64(cpu, bus, vaddr, @truncate(val)) catch {
+                    A64.handleAbort64(cpu, cur_pc);
+                    return 1;
+                },
+                16 => A64.writeData128(cpu, bus, vaddr, val) catch {
+                    A64.handleAbort64(cpu, cur_pc);
+                    return 1;
+                },
+                else => unreachable,
+            }
+            if (do_wb) {
+                A64.setXOrSp(cpu, rn, vaddr +% @as(u64, @bitCast(@as(i64, wb_disp))));
+            }
+            const priv: u1 = @intFromBool(A64.currentEl(cpu) != 0);
+            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((vaddr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+            if ((vaddr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                cpu.pc64 = cur_pc +% 4;
+                if (A64.checkInterrupts64(cpu, bus)) return 2;
+                cpu.pc64 = cur_pc -% pc_page_off;
+            }
+            return 0;
+        }
+
+        pub fn jitSlowPairFp64(
+            cpu_opaque: *anyopaque,
+            bus_opaque: *anyopaque,
+            vaddr: u64,
+            pc_page_off: u32,
+            packed_info: u64,
+        ) callconv(.c) u64 {
+            const cpu: *CpuType = @ptrCast(@alignCast(cpu_opaque));
+            const bus: *Bus = @ptrCast(@alignCast(bus_opaque));
+            const cur_pc = cpu.pc64 +% pc_page_off;
+            const rt: u5 = @intCast(packed_info & 0x1f);
+            const rt2: u5 = @intCast((packed_info >> 5) & 0x1f);
+            const rn: u5 = @intCast((packed_info >> 10) & 0x1f);
+            const is128 = ((packed_info >> 15) & 1) != 0;
+            const do_wb = ((packed_info >> 16) & 1) != 0;
+            const is_load = ((packed_info >> 17) & 1) != 0;
+            const wb_addr = vaddr +% @as(u64, @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(packed_info >> 32)))))));
+
+            if (is_load) {
+                if (is128) {
+                    const v1 = A64.readData128(cpu, bus, vaddr) catch {
+                        A64.handleAbort64(cpu, cur_pc);
+                        return 1;
+                    };
+                    const v2 = A64.readData128(cpu, bus, vaddr +% 16) catch {
+                        A64.handleAbort64(cpu, cur_pc);
+                        return 1;
+                    };
+                    cpu.vfp.v[rt] = v1;
+                    cpu.vfp.v[rt2] = v2;
+                } else {
+                    const pair = A64.readData128(cpu, bus, vaddr) catch {
+                        A64.handleAbort64(cpu, cur_pc);
+                        return 1;
+                    };
+                    cpu.vfp.v[rt] = @as(u64, @truncate(pair));
+                    cpu.vfp.v[rt2] = @as(u64, @truncate(pair >> 64));
+                }
+                if (do_wb) A64.setXOrSp(cpu, rn, wb_addr);
+                return 0;
+            } else {
+                if (is128) {
+                    A64.writeData128(cpu, bus, vaddr, cpu.vfp.v[rt]) catch {
+                        A64.handleAbort64(cpu, cur_pc);
+                        return 1;
+                    };
+                    A64.writeData128(cpu, bus, vaddr +% 16, cpu.vfp.v[rt2]) catch {
+                        A64.handleAbort64(cpu, cur_pc);
+                        return 1;
+                    };
+                } else {
+                    const v1: u64 = @truncate(cpu.vfp.v[rt]);
+                    const v2: u64 = @truncate(cpu.vfp.v[rt2]);
+                    A64.writeData128(cpu, bus, vaddr, @as(u128, v1) | (@as(u128, v2) << 64)) catch {
+                        A64.handleAbort64(cpu, cur_pc);
+                        return 1;
+                    };
+                }
+                if (do_wb) A64.setXOrSp(cpu, rn, wb_addr);
+                const priv: u1 = @intFromBool(A64.currentEl(cpu) != 0);
+                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((vaddr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                if ((vaddr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                    cpu.pc64 = cur_pc +% 4;
+                    if (A64.checkInterrupts64(cpu, bus)) return 2;
+                    cpu.pc64 = cur_pc -% pc_page_off;
+                }
+                return 0;
+            }
+        }
+
+        pub fn jitSlowDcZva64(
+            cpu_opaque: *anyopaque,
+            bus_opaque: *anyopaque,
+            base_va: u64,
+            pc_page_off: u32,
+        ) callconv(.c) u64 {
+            const cpu: *CpuType = @ptrCast(@alignCast(cpu_opaque));
+            const bus: *Bus = @ptrCast(@alignCast(bus_opaque));
+            const cur_pc = cpu.pc64 +% pc_page_off;
+            var off: u64 = 0;
+            while (off < 64) : (off += 8) {
+                A64.writeData64(cpu, bus, base_va +% off, 0) catch {
+                    A64.handleAbort64(cpu, cur_pc);
+                    return 1;
+                };
+            }
+            return 0;
+        }
+
+        fn emitA64LoadFpAddr(
+            em: *X64Emitter,
+            rd: u8,
+            rn: u8,
+            size: u5,
+            do_wb: bool,
+            wb_disp: i32,
+            pc_page_off: u32,
+            abort_epilogue_label: u16,
+        ) void {
+            const slow_label = em.newLabel();
+            const done_label = em.newLabel();
+
+            em.movRegReg(true, .rcx, .rdi);
+            em.shrImm(true, .rcx, 7);
+            em.andRegImm(false, .rcx, 0x1ffe0);
+
+            if (size == 16) {
+                em.movRegReg(true, .rax, .rdi);
+                em.andRegImm(true, .rax, -4096);
+                em.cmpSibReg(true, .rbp, .rcx, 0, off_tlb64_read_vpage, .rax);
+                em.jccLabel(.ne, slow_label);
+                em.movRegReg(false, .rdx, .rdi);
+                em.andRegImm(false, .rdx, 0xfff);
+                em.cmpRegImm(false, .rdx, 4096 - 16);
+                em.jccLabel(.a, slow_label);
+                em.movRegSib(false, .rax, .rbp, .rcx, 0, off_tlb64_pbase);
+                em.orRegReg(true, .rax, .rdx);
+                em.movupsLoadSib(.xmm0, .r13, .rax, 0, 0);
+                if (do_wb) {
+                    em.leaRegMem(true, .rcx, .rdi, wb_disp);
+                    emitStoreA64Reg(em, rn, .rcx, true, .rdx);
+                }
+                em.movupsStore(.rbx, a64VfpOff(rd), .xmm0);
+            } else {
+                const align_mask: i32 = if (size == 8) -4089 else -4093;
+                em.movRegReg(true, .rax, .rdi);
+                em.andRegImm(true, .rax, align_mask);
+                em.cmpSibReg(true, .rbp, .rcx, 0, off_tlb64_read_vpage, .rax);
+                em.jccLabel(.ne, slow_label);
+                em.movRegSib(false, .rax, .rbp, .rcx, 0, off_tlb64_pbase);
+                em.movRegReg(false, .rdx, .rdi);
+                em.andRegImm(false, .rdx, 0xfff);
+                em.orRegReg(true, .rax, .rdx);
+                em.movRegSib(size == 8, .rax, .r13, .rax, 0, 0);
+                if (do_wb) {
+                    em.leaRegMem(true, .rcx, .rdi, wb_disp);
+                    emitStoreA64Reg(em, rn, .rcx, true, .rdx);
+                }
+                em.movMemReg(true, .rbx, a64VfpOff(rd), .rax);
+                em.xorRegReg(false, .rax, .rax);
+                em.movMemReg(true, .rbx, a64VfpOff(rd) + 8, .rax);
+            }
+            em.jmpLabel(done_label);
+
+            em.bindLabel(slow_label);
+            emitSpillPinned64(em);
+            const info: u32 = @as(u32, size) |
+                (if (do_wb) @as(u32, 0x20) else 0) |
+                (@as(u32, rd & 0x1f) << 8) |
+                (@as(u32, rn & 0x1f) << 16);
+            const pc_and_wb: u64 = @as(u64, pc_page_off) |
+                (if (do_wb) (@as(u64, @as(u32, @bitCast(wb_disp))) << 32) else 0);
+            em.movRegReg(true, .rdx, .rdi);
+            em.movRegReg(true, .rdi, .rbx);
+            em.movRegReg(true, .rsi, .r12);
+            em.movImm64(.rcx, pc_and_wb);
+            em.movImm32(.r8, info);
+            em.movImm64(.r11, @intFromPtr(&jitSlowLoadFp64));
+            em.callReg(.r11);
+
+            em.testRegReg(true, .rax, .rax);
+            em.jccLabel(.ne, abort_epilogue_label);
+            emitReloadPinned64(em);
+
+            em.bindLabel(done_label);
+        }
+
+        fn emitA64StoreFpAddr(
+            em: *X64Emitter,
+            rd: u8,
+            rn: u8,
+            size: u5,
+            do_wb: bool,
+            wb_disp: i32,
+            pc_page_off: u32,
+            abort_epilogue_label: u16,
+        ) void {
+            const slow_label = em.newLabel();
+            const done_label = em.newLabel();
+
+            em.movRegReg(true, .rcx, .rdi);
+            em.shrImm(true, .rcx, 7);
+            em.andRegImm(false, .rcx, 0x1ffe0);
+
+            if (size == 16) {
+                em.movRegReg(true, .rax, .rdi);
+                em.andRegImm(true, .rax, -4096);
+                em.cmpSibReg(true, .rbp, .rcx, 0, off_tlb64_write_vpage, .rax);
+                em.jccLabel(.ne, slow_label);
+                em.movRegReg(false, .rdx, .rdi);
+                em.andRegImm(false, .rdx, 0xfff);
+                em.cmpRegImm(false, .rdx, 4096 - 16);
+                em.jccLabel(.a, slow_label);
+                em.movRegSib(false, .rax, .rbp, .rcx, 0, off_tlb64_pbase);
+                em.orRegReg(true, .rax, .rdx);
+                em.movupsLoad(.xmm0, .rbx, a64VfpOff(rd));
+                em.movupsStoreSib(.r13, .rax, 0, 0, .xmm0);
+            } else {
+                const align_mask: i32 = if (size == 8) -4089 else -4093;
+                em.movRegReg(true, .rax, .rdi);
+                em.andRegImm(true, .rax, align_mask);
+                em.cmpSibReg(true, .rbp, .rcx, 0, off_tlb64_write_vpage, .rax);
+                em.jccLabel(.ne, slow_label);
+                em.movRegSib(false, .rax, .rbp, .rcx, 0, off_tlb64_pbase);
+                em.movRegReg(false, .rdx, .rdi);
+                em.andRegImm(false, .rdx, 0xfff);
+                em.orRegReg(true, .rax, .rdx);
+                em.movRegMem(size == 8, .rcx, .rbx, a64VfpOff(rd));
+                em.movSibReg(size == 8, .r13, .rax, 0, 0, .rcx);
+            }
+            if (do_wb) {
+                em.leaRegMem(true, .rcx, .rdi, wb_disp);
+                emitStoreA64Reg(em, rn, .rcx, true, .rdx);
+            }
+            em.jmpLabel(done_label);
+
+            em.bindLabel(slow_label);
+            emitSpillPinned64(em);
+            const info: u32 = @as(u32, size) |
+                (if (do_wb) @as(u32, 0x20) else 0) |
+                (@as(u32, rd & 0x1f) << 8) |
+                (@as(u32, rn & 0x1f) << 16);
+            const pc_and_wb: u64 = @as(u64, pc_page_off) |
+                (if (do_wb) (@as(u64, @as(u32, @bitCast(wb_disp))) << 32) else 0);
+            em.movRegReg(true, .rdx, .rdi);
+            em.movRegReg(true, .rdi, .rbx);
+            em.movRegReg(true, .rsi, .r12);
+            em.movImm64(.rcx, pc_and_wb);
+            em.movImm32(.r8, info);
+            em.movImm64(.r11, @intFromPtr(&jitSlowStoreFp64));
+            em.callReg(.r11);
+
+            em.testRegReg(true, .rax, .rax);
+            em.jccLabel(.ne, abort_epilogue_label);
+            emitReloadPinned64(em);
+
+            em.bindLabel(done_label);
+        }
+
+        fn emitA64PairFpMem(
+            em: *X64Emitter,
+            rd: u8,
+            rm: u8,
+            rn: u8,
+            is_load: bool,
+            is128: bool,
+            pre_disp: i32,
+            do_wb: bool,
+            wb_disp: i32,
+            pc_page_off: u32,
+            abort_epilogue_label: u16,
+        ) void {
+            emitLoadA64Reg(em, true, .rdi, rn & 0x1f, true);
+            if (pre_disp != 0) em.addRegImm(true, .rdi, pre_disp);
+
+            const slow_label = em.newLabel();
+            const done_label = em.newLabel();
+
+            em.movRegReg(true, .rcx, .rdi);
+            em.shrImm(true, .rcx, 7);
+            em.andRegImm(false, .rcx, 0x1ffe0);
+
+            em.movRegReg(true, .rax, .rdi);
+            em.andRegImm(true, .rax, -4096);
+            em.cmpSibReg(true, .rbp, .rcx, 0, if (is_load) off_tlb64_read_vpage else off_tlb64_write_vpage, .rax);
+            em.jccLabel(.ne, slow_label);
+
+            em.movRegReg(false, .rdx, .rdi);
+            em.andRegImm(false, .rdx, 0xfff);
+            em.cmpRegImm(false, .rdx, if (is128) 4096 - 32 else 4096 - 16);
+            em.jccLabel(.a, slow_label);
+
+            em.movRegSib(false, .rax, .rbp, .rcx, 0, off_tlb64_pbase);
+            em.orRegReg(true, .rax, .rdx);
+
+            if (is_load) {
+                if (is128) {
+                    em.movupsLoadSib(.xmm0, .r13, .rax, 0, 0);
+                    em.movupsLoadSib(.xmm1, .r13, .rax, 0, 16);
+                    if (do_wb) {
+                        em.leaRegMem(true, .rdi, .rdi, wb_disp);
+                        emitStoreA64Reg(em, rn & 0x1f, .rdi, true, .rax);
+                    }
+                    em.movupsStore(.rbx, a64VfpOff(rd), .xmm0);
+                    em.movupsStore(.rbx, a64VfpOff(rm), .xmm1);
+                } else {
+                    em.movRegSib(true, .rcx, .r13, .rax, 0, 0);
+                    em.movRegSib(true, .rdx, .r13, .rax, 0, 8);
+                    if (do_wb) {
+                        em.leaRegMem(true, .rdi, .rdi, wb_disp);
+                        emitStoreA64Reg(em, rn & 0x1f, .rdi, true, .rax);
+                    }
+                    em.xorRegReg(false, .rax, .rax);
+                    em.movMemReg(true, .rbx, a64VfpOff(rd), .rcx);
+                    em.movMemReg(true, .rbx, a64VfpOff(rd) + 8, .rax);
+                    em.movMemReg(true, .rbx, a64VfpOff(rm), .rdx);
+                    em.movMemReg(true, .rbx, a64VfpOff(rm) + 8, .rax);
+                }
+            } else {
+                if (is128) {
+                    em.movupsLoad(.xmm0, .rbx, a64VfpOff(rd));
+                    em.movupsLoad(.xmm1, .rbx, a64VfpOff(rm));
+                    em.movupsStoreSib(.r13, .rax, 0, 0, .xmm0);
+                    em.movupsStoreSib(.r13, .rax, 0, 16, .xmm1);
+                } else {
+                    em.movRegMem(true, .rcx, .rbx, a64VfpOff(rd));
+                    em.movRegMem(true, .rdx, .rbx, a64VfpOff(rm));
+                    em.movSibReg(true, .r13, .rax, 0, 0, .rcx);
+                    em.movSibReg(true, .r13, .rax, 0, 8, .rdx);
+                }
+                if (do_wb) {
+                    em.leaRegMem(true, .rdi, .rdi, wb_disp);
+                    emitStoreA64Reg(em, rn & 0x1f, .rdi, true, .rax);
+                }
+            }
+            em.jmpLabel(done_label);
+
+            em.bindLabel(slow_label);
+            emitSpillPinned64(em);
+            const packed_low: u64 = @as(u64, rd & 0x1f) |
+                (@as(u64, rm & 0x1f) << 5) |
+                (@as(u64, rn & 0x1f) << 10) |
+                (if (is128) @as(u64, 1) << 15 else 0) |
+                (if (do_wb) @as(u64, 1) << 16 else 0) |
+                (if (is_load) @as(u64, 1) << 17 else 0);
+            const packed_info: u64 = packed_low | (@as(u64, @as(u32, @bitCast(wb_disp))) << 32);
+
+            em.movRegReg(true, .rdx, .rdi);
+            em.movRegReg(true, .rdi, .rbx);
+            em.movRegReg(true, .rsi, .r12);
+            em.movImm32(.rcx, pc_page_off);
+            em.movImm64(.r8, packed_info);
+            em.movImm64(.r11, @intFromPtr(&jitSlowPairFp64));
+            em.callReg(.r11);
+
+            em.testRegReg(true, .rax, .rax);
+            em.jccLabel(.ne, abort_epilogue_label);
+            emitReloadPinned64(em);
+
+            em.bindLabel(done_label);
+        }
+
         pub fn canCompileOp(op: A64Op) bool {
             return switch (op) {
                 .nop,
@@ -1567,6 +2184,84 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                 .stp32_pre,
                 .ldp32_post,
                 .stp32_post,
+                .ldr_fp32_uimm,
+                .str_fp32_uimm,
+                .ldr_fp64_uimm,
+                .str_fp64_uimm,
+                .ldr_fp128_uimm,
+                .str_fp128_uimm,
+                .ldr_fp64_pre,
+                .ldr_fp64_post,
+                .str_fp64_pre,
+                .str_fp64_post,
+                .ldr_fp128_pre,
+                .ldr_fp128_post,
+                .str_fp128_pre,
+                .str_fp128_post,
+                .ldr_fp64_reg_lsl,
+                .str_fp64_reg_lsl,
+                .ldr_fp128_reg_lsl,
+                .str_fp128_reg_lsl,
+                .ldp_fp64_off,
+                .stp_fp64_off,
+                .ldp_fp64_pre,
+                .stp_fp64_pre,
+                .ldp_fp64_post,
+                .stp_fp64_post,
+                .ldp_fp128_off,
+                .stp_fp128_off,
+                .ldp_fp128_pre,
+                .stp_fp128_pre,
+                .ldp_fp128_post,
+                .stp_fp128_post,
+                .dc_zva,
+                .fmov_d_x,
+                .fmov_x_d,
+                .fmov_s_w,
+                .fmov_w_s,
+                .fmov_d_hi_x,
+                .fmov_x_d_hi,
+                .fmov_f64,
+                .fmov_f32,
+                .fabs_f64,
+                .fneg_f64,
+                .fabs_f32,
+                .fneg_f32,
+                .fadd_f64,
+                .fsub_f64,
+                .fmul_f64,
+                .fdiv_f64,
+                .fadd_f32,
+                .fsub_f32,
+                .fmul_f32,
+                .fdiv_f32,
+                .fmadd_f64,
+                .fmsub_f64,
+                .fmadd_f32,
+                .fmsub_f32,
+                .simd_movi,
+                .simd_and,
+                .simd_bic,
+                .simd_orr,
+                .simd_orn,
+                .simd_eor,
+                .simd_bsl,
+                .simd_not,
+                .simd_dup_gpr,
+                .simd_dup_elem,
+                .simd_umov32,
+                .simd_umov64,
+                .simd_add_8,
+                .simd_sub_8,
+                .simd_add_16,
+                .simd_sub_16,
+                .simd_add_32,
+                .simd_sub_32,
+                .simd_add_64,
+                .simd_sub_64,
+                .simd_cmeq_8,
+                .simd_cmeqz_8,
+                .simd_cmtst_8,
                 .b_imm,
                 .bl_imm,
                 .b_cond,
@@ -1673,7 +2368,16 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                             bump(&counts, @truncate((d.raw >> 5) & 0x1f));
                         }
                     },
-                    .mrs_sys => bump(&counts, d.rd),
+                    .mrs_sys, .dc_zva, .fmov_x_d, .fmov_w_s, .fmov_x_d_hi, .simd_umov32, .simd_umov64 => bump(&counts, d.rd),
+                    .fmov_d_x, .fmov_s_w, .fmov_d_hi_x, .simd_dup_gpr, .ldr_fp32_uimm, .str_fp32_uimm, .ldr_fp64_uimm, .str_fp64_uimm, .ldr_fp128_uimm, .str_fp128_uimm, .ldp_fp64_off, .stp_fp64_off, .ldp_fp128_off, .stp_fp128_off => bump(&counts, d.rn),
+                    .ldr_fp64_pre, .ldr_fp64_post, .str_fp64_pre, .str_fp64_post, .ldr_fp128_pre, .ldr_fp128_post, .str_fp128_pre, .str_fp128_post, .ldp_fp64_pre, .stp_fp64_pre, .ldp_fp64_post, .stp_fp64_post, .ldp_fp128_pre, .stp_fp128_pre, .ldp_fp128_post, .stp_fp128_post => {
+                        bump(&counts, d.rn);
+                        bump(&counts, d.rn);
+                    },
+                    .ldr_fp64_reg_lsl, .str_fp64_reg_lsl, .ldr_fp128_reg_lsl, .str_fp128_reg_lsl => {
+                        bump(&counts, d.rn);
+                        bump(&counts, d.rm);
+                    },
                     .bl_imm => bump(&counts, 30),
                     .br_reg, .ret => bump(&counts, d.rn),
                     .blr_reg => {
@@ -2736,6 +3440,391 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                         );
                     },
 
+                    .ldr_fp32_uimm, .ldr_fp64_uimm, .ldr_fp128_uimm => {
+                        const size: u5 = switch (op) {
+                            .ldr_fp32_uimm => 4,
+                            .ldr_fp64_uimm => 8,
+                            .ldr_fp128_uimm => 16,
+                            else => unreachable,
+                        };
+                        emitLoadA64Reg(&em, true, .rdi, d.rn, true);
+                        const disp: i32 = @bitCast(@as(u32, @truncate(d.imm)));
+                        if (disp != 0) em.addRegImm(true, .rdi, disp);
+                        emitA64LoadFpAddr(&em, d.rd, d.rn, size, false, 0, pc_page_off, abort_epilogue_label);
+                    },
+
+                    .str_fp32_uimm, .str_fp64_uimm, .str_fp128_uimm => {
+                        const size: u5 = switch (op) {
+                            .str_fp32_uimm => 4,
+                            .str_fp64_uimm => 8,
+                            .str_fp128_uimm => 16,
+                            else => unreachable,
+                        };
+                        emitLoadA64Reg(&em, true, .rdi, d.rn, true);
+                        const disp: i32 = @bitCast(@as(u32, @truncate(d.imm)));
+                        if (disp != 0) em.addRegImm(true, .rdi, disp);
+                        emitA64StoreFpAddr(&em, d.rd, d.rn, size, false, 0, pc_page_off, abort_epilogue_label);
+                    },
+
+                    .ldr_fp64_pre, .ldr_fp64_post, .ldr_fp128_pre, .ldr_fp128_post => {
+                        const is_pre = op == .ldr_fp64_pre or op == .ldr_fp128_pre;
+                        const size: u5 = if (op == .ldr_fp128_pre or op == .ldr_fp128_post) 16 else 8;
+                        const disp: i32 = @bitCast(@as(u32, @truncate(d.imm)));
+                        emitLoadA64Reg(&em, true, .rdi, d.rn, true);
+                        if (is_pre and disp != 0) em.addRegImm(true, .rdi, disp);
+                        emitA64LoadFpAddr(&em, d.rd, d.rn, size, true, if (is_pre) 0 else disp, pc_page_off, abort_epilogue_label);
+                    },
+
+                    .str_fp64_pre, .str_fp64_post, .str_fp128_pre, .str_fp128_post => {
+                        const is_pre = op == .str_fp64_pre or op == .str_fp128_pre;
+                        const size: u5 = if (op == .str_fp128_pre or op == .str_fp128_post) 16 else 8;
+                        const disp: i32 = @bitCast(@as(u32, @truncate(d.imm)));
+                        emitLoadA64Reg(&em, true, .rdi, d.rn, true);
+                        if (is_pre and disp != 0) em.addRegImm(true, .rdi, disp);
+                        emitA64StoreFpAddr(&em, d.rd, d.rn, size, true, if (is_pre) 0 else disp, pc_page_off, abort_epilogue_label);
+                    },
+
+                    .ldr_fp64_reg_lsl, .ldr_fp128_reg_lsl => {
+                        const size: u5 = if (op == .ldr_fp128_reg_lsl) 16 else 8;
+                        emitLoadA64Reg(&em, true, .rdi, d.rn, true);
+                        emitLoadA64Reg(&em, true, .rax, d.rm, false);
+                        const sh: u6 = @truncate(d.imm);
+                        if (sh != 0) em.shlImm(true, .rax, sh);
+                        em.addRegReg(true, .rdi, .rax);
+                        emitA64LoadFpAddr(&em, d.rd, d.rn, size, false, 0, pc_page_off, abort_epilogue_label);
+                    },
+
+                    .str_fp64_reg_lsl, .str_fp128_reg_lsl => {
+                        const size: u5 = if (op == .str_fp128_reg_lsl) 16 else 8;
+                        emitLoadA64Reg(&em, true, .rdi, d.rn, true);
+                        emitLoadA64Reg(&em, true, .rax, d.rm, false);
+                        const sh: u6 = @truncate(d.imm);
+                        if (sh != 0) em.shlImm(true, .rax, sh);
+                        em.addRegReg(true, .rdi, .rax);
+                        emitA64StoreFpAddr(&em, d.rd, d.rn, size, false, 0, pc_page_off, abort_epilogue_label);
+                    },
+
+                    .ldp_fp64_off, .ldp_fp64_pre, .ldp_fp64_post, .stp_fp64_off, .stp_fp64_pre, .stp_fp64_post, .ldp_fp128_off, .ldp_fp128_pre, .ldp_fp128_post, .stp_fp128_off, .stp_fp128_pre, .stp_fp128_post => {
+                        const is_load = switch (op) {
+                            .ldp_fp64_off, .ldp_fp64_pre, .ldp_fp64_post, .ldp_fp128_off, .ldp_fp128_pre, .ldp_fp128_post => true,
+                            else => false,
+                        };
+                        const is128 = switch (op) {
+                            .ldp_fp128_off, .ldp_fp128_pre, .ldp_fp128_post, .stp_fp128_off, .stp_fp128_pre, .stp_fp128_post => true,
+                            else => false,
+                        };
+                        const is_pre = op == .ldp_fp64_pre or op == .stp_fp64_pre or op == .ldp_fp128_pre or op == .stp_fp128_pre;
+                        const is_post = op == .ldp_fp64_post or op == .stp_fp64_post or op == .ldp_fp128_post or op == .stp_fp128_post;
+                        const disp: i32 = @bitCast(@as(u32, @truncate(d.imm)));
+                        emitA64PairFpMem(
+                            &em,
+                            d.rd,
+                            d.rm,
+                            d.rn,
+                            is_load,
+                            is128,
+                            if (is_post) 0 else disp,
+                            is_pre or is_post,
+                            if (is_post) disp else 0,
+                            pc_page_off,
+                            abort_epilogue_label,
+                        );
+                    },
+
+                    .dc_zva => {
+                        const slow_zva = em.newLabel();
+                        const done_zva = em.newLabel();
+                        emitLoadA64Reg(&em, true, .rdi, d.rd, false);
+                        em.andRegImm(true, .rdi, -64);
+
+                        em.movRegReg(true, .rcx, .rdi);
+                        em.shrImm(true, .rcx, 7);
+                        em.andRegImm(false, .rcx, 0x1ffe0);
+
+                        em.movRegReg(true, .rax, .rdi);
+                        em.andRegImm(true, .rax, -4096);
+                        em.cmpSibReg(true, .rbp, .rcx, 0, off_tlb64_write_vpage, .rax);
+                        em.jccLabel(.ne, slow_zva);
+
+                        em.movRegSib(false, .rax, .rbp, .rcx, 0, off_tlb64_pbase);
+                        em.movRegReg(false, .rdx, .rdi);
+                        em.andRegImm(false, .rdx, 0xfc0);
+                        em.orRegReg(true, .rax, .rdx);
+
+                        em.pxor(.xmm0, .xmm0);
+                        em.movupsStoreSib(.r13, .rax, 0, 0, .xmm0);
+                        em.movupsStoreSib(.r13, .rax, 0, 16, .xmm0);
+                        em.movupsStoreSib(.r13, .rax, 0, 32, .xmm0);
+                        em.movupsStoreSib(.r13, .rax, 0, 48, .xmm0);
+                        em.jmpLabel(done_zva);
+
+                        em.bindLabel(slow_zva);
+                        emitSpillPinned64(&em);
+                        em.movRegReg(true, .rdx, .rdi);
+                        em.movRegReg(true, .rdi, .rbx);
+                        em.movRegReg(true, .rsi, .r12);
+                        em.movImm32(.rcx, pc_page_off);
+                        em.movImm64(.r11, @intFromPtr(&jitSlowDcZva64));
+                        em.callReg(.r11);
+                        em.testRegReg(true, .rax, .rax);
+                        em.jccLabel(.ne, abort_epilogue_label);
+                        emitReloadPinned64(&em);
+
+                        em.bindLabel(done_zva);
+                    },
+
+                    .fmov_d_x, .fmov_s_w => {
+                        emitLoadA64Reg(&em, op == .fmov_d_x, .rax, d.rn, false);
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd), .rax);
+                        em.xorRegReg(false, .rcx, .rcx);
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd) + 8, .rcx);
+                    },
+                    .fmov_x_d, .fmov_w_s => {
+                        em.movRegMem(op == .fmov_x_d, .rax, .rbx, a64VfpOff(d.rn));
+                        emitStoreA64Reg(&em, d.rd, .rax, false, .rcx);
+                    },
+                    .fmov_d_hi_x => {
+                        emitLoadA64Reg(&em, true, .rax, d.rn, false);
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd) + 8, .rax);
+                    },
+                    .fmov_x_d_hi => {
+                        em.movRegMem(true, .rax, .rbx, a64VfpOff(d.rn) + 8);
+                        emitStoreA64Reg(&em, d.rd, .rax, false, .rcx);
+                    },
+                    .fmov_f64, .fmov_f32 => {
+                        em.movRegMem(op == .fmov_f64, .rax, .rbx, a64VfpOff(d.rn));
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd), .rax);
+                        em.xorRegReg(false, .rcx, .rcx);
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd) + 8, .rcx);
+                    },
+                    .fabs_f64, .fneg_f64 => {
+                        em.movRegMem(true, .rax, .rbx, a64VfpOff(d.rn));
+                        em.movImm64(.rcx, if (op == .fabs_f64) 0x7fff_ffff_ffff_ffff else 0x8000_0000_0000_0000);
+                        if (op == .fabs_f64) em.andRegReg(true, .rax, .rcx) else em.xorRegReg(true, .rax, .rcx);
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd), .rax);
+                        em.xorRegReg(false, .rcx, .rcx);
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd) + 8, .rcx);
+                    },
+                    .fabs_f32, .fneg_f32 => {
+                        em.movRegMem(false, .rax, .rbx, a64VfpOff(d.rn));
+                        if (op == .fabs_f32) {
+                            em.andRegImm(false, .rax, 0x7fff_ffff);
+                        } else {
+                            em.xorRegImm(false, .rax, @bitCast(@as(u32, 0x8000_0000)));
+                        }
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd), .rax);
+                        em.xorRegReg(false, .rcx, .rcx);
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd) + 8, .rcx);
+                    },
+                    .fadd_f64, .fsub_f64, .fmul_f64, .fdiv_f64 => {
+                        em.movsdLoad(.xmm0, .rbx, a64VfpOff(d.rn));
+                        em.movsdLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                        switch (op) {
+                            .fadd_f64 => em.addsd(.xmm0, .xmm1),
+                            .fsub_f64 => em.subsd(.xmm0, .xmm1),
+                            .fmul_f64 => em.mulsd(.xmm0, .xmm1),
+                            .fdiv_f64 => em.divsd(.xmm0, .xmm1),
+                            else => unreachable,
+                        }
+                        em.movupsStore(.rbx, a64VfpOff(d.rd), .xmm0);
+                    },
+                    .fadd_f32, .fsub_f32, .fmul_f32, .fdiv_f32 => {
+                        em.movssLoad(.xmm0, .rbx, a64VfpOff(d.rn));
+                        em.movssLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                        switch (op) {
+                            .fadd_f32 => em.addss(.xmm0, .xmm1),
+                            .fsub_f32 => em.subss(.xmm0, .xmm1),
+                            .fmul_f32 => em.mulss(.xmm0, .xmm1),
+                            .fdiv_f32 => em.divss(.xmm0, .xmm1),
+                            else => unreachable,
+                        }
+                        em.movupsStore(.rbx, a64VfpOff(d.rd), .xmm0);
+                    },
+                    .fmadd_f64, .fmsub_f64 => {
+                        em.movsdLoad(.xmm0, .rbx, a64VfpOff(d.rn));
+                        em.movsdLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                        em.mulsd(.xmm0, .xmm1);
+                        em.movsdLoad(.xmm1, .rbx, a64VfpOff(@truncate(d.imm)));
+                        if (op == .fmadd_f64) em.addsd(.xmm1, .xmm0) else em.subsd(.xmm1, .xmm0);
+                        em.movupsStore(.rbx, a64VfpOff(d.rd), .xmm1);
+                    },
+                    .fmadd_f32, .fmsub_f32 => {
+                        em.movssLoad(.xmm0, .rbx, a64VfpOff(d.rn));
+                        em.movssLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                        em.mulss(.xmm0, .xmm1);
+                        em.movssLoad(.xmm1, .rbx, a64VfpOff(@truncate(d.imm)));
+                        if (op == .fmadd_f32) em.addss(.xmm1, .xmm0) else em.subss(.xmm1, .xmm0);
+                        em.movupsStore(.rbx, a64VfpOff(d.rd), .xmm1);
+                    },
+
+                    .simd_movi => {
+                        if (d.imm == 0) {
+                            em.pxor(.xmm0, .xmm0);
+                            em.movupsStore(.rbx, a64VfpOff(d.rd), .xmm0);
+                        } else {
+                            em.movImm64(.rax, d.imm);
+                            em.movMemReg(true, .rbx, a64VfpOff(d.rd), .rax);
+                            if (d.rn == 0) em.xorRegReg(false, .rax, .rax);
+                            em.movMemReg(true, .rbx, a64VfpOff(d.rd) + 8, .rax);
+                        }
+                    },
+                    .simd_dup_gpr => {
+                        emitLoadA64Reg(&em, true, .rax, d.rn, false);
+                        switch (d.rm) {
+                            1 => {
+                                em.movzx8(true, .rax, .rax);
+                                em.movImm64(.rcx, 0x0101_0101_0101_0101);
+                                em.imulRegReg(true, .rax, .rcx);
+                            },
+                            2 => {
+                                em.movzx16(true, .rax, .rax);
+                                em.movImm64(.rcx, 0x0001_0001_0001_0001);
+                                em.imulRegReg(true, .rax, .rcx);
+                            },
+                            4 => {
+                                em.movRegReg(false, .rax, .rax);
+                                em.movImm64(.rcx, 0x0000_0001_0000_0001);
+                                em.imulRegReg(true, .rax, .rcx);
+                            },
+                            else => {},
+                        }
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd), .rax);
+                        if (d.imm == 0) em.xorRegReg(false, .rax, .rax);
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd) + 8, .rax);
+                    },
+                    .simd_dup_elem => {
+                        const sh: u7 = @truncate(d.rm);
+                        em.movRegMem(true, .rax, .rbx, a64VfpOff(d.rn) + (if (sh >= 64) @as(i32, 8) else 0));
+                        const bit_sh: u6 = @intCast(sh & 63);
+                        if (bit_sh != 0) em.shrImm(true, .rax, bit_sh);
+                        const esize_bytes: u8 = @truncate(d.imm >> 1);
+                        switch (esize_bytes) {
+                            1 => {
+                                em.movzx8(true, .rax, .rax);
+                                em.movImm64(.rcx, 0x0101_0101_0101_0101);
+                                em.imulRegReg(true, .rax, .rcx);
+                            },
+                            2 => {
+                                em.movzx16(true, .rax, .rax);
+                                em.movImm64(.rcx, 0x0001_0001_0001_0001);
+                                em.imulRegReg(true, .rax, .rcx);
+                            },
+                            4 => {
+                                em.movRegReg(false, .rax, .rax);
+                                em.movImm64(.rcx, 0x0000_0001_0000_0001);
+                                em.imulRegReg(true, .rax, .rcx);
+                            },
+                            else => {},
+                        }
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd), .rax);
+                        if ((d.imm & 1) == 0) em.xorRegReg(false, .rax, .rax);
+                        em.movMemReg(true, .rbx, a64VfpOff(d.rd) + 8, .rax);
+                    },
+                    .simd_umov32, .simd_umov64 => {
+                        const is64 = op == .simd_umov64;
+                        const sh: u7 = @truncate(d.rm);
+                        em.movRegMem(true, .rax, .rbx, a64VfpOff(d.rn) + (if (sh >= 64) @as(i32, 8) else 0));
+                        const bit_sh: u6 = @intCast(sh & 63);
+                        if (bit_sh != 0) em.shrImm(true, .rax, bit_sh);
+                        if (!is64) em.movRegReg(false, .rax, .rax);
+                        emitStoreA64Reg(&em, d.rd, .rax, false, .rcx);
+                    },
+                    .simd_and, .simd_bic, .simd_orr, .simd_orn, .simd_eor, .simd_bsl, .simd_not, .simd_add_8, .simd_sub_8, .simd_add_16, .simd_sub_16, .simd_add_32, .simd_sub_32, .simd_add_64, .simd_sub_64, .simd_cmeq_8, .simd_cmeqz_8, .simd_cmtst_8 => {
+                        em.movupsLoad(.xmm0, .rbx, a64VfpOff(d.rn));
+                        switch (op) {
+                            .simd_and => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.pand(.xmm0, .xmm1);
+                            },
+                            .simd_bic => {
+                                em.movupsLoad(.xmm0, .rbx, a64VfpOff(d.rm));
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rn));
+                                em.pandn(.xmm0, .xmm1);
+                            },
+                            .simd_orr => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.por(.xmm0, .xmm1);
+                            },
+                            .simd_orn => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.pcmpeqb(.xmm2, .xmm2);
+                                em.pxor(.xmm1, .xmm2);
+                                em.por(.xmm0, .xmm1);
+                            },
+                            .simd_eor => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.pxor(.xmm0, .xmm1);
+                            },
+                            .simd_bsl => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.movupsLoad(.xmm2, .rbx, a64VfpOff(d.rd));
+                                em.pand(.xmm0, .xmm2);
+                                em.pandn(.xmm2, .xmm1);
+                                em.por(.xmm0, .xmm2);
+                            },
+                            .simd_not => {
+                                em.pcmpeqb(.xmm1, .xmm1);
+                                em.pxor(.xmm0, .xmm1);
+                            },
+                            .simd_add_8 => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.paddb(.xmm0, .xmm1);
+                            },
+                            .simd_sub_8 => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.psubb(.xmm0, .xmm1);
+                            },
+                            .simd_add_16 => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.paddw(.xmm0, .xmm1);
+                            },
+                            .simd_sub_16 => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.psubw(.xmm0, .xmm1);
+                            },
+                            .simd_add_32 => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.paddd(.xmm0, .xmm1);
+                            },
+                            .simd_sub_32 => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.psubd(.xmm0, .xmm1);
+                            },
+                            .simd_add_64 => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.paddq(.xmm0, .xmm1);
+                            },
+                            .simd_sub_64 => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.psubq(.xmm0, .xmm1);
+                            },
+                            .simd_cmeq_8 => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.pcmpeqb(.xmm0, .xmm1);
+                            },
+                            .simd_cmeqz_8 => {
+                                em.pxor(.xmm1, .xmm1);
+                                em.pcmpeqb(.xmm0, .xmm1);
+                            },
+                            .simd_cmtst_8 => {
+                                em.movupsLoad(.xmm1, .rbx, a64VfpOff(d.rm));
+                                em.pand(.xmm0, .xmm1);
+                                em.pxor(.xmm1, .xmm1);
+                                em.pcmpeqb(.xmm0, .xmm1);
+                                em.pcmpeqb(.xmm2, .xmm2);
+                                em.pxor(.xmm0, .xmm2);
+                            },
+                            else => unreachable,
+                        }
+                        if (d.imm != 0) {
+                            em.movupsStore(.rbx, a64VfpOff(d.rd), .xmm0);
+                        } else {
+                            em.movsdStore(.rbx, a64VfpOff(d.rd), .xmm0);
+                            em.xorRegReg(false, .rax, .rax);
+                            em.movMemReg(true, .rbx, a64VfpOff(d.rd) + 8, .rax);
+                        }
+                    },
+
                     .b_imm, .bl_imm => {
                         if (op == .bl_imm) {
                             em.movRegMem(true, .rax, .rbx, off_pc64);
@@ -2911,10 +4000,23 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
     const off_tpidruro: i32 = off_mmu + @as(i32, @intCast(@offsetOf(mmu_mod.Mmu, "tpidruro")));
     const off_tpidrurw: i32 = off_mmu + @as(i32, @intCast(@offsetOf(mmu_mod.Mmu, "tpidrurw")));
     const off_tpidrprw: i32 = off_mmu + @as(i32, @intCast(@offsetOf(mmu_mod.Mmu, "tpidrprw")));
+    const off_cpacr: i32 = off_mmu + @as(i32, @intCast(@offsetOf(mmu_mod.Mmu, "cpacr")));
+    const off_vfp: i32 = @intCast(@offsetOf(CpuType, "vfp"));
+    const off_vfp_s: i32 = off_vfp + @as(i32, @intCast(@offsetOf(vfp_mod.Vfp, "s")));
+    const off_vfp_fpscr: i32 = off_vfp + @as(i32, @intCast(@offsetOf(vfp_mod.Vfp, "fpscr")));
+    const off_vfp_fpexc: i32 = off_vfp + @as(i32, @intCast(@offsetOf(vfp_mod.Vfp, "fpexc")));
 
     return struct {
         inline fn arm32RegOff(reg: u8) i32 {
             return off_r + @as(i32, reg & 0xf) * 4;
+        }
+
+        inline fn arm32VfpSOff(s_reg: u8) i32 {
+            return off_vfp_s + @as(i32, s_reg & 0x3f) * 4;
+        }
+
+        inline fn arm32VfpDOff(d_reg: u8) i32 {
+            return off_vfp_s + @as(i32, d_reg & 0x1f) * 8;
         }
 
         fn emitReloadPinned32(em: *X64Emitter) void {
@@ -3092,6 +4194,57 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
             }
         }
 
+        pub fn jitSlowVfp32(
+            cpu_opaque: *anyopaque,
+            bus_opaque: *anyopaque,
+            pc_page_off: u32,
+            raw_inst: u32,
+        ) callconv(.c) u64 {
+            const cpu: *CpuType = @ptrCast(@alignCast(cpu_opaque));
+            const bus: *Bus = @ptrCast(@alignCast(bus_opaque));
+            const trace_pc = cpu.r[15];
+            const cur_pc = trace_pc +% pc_page_off;
+            cpu.r[15] = cur_pc +% 4;
+            cpu.executeVfp(bus, cur_pc, raw_inst, ((raw_inst >> 8) & 0xf) == 11);
+            if (cpu.r[15] != cur_pc +% 4) return 1;
+            if ((raw_inst & 0x0e10_0000) == 0x0c00_0000) {
+                if (cpu.checkInterrupts(bus)) return 1;
+            }
+            cpu.r[15] = trace_pc;
+            return 0;
+        }
+
+        fn emitVfpReadyCheck(em: *X64Emitter, slow_label: u16) void {
+            em.movRegMem(false, .rax, .rbx, off_vfp_fpexc);
+            em.testRegImm32(false, .rax, 1 << 30);
+            em.jccLabel(.e, slow_label);
+            em.movRegMem(false, .rax, .rbx, off_cpacr);
+            em.testRegImm32(false, .rax, 2 << 20);
+            em.jccLabel(.e, slow_label);
+        }
+
+        fn emitSlowVfpCall(
+            em: *X64Emitter,
+            slow_label: u16,
+            done_label: u16,
+            pc_page_off: u32,
+            raw: u32,
+            abort_epilogue_label: u16,
+        ) void {
+            em.bindLabel(slow_label);
+            emitSpillPinned32(em);
+            em.movRegReg(true, .rdi, .rbx);
+            em.movRegReg(true, .rsi, .r12);
+            em.movImm32(.rdx, pc_page_off);
+            em.movImm32(.rcx, raw);
+            em.movImm64(.r11, @intFromPtr(&jitSlowVfp32));
+            em.callReg(.r11);
+            em.testRegReg(true, .rax, .rax);
+            em.jccLabel(.ne, abort_epilogue_label);
+            emitReloadPinned32(em);
+            em.bindLabel(done_label);
+        }
+
         pub fn canCompileSlot(d: DecodedSlot) bool {
             const raw = d.raw;
             const op: ArmOp = @enumFromInt(d.op);
@@ -3232,6 +4385,33 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                 .mrc_tpidruro_al,
                 .mrc_tpidrurw_al,
                 .mrc_tpidrprw_al,
+                .vldr_f64_al,
+                .vstr_f64_al,
+                .vldr_f32_al,
+                .vstr_f32_al,
+                .vldm_al,
+                .vstm_al,
+                .vmov_r_f64_al,
+                .vmov_f64_r_al,
+                .vmov_r_f32_al,
+                .vmov_f32_r_al,
+                .vmrs_apsr_al,
+                .vadd_f64_al,
+                .vsub_f64_al,
+                .vmul_f64_al,
+                .vdiv_f64_al,
+                .vmla_f64_al,
+                .vmls_f64_al,
+                .vmov_f64_al,
+                .vcmp_f64_al,
+                .vcmpz_f64_al,
+                .vadd_f32_al,
+                .vsub_f32_al,
+                .vmul_f32_al,
+                .vdiv_f32_al,
+                .vmla_f32_al,
+                .vmls_f32_al,
+                .vmov_f32_al,
                 => true,
                 else => false,
             };
@@ -3325,6 +4505,16 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                         bump(&counts, @truncate(d.raw & 0xf));
                         if ((d.raw & (1 << 4)) != 0) bump(&counts, @truncate((d.raw >> 8) & 0xf));
                     },
+                    .vldr_f64_al, .vstr_f64_al, .vldr_f32_al, .vstr_f32_al, .vldm_al, .vstm_al => {
+                        bump(&counts, d.rn);
+                    },
+                    .vmov_r_f64_al, .vmov_f64_r_al => {
+                        bump(&counts, d.rd);
+                        bump(&counts, d.rn);
+                    },
+                    .vmov_r_f32_al, .vmov_f32_r_al => {
+                        bump(&counts, d.rd);
+                    },
                     else => {},
                 }
             }
@@ -3397,7 +4587,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                         .adc_imm_al, .sbc_imm_al, .rsc_imm_al, .adcs_imm_al, .sbcs_imm_al,
                         .adc_reg_al, .sbc_reg_al, .rsc_reg_al, .adcs_reg_al, .sbcs_reg_al,
                         .tst_lsl_reg_al, .tst_lsr_reg_al,
-                        .mrs_cpsr_al, .msr_cpsr_c_al, .cpsid_al, .cpsie_al,
+                        .mrs_cpsr_al, .msr_cpsr_c_al, .cpsid_al, .cpsie_al, .vmrs_apsr_al,
                         .dp_imm_general, .dp_reg_general,
                         => return false,
                         .ldr_wb_al => if (jd.rd == 15) return false,
@@ -4750,6 +5940,264 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                         }
                     },
 
+                    .vldr_f64_al, .vstr_f64_al, .vldr_f32_al, .vstr_f32_al => {
+                        const is_load = op == .vldr_f64_al or op == .vldr_f32_al;
+                        const is64 = op == .vldr_f64_al or op == .vstr_f64_al;
+                        const addr_off: i32 = @bitCast(imm32);
+                        const slow_vfp = em.newLabel();
+                        const done_vfp = em.newLabel();
+                        emitVfpReadyCheck(&em, slow_vfp);
+
+                        emitLoadArm32Reg(&em, .rdi, d.rn, pc_page_off);
+                        if (addr_off != 0) em.addRegImm(false, .rdi, addr_off);
+
+                        em.movRegReg(false, .rcx, .rdi);
+                        em.shrImm(false, .rcx, 8);
+                        em.andRegImm(false, .rcx, 0xfff0);
+
+                        em.movRegReg(false, .rax, .rdi);
+                        em.andRegImm(false, .rax, -4093);
+                        em.cmpSibReg(false, .rbp, .rcx, 0, if (is_load) off_tlb32_read_vpage else off_tlb32_write_vpage, .rax);
+                        em.jccLabel(.ne, slow_vfp);
+                        if (is64) {
+                            em.leaRegMem(false, .rdx, .rdi, 4);
+                            em.andRegImm(false, .rdx, -4093);
+                            em.cmpRegReg(false, .rax, .rdx);
+                            em.jccLabel(.ne, slow_vfp);
+                        }
+
+                        em.movRegSib(false, .rax, .rbp, .rcx, 0, off_tlb32_pbase);
+                        em.movRegReg(false, .rdx, .rdi);
+                        em.andRegImm(false, .rdx, 0xfff);
+                        em.orRegReg(false, .rax, .rdx);
+
+                        if (is_load) {
+                            em.movRegSib(is64, .rcx, .r13, .rax, 0, 0);
+                            em.movMemReg(is64, .rbx, arm32VfpSOff(d.rd), .rcx);
+                        } else {
+                            em.movRegMem(is64, .rcx, .rbx, arm32VfpSOff(d.rd));
+                            em.movSibReg(is64, .r13, .rax, 0, 0, .rcx);
+                        }
+                        em.jmpLabel(done_vfp);
+                        emitSlowVfpCall(&em, slow_vfp, done_vfp, pc_page_off, raw, abort_epilogue_label);
+                    },
+
+                    .vldm_al, .vstm_al => {
+                        const is_load = op == .vldm_al;
+                        const nbytes: u16 = @truncate(d.imm);
+                        const last_off: u16 = @truncate(d.imm >> 16);
+                        const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
+                        const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
+                        const slow_vfp = em.newLabel();
+                        const done_vfp = em.newLabel();
+                        emitVfpReadyCheck(&em, slow_vfp);
+
+                        emitLoadArm32Reg(&em, .rdi, d.rn, pc_page_off);
+                        if (start_off != 0) em.addRegImm(false, .rdi, start_off);
+
+                        em.movRegReg(false, .rcx, .rdi);
+                        em.shrImm(false, .rcx, 8);
+                        em.andRegImm(false, .rcx, 0xfff0);
+
+                        em.movRegReg(false, .rax, .rdi);
+                        em.andRegImm(false, .rax, -4093);
+                        em.cmpSibReg(false, .rbp, .rcx, 0, if (is_load) off_tlb32_read_vpage else off_tlb32_write_vpage, .rax);
+                        em.jccLabel(.ne, slow_vfp);
+                        if (last_off != 0) {
+                            em.leaRegMem(false, .rdx, .rdi, @intCast(last_off));
+                            em.andRegImm(false, .rdx, -4093);
+                            em.cmpRegReg(false, .rax, .rdx);
+                            em.jccLabel(.ne, slow_vfp);
+                        }
+
+                        em.movRegSib(false, .rax, .rbp, .rcx, 0, off_tlb32_pbase);
+                        em.movRegReg(false, .rdx, .rdi);
+                        em.andRegImm(false, .rdx, 0xfff);
+                        em.orRegReg(false, .rax, .rdx);
+
+                        var cur: u16 = 0;
+                        const base_s_off = arm32VfpSOff(d.rd);
+                        while (cur + 8 <= nbytes) : (cur += 8) {
+                            if (is_load) {
+                                em.movRegSib(true, .rcx, .r13, .rax, 0, @intCast(cur));
+                                em.movMemReg(true, .rbx, base_s_off + @as(i32, cur), .rcx);
+                            } else {
+                                em.movRegMem(true, .rcx, .rbx, base_s_off + @as(i32, cur));
+                                em.movSibReg(true, .r13, .rax, 0, @intCast(cur), .rcx);
+                            }
+                        }
+                        if (cur < nbytes) {
+                            if (is_load) {
+                                em.movRegSib(false, .rcx, .r13, .rax, 0, @intCast(cur));
+                                em.movMemReg(false, .rbx, base_s_off + @as(i32, cur), .rcx);
+                            } else {
+                                em.movRegMem(false, .rcx, .rbx, base_s_off + @as(i32, cur));
+                                em.movSibReg(false, .r13, .rax, 0, @intCast(cur), .rcx);
+                            }
+                        }
+                        if (wb_off != 0) {
+                            em.leaRegMem(false, .rcx, .rdi, wb_off -% start_off);
+                            emitStoreArm32Reg(&em, d.rn, .rcx);
+                        }
+                        em.jmpLabel(done_vfp);
+                        emitSlowVfpCall(&em, slow_vfp, done_vfp, pc_page_off, raw, abort_epilogue_label);
+                    },
+
+                    .vmov_r_f64_al, .vmov_f64_r_al => {
+                        const slow_vfp = em.newLabel();
+                        const done_vfp = em.newLabel();
+                        emitVfpReadyCheck(&em, slow_vfp);
+                        if (op == .vmov_r_f64_al) {
+                            em.movRegMem(false, .rax, .rbx, arm32VfpSOff(d.rm));
+                            emitStoreArm32Reg(&em, d.rd, .rax);
+                            em.movRegMem(false, .rax, .rbx, arm32VfpSOff(d.rm + 1));
+                            emitStoreArm32Reg(&em, d.rn, .rax);
+                        } else {
+                            emitLoadArm32Reg(&em, .rax, d.rd, pc_page_off);
+                            em.movMemReg(false, .rbx, arm32VfpSOff(d.rm), .rax);
+                            emitLoadArm32Reg(&em, .rax, d.rn, pc_page_off);
+                            em.movMemReg(false, .rbx, arm32VfpSOff(d.rm + 1), .rax);
+                        }
+                        em.jmpLabel(done_vfp);
+                        emitSlowVfpCall(&em, slow_vfp, done_vfp, pc_page_off, raw, abort_epilogue_label);
+                    },
+
+                    .vmov_r_f32_al, .vmov_f32_r_al => {
+                        const slow_vfp = em.newLabel();
+                        const done_vfp = em.newLabel();
+                        emitVfpReadyCheck(&em, slow_vfp);
+                        if (op == .vmov_r_f32_al) {
+                            em.movRegMem(false, .rax, .rbx, arm32VfpSOff(d.rn));
+                            emitStoreArm32Reg(&em, d.rd, .rax);
+                        } else {
+                            emitLoadArm32Reg(&em, .rax, d.rd, pc_page_off);
+                            em.movMemReg(false, .rbx, arm32VfpSOff(d.rn), .rax);
+                        }
+                        em.jmpLabel(done_vfp);
+                        emitSlowVfpCall(&em, slow_vfp, done_vfp, pc_page_off, raw, abort_epilogue_label);
+                    },
+
+                    .vmrs_apsr_al => {
+                        const slow_vfp = em.newLabel();
+                        const done_vfp = em.newLabel();
+                        emitVfpReadyCheck(&em, slow_vfp);
+                        em.movRegMem(false, .rax, .rbx, off_vfp_fpscr);
+                        em.andRegImm(false, .rax, @bitCast(@as(u32, 0xf000_0000)));
+                        em.movRegMem(false, .rcx, .rbx, off_cpsr);
+                        em.andRegImm(false, .rcx, 0x0fff_ffff);
+                        em.orRegReg(false, .rcx, .rax);
+                        em.movMemReg(false, .rbx, off_cpsr, .rcx);
+                        em.jmpLabel(done_vfp);
+                        emitSlowVfpCall(&em, slow_vfp, done_vfp, pc_page_off, raw, abort_epilogue_label);
+                    },
+
+                    .vmov_f64_al, .vadd_f64_al, .vsub_f64_al, .vmul_f64_al, .vdiv_f64_al, .vmla_f64_al, .vmls_f64_al => {
+                        const slow_vfp = em.newLabel();
+                        const done_vfp = em.newLabel();
+                        emitVfpReadyCheck(&em, slow_vfp);
+                        switch (op) {
+                            .vmov_f64_al => {
+                                em.movRegMem(true, .rax, .rbx, arm32VfpDOff(d.rm));
+                                em.movMemReg(true, .rbx, arm32VfpDOff(d.rd), .rax);
+                            },
+                            .vadd_f64_al, .vsub_f64_al, .vmul_f64_al, .vdiv_f64_al => {
+                                em.movsdLoad(.xmm0, .rbx, arm32VfpDOff(d.rn));
+                                em.movsdLoad(.xmm1, .rbx, arm32VfpDOff(d.rm));
+                                switch (op) {
+                                    .vadd_f64_al => em.addsd(.xmm0, .xmm1),
+                                    .vsub_f64_al => em.subsd(.xmm0, .xmm1),
+                                    .vmul_f64_al => em.mulsd(.xmm0, .xmm1),
+                                    .vdiv_f64_al => em.divsd(.xmm0, .xmm1),
+                                    else => unreachable,
+                                }
+                                em.movsdStore(.rbx, arm32VfpDOff(d.rd), .xmm0);
+                            },
+                            .vmla_f64_al, .vmls_f64_al => {
+                                em.movsdLoad(.xmm0, .rbx, arm32VfpDOff(d.rn));
+                                em.movsdLoad(.xmm1, .rbx, arm32VfpDOff(d.rm));
+                                em.mulsd(.xmm0, .xmm1);
+                                em.movsdLoad(.xmm1, .rbx, arm32VfpDOff(d.rd));
+                                if (op == .vmla_f64_al) em.addsd(.xmm1, .xmm0) else em.subsd(.xmm1, .xmm0);
+                                em.movsdStore(.rbx, arm32VfpDOff(d.rd), .xmm1);
+                            },
+                            else => unreachable,
+                        }
+                        em.jmpLabel(done_vfp);
+                        emitSlowVfpCall(&em, slow_vfp, done_vfp, pc_page_off, raw, abort_epilogue_label);
+                    },
+
+                    .vmov_f32_al, .vadd_f32_al, .vsub_f32_al, .vmul_f32_al, .vdiv_f32_al, .vmla_f32_al, .vmls_f32_al => {
+                        const slow_vfp = em.newLabel();
+                        const done_vfp = em.newLabel();
+                        emitVfpReadyCheck(&em, slow_vfp);
+                        switch (op) {
+                            .vmov_f32_al => {
+                                em.movRegMem(false, .rax, .rbx, arm32VfpSOff(d.rm));
+                                em.movMemReg(false, .rbx, arm32VfpSOff(d.rd), .rax);
+                            },
+                            .vadd_f32_al, .vsub_f32_al, .vmul_f32_al, .vdiv_f32_al => {
+                                em.movssLoad(.xmm0, .rbx, arm32VfpSOff(d.rn));
+                                em.movssLoad(.xmm1, .rbx, arm32VfpSOff(d.rm));
+                                switch (op) {
+                                    .vadd_f32_al => em.addss(.xmm0, .xmm1),
+                                    .vsub_f32_al => em.subss(.xmm0, .xmm1),
+                                    .vmul_f32_al => em.mulss(.xmm0, .xmm1),
+                                    .vdiv_f32_al => em.divss(.xmm0, .xmm1),
+                                    else => unreachable,
+                                }
+                                em.movssStore(.rbx, arm32VfpSOff(d.rd), .xmm0);
+                            },
+                            .vmla_f32_al, .vmls_f32_al => {
+                                em.movssLoad(.xmm0, .rbx, arm32VfpSOff(d.rn));
+                                em.movssLoad(.xmm1, .rbx, arm32VfpSOff(d.rm));
+                                em.mulss(.xmm0, .xmm1);
+                                em.movssLoad(.xmm1, .rbx, arm32VfpSOff(d.rd));
+                                if (op == .vmla_f32_al) em.addss(.xmm1, .xmm0) else em.subss(.xmm1, .xmm0);
+                                em.movssStore(.rbx, arm32VfpSOff(d.rd), .xmm1);
+                            },
+                            else => unreachable,
+                        }
+                        em.jmpLabel(done_vfp);
+                        emitSlowVfpCall(&em, slow_vfp, done_vfp, pc_page_off, raw, abort_epilogue_label);
+                    },
+
+                    .vcmp_f64_al, .vcmpz_f64_al => {
+                        const slow_vfp = em.newLabel();
+                        const done_vfp = em.newLabel();
+                        const nan_lbl = em.newLabel();
+                        const eq_lbl = em.newLabel();
+                        const lt_lbl = em.newLabel();
+                        const set_lbl = em.newLabel();
+                        emitVfpReadyCheck(&em, slow_vfp);
+                        em.movsdLoad(.xmm0, .rbx, arm32VfpDOff(d.rd));
+                        if (op == .vcmpz_f64_al) {
+                            em.pxor(.xmm1, .xmm1);
+                        } else {
+                            em.movsdLoad(.xmm1, .rbx, arm32VfpDOff(d.rm));
+                        }
+                        em.ucomisd(.xmm0, .xmm1);
+                        em.jccLabel(.p, nan_lbl);
+                        em.jccLabel(.e, eq_lbl);
+                        em.jccLabel(.b, lt_lbl);
+                        em.movImm32(.rax, 0x2000_0000);
+                        em.jmpLabel(set_lbl);
+                        em.bindLabel(nan_lbl);
+                        em.movImm32(.rax, 0x3000_0000);
+                        em.jmpLabel(set_lbl);
+                        em.bindLabel(eq_lbl);
+                        em.movImm32(.rax, 0x6000_0000);
+                        em.jmpLabel(set_lbl);
+                        em.bindLabel(lt_lbl);
+                        em.movImm32(.rax, 0x8000_0000);
+                        em.bindLabel(set_lbl);
+                        em.movRegMem(false, .rcx, .rbx, off_vfp_fpscr);
+                        em.andRegImm(false, .rcx, 0x0fff_ffff);
+                        em.orRegReg(false, .rcx, .rax);
+                        em.movMemReg(false, .rbx, off_vfp_fpscr, .rcx);
+                        em.jmpLabel(done_vfp);
+                        emitSlowVfpCall(&em, slow_vfp, done_vfp, pc_page_off, raw, abort_epilogue_label);
+                    },
+
                     else => unreachable,
                 }
 
@@ -4782,6 +6230,663 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
     };
 }
 
+// ============================================================================
+// Thumb 16-bit Hot-Loop JIT Backend
+// ============================================================================
+
+pub fn ThumbJit(comptime CpuType: type, comptime Bus: type) type {
+    const ThumbSlot = arm1176_mod.ThumbSlot;
+    const Arm32 = Arm32Jit(CpuType, Bus);
+    const off_r: i32 = @intCast(@offsetOf(CpuType, "r"));
+    const off_r15: i32 = off_r + 15 * 4;
+    const off_cpsr: i32 = @intCast(@offsetOf(CpuType, "cpsr"));
+
+    return struct {
+        inline fn thumbRegOff(reg: u8) i32 {
+            return off_r + @as(i32, reg & 0xf) * 4;
+        }
+
+        fn emitReloadPinnedThumb(em: *X64Emitter) void {
+            for (0..em.pins.count) |i| {
+                const r = em.pins.guest_regs[i] & 0xf;
+                em.movRegMem(false, host_pin_regs[i], .rbx, thumbRegOff(r));
+            }
+        }
+
+        fn emitSpillPinnedThumb(em: *X64Emitter) void {
+            for (0..em.pins.count) |i| {
+                const r = em.pins.guest_regs[i] & 0xf;
+                em.movMemReg(false, .rbx, thumbRegOff(r), host_pin_regs[i]);
+            }
+        }
+
+        fn emitLoadThumbReg(em: *X64Emitter, dst: Reg, reg: u8, pc_page_off: u32) void {
+            const r = reg & 0xf;
+            if (em.pins.getHost(r)) |hreg| {
+                if (dst != hreg) em.movRegReg(false, dst, hreg);
+                return;
+            }
+            em.movRegMem(false, dst, .rbx, thumbRegOff(r));
+            if (r == 15) {
+                em.addRegImm(false, dst, @intCast(pc_page_off + 4));
+            }
+        }
+
+        fn emitStoreThumbReg(em: *X64Emitter, reg: u8, src: Reg) void {
+            const r = reg & 0xf;
+            if (em.pins.getHost(r)) |hreg| {
+                if (hreg != src) em.movRegReg(false, hreg, src);
+                return;
+            }
+            em.movMemReg(false, .rbx, thumbRegOff(r), src);
+        }
+
+        fn emitSetPcInterworkingThumbAndExit(em: *X64Emitter, epilogue_label: u16) void {
+            const arm_label = em.newLabel();
+            em.testRegImm32(false, .rax, 1);
+            em.jccLabel(.e, arm_label);
+            em.andRegImm(false, .rax, -2);
+            em.movMemReg(false, .rbx, off_r15, .rax);
+            em.jmpLabel(epilogue_label);
+            em.bindLabel(arm_label);
+            em.andRegImm(false, .rax, -4);
+            em.movMemReg(false, .rbx, off_r15, .rax);
+            em.movRegMem(false, .rcx, .rbx, off_cpsr);
+            em.andRegImm(false, .rcx, ~@as(i32, 1 << 5));
+            em.movMemReg(false, .rbx, off_cpsr, .rcx);
+            em.jmpLabel(epilogue_label);
+        }
+
+        pub fn canCompileSlot(td: ThumbSlot) bool {
+            return switch (td.op) {
+                .nop,
+                .lsl_imm,
+                .lsr_imm,
+                .asr_imm,
+                .add_reg3,
+                .sub_reg3,
+                .add_imm3,
+                .sub_imm3,
+                .mov_imm8,
+                .cmp_imm8,
+                .add_imm8,
+                .sub_imm8,
+                .alu_and,
+                .alu_eor,
+                .alu_tst,
+                .alu_neg,
+                .alu_cmp,
+                .alu_cmn,
+                .alu_orr,
+                .alu_mul,
+                .alu_bic,
+                .alu_mvn,
+                .hi_cmp,
+                .bx,
+                .ldr_lit,
+                .ldr_imm,
+                .str_imm,
+                .ldrb_imm,
+                .strb_imm,
+                .ldrh_imm,
+                .strh_imm,
+                .ldr_reg,
+                .str_reg,
+                .ldrb_reg,
+                .strb_reg,
+                .ldrh_reg,
+                .strh_reg,
+                .ldrsb_reg,
+                .ldrsh_reg,
+                .ldr_sp,
+                .str_sp,
+                .add_pc,
+                .add_sp_rd,
+                .add_sp_imm,
+                .sub_sp_imm,
+                .sxth,
+                .sxtb,
+                .uxth,
+                .uxtb,
+                .rev,
+                .rev16,
+                .revsh,
+                .b_cond,
+                .b_uncond,
+                => true,
+                .hi_add, .hi_mov => td.rd != 15,
+                else => false,
+            };
+        }
+
+        fn selectPinnedRegsThumb(decoded: []const ThumbSlot) RegPinSet {
+            var counts: [15]u16 = @splat(0);
+            const bump = struct {
+                inline fn add(c: *[15]u16, r: u8) void {
+                    const idx = r & 0xf;
+                    if (idx < 15) c[idx] +|= 1;
+                }
+            }.add;
+            for (decoded) |td| {
+                switch (td.op) {
+                    .nop, .b_cond, .b_uncond => {},
+                    .bx => bump(&counts, td.rm),
+                    .mov_imm8, .cmp_imm8, .ldr_lit, .add_pc => bump(&counts, td.rd),
+                    .add_imm8, .sub_imm8 => {
+                        bump(&counts, td.rd);
+                        bump(&counts, td.rd);
+                    },
+                    .add_sp_imm, .sub_sp_imm => {
+                        bump(&counts, 13);
+                        bump(&counts, 13);
+                    },
+                    .ldr_sp, .str_sp, .add_sp_rd => {
+                        bump(&counts, td.rd);
+                        bump(&counts, 13);
+                    },
+                    .lsl_imm, .lsr_imm, .asr_imm, .alu_neg, .alu_mvn, .hi_mov, .sxth, .sxtb, .uxth, .uxtb, .rev, .rev16, .revsh => {
+                        bump(&counts, td.rd);
+                        bump(&counts, td.rm);
+                    },
+                    .alu_tst, .alu_cmp, .alu_cmn, .hi_cmp => {
+                        bump(&counts, td.rd);
+                        bump(&counts, td.rm);
+                    },
+                    .alu_and, .alu_eor, .alu_orr, .alu_mul, .alu_bic, .hi_add => {
+                        bump(&counts, td.rd);
+                        bump(&counts, td.rd);
+                        bump(&counts, td.rm);
+                    },
+                    .add_imm3, .sub_imm3, .ldr_imm, .str_imm, .ldrb_imm, .strb_imm, .ldrh_imm, .strh_imm => {
+                        bump(&counts, td.rd);
+                        bump(&counts, td.rn);
+                    },
+                    .add_reg3, .sub_reg3, .ldr_reg, .str_reg, .ldrb_reg, .strb_reg, .ldrh_reg, .strh_reg, .ldrsb_reg, .ldrsh_reg => {
+                        bump(&counts, td.rd);
+                        bump(&counts, td.rn);
+                        bump(&counts, td.rm);
+                    },
+                    else => {},
+                }
+            }
+            var pins = RegPinSet{};
+            while (pins.count < 5) {
+                var best_r: u8 = 0xff;
+                var best_c: u16 = 1;
+                for (0..15) |r| {
+                    if (counts[r] > best_c) {
+                        best_c = counts[r];
+                        best_r = @intCast(r);
+                    }
+                }
+                if (best_r == 0xff) break;
+                pins.guest_regs[pins.count] = best_r;
+                pins.count += 1;
+                counts[best_r] = 0;
+            }
+            return pins;
+        }
+
+        pub fn compileTrace(
+            buf: *JitCodeBuffer,
+            core_id: u2,
+            code_page_ptr: [*]const u8,
+            start_hw: u11,
+            requested_end_hw: u16,
+            out_end_hw: *u16,
+        ) ?JitFn {
+            if (!is_x86_64_linux) return null;
+            if (requested_end_hw <= start_hw + 1 or requested_end_hw - start_hw > 64 or requested_end_hw > 2048) return null;
+
+            const trace_len: u16 = requested_end_hw - start_hw;
+            var decoded: [64]ThumbSlot = undefined;
+            for (0..trace_len) |i| {
+                const hw = start_hw + @as(u16, @intCast(i));
+                const raw16 = std.mem.readInt(u16, code_page_ptr[@as(usize, hw) * 2 ..][0..2], .little);
+                // Reject 32-bit Thumb-2 prefixes inside 16-bit Thumb hot-loop traces
+                if ((raw16 & 0xf800) == 0xe800 or (raw16 & 0xf000) == 0xf000) return null;
+                const td = arm1176_mod.decodeThumb16(raw16, null);
+                if (!canCompileSlot(td)) return null;
+                decoded[i] = td;
+            }
+
+            const end_hw: u16 = start_hw + trace_len;
+            out_end_hw.* = end_hw;
+
+            var em = X64Emitter{
+                .pins = selectPinnedRegsThumb(decoded[0..trace_len]),
+            };
+            em.emitPrologue();
+            emitReloadPinnedThumb(&em);
+
+            const epilogue_label = em.newLabel();
+            const abort_epilogue_label = em.newLabel();
+            var inst_labels: [64]u16 = undefined;
+            for (0..trace_len) |i| {
+                inst_labels[i] = em.newLabel();
+            }
+
+            var exit_stubs: [128]ExitStub = undefined;
+            var exit_stub_count: usize = 0;
+
+            for (0..trace_len) |idx| {
+                const hw: u16 = start_hw + @as(u16, @intCast(idx));
+                const pc_page_off: u32 = @as(u32, hw) * 2;
+                const td = decoded[idx];
+                const op = td.op;
+
+                em.bindLabel(inst_labels[idx]);
+                em.addRegImm(true, .r15, 1);
+
+                switch (op) {
+                    .nop => {},
+                    .lsl_imm, .lsr_imm, .asr_imm => {
+                        const sh: u6 = @truncate(td.imm & 0x1f);
+                        emitLoadThumbReg(&em, .rax, td.rm, pc_page_off);
+                        if (sh == 0) {
+                            switch (op) {
+                                .lsl_imm => {
+                                    em.testRegReg(false, .rax, .rax);
+                                    emitStoreThumbReg(&em, td.rd, .rax);
+                                    emitUpdateNZ_Logic(&em, off_cpsr, true);
+                                },
+                                .lsr_imm => {
+                                    em.shrImm(false, .rax, 31);
+                                    em.shlImm(false, .rax, 29);
+                                    em.orRegImm(false, .rax, 1 << 30);
+                                    em.movRegMem(false, .rcx, .rbx, off_cpsr);
+                                    em.andRegImm(false, .rcx, 0x1fff_ffff);
+                                    em.orRegReg(false, .rcx, .rax);
+                                    em.movMemReg(false, .rbx, off_cpsr, .rcx);
+                                    em.xorRegReg(false, .rax, .rax);
+                                    emitStoreThumbReg(&em, td.rd, .rax);
+                                },
+                                .asr_imm => {
+                                    em.sarImm(false, .rax, 31);
+                                    emitStoreThumbReg(&em, td.rd, .rax);
+                                    em.andRegImm(false, .rax, @bitCast(@as(u32, 0xa000_0000)));
+                                    em.setcc(.e, .rcx);
+                                    em.movzx8(false, .rcx, .rcx);
+                                    em.shlImm(false, .rcx, 30);
+                                    em.orRegReg(false, .rax, .rcx);
+                                    em.movRegMem(false, .rcx, .rbx, off_cpsr);
+                                    em.andRegImm(false, .rcx, 0x1fff_ffff);
+                                    em.orRegReg(false, .rcx, .rax);
+                                    em.movMemReg(false, .rbx, off_cpsr, .rcx);
+                                },
+                                else => unreachable,
+                            }
+                        } else {
+                            switch (op) {
+                                .lsl_imm => em.shlImm(false, .rax, sh),
+                                .lsr_imm => em.shrImm(false, .rax, sh),
+                                .asr_imm => em.sarImm(false, .rax, sh),
+                                else => unreachable,
+                            }
+                            emitStoreThumbReg(&em, td.rd, .rax);
+                            em.setcc(.b, .rdx);
+                            em.setcc(.e, .rcx);
+                            em.movzx8(false, .rdx, .rdx);
+                            em.movzx8(false, .rcx, .rcx);
+                            em.shlImm(false, .rdx, 29);
+                            em.shlImm(false, .rcx, 30);
+                            em.andRegImm(false, .rax, @bitCast(@as(u32, 0x8000_0000)));
+                            em.orRegReg(false, .rax, .rcx);
+                            em.orRegReg(false, .rax, .rdx);
+                            em.movRegMem(false, .rcx, .rbx, off_cpsr);
+                            em.andRegImm(false, .rcx, 0x1fff_ffff);
+                            em.orRegReg(false, .rcx, .rax);
+                            em.movMemReg(false, .rbx, off_cpsr, .rcx);
+                        }
+                    },
+
+                    .add_reg3, .sub_reg3 => {
+                        const is_sub = op == .sub_reg3;
+                        emitLoadThumbReg(&em, .rax, td.rn, pc_page_off);
+                        emitLoadThumbReg(&em, .rcx, td.rm, pc_page_off);
+                        if (is_sub) em.subRegReg(false, .rax, .rcx) else em.addRegReg(false, .rax, .rcx);
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                        emitUpdateNZCV_AddSub(&em, off_cpsr, is_sub);
+                    },
+
+                    .add_imm3, .sub_imm3 => {
+                        const is_sub = op == .sub_imm3;
+                        emitLoadThumbReg(&em, .rax, td.rn, pc_page_off);
+                        if (is_sub) em.subRegImm(false, .rax, @intCast(td.imm)) else em.addRegImm(false, .rax, @intCast(td.imm));
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                        emitUpdateNZCV_AddSub(&em, off_cpsr, is_sub);
+                    },
+
+                    .mov_imm8 => {
+                        em.movImm32(.rax, td.imm);
+                        em.testRegReg(false, .rax, .rax);
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                        emitUpdateNZ_Logic(&em, off_cpsr, true);
+                    },
+
+                    .cmp_imm8 => {
+                        emitLoadThumbReg(&em, .rax, td.rd, pc_page_off);
+                        em.subRegImm(false, .rax, @intCast(td.imm));
+                        emitUpdateNZCV_AddSub(&em, off_cpsr, true);
+                    },
+
+                    .add_imm8, .sub_imm8 => {
+                        const is_sub = op == .sub_imm8;
+                        emitLoadThumbReg(&em, .rax, td.rd, pc_page_off);
+                        if (is_sub) em.subRegImm(false, .rax, @intCast(td.imm)) else em.addRegImm(false, .rax, @intCast(td.imm));
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                        emitUpdateNZCV_AddSub(&em, off_cpsr, is_sub);
+                    },
+
+                    .alu_and, .alu_eor, .alu_orr, .alu_bic, .alu_mul => {
+                        emitLoadThumbReg(&em, .rax, td.rd, pc_page_off);
+                        emitLoadThumbReg(&em, .rcx, td.rm, pc_page_off);
+                        switch (op) {
+                            .alu_and => em.andRegReg(false, .rax, .rcx),
+                            .alu_eor => em.xorRegReg(false, .rax, .rcx),
+                            .alu_orr => em.orRegReg(false, .rax, .rcx),
+                            .alu_bic => {
+                                em.notReg(false, .rcx);
+                                em.andRegReg(false, .rax, .rcx);
+                            },
+                            .alu_mul => {
+                                em.imulRegReg(false, .rax, .rcx);
+                                em.testRegReg(false, .rax, .rax);
+                            },
+                            else => unreachable,
+                        }
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                        emitUpdateNZ_Logic(&em, off_cpsr, true);
+                    },
+
+                    .alu_mvn => {
+                        emitLoadThumbReg(&em, .rax, td.rm, pc_page_off);
+                        em.notReg(false, .rax);
+                        em.testRegReg(false, .rax, .rax);
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                        emitUpdateNZ_Logic(&em, off_cpsr, true);
+                    },
+
+                    .alu_tst => {
+                        emitLoadThumbReg(&em, .rax, td.rd, pc_page_off);
+                        emitLoadThumbReg(&em, .rcx, td.rm, pc_page_off);
+                        em.andRegReg(false, .rax, .rcx);
+                        emitUpdateNZ_Logic(&em, off_cpsr, true);
+                    },
+
+                    .alu_neg => {
+                        em.xorRegReg(false, .rax, .rax);
+                        emitLoadThumbReg(&em, .rcx, td.rm, pc_page_off);
+                        em.subRegReg(false, .rax, .rcx);
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                        emitUpdateNZCV_AddSub(&em, off_cpsr, true);
+                    },
+
+                    .alu_cmp, .alu_cmn, .hi_cmp => {
+                        const is_sub = op != .alu_cmn;
+                        emitLoadThumbReg(&em, .rax, td.rd, pc_page_off);
+                        emitLoadThumbReg(&em, .rcx, td.rm, pc_page_off);
+                        if (is_sub) em.subRegReg(false, .rax, .rcx) else em.addRegReg(false, .rax, .rcx);
+                        emitUpdateNZCV_AddSub(&em, off_cpsr, is_sub);
+                    },
+
+                    .hi_add => {
+                        emitLoadThumbReg(&em, .rax, td.rd, pc_page_off);
+                        emitLoadThumbReg(&em, .rcx, td.rm, pc_page_off);
+                        em.addRegReg(false, .rax, .rcx);
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                    },
+
+                    .hi_mov => {
+                        emitLoadThumbReg(&em, .rax, td.rm, pc_page_off);
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                    },
+
+                    .bx => {
+                        emitLoadThumbReg(&em, .rax, td.rm, pc_page_off);
+                        emitSetPcInterworkingThumbAndExit(&em, epilogue_label);
+                    },
+
+                    .add_pc => {
+                        em.movRegMem(false, .rax, .rbx, off_r15);
+                        const aligned_off: u32 = ((pc_page_off + 4) & ~@as(u32, 3)) + td.imm;
+                        if (aligned_off != 0) em.addRegImm(false, .rax, @intCast(aligned_off));
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                    },
+
+                    .add_sp_rd => {
+                        emitLoadThumbReg(&em, .rax, 13, pc_page_off);
+                        if (td.imm != 0) em.addRegImm(false, .rax, @intCast(td.imm));
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                    },
+
+                    .add_sp_imm, .sub_sp_imm => {
+                        emitLoadThumbReg(&em, .rax, 13, pc_page_off);
+                        if (td.imm != 0) {
+                            if (op == .sub_sp_imm) em.subRegImm(false, .rax, @intCast(td.imm)) else em.addRegImm(false, .rax, @intCast(td.imm));
+                        }
+                        emitStoreThumbReg(&em, 13, .rax);
+                    },
+
+                    .sxth, .sxtb, .uxth, .uxtb => {
+                        emitLoadThumbReg(&em, .rax, td.rm, pc_page_off);
+                        switch (op) {
+                            .sxth => em.movsx16(false, .rax, .rax),
+                            .sxtb => em.movsx8(false, .rax, .rax),
+                            .uxth => em.movzx16(false, .rax, .rax),
+                            .uxtb => em.movzx8(false, .rax, .rax),
+                            else => unreachable,
+                        }
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                    },
+
+                    .rev, .rev16, .revsh => {
+                        emitLoadThumbReg(&em, .rax, td.rm, pc_page_off);
+                        em.bswap(false, .rax);
+                        if (op == .rev16) {
+                            em.rorImm(false, .rax, 16);
+                        } else if (op == .revsh) {
+                            em.sarImm(false, .rax, 16);
+                        }
+                        emitStoreThumbReg(&em, td.rd, .rax);
+                    },
+
+                    .ldr_lit, .ldr_imm, .str_imm, .ldrb_imm, .strb_imm, .ldrh_imm, .strh_imm, .ldr_reg, .str_reg, .ldrb_reg, .strb_reg, .ldrh_reg, .strh_reg, .ldrsb_reg, .ldrsh_reg, .ldr_sp, .str_sp => {
+                        const is_load = switch (op) {
+                            .str_imm, .strb_imm, .strh_imm, .str_reg, .strb_reg, .strh_reg, .str_sp => false,
+                            else => true,
+                        };
+                        const size: u32 = switch (op) {
+                            .ldr_lit, .ldr_imm, .str_imm, .ldr_reg, .str_reg, .ldr_sp, .str_sp => 4,
+                            .ldrh_imm, .strh_imm, .ldrh_reg, .strh_reg, .ldrsh_reg => 2,
+                            .ldrb_imm, .strb_imm, .ldrb_reg, .strb_reg, .ldrsb_reg => 1,
+                            else => unreachable,
+                        };
+                        const is_signed = op == .ldrsb_reg or op == .ldrsh_reg;
+                        const is_reg_off = switch (op) {
+                            .ldr_reg, .str_reg, .ldrb_reg, .strb_reg, .ldrh_reg, .strh_reg, .ldrsb_reg, .ldrsh_reg => true,
+                            else => false,
+                        };
+
+                        if (op == .ldr_lit) {
+                            em.movRegMem(false, .rdi, .rbx, off_r15);
+                            const aligned_off: u32 = ((pc_page_off + 4) & ~@as(u32, 3)) + td.imm;
+                            if (aligned_off != 0) em.addRegImm(false, .rdi, @intCast(aligned_off));
+                        } else if (is_reg_off) {
+                            emitLoadThumbReg(&em, .rdi, td.rn, pc_page_off);
+                            emitLoadThumbReg(&em, .rcx, td.rm, pc_page_off);
+                            em.addRegReg(false, .rdi, .rcx);
+                        } else {
+                            const base_r: u8 = if (op == .ldr_sp or op == .str_sp) 13 else td.rn;
+                            emitLoadThumbReg(&em, .rdi, base_r, pc_page_off);
+                            if (td.imm != 0) em.addRegImm(false, .rdi, @intCast(td.imm));
+                        }
+
+                        const slow_label = em.newLabel();
+                        const done_label = em.newLabel();
+
+                        em.movRegReg(false, .rcx, .rdi);
+                        em.shrImm(false, .rcx, 8);
+                        em.andRegImm(false, .rcx, 0xfff0);
+
+                        const align_mask: i32 = switch (size) {
+                            4 => -4093,
+                            2 => -4095,
+                            1 => -4096,
+                            else => unreachable,
+                        };
+                        em.movRegReg(false, .rax, .rdi);
+                        em.andRegImm(false, .rax, align_mask);
+                        em.cmpSibReg(false, .rbp, .rcx, 0, if (is_load) off_tlb32_read_vpage else off_tlb32_write_vpage, .rax);
+                        em.jccLabel(.ne, slow_label);
+
+                        em.movRegSib(false, .rax, .rbp, .rcx, 0, off_tlb32_pbase);
+                        em.movRegReg(false, .rdx, .rdi);
+                        em.andRegImm(false, .rdx, 0xfff);
+                        em.orRegReg(false, .rax, .rdx);
+
+                        if (is_load) {
+                            switch (size) {
+                                4 => em.movRegSib(false, .rax, .r13, .rax, 0, 0),
+                                2 => {
+                                    em.movzxSib16(.rax, .r13, .rax, 0, 0);
+                                    if (is_signed) em.movsx16(false, .rax, .rax);
+                                },
+                                1 => {
+                                    em.movzxSib8(.rax, .r13, .rax, 0, 0);
+                                    if (is_signed) em.movsx8(false, .rax, .rax);
+                                },
+                                else => unreachable,
+                            }
+                            emitStoreThumbReg(&em, td.rd, .rax);
+                        } else {
+                            emitLoadThumbReg(&em, .rcx, td.rd, pc_page_off);
+                            switch (size) {
+                                4 => em.movSibReg(false, .r13, .rax, 0, 0, .rcx),
+                                2 => em.movSib16Reg(.r13, .rax, 0, 0, .rcx),
+                                1 => em.movSib8Reg(.r13, .rax, 0, 0, .rcx),
+                                else => unreachable,
+                            }
+                        }
+                        em.jmpLabel(done_label);
+
+                        em.bindLabel(slow_label);
+                        emitSpillPinnedThumb(&em);
+                        if (is_load) {
+                            em.movRegReg(false, .rdx, .rdi);
+                            em.movRegReg(true, .rdi, .rbx);
+                            em.movRegReg(true, .rsi, .r12);
+                            em.movImm32(.rcx, pc_page_off);
+                            em.movImm32(.r8, size);
+                            em.movImm64(.r11, @intFromPtr(&Arm32.jitSlowLoad32));
+                            em.callReg(.r11);
+
+                            em.cmpRegImm(true, .rdx, 1);
+                            em.jccLabel(.e, abort_epilogue_label);
+                            emitReloadPinnedThumb(&em);
+                            if (is_signed) {
+                                if (size == 2) em.movsx16(false, .rax, .rax) else em.movsx8(false, .rax, .rax);
+                            }
+                            emitStoreThumbReg(&em, td.rd, .rax);
+                        } else {
+                            em.movRegReg(false, .rdx, .rdi);
+                            emitLoadThumbReg(&em, .rcx, td.rd, pc_page_off);
+                            em.movRegReg(true, .rdi, .rbx);
+                            em.movRegReg(true, .rsi, .r12);
+                            em.movImm32(.r8, pc_page_off);
+                            em.movImm32(.r9, size);
+                            em.movImm64(.r11, @intFromPtr(&Arm32.jitSlowStore32));
+                            em.callReg(.r11);
+
+                            em.testRegReg(true, .rax, .rax);
+                            em.jccLabel(.ne, abort_epilogue_label);
+                            emitReloadPinnedThumb(&em);
+                        }
+
+                        em.bindLabel(done_label);
+                    },
+
+                    .b_uncond, .b_cond => {
+                        const off_i32: i32 = @as(i16, @bitCast(td.imm));
+                        const target_delta: i32 = @as(i32, @intCast(pc_page_off + 4)) + off_i32;
+                        const target_hw_i32 = @divExact(target_delta, 2);
+                        const in_trace = target_hw_i32 >= @as(i32, start_hw) and target_hw_i32 < @as(i32, end_hw);
+
+                        if (op == .b_uncond) {
+                            if (in_trace) {
+                                const target_hw: u16 = @intCast(target_hw_i32);
+                                const target_idx = target_hw - start_hw;
+                                if (target_hw > hw) {
+                                    em.jmpLabel(inst_labels[target_idx]);
+                                } else {
+                                    const rem: i32 = @intCast(end_hw - target_hw);
+                                    const exit_label = em.newLabel();
+                                    exit_stubs[exit_stub_count] = .{ .label = exit_label, .pc_delta = target_delta };
+                                    exit_stub_count += 1;
+                                    em.leaRegMem(true, .rax, .r15, rem);
+                                    em.cmpRegReg(true, .rax, .r14);
+                                    em.jccLabel(.a, exit_label);
+                                    em.jmpLabel(inst_labels[target_idx]);
+                                }
+                            } else {
+                                em.addMemImm32(false, .rbx, off_r15, target_delta);
+                                em.jmpLabel(epilogue_label);
+                            }
+                        } else {
+                            const not_taken = em.newLabel();
+                            emitArmCondBranch(&em, off_cpsr, @intCast(td.rd & 0xf), false, not_taken);
+                            if (in_trace) {
+                                const target_hw: u16 = @intCast(target_hw_i32);
+                                const target_idx = target_hw - start_hw;
+                                if (target_hw > hw) {
+                                    em.jmpLabel(inst_labels[target_idx]);
+                                } else {
+                                    const rem: i32 = @intCast(end_hw - target_hw);
+                                    const exit_label = em.newLabel();
+                                    exit_stubs[exit_stub_count] = .{ .label = exit_label, .pc_delta = target_delta };
+                                    exit_stub_count += 1;
+                                    em.leaRegMem(true, .rax, .r15, rem);
+                                    em.cmpRegReg(true, .rax, .r14);
+                                    em.jccLabel(.a, exit_label);
+                                    em.jmpLabel(inst_labels[target_idx]);
+                                }
+                            } else {
+                                const exit_label = em.newLabel();
+                                exit_stubs[exit_stub_count] = .{ .label = exit_label, .pc_delta = target_delta };
+                                exit_stub_count += 1;
+                                em.jmpLabel(exit_label);
+                            }
+                            em.bindLabel(not_taken);
+                        }
+                    },
+
+                    else => unreachable,
+                }
+            }
+
+            const last_op = decoded[trace_len - 1].op;
+            if (last_op != .b_uncond and last_op != .bx) {
+                em.addMemImm32(false, .rbx, off_r15, @intCast(@as(u32, end_hw) * 2));
+                em.jmpLabel(epilogue_label);
+            }
+
+            for (exit_stubs[0..exit_stub_count]) |stub| {
+                em.bindLabel(stub.label);
+                em.addMemImm32(false, .rbx, off_r15, stub.pc_delta);
+                em.jmpLabel(epilogue_label);
+            }
+
+            em.bindLabel(epilogue_label);
+            emitSpillPinnedThumb(&em);
+            em.bindLabel(abort_epilogue_label);
+            em.emitEpilogue();
+
+            if (!em.resolveFixups()) return null;
+            return buf.allocCode(core_id, em.buf[0..em.len]);
+        }
+    };
+}
+
 test "X64Emitter encodes basic arithmetic and branches" {
     var em = X64Emitter{};
     em.emitPrologue();
@@ -4802,5 +6907,6 @@ test "X64Emitter encodes basic arithmetic and branches" {
         try std.testing.expectEqual(@as(usize, 5), ran);
     }
 }
+
 
 

@@ -1100,6 +1100,13 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return_pc: u64,
             h: u8,
         ) void {
+            if ((return_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                const ret_word: u10 = @truncate((return_pc >> 2) & 0x3ff);
+                if (code_icache_ptr[ret_word].op != @intFromEnum(A64Op.jit_trace)) {
+                    const rh: u8 = @truncate((return_pc >> 2) ^ (return_pc >> 10));
+                    _ = compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, ret_word, 0, rh, 0x20);
+                }
+            }
             const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
             if ((target_pc & ~@as(u64, 0xfff)) == code_vbase) {
                 if (code_icache_ptr[start_word].op != @intFromEnum(A64Op.jit_trace)) {
@@ -1110,17 +1117,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 if ((target_pc & ~@as(u64, 0xfff)) == tslot.x_vbase) {
                     const t_pbase = tslot.pbase;
                     const t_page_idx = CpuType.icachePageIdx(t_pbase);
-                    const t_icache_ptr = cpu.prepareIcachePage(t_page_idx, t_pbase);
-                    if (t_icache_ptr[start_word].op != @intFromEnum(A64Op.jit_trace)) {
-                        _ = compileHotLoop64(cpu, SlotType, t_page_idx, t_icache_ptr, bus.ram.ptr + t_pbase, start_word, 0, h, 0x20);
+                    if (t_page_idx != code_page_idx) {
+                        const t_icache_ptr = cpu.prepareIcachePage(t_page_idx, t_pbase);
+                        if (t_icache_ptr[start_word].op != @intFromEnum(A64Op.jit_trace)) {
+                            _ = compileHotLoop64(cpu, SlotType, t_page_idx, t_icache_ptr, bus.ram.ptr + t_pbase, start_word, 0, h, 0x20);
+                        }
                     }
-                }
-            }
-            if ((return_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                const ret_word: u10 = @truncate((return_pc >> 2) & 0x3ff);
-                if (code_icache_ptr[ret_word].op != @intFromEnum(A64Op.jit_trace)) {
-                    const rh: u8 = @truncate((return_pc >> 2) ^ (return_pc >> 10));
-                    _ = compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, ret_word, 0, rh, 0x20);
                 }
             }
         }
@@ -9080,5 +9082,45 @@ test "AArch64 superinstruction fusion (ADRP+ADD, ADRP+LDR, STP+MOV FP, CMP+B.con
         try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1200 & 0xfff) >> 2)].op)));
         try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1144 & 0xfff) >> 2)].op)));
     }
+
+    // Verify AArch64 NEON SIMD / DC ZVA hot loop compiles to .jit_trace and executes accurately
+    // Populate SoftTLB64 for data page 0x2000
+    cpu.mmu.populateSoftTlb64(ram.len, 0x2000, 0x2000, mmu_mod.Mmu.perm_priv_r | mmu_mod.Mmu.perm_priv_w, false);
+    // 0x1300: dc zva, x2              (0xd50b7422)
+    // 0x1304: dup v0.16b, w3          (0x4e010c60)
+    // 0x1308: stp q0, q0, [x4]        (0xad000080)
+    // 0x130c: sub x11, x11, #1        (0xd100056b)
+    // 0x1310: cbnz x11, 0x1300 (-16)  (0xb5ffff8b)
+    // 0x1314: wfi                     (0xd503207f)
+    const neon_prog = [_]u32{
+        0xd50b7422,
+        0x4e010c60,
+        0xad000080,
+        0xd100056b,
+        0xb5ffff8b,
+        0xd503207f,
+    };
+    for (neon_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1300 + i * 4 ..][0..4], inst, .little);
+    }
+    @memset(ram[0x2000..0x2040], 0xaa);
+    cpu.invalidateIcache();
+    cpu.mmu.halted_wfi = false;
+    cpu.pc64 = 0x1300;
+    cpu.x[2] = 0x2000;
+    cpu.x[3] = 0x5a;
+    cpu.x[4] = 0x2080;
+    cpu.x[11] = 40;
+    const neon_ran = cpu.runSteps(&bus, 500);
+    try std.testing.expectEqual(@as(usize, 40 * 5 + 1), neon_ran);
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, ram[0x2000..][0..8], .little));
+    try std.testing.expectEqual(@as(u64, 0), std.mem.readInt(u64, ram[0x2038..][0..8], .little));
+    try std.testing.expectEqual(@as(u128, 0x5a5a5a5a_5a5a5a5a_5a5a5a5a_5a5a5a5a), std.mem.readInt(u128, ram[0x2080..][0..16], .little));
+    try std.testing.expectEqual(@as(u128, 0x5a5a5a5a_5a5a5a5a_5a5a5a5a_5a5a5a5a), std.mem.readInt(u128, ram[0x2090..][0..16], .little));
+    if (jit_mod.is_x86_64_linux) {
+        const Exec = Aarch64Exec(Cpu, TestBus);
+        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1300 & 0xfff) >> 2)].op)));
+    }
 }
+
 

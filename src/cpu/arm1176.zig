@@ -106,6 +106,7 @@ pub const ThumbOp = enum(u8) {
     movw_pair,
     movt_pair,
     nop,
+    jit_trace,
 };
 
 pub const ThumbSlot = struct {
@@ -2285,6 +2286,13 @@ pub fn Arm1176(comptime Bus: type) type {
             return_pc: u32,
             h: u8,
         ) void {
+            if ((return_pc & ~@as(u32, 0xffc)) == code_vbase) {
+                const ret_word: u10 = @truncate((return_pc >> 2) & 0x3ff);
+                if (code_icache_ptr[ret_word].op != @intFromEnum(ArmOp.jit_trace)) {
+                    const rh: u8 = @truncate((return_pc >> 2) ^ (return_pc >> 10));
+                    _ = self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, ret_word, 0, rh, 0x20);
+                }
+            }
             const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
             if ((target_pc & ~@as(u32, 0xffc)) == code_vbase) {
                 if (code_icache_ptr[start_word].op != @intFromEnum(ArmOp.jit_trace)) {
@@ -2295,17 +2303,12 @@ pub fn Arm1176(comptime Bus: type) type {
                 if ((target_pc & 0xffff_f000) == tslot.x_vbase) {
                     const t_pbase = tslot.pbase;
                     const t_page_idx = icachePageIdx(t_pbase);
-                    const t_icache_ptr = self.prepareIcachePage(t_page_idx, t_pbase);
-                    if (t_icache_ptr[start_word].op != @intFromEnum(ArmOp.jit_trace)) {
-                        _ = self.compileHotLoop32(t_page_idx, t_icache_ptr, bus.ram.ptr + t_pbase, start_word, 0, h, 0x20);
+                    if (t_page_idx != code_page_idx) {
+                        const t_icache_ptr = self.prepareIcachePage(t_page_idx, t_pbase);
+                        if (t_icache_ptr[start_word].op != @intFromEnum(ArmOp.jit_trace)) {
+                            _ = self.compileHotLoop32(t_page_idx, t_icache_ptr, bus.ram.ptr + t_pbase, start_word, 0, h, 0x20);
+                        }
                     }
-                }
-            }
-            if ((return_pc & ~@as(u32, 0xffc)) == code_vbase) {
-                const ret_word: u10 = @truncate((return_pc >> 2) & 0x3ff);
-                if (code_icache_ptr[ret_word].op != @intFromEnum(ArmOp.jit_trace)) {
-                    const rh: u8 = @truncate((return_pc >> 2) ^ (return_pc >> 10));
-                    _ = self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, ret_word, 0, rh, 0x20);
                 }
             }
         }
@@ -2321,6 +2324,96 @@ pub fn Arm1176(comptime Bus: type) type {
             const next_hw: ?u16 = if (page_hw < 0x7ff) std.mem.readInt(u16, thumb_page_ptr[(page_hw + 1) * 2 ..][0..2], .little) else null;
             thumb_icache_ptr[page_hw] = decodeThumb16(inst16, next_hw);
             self.markThumbIcacheDirty(thumb_page_idx, page_hw);
+        }
+
+        noinline fn compileHotLoopThumb(
+            self: *Self,
+            thumb_page_idx: usize,
+            thumb_icache_ptr: [*]ThumbSlot,
+            thumb_page_ptr: [*]const u8,
+            start_hw: u11,
+            end_hw_req: u16,
+        ) void {
+            if (thumb_icache_ptr[start_hw].op == .jit_trace) return;
+            const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdxThumb(thumb_page_ptr, start_hw, end_hw_req);
+            const code_hash = jit_mod.JitCodeBuffer.hashThumbHalfwords(thumb_page_ptr, start_hw, end_hw_req);
+            const entry = &self.jit_buf.trace_cache[tc_idx];
+            if (entry.page_ptr == @intFromPtr(thumb_page_ptr) and
+                entry.start_word == start_hw and
+                entry.end_word_req == end_hw_req and
+                entry.code_hash == code_hash)
+            {
+                if (entry.failed) return;
+                if (entry.fn_ptr != null) {
+                    const inst16 = std.mem.readInt(u16, thumb_page_ptr[@as(usize, start_hw) * 2 ..][0..2], .little);
+                    thumb_icache_ptr[start_hw] = .{
+                        .raw = inst16,
+                        .op = .jit_trace,
+                        .rd = entry.trace_len,
+                        .imm = @intCast(tc_idx),
+                    };
+                    self.markThumbIcacheDirty(thumb_page_idx, start_hw);
+                    return;
+                }
+            }
+            const JitThumb = jit_mod.ThumbJit(Self, Bus);
+            var end_hw: u16 = 0;
+            if (JitThumb.compileTrace(&self.jit_buf, self.mmu.core_id, thumb_page_ptr, start_hw, end_hw_req, &end_hw)) |fn_ptr| {
+                const inst16 = std.mem.readInt(u16, thumb_page_ptr[@as(usize, start_hw) * 2 ..][0..2], .little);
+                const trace_len: u8 = @intCast(end_hw - @as(u16, start_hw));
+                entry.* = .{
+                    .page_ptr = @intFromPtr(thumb_page_ptr),
+                    .start_word = start_hw,
+                    .end_word_req = end_hw_req,
+                    .trace_len = trace_len,
+                    .failed = false,
+                    .is_spin = false,
+                    .code_hash = code_hash,
+                    .fn_ptr = fn_ptr,
+                };
+                thumb_icache_ptr[start_hw] = .{
+                    .raw = inst16,
+                    .op = .jit_trace,
+                    .rd = trace_len,
+                    .imm = @intCast(tc_idx),
+                };
+                self.markThumbIcacheDirty(thumb_page_idx, start_hw);
+            } else {
+                entry.* = .{
+                    .page_ptr = @intFromPtr(thumb_page_ptr),
+                    .start_word = start_hw,
+                    .end_word_req = end_hw_req,
+                    .trace_len = 0,
+                    .failed = true,
+                    .is_spin = false,
+                    .code_hash = code_hash,
+                    .fn_ptr = null,
+                };
+            }
+        }
+
+        inline fn noteBackwardBranchThumb(
+            self: *Self,
+            code_vbase: u32,
+            thumb_page_idx: usize,
+            thumb_icache_ptr: [*]ThumbSlot,
+            thumb_page_ptr: [*]const u8,
+            cur_pc: u32,
+            target_pc: u32,
+        ) void {
+            if (target_pc <= cur_pc and (target_pc & ~@as(u32, 0xffe)) == code_vbase) {
+                const start_hw: u11 = @truncate((target_pc >> 1) & 0x7ff);
+                if (thumb_icache_ptr[start_hw].op == .jit_trace) return;
+                const end_hw_req: u16 = @as(u16, @truncate((cur_pc >> 1) & 0x7ff)) + 1;
+                if (end_hw_req > @as(u16, start_hw) + 1 and end_hw_req - @as(u16, start_hw) <= 64) {
+                    const h: u8 = @truncate((target_pc >> 1) ^ (target_pc >> 9));
+                    const c = self.jit_buf.loop_counts[h] +% 1;
+                    self.jit_buf.loop_counts[h] = c;
+                    if ((c & 0x1f) == 0) {
+                        self.compileHotLoopThumb(thumb_page_idx, thumb_icache_ptr, thumb_page_ptr, start_hw, end_hw_req);
+                    }
+                }
+            }
         }
 
         // --- Execution Step ---
@@ -5706,7 +5799,7 @@ pub fn Arm1176(comptime Bus: type) type {
             return self.vfp.isEnabled() and (cp10_acc >= 2 or (cp10_acc == 1 and priv != 0));
         }
 
-        noinline fn executeVfp(self: *Self, bus: *Bus, inst_pc: u32, inst: u32, is_double: bool) void {
+        pub noinline fn executeVfp(self: *Self, bus: *Bus, inst_pc: u32, inst: u32, is_double: bool) void {
             // Check CPACR bits [21:20] for CP10 access permission
             const cp10_acc: u2 = @truncate((self.mmu.cpacr >> 20) & 3);
             if (cp10_acc == 0b00 or (cp10_acc == 0b01 and !self.isPrivileged())) {
@@ -5989,7 +6082,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     }
                     self.r[15] = pc +% 2;
                     executed += 1;
-                    if (self.executeThumbDecoded(bus, pc, td, &executed, batch_end, priv, thumb_vbase, thumb_pbase, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
+                    if (self.executeThumbDecoded(bus, pc, td, &executed, batch_end, priv, thumb_vbase, thumb_pbase, thumb_page_idx, thumb_icache_ptr, thumb_page_ptr, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
                         if (self.mmu.halted_wfi or self.yield_slice) return executed;
                         _ = self.checkInterrupts(bus);
                         priv = @intFromBool(self.isPrivileged());
@@ -6012,6 +6105,9 @@ pub fn Arm1176(comptime Bus: type) type {
             priv: u1,
             code_vbase: u32,
             code_pbase: u32,
+            thumb_page_idx: usize,
+            thumb_icache_ptr: [*]ThumbSlot,
+            thumb_page_ptr: [*]const u8,
             data_r_vbase: *[2]u32,
             data_w_vbase: *[2]u32,
             data_r_page_ptr: *[2][*]const u8,
@@ -6019,6 +6115,19 @@ pub fn Arm1176(comptime Bus: type) type {
         ) bool {
             switch (td.op) {
                 .nop => return false,
+                .jit_trace => {
+                    const max_jit: usize = (batch_end - executed.*) + 1;
+                    if (max_jit >= td.rd) {
+                        if (self.jit_buf.trace_cache[td.imm].fn_ptr) |fn_ptr| {
+                            self.r[15] = code_vbase;
+                            const tlb_ptr = &self.mmu.soft_tlb32[priv][0];
+                            const ran = fn_ptr(self, bus, bus.ram.ptr, tlb_ptr, max_jit, bus.ram.ptr);
+                            executed.* += ran - 1;
+                            return true;
+                        }
+                    }
+                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr);
+                },
                 .lsl_imm => {
                     const carry_in: u1 = @truncate((self.cpsr >> 29) & 1);
                     const sh = dec.barrelShiftImm(self.r[td.rm], 0b00, @truncate(td.imm), carry_in);
@@ -6465,13 +6574,17 @@ pub fn Arm1176(comptime Bus: type) type {
                 .b_cond => {
                     if (dec.checkCond(@truncate(td.rd), self.cpsr)) {
                         const off: u32 = @bitCast(@as(i32, @as(i16, @bitCast(td.imm))));
-                        self.r[15] = (inst_pc +% 4) +% off;
+                        const target_pc = (inst_pc +% 4) +% off;
+                        self.r[15] = target_pc;
+                        self.noteBackwardBranchThumb(code_vbase, thumb_page_idx, thumb_icache_ptr, thumb_page_ptr, inst_pc, target_pc);
                     }
                     return false;
                 },
                 .b_uncond => {
                     const off: u32 = @bitCast(@as(i32, @as(i16, @bitCast(td.imm))));
-                    self.r[15] = (inst_pc +% 4) +% off;
+                    const target_pc = (inst_pc +% 4) +% off;
+                    self.r[15] = target_pc;
+                    self.noteBackwardBranchThumb(code_vbase, thumb_page_idx, thumb_icache_ptr, thumb_page_ptr, inst_pc, target_pc);
                     return false;
                 },
                 .bl_prefix => {
@@ -8077,6 +8190,78 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
         try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1d00 & 0xfff) >> 2)].op)));
         try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1c44 & 0xfff) >> 2)].op)));
     }
+
+    // Verify ARM32 VFPv2/VFPv4 hot loop (VLDR.64 / VADD.F64 / VSTR.64) compiles to .jit_trace
+    // Enable VFP (FPEXC.EN = 1, CPACR CP10/11 = 0b1111)
+    cpu.vfp.fpexc = 1 << 30;
+    cpu.mmu.cpacr = 0x00f0_0000;
+    // 0x1c80: vldr d0, [r4]           (0xed940b00)
+    // 0x1c84: vadd.f64 d1, d1, d0     (0xee311b00)
+    // 0x1c88: vstr d1, [r5]           (0xed851b00)
+    // 0x1c8c: subs r0, r0, #1         (0xe2500001)
+    // 0x1c90: bne 0x1c80              (0x1afffffa)
+    const vfp32_prog = [_]u32{
+        0xed940b00,
+        0xee311b00,
+        0xed851b00,
+        0xe2500001,
+        0x1afffffa,
+    };
+    for (vfp32_prog, 0..) |inst, i| {
+        std.mem.writeInt(u32, ram[0x1c80 + i * 4 ..][0..4], inst, .little);
+    }
+    std.mem.writeInt(u64, ram[0x2400..][0..8], @bitCast(@as(f64, 2.5)), .little);
+    std.mem.writeInt(u64, ram[0x2408..][0..8], 0, .little);
+    cpu.vfp.setDU64(0, 0);
+    cpu.vfp.setDU64(1, @bitCast(@as(f64, 0.0)));
+    cpu.invalidateIcache();
+    cpu.r[15] = 0x1c80;
+    cpu.r[0] = 40;
+    cpu.r[4] = 0x2400;
+    cpu.r[5] = 0x2408;
+    const vfp32_ran = cpu.runSteps(&bus, 40 * 5);
+    try std.testing.expectEqual(@as(usize, 200), vfp32_ran);
+    try std.testing.expectEqual(@as(u32, 0), cpu.r[0]);
+    try std.testing.expectEqual(@as(f64, 100.0), @as(f64, @bitCast(std.mem.readInt(u64, ram[0x2408..][0..8], .little))));
+    if (jit_mod.is_x86_64_linux) {
+        const page_idx: usize = ((0x1000 >> 12) ^ (0x1000 >> 16) ^ (0x1000 >> 20)) & (icache_pages - 1);
+        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1c80 & 0xfff) >> 2)].op)));
+    }
+
+    // Verify 16-bit Thumb hot backward-branch loop compiles to .jit_trace
+    // 0x1e00: adds r1, #3             (0x3103)
+    // 0x1e02: str r1, [r4, #0]        (0x6021)
+    // 0x1e04: subs r0, #1             (0x3801)
+    // 0x1e06: bne 0x1e00 (-8)         (0xd1fb)
+    // 0x1e08: adds r2, r1, #1         (0x1c4a)
+    const thumb_jit_prog = [_]u16{
+        0x3103,
+        0x6021,
+        0x3801,
+        0xd1fb,
+        0x1c4a,
+    };
+    for (thumb_jit_prog, 0..) |inst16, i| {
+        std.mem.writeInt(u16, ram[0x1e00 + i * 2 ..][0..2], inst16, .little);
+    }
+    cpu.invalidateIcache();
+    cpu.cpsr |= PsrFlags.T;
+    cpu.r[15] = 0x1e00;
+    cpu.r[0] = 40;
+    cpu.r[1] = 0;
+    cpu.r[2] = 0;
+    cpu.r[4] = 0x2500;
+    const thumb_ran = cpu.runSteps(&bus, 40 * 4 + 1);
+    try std.testing.expectEqual(@as(usize, 161), thumb_ran);
+    try std.testing.expectEqual(@as(u32, 0), cpu.r[0]);
+    try std.testing.expectEqual(@as(u32, 120), cpu.r[1]);
+    try std.testing.expectEqual(@as(u32, 121), cpu.r[2]);
+    try std.testing.expectEqual(@as(u32, 120), std.mem.readInt(u32, ram[0x2500..][0..4], .little));
+    if (jit_mod.is_x86_64_linux) {
+        const tpage_idx = Cpu.thumbIcachePageIdx(0x1000);
+        try std.testing.expectEqual(ThumbOp.jit_trace, cpu.thumb_icache[tpage_idx * 2048 + ((0x1e00 & 0xfff) >> 1)].op);
+    }
 }
+
 
 
