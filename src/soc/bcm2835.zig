@@ -222,12 +222,17 @@ pub const Bcm2835 = struct {
             if (self.computeFiqPendingForCore(cid)) summary |= @as(u32, 1) << (@as(u5, cid) + 4);
         }
         self.smp.irq_summary.store(summary, .release);
+        const wfi_m = self.smp.wfi_mask.load(.monotonic);
+        if (wfi_m != 0 and (((summary & 0x0f) | (summary >> 4)) & wfi_m) != 0) {
+            self.smp.wake_wfi.store(1, .release);
+        }
     }
 
     /// Updates the generic timer interrupt lines of `core_id` after a CPU writes its timer registers.
     pub fn setCoreTimerLines(self: *Bcm2835, core_id: u2, lines: u4) void {
         if (!self.smp.parallel) {
             self.local_intc.core_timer_lines[core_id] = lines;
+            if (self.smp.wfi_mask.load(.monotonic) != 0) self.publishIrqSummary();
             return;
         }
         self.smp.device_lock.lock();
@@ -246,7 +251,11 @@ pub const Bcm2835 = struct {
     }
 
     inline fn cpuWriteMmio32(self: *Bcm2835, addr: u32, val: u32) void {
-        if (!self.smp.parallel) return self.writeMmio32(addr, val);
+        if (!self.smp.parallel) {
+            self.writeMmio32(addr, val);
+            if (self.smp.wfi_mask.load(.monotonic) != 0) self.publishIrqSummary();
+            return;
+        }
         self.smp.device_lock.lock();
         defer self.smp.device_lock.unlock();
         self.writeMmio32(addr, val);

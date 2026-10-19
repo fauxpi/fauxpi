@@ -576,13 +576,18 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
         // Cores in WFI with nothing pending would return immediately; leave them out of the slice.
         var active: u4 = 0;
+        var wfi_mask: u4 = 0;
         for (0..num_cores) |i| {
             if (cpus[i].halted_spin) continue;
             const cid: u2 = @intCast(i);
             if (!cpus[i].mmu.halted_wfi or soc.hasPendingIrqForCore(cid) or soc.hasPendingFiqForCore(cid)) {
                 active |= @as(u4, 1) << cid;
+            } else {
+                wfi_mask |= @as(u4, 1) << cid;
             }
         }
+        soc.smp.wfi_mask.store(wfi_mask, .release);
+        soc.smp.wake_wfi.store(0, .release);
         const max_slice: u64 = if (@popCount(active) > 1) 16384 else 65536;
         const batch: usize = if (opts.max_steps != 0)
             @intCast(@min(max_slice, opts.max_steps -| cpus[0].cycles))

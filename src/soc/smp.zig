@@ -72,7 +72,70 @@ pub const Smp = struct {
     irq_summary: std.atomic.Value(u32) = .init(0),
     /// True while core `n` is executing its slice.
     running: [max_cores]std.atomic.Value(bool) = @splat(.init(false)),
+    /// Bit `n` is 1 while core `n` is actively executing instructions (not parked and not in `onSpinWait`).
+    active_mask: std.atomic.Value(u8) = .init(0),
+    /// Bit `n` is 1 if core `n` was in WFI when the current slice started.
+    wfi_mask: std.atomic.Value(u8) = .init(0),
+    /// Non-zero when an interrupt became pending for a core in `wfi_mask` during the current slice.
+    wake_wfi: std.atomic.Value(u32) = .init(0),
+    /// Incremented by `signalEvent()` when a core executes `SEV`, `STLR`, or `STXR` during a parallel slice.
+    sev_gen: std.atomic.Value(u32) = .init(0),
     tlb: [max_cores]TlbInbox = @splat(.{}),
+
+    /// Signals an event (`SEV` or store-release/store-exclusive) to wake cores waiting in `onSpinWait`.
+    pub inline fn signalEvent(self: *Smp) void {
+        if (self.parallel) _ = self.sev_gen.fetchAdd(1, .release);
+    }
+
+    /// True if `core` has a pending IRQ or FIQ in `irq_summary`.
+    pub inline fn hasPendingInterrupt(self: *const Smp, core: u2) bool {
+        return (self.irq_summary.load(.acquire) & (@as(u32, 0x11) << core)) != 0;
+    }
+
+    /// Coordinates a guest core that executed `WFE`, `YIELD`, `DMB`-spin, or a detected spinloop
+    /// during a parallel SMP slice (`parallel == true`).
+    /// Returns `true` if the core should yield the remainder of its slice (`break :step_loop`),
+    /// or `false` if another core is actively running and this core should continue its slice
+    /// after a brief host pause.
+    pub noinline fn onSpinWait(self: *Smp, core: u2, mmu: *Mmu, wait_count: *u32) bool {
+        if (!self.parallel) return true;
+        if (self.wake_wfi.load(.acquire) != 0) return true;
+
+        const bit: u8 = @as(u8, 1) << core;
+        const prev = self.active_mask.fetchAnd(~bit, .acq_rel);
+        if ((prev & ~bit) == 0) {
+            return true;
+        }
+
+        wait_count.* += 1;
+        if (wait_count.* > 16) {
+            return true;
+        }
+
+        const sev_before = self.sev_gen.load(.acquire);
+        const max_spins: u32 = if (wait_count.* <= 2) 128 else 512;
+        var spins: u32 = 0;
+        while (spins < max_spins) : (spins += 1) {
+            std.atomic.spinLoopHint();
+            if (self.tlb[core].pending.load(.monotonic) != 0) {
+                _ = self.serviceTlb(core, mmu);
+            }
+            if ((self.active_mask.load(.acquire) & ~bit) == 0) break;
+            if (self.sev_gen.load(.acquire) != sev_before) {
+                wait_count.* = 0;
+                break;
+            }
+            if (self.wake_wfi.load(.acquire) != 0) break;
+            if (self.hasPendingInterrupt(core)) break;
+        }
+        _ = self.serviceTlb(core, mmu);
+
+        if ((self.active_mask.load(.acquire) & ~bit) == 0 or self.wake_wfi.load(.acquire) != 0) {
+            return true;
+        }
+        _ = self.active_mask.fetchOr(bit, .acq_rel);
+        return false;
+    }
 
     /// Posts the TLB invalidations `mmu` (core `from`) queued with `TLBI ...IS`
     /// to every other core, then waits until each core still running its slice
@@ -182,6 +245,16 @@ pub fn Runner(comptime Cpu: type, comptime Bus: type) type {
         /// Runs one slice of `batch` instructions on every core in `active` (bit `n` = core `n`)
         /// and returns the most instructions any core executed.
         pub fn runSlice(self: *Self, active: u4, batch: usize) usize {
+            const smp = &self.bus.smp;
+            var wfi_bits: u8 = 0;
+            for (0..max_cores) |i| {
+                if ((active >> @intCast(i)) & 1 == 0 and !self.cpus[i].halted_spin and self.cpus[i].mmu.halted_wfi) {
+                    wfi_bits |= @as(u8, 1) << @intCast(i);
+                }
+            }
+            smp.wfi_mask.store(wfi_bits, .monotonic);
+            smp.wake_wfi.store(0, .monotonic);
+
             var parallel_mask: u4 = 0;
             for (1..max_cores) |k| {
                 if ((active >> @intCast(k)) & 1 != 0 and self.workers[k].thread != null) parallel_mask |= @as(u4, 1) << @intCast(k);
@@ -195,12 +268,14 @@ pub fn Runner(comptime Cpu: type, comptime Bus: type) type {
                     // Complete this core's TLBI ...IS before the next core runs.
                     self.applyQueuedBroadcast(i);
                 }
+                smp.wfi_mask.store(0, .monotonic);
+                smp.wake_wfi.store(0, .monotonic);
                 return max_ran;
             }
 
-            const smp = &self.bus.smp;
             self.bus.publishIrqSummary();
             smp.parallel = true;
+            smp.active_mask.store(active, .seq_cst);
             self.batch = batch;
             self.expected = @popCount(parallel_mask);
             self.done.store(0, .monotonic);
@@ -219,6 +294,7 @@ pub fn Runner(comptime Cpu: type, comptime Bus: type) type {
                 // Cores without a worker thread (core 0, or a failed spawn) run here.
                 if ((active >> @intCast(i)) & 1 == 0 or (parallel_mask >> @intCast(i)) & 1 != 0) continue;
                 max_ran = @max(max_ran, self.cpus[i].runSteps(self.bus, batch));
+                _ = smp.active_mask.fetchAnd(~(@as(u8, 1) << @intCast(i)), .release);
                 smp.running[i].store(false, .release);
             }
 
@@ -236,6 +312,9 @@ pub fn Runner(comptime Cpu: type, comptime Bus: type) type {
                 self.main_sleeping.store(0, .release);
             }
             smp.parallel = false;
+            smp.active_mask.store(0, .monotonic);
+            smp.wfi_mask.store(0, .monotonic);
+            smp.wake_wfi.store(0, .monotonic);
 
             for (1..max_cores) |k| {
                 if ((parallel_mask >> @intCast(k)) & 1 != 0) max_ran = @max(max_ran, self.workers[k].ran);
@@ -288,6 +367,7 @@ pub fn Runner(comptime Cpu: type, comptime Bus: type) type {
                 if (self.stop.load(.acquire)) return;
 
                 w.ran = self.cpus[k].runSteps(self.bus, self.batch);
+                _ = self.bus.smp.active_mask.fetchAnd(~(@as(u8, 1) << @intCast(k)), .release);
                 self.bus.smp.running[k].store(false, .release);
                 const d = self.done.fetchAdd(1, .seq_cst) + 1;
                 if (d == self.expected and self.main_sleeping.load(.seq_cst) != 0) {

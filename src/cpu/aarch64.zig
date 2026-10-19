@@ -497,6 +497,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     }
                 }
             }
+            if (atomic_ram.shouldWakeWfi(bus)) {
+                cpu.yield_slice = true;
+            }
             return false;
         }
 
@@ -1041,6 +1044,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
         inline fn noteBackwardBranch64(
             cpu: *CpuType,
             comptime SlotType: type,
+            bus: *Bus,
             code_vbase: u64,
             code_page_idx: usize,
             code_icache_ptr: [*]SlotType,
@@ -1051,15 +1055,18 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
         ) void {
             if (target_pc <= cur_pc and (target_pc & ~@as(u64, 0xfff)) == code_vbase) {
                 const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
-                if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) return;
                 if (end_word_req > @as(u16, start_word) + 1 and end_word_req - @as(u16, start_word) <= 64) {
+                    if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace) and
+                        code_icache_ptr[start_word].rd >= end_word_req - @as(u16, start_word)) return;
                     const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
                     const c = cpu.jit_buf.loop_counts[h] +% 1;
                     cpu.jit_buf.loop_counts[h] = c;
-                    const mask: u8 = if (cpu.jit_buf.isSpinHash(h)) 7 else 0x1f;
+                    const mask: u8 = if (cpu.jit_buf.isSpinHash(h)) 1 else 0x1f;
                     if ((c & mask) == 0) {
                         if (compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req, h, c)) {
-                            cpu.yield_slice = true;
+                            if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
+                                cpu.yield_slice = true;
+                            }
                         }
                     }
                 }
@@ -1825,7 +1832,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (op0_sys == 0) {
                             if (crn == 2) {
                                 const hint = (@as(u8, crm) << 3) | op2_sys;
-                                if (hint == 0 or hint > 3) {
+                                if (hint == 4) {
+                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 12 }; // SEV
+                                } else if (hint == 0 or hint > 3) {
                                     return .{ .raw = inst, .op = @intFromEnum(A64Op.nop) };
                                 } else if (hint == 1 or hint == 2) {
                                     return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 1 };
@@ -2240,6 +2249,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             if (cpu.mmu.halted_wfi) return 0;
 
             cpu.yield_slice = false;
+            cpu.spin_wait_count = 0;
             cpu.last_dmb_pc = 0xffff_ffff;
             defer cpu.excl_valid = false;
 
@@ -2261,12 +2271,25 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 if (executed >= max_steps) {
                     if (executed >= limit or (cpu.pstate & PstateFlags.I) == 0) break;
                 }
+                if (atomic_ram.shouldWakeWfi(bus)) {
+                    cpu.yield_slice = true;
+                    break :step_loop;
+                }
                 if (atomic_ram.busParallel(bus)) {
                     // Apply TLB invalidations other cores broadcast while this slice runs
                     if (bus.smp.serviceTlb(cpu.mmu.core_id, &cpu.mmu)) {
                         code_vbase = 0xffff_ffff_ffff_ffff;
                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                    }
+                    if (atomic_ram.hasPendingSmpInterrupt(bus, cpu.mmu.core_id)) {
+                        if (checkInterrupts64(cpu, bus)) {
+                            priv = 1;
+                            code_vbase = 0xffff_ffff_ffff_ffff;
+                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                        }
+                        if (cpu.mmu.halted_wfi or cpu.yield_slice) break :step_loop;
                     }
                 }
                 const batch_end = if (executed >= max_steps)
@@ -2404,7 +2427,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
                                 const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
                                 cpu.pc64 = target_pc;
-                                noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
                                 if (cpu.yield_slice) break :step_loop;
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
@@ -2421,7 +2444,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
                                 const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
                                 cpu.pc64 = target_pc;
-                                noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
                                 if (cpu.yield_slice) break :step_loop;
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
@@ -2439,7 +2462,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
                                 const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
                                 cpu.pc64 = target_pc;
-                                noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
                                 if (cpu.yield_slice) break :step_loop;
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
@@ -2463,7 +2486,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
                                 const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
                                 cpu.pc64 = target_pc;
-                                noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
                                 if (cpu.yield_slice) break :step_loop;
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
@@ -2528,7 +2551,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
                                 const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
                                 cpu.pc64 = target_pc;
-                                noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
                                 if (cpu.yield_slice) break :step_loop;
                             } else {
                                 cpu.pc64 = cur_pc +% 8;
@@ -3571,6 +3594,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (cpu.excl_valid and (paddr & ~@as(u32, 7)) == cpu.excl_paddr) {
                                 const stored = atomic_ram.compareAndSwap(u64, bus.ram, paddr, cpu.excl_val, val);
                                 cpu.excl_valid = false;
+                                if (stored) atomic_ram.signalEvent(bus);
                                 setW(cpu, @truncate(d.rm), if (stored) 0 else 1);
                             } else {
                                 cpu.excl_valid = false;
@@ -3617,6 +3641,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (cpu.excl_valid and (paddr & ~@as(u32, 7)) == cpu.excl_paddr) {
                                 const stored = atomic_ram.compareAndSwap(u32, bus.ram, paddr, @truncate(cpu.excl_val), val);
                                 cpu.excl_valid = false;
+                                if (stored) atomic_ram.signalEvent(bus);
                                 setW(cpu, @truncate(d.rm), if (stored) 0 else 1);
                             } else {
                                 cpu.excl_valid = false;
@@ -4611,7 +4636,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     .b_imm => {
                         const target_pc = cur_pc +% d.imm;
                         cpu.pc64 = target_pc;
-                        noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                        noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
                         if (cpu.yield_slice) break :step_loop;
                     },
                     .bl_imm => {
@@ -4624,7 +4649,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (evalCond(cpu.pstate, @truncate(d.rd))) {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
                             if (cpu.yield_slice) break :step_loop;
                         }
                     },
@@ -4632,7 +4657,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (getX(cpu, @truncate(d.rd)) == 0) {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
                             if (cpu.yield_slice) break :step_loop;
                         }
                     },
@@ -4640,7 +4665,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (getX(cpu, @truncate(d.rd)) != 0) {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
                             if (cpu.yield_slice) break :step_loop;
                         }
                     },
@@ -4648,7 +4673,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (getW(cpu, @truncate(d.rd)) == 0) {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
                             if (cpu.yield_slice) break :step_loop;
                         }
                     },
@@ -4656,7 +4681,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (getW(cpu, @truncate(d.rd)) != 0) {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
                             if (cpu.yield_slice) break :step_loop;
                         }
                     },
@@ -4664,7 +4689,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (((getX(cpu, @truncate(d.rd)) >> @intCast(d.rm)) & 1) == 0) {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
                             if (cpu.yield_slice) break :step_loop;
                         }
                     },
@@ -4672,7 +4697,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (((getX(cpu, @truncate(d.rd)) >> @intCast(d.rm)) & 1) != 0) {
                             const target_pc = cur_pc +% d.imm;
                             cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
                             if (cpu.yield_slice) break :step_loop;
                         }
                     },
@@ -4702,6 +4727,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                             continue;
                         }
+                        if (cpu.yield_slice) break :step_loop;
                     },
                     .mrs_tpidr_el0 => setX(cpu, @truncate(d.rd), cpu.mmu.tpidr_el0),
                     .mrs_sys => {
@@ -4716,8 +4742,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         switch (d.rn) {
                             0 => cpu.excl_valid = false,
                             1 => {
-                                cpu.yield_slice = true;
-                                break :step_loop;
+                                if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
+                                    cpu.yield_slice = true;
+                                    break :step_loop;
+                                }
                             },
                             2 => {
                                 if (atomic_ram.busParallel(bus)) {
@@ -4726,12 +4754,17 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 }
                                 const pc32: u32 = @truncate(cur_pc);
                                 if ((cpu.last_dmb_pc ^ pc32) < 256) {
-                                    cpu.yield_slice = true;
                                     cpu.last_dmb_pc = pc32;
-                                    break :step_loop;
+                                    if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
+                                        cpu.yield_slice = true;
+                                        break :step_loop;
+                                    }
+                                } else {
+                                    cpu.last_dmb_pc = pc32;
+                                    atomic_ram.signalEvent(bus);
                                 }
-                                cpu.last_dmb_pc = pc32;
                             },
+                            12 => atomic_ram.signalEvent(bus),
                             3 => cpu.pstate |= @truncate(d.imm),
                             4 => {
                                 cpu.pstate &= @truncate(d.imm);
@@ -5693,9 +5726,13 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     // Hints: NOP (0), YIELD (1), WFE (2), WFI (3), SEV (4), SEVL (5)
                     const hint = (@as(u8, crm) << 3) | op2;
                     if (hint == 1 or hint == 2) {
-                        cpu.yield_slice = true;
+                        if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
+                            cpu.yield_slice = true;
+                        }
                     } else if (hint == 3) {
                         cpu.mmu.halted_wfi = true;
+                    } else if (hint == 4) {
+                        atomic_ram.signalEvent(bus);
                     }
                 } else if (crn == 3) {
                     if (op2 == 2) {
@@ -5708,7 +5745,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         }
                         const pc32: u32 = @truncate(cur_pc);
                         if ((cpu.last_dmb_pc ^ pc32) < 256) {
-                            cpu.yield_slice = true;
+                            if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
+                                cpu.yield_slice = true;
+                            }
                         }
                         cpu.last_dmb_pc = pc32;
                     }
@@ -6380,6 +6419,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             atomic_ram.compareAndSwap(u64, bus.ram, paddr, cpu.excl_val, @as(u64, getW(cpu, rt)) | (@as(u64, getW(cpu, rt2)) << 32))
                         else
                             atomic_ram.compareAndSwap(u128, bus.ram, paddr, @as(u128, cpu.excl_val) | (@as(u128, cpu.excl_val_hi) << 64), @as(u128, getX(cpu, rt)) | (@as(u128, getX(cpu, rt2)) << 64));
+                        if (stored) atomic_ram.signalEvent(bus);
                         setW(cpu, rs, if (stored) 0 else 1);
                         return;
                     }
@@ -6405,7 +6445,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 // Load-Acquire / Store-Release (`LDAR` / `STLR`)
                 const parallel = atomic_ram.busParallel(bus);
                 if (parallel) atomic_ram.fence(&cpu.fence_word);
-                defer if (parallel) atomic_ram.fence(&cpu.fence_word);
+                defer if (parallel) {
+                    atomic_ram.fence(&cpu.fence_word);
+                    if (!is_load) atomic_ram.signalEvent(bus);
+                };
                 if (is_load) {
                     switch (size) {
                         0 => setW(cpu, rt, try readData8(cpu, bus, addr)),

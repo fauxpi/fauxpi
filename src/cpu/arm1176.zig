@@ -670,7 +670,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                 if (op == 0b1001 and rn == 0) {
                     const hint = inst & 0xff;
                     if (hint == 0 or hint > 3) {
-                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.nop_al) };
+                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.nop_al), .rd = if (hint == 4) 4 else 0 };
                     } else if (hint == 1 or hint == 2) {
                         return .{ .raw = inst, .op = @intFromEnum(ArmOp.yield_wfe_al) };
                     }
@@ -1561,6 +1561,7 @@ pub fn Arm1176(comptime Bus: type) type {
         halted_spin: bool = false,
         /// True when `WFE` or `YIELD` executes so the SMP scheduler switches to the next core immediately
         yield_slice: bool = false,
+        spin_wait_count: u32 = 0,
 
         /// Total executed instructions
         cycles: u64 = 0,
@@ -1687,6 +1688,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.fence_word = 0;
             self.halted_spin = false;
             self.yield_slice = false;
+            self.spin_wait_count = 0;
             self.cycles = 0;
             self.last_inst = 0;
             self.last_dmb_pc = 0xffff_ffff;
@@ -1888,6 +1890,9 @@ pub fn Arm1176(comptime Bus: type) type {
                     }
                 }
             }
+            if (atomic_ram.shouldWakeWfi(bus)) {
+                self.yield_slice = true;
+            }
             return false;
         }
 
@@ -1916,7 +1921,9 @@ pub fn Arm1176(comptime Bus: type) type {
             if (!self.excl_valid) return 1;
             self.excl_valid = false;
             if (paddr < bus.ram.len) {
-                return if (atomic_ram.compareAndSwap(T, bus.ram, paddr, @truncate(self.excl_val), val)) 0 else 1;
+                const stored = atomic_ram.compareAndSwap(T, bus.ram, paddr, @truncate(self.excl_val), val);
+                if (stored) atomic_ram.signalEvent(bus);
+                return if (stored) 0 else 1;
             }
             switch (T) {
                 u8 => try self.write8(bus, vaddr, val),
@@ -2229,6 +2236,7 @@ pub fn Arm1176(comptime Bus: type) type {
 
         inline fn noteBackwardBranch32(
             self: *Self,
+            bus: *Bus,
             code_vbase: u32,
             code_page_idx: usize,
             code_icache_ptr: [*]DecodedSlot,
@@ -2239,15 +2247,18 @@ pub fn Arm1176(comptime Bus: type) type {
         ) void {
             if (target_pc <= cur_pc and (target_pc & ~@as(u32, 0xffc)) == code_vbase) {
                 const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
-                if (code_icache_ptr[start_word].op == @intFromEnum(ArmOp.jit_trace)) return;
                 if (end_word_req > @as(u16, start_word) + 1 and end_word_req - @as(u16, start_word) <= 64) {
+                    if (code_icache_ptr[start_word].op == @intFromEnum(ArmOp.jit_trace) and
+                        code_icache_ptr[start_word].rd >= end_word_req - @as(u16, start_word)) return;
                     const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
                     const c = self.jit_buf.loop_counts[h] +% 1;
                     self.jit_buf.loop_counts[h] = c;
-                    const mask: u8 = if (self.jit_buf.isSpinHash(h)) 7 else 0x1f;
+                    const mask: u8 = if (self.jit_buf.isSpinHash(h)) 1 else 0x1f;
                     if ((c & mask) == 0) {
                         if (self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req, h, c)) {
-                            self.yield_slice = true;
+                            if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                                self.yield_slice = true;
+                            }
                         }
                     }
                 }
@@ -2431,6 +2442,7 @@ pub fn Arm1176(comptime Bus: type) type {
             if (self.mmu.halted_wfi) return 0;
 
             self.yield_slice = false;
+            self.spin_wait_count = 0;
             self.last_dmb_pc = 0xffff_ffff;
 
             const limit = if (max_steps >= 4096) max_steps + 256 else max_steps;
@@ -2455,12 +2467,25 @@ pub fn Arm1176(comptime Bus: type) type {
                 if (executed >= max_steps) {
                     if (executed >= limit or (self.cpsr & PsrFlags.I) == 0) break;
                 }
+                if (atomic_ram.shouldWakeWfi(bus)) {
+                    self.yield_slice = true;
+                    break :step_loop;
+                }
                 if (atomic_ram.busParallel(bus)) {
                     // Apply TLB invalidations other cores broadcast while this slice runs
                     if (bus.smp.serviceTlb(self.mmu.core_id, &self.mmu)) {
                         code_vbase = 0xffff_ffff;
                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                    }
+                    if (atomic_ram.hasPendingSmpInterrupt(bus, self.mmu.core_id)) {
+                        if (self.checkInterrupts(bus)) {
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        }
+                        if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
                     }
                 }
                 const batch_end = if (executed >= max_steps)
@@ -2579,7 +2604,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             const target_off: u32 = @truncate(d.imm >> 32);
                             const target_pc = pc +% target_off;
                             self.r[15] = target_pc;
-                            self.noteBackwardBranch32(code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
                             if (self.yield_slice) break :step_loop;
                         } else {
                             self.r[15] = pc +% 8;
@@ -2592,7 +2617,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             const target_off: u32 = @truncate(d.imm >> 32);
                             const target_pc = pc +% target_off;
                             self.r[15] = target_pc;
-                            self.noteBackwardBranch32(code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
                             if (self.yield_slice) break :step_loop;
                         } else {
                             self.r[15] = pc +% 8;
@@ -2605,7 +2630,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             const target_off: u32 = @truncate(d.imm >> 32);
                             const target_pc = pc +% target_off;
                             self.r[15] = target_pc;
-                            self.noteBackwardBranch32(code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
                             if (self.yield_slice) break :step_loop;
                         } else {
                             self.r[15] = pc +% 8;
@@ -2618,7 +2643,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             const target_off: u32 = @truncate(d.imm >> 32);
                             const target_pc = pc +% target_off;
                             self.r[15] = target_pc;
-                            self.noteBackwardBranch32(code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
                             if (self.yield_slice) break :step_loop;
                         } else {
                             self.r[15] = pc +% 8;
@@ -2631,7 +2656,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             const target_off: u32 = @truncate(d.imm >> 32);
                             const target_pc = pc +% target_off;
                             self.r[15] = target_pc;
-                            self.noteBackwardBranch32(code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
                             if (self.yield_slice) break :step_loop;
                         } else {
                             self.r[15] = pc +% 8;
@@ -2644,7 +2669,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             const target_off: u32 = @truncate(d.imm >> 32);
                             const target_pc = pc +% target_off;
                             self.r[15] = target_pc;
-                            self.noteBackwardBranch32(code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
                             if (self.yield_slice) break :step_loop;
                         } else {
                             self.r[15] = pc +% 8;
@@ -2890,6 +2915,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
                             if (self.excl_valid) {
                                 const stored = atomic_ram.compareAndSwap(u32, bus.ram, slot.pbase | (vaddr & 0xfff), @truncate(self.excl_val), val);
+                                if (stored) atomic_ram.signalEvent(bus);
                                 self.r[d.rd] = if (stored) 0 else 1;
                                 self.excl_valid = false;
                             } else {
@@ -3811,7 +3837,9 @@ pub fn Arm1176(comptime Bus: type) type {
                         const shift_imm: i32 = @bitCast(imm32);
                         if (shift_imm >= -28 and shift_imm < 0) {
                             if (self.last_dmb_pc == pc) {
-                                self.yield_slice = true;
+                                if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                                    self.yield_slice = true;
+                                }
                             } else if ((pc & 0xfff) < 0xffc and (pc & 0xffff_f000) == code_vbase) {
                                 const next_paddr = code_pbase | ((pc +% 4) & 0xfff);
                                 const next_inst = std.mem.readInt(u32, bus.ram[next_paddr..][0..4], .little);
@@ -3823,14 +3851,16 @@ pub fn Arm1176(comptime Bus: type) type {
                         const target_pc = (pc +% 8) +% imm32;
                         self.r[15] = target_pc;
                         if (self.yield_slice) break :step_loop;
-                        self.noteBackwardBranch32(code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 1));
+                        self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 1));
                     },
                     .bl_al => {
                         const target_pc = (pc +% 8) +% imm32;
                         self.r[14] = pc +% 4;
                         if (inst >= 0xe000_0000) {
                             if (self.last_dmb_pc == pc) {
-                                self.yield_slice = true;
+                                if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                                    self.yield_slice = true;
+                                }
                             } else {
                                 const tslot = self.mmu.soft_tlb32[priv][(target_pc >> 12) & Mmu.soft_tlb_mask];
                                 if ((target_pc & 0xffff_f000) == tslot.x_vbase) {
@@ -3925,21 +3955,29 @@ pub fn Arm1176(comptime Bus: type) type {
                             code_vbase = 0xffff_ffff;
                         } else {
                             self.memoryBarrier(bus, d.rd != 0);
+                            atomic_ram.signalEvent(bus);
                         }
                     },
-                    .nop_al => {},
+                    .nop_al => {
+                        if (d.rd == 4) atomic_ram.signalEvent(bus);
+                    },
                     .yield_wfe_al => {
-                        self.yield_slice = true;
-                        break :step_loop;
+                        if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                            self.yield_slice = true;
+                            break :step_loop;
+                        }
                     },
                     .clrex_al => self.excl_valid = false,
                     .dmb_dsb_v7_al => {
                         self.memoryBarrier(bus, d.rd != 0);
                         if (self.last_dmb_pc == pc) {
-                            self.yield_slice = true;
-                            break :step_loop;
+                            if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                                self.yield_slice = true;
+                                break :step_loop;
+                            }
                         } else {
                             self.last_dmb_pc = pc;
+                            atomic_ram.signalEvent(bus);
                         }
                     },
                     .cpsid_al => {
@@ -4731,9 +4769,12 @@ pub fn Arm1176(comptime Bus: type) type {
                     self.memoryBarrier(bus, (inst & 0x10) == 0);
                     // DSB / DMB: yield slice if repeated at the same PC within the current slice
                     if (self.last_dmb_pc == inst_pc) {
-                        self.yield_slice = true;
+                        if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                            self.yield_slice = true;
+                        }
                     } else {
                         self.last_dmb_pc = inst_pc;
+                        atomic_ram.signalEvent(bus);
                     }
                 } else if ((inst & 0x0fff_fff0) == 0x057f_f060) {
                     self.invalidateIcache();
@@ -6018,11 +6059,24 @@ pub fn Arm1176(comptime Bus: type) type {
                 if (executed >= max_steps) {
                     if (executed >= limit or (self.cpsr & PsrFlags.I) == 0) break;
                 }
+                if (atomic_ram.shouldWakeWfi(bus)) {
+                    self.yield_slice = true;
+                    break;
+                }
                 if (atomic_ram.busParallel(bus)) {
                     if (bus.smp.serviceTlb(self.mmu.core_id, &self.mmu)) {
                         thumb_vbase = 0xffff_ffff;
                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                    }
+                    if (atomic_ram.hasPendingSmpInterrupt(bus, self.mmu.core_id)) {
+                        if (self.checkInterrupts(bus)) {
+                            priv = @intFromBool(self.isPrivileged());
+                            thumb_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        }
+                        if (self.mmu.halted_wfi or self.yield_slice or !self.isThumb()) break;
                     }
                 }
                 const batch_end = if (executed >= max_steps)

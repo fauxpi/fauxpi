@@ -32,6 +32,30 @@ pub inline fn busParallel(bus: anytype) bool {
     return bus.smp.parallel;
 }
 
+pub inline fn onSpinWait(bus: anytype, core: u2, mmu: anytype, wait_count: *u32) bool {
+    const B = @TypeOf(bus.*);
+    if (comptime !@hasField(B, "smp")) return true;
+    return bus.smp.onSpinWait(core, mmu, wait_count);
+}
+
+pub inline fn signalEvent(bus: anytype) void {
+    const B = @TypeOf(bus.*);
+    if (comptime !@hasField(B, "smp")) return;
+    bus.smp.signalEvent();
+}
+
+pub inline fn shouldWakeWfi(bus: anytype) bool {
+    const B = @TypeOf(bus.*);
+    if (comptime !@hasField(B, "smp")) return false;
+    return bus.smp.wake_wfi.load(.acquire) != 0;
+}
+
+pub inline fn hasPendingSmpInterrupt(bus: anytype, core: u2) bool {
+    const B = @TypeOf(bus.*);
+    if (comptime !@hasField(B, "smp")) return false;
+    return bus.smp.hasPendingInterrupt(core);
+}
+
 /// Full host memory barrier for guest `DMB` / `DSB` and acquire/release accesses.
 /// `word` should be private to the calling core so the barrier does not bounce a cache line.
 pub inline fn fence(word: *u32) void {
