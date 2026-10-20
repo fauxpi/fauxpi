@@ -2161,7 +2161,7 @@ pub fn Arm1176(comptime Bus: type) type {
             count: u8,
         ) bool {
             if (code_icache_ptr[start_word].op == @intFromEnum(ArmOp.jit_trace)) return false;
-            const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdx(code_page_ptr, start_word, end_word_req);
+            const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdx(code_page_idx, start_word, end_word_req);
             const code_hash = jit_mod.JitCodeBuffer.hashLoopWords(code_page_ptr, start_word, end_word_req);
             const entry = &self.jit_buf.trace_cache[tc_idx];
             if (entry.page_ptr == @intFromPtr(code_page_ptr) and
@@ -2346,7 +2346,7 @@ pub fn Arm1176(comptime Bus: type) type {
             end_hw_req: u16,
         ) void {
             if (thumb_icache_ptr[start_hw].op == .jit_trace) return;
-            const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdxThumb(thumb_page_ptr, start_hw, end_hw_req);
+            const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdxThumb(thumb_page_idx, start_hw, end_hw_req);
             const code_hash = jit_mod.JitCodeBuffer.hashThumbHalfwords(thumb_page_ptr, start_hw, end_hw_req);
             const entry = &self.jit_buf.trace_cache[tc_idx];
             if (entry.page_ptr == @intFromPtr(thumb_page_ptr) and

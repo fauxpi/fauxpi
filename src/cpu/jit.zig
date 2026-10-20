@@ -56,9 +56,11 @@ pub const JitCodeBuffer = struct {
         self.spin_hashes[h >> 6] |= (@as(u64, 1) << @intCast(h & 63));
     }
 
-    pub inline fn traceCacheIdx(code_page_ptr: [*]const u8, start_word: u10, end_word_req: u16) usize {
-        const p = @intFromPtr(code_page_ptr);
-        return ((p >> 12) ^ (p >> 20) ^ @as(usize, start_word) ^ (@as(usize, end_word_req) << 4)) & (trace_cache_size - 1);
+    /// Hashes on the decoded-icache page slot (derived from the guest physical address) rather than the
+    /// host pointer, so trace placement - and with it `--clock instructions` timing - doesn't vary with ASLR.
+    pub inline fn traceCacheIdx(code_page_idx: usize, start_word: u10, end_word_req: u16) usize {
+        const p = code_page_idx *% 0x9E3779B1;
+        return (p ^ (p >> 8) ^ @as(usize, start_word) ^ (@as(usize, end_word_req) << 4)) & (trace_cache_size - 1);
     }
 
     pub inline fn hashLoopWords(code_page_ptr: [*]const u8, start_word: u10, end_word_req: u16) u64 {
@@ -72,9 +74,9 @@ pub const JitCodeBuffer = struct {
         return h;
     }
 
-    pub inline fn traceCacheIdxThumb(code_page_ptr: [*]const u8, start_hw: u11, end_hw_req: u16) usize {
-        const p = @intFromPtr(code_page_ptr);
-        return ((p >> 12) ^ (p >> 20) ^ @as(usize, start_hw) ^ (@as(usize, end_hw_req) << 4) ^ 0x155) & (trace_cache_size - 1);
+    pub inline fn traceCacheIdxThumb(thumb_page_idx: usize, start_hw: u11, end_hw_req: u16) usize {
+        const p = thumb_page_idx *% 0x9E3779B1;
+        return (p ^ (p >> 8) ^ @as(usize, start_hw) ^ (@as(usize, end_hw_req) << 4) ^ 0x155) & (trace_cache_size - 1);
     }
 
     pub inline fn hashThumbHalfwords(code_page_ptr: [*]const u8, start_hw: u11, end_hw_req: u16) u64 {

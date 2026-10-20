@@ -968,7 +968,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             count: u8,
         ) bool {
             if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) return false;
-            const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdx(code_page_ptr, start_word, end_word_req);
+            const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdx(code_page_idx, start_word, end_word_req);
             const code_hash = jit_mod.JitCodeBuffer.hashLoopWords(code_page_ptr, start_word, end_word_req);
             const entry = &cpu.jit_buf.trace_cache[tc_idx];
             if (entry.page_ptr == @intFromPtr(code_page_ptr) and

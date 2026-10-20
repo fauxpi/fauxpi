@@ -759,6 +759,20 @@ pub fn monotonicNs() u64 {
     }
 }
 
+/// Sleeps the calling thread for about `us` microseconds (millisecond granularity on Windows).
+pub fn sleepUs(us: u64) void {
+    if (us == 0) return;
+    if (is_linux) {
+        var ts: std.os.linux.timespec = .{ .sec = @intCast(us / 1_000_000), .nsec = @intCast((us % 1_000_000) * 1000) };
+        _ = std.os.linux.nanosleep(&ts, null);
+    } else if (is_windows) {
+        Sleep(@intCast(@min((us + 999) / 1000, std.math.maxInt(u32))));
+    } else {
+        var ts: std.c.timespec = .{ .sec = @intCast(us / 1_000_000), .nsec = @intCast((us % 1_000_000) * 1000) };
+        _ = std.c.nanosleep(&ts, null);
+    }
+}
+
 pub fn realtimeSecNsec() struct { sec: u64, nsec: u64 } {
     if (is_linux) {
         var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
@@ -787,9 +801,22 @@ pub fn realtimeSecNsec() struct { sec: u64, nsec: u64 } {
     }
 }
 
+/// When set, `getRandomBytes` returns a fixed pseudo-random sequence, so that guest-visible
+/// randomness (such as the device-tree `rng-seed`) is reproducible (`--clock instructions`).
+pub var deterministic_random: bool = false;
+var deterministic_random_state: u64 = 0x9E3779B97F4A7C15;
+
 pub fn getRandomBytes(buf: []u8) void {
     if (buf.len == 0) return;
-    if (is_linux) {
+    if (deterministic_random) {
+        for (buf) |*b| {
+            deterministic_random_state +%= 0x9E3779B97F4A7C15;
+            var z = deterministic_random_state;
+            z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+            z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+            b.* = @truncate(z ^ (z >> 31));
+        }
+    } else if (is_linux) {
         _ = std.os.linux.getrandom(buf.ptr, buf.len, 0);
     } else if (is_windows) {
         var seed: u64 = monotonicNs() ^ realtimeSecNsec().nsec ^ 0x9E3779B97F4A7C15;

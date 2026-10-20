@@ -69,6 +69,40 @@ const CliOptions = struct {
     max_steps: u64 = 0,
     sequential_cores: bool = false,
     strict: bool = false,
+    clock: ClockMode = .realtime,
+};
+
+const ClockMode = enum {
+    /// Guest time follows the host's monotonic clock, and idle cores sleep in real time.
+    realtime,
+    /// Guest time advances by instructions executed (~256 per us) and skips over idle periods,
+    /// so a `--max-steps` run is reproducible and boots without waiting in real time.
+    instructions,
+};
+
+/// Maps host time onto the guest's 1 MHz system timer for `--clock realtime`.
+const RealtimeClock = struct {
+    /// Host time at which guest time was 0.
+    base_ns: u64,
+
+    /// Host stalls longer than this (suspend, a debugger, heavy host load) are absorbed instead
+    /// of replayed in one step, which would fire the guest watchdog and every pending timer at once.
+    const max_step_us: u64 = 250_000;
+
+    fn start(now_ns: u64) RealtimeClock {
+        return .{ .base_ns = now_ns };
+    }
+
+    /// Returns how many microseconds guest time (`guest_us`) must advance to catch up with the host.
+    fn ticks(self: *RealtimeClock, now_ns: u64, guest_us: u64) u64 {
+        const target_us = (now_ns -| self.base_ns) / 1000;
+        const delta = target_us -| guest_us;
+        if (delta > max_step_us) {
+            self.base_ns += (delta - max_step_us) * 1000;
+            return max_step_us;
+        }
+        return delta;
+    }
 };
 
 fn readSdImageLinux(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
@@ -123,6 +157,8 @@ fn printUsage() void {
         \\  --hdmi-size <WxH>   HDMI output size in pixels (default: 1280x720)
         \\  --headless          Run without opening a desktop window
         \\  --max-steps <n>     Stop simulation after <n> ARM instructions
+        \\  --clock <mode>      Guest clock: realtime (default) follows the host clock; instructions
+        \\                      counts executed instructions and skips idle time (reproducible --max-steps runs)
         \\  --sequential-cores  Run all emulated cores on one host thread (deterministic)
         \\  --strict            Stop if the guest uses firmware calls or peripherals fauxpi does not emulate
         \\  --help              Show this help message
@@ -191,6 +227,15 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--max-steps")) {
             const s = args.next() orelse return 1;
             opts.max_steps = std.fmt.parseInt(u64, s, 10) catch return 1;
+        } else if (std.mem.eql(u8, arg, "--clock")) {
+            const c = args.next() orelse {
+                printUsage();
+                return 1;
+            };
+            opts.clock = std.meta.stringToEnum(ClockMode, c) orelse {
+                std.debug.print("Unknown clock: {s} (expected realtime or instructions)\n", .{c});
+                return 1;
+            };
         } else if (std.mem.eql(u8, arg, "--sequential-cores")) {
             opts.sequential_cores = true;
         } else if (std.mem.eql(u8, arg, "--strict")) {
@@ -204,6 +249,9 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             return 1;
         }
     }
+
+    // Guest-visible randomness must repeat too for `--clock instructions` runs to be reproducible.
+    host_posix.deterministic_random = opts.clock == .instructions;
 
     if (opts.headless and opts.sd_path == null) {
         printUsage();
@@ -303,6 +351,23 @@ fn resetCpusForBoard(
     }
 }
 
+/// Wakes core 0 after a second of idling with no timer armed (`--clock realtime`), matching the
+/// fast-forward path of `--clock instructions`, so a guest waiting on an event fauxpi never raises still runs.
+fn noteRealtimeIdle(since_ns: *?u64, timer_wait_us: u64, cpus: *[4]Cpu) void {
+    if (timer_wait_us < 1_000_000) {
+        since_ns.* = null;
+        return;
+    }
+    const now = monotonicNs();
+    const since = since_ns.* orelse now;
+    if (now -| since >= std.time.ns_per_s) {
+        cpus[0].mmu.halted_wfi = false;
+        since_ns.* = null;
+    } else {
+        since_ns.* = since;
+    }
+}
+
 fn syncWindowPeripheralsToSoc(w: *const window.Window, soc: *Bcm2835) void {
     soc.setHdmiConnected(w.status.hdmi_connected);
     soc.setAudioConnected(w.status.audio_connected);
@@ -352,6 +417,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     if (!opts.sequential_cores) runner.start();
     defer runner.deinit();
     var guest_booted = false;
+    var guest_boot_ns: u64 = 0;
     var strict_stopped = false;
     var boot_failed = false;
 
@@ -401,6 +467,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             if (wl_win) |w| syncWindowPeripheralsToSoc(w, soc);
             resetCpusForBoard(cpus, &num_cores, bm, boot_res);
             guest_booted = true;
+            guest_boot_ns = monotonicNs();
         } else |err| {
             if (wl_win) |w| {
                 std.debug.print("fauxpi: failed to boot SD image: {s}\n", .{@errorName(err)});
@@ -435,6 +502,10 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     var last_vblank_ns: u64 = monotonicNs();
     var last_guest_vblank_us: u64 = 0;
     var active_us_accum: u64 = 0;
+    const realtime = opts.clock == .realtime;
+    var rt_clock = RealtimeClock.start(guest_boot_ns);
+    // Host time since every core went idle with no timer armed (`--clock realtime`).
+    var rt_idle_no_deadline_since_ns: ?u64 = null;
 
     while (true) {
         if (wl_win) |w| {
@@ -485,6 +556,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                         w.ui.dismissSnackbar();
                         last_guest_vblank_us = 0;
                         active_us_accum = 0;
+                        rt_clock = RealtimeClock.start(monotonicNs());
+                        rt_idle_no_deadline_since_ns = null;
                         if (host_audio) |ha| ha.setPaused(false);
                     } else |err| {
                         std.debug.print("fauxpi: failed to boot SD image: {s}\n", .{@errorName(err)});
@@ -595,9 +668,10 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             @intCast(max_slice);
         const max_ran = runner.runSlice(active, batch);
 
-        // Advance 1 MHz system timer and ARM timer proportionally to instructions executed (~256 instructions per us).
-        // When all active cores yield early (WFE / YIELD / timer poll loop), fast-forward up to 16 us (clamped to next IRQ).
-        var all_yielded = (active != 0) and (max_ran < 64);
+        // `--clock realtime`: advance the 1 MHz system timer and ARM timer to the host clock.
+        // `--clock instructions`: advance them proportionally to instructions executed (~256 instructions per us),
+        // and when all active cores yield early (WFE / YIELD / timer poll loop), fast-forward up to 16 us (clamped to next IRQ).
+        var all_yielded = !realtime and (active != 0) and (max_ran < 64);
         if (all_yielded) {
             for (0..num_cores) |i| {
                 if ((active >> @intCast(i)) & 1 == 0) continue;
@@ -607,7 +681,9 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 }
             }
         }
-        const timer_ticks: u64 = if (all_yielded) blk: {
+        const timer_ticks: u64 = if (realtime)
+            rt_clock.ticks(monotonicNs(), soc.timer.counter)
+        else if (all_yielded) blk: {
             var wait_us = @min(
                 soc.timer.usUntilNextMatch(16),
                 @min(
@@ -622,7 +698,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             }
             break :blk @max(wait_us, 1);
         } else if (max_ran > 0) @max(max_ran / 256, 1) else 1;
-        active_us_accum += timer_ticks;
+        if (!realtime or active != 0) active_us_accum += timer_ticks;
         soc.timer.advance(timer_ticks, &soc.intc);
         soc.arm_timer.advance(timer_ticks, &soc.intc);
         soc.pm.advance(timer_ticks);
@@ -664,7 +740,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         }
 
         if (all_wfi) {
-            if (guest_ready_for_realtime_sleep) {
+            if (wl_win != null and (realtime or guest_ready_for_realtime_sleep)) {
                 const w = wl_win.?;
                 var timer_wait_us = @min(
                     soc.timer.usUntilNextMatch(1_000_000),
@@ -714,27 +790,61 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 } else {
                     try w.pollEvents();
                 }
-                const sleep_end_ns = monotonicNs();
-                const elapsed_sleep_us = @max((sleep_end_ns -| sleep_start_ns) / 1000, 1);
-                const woke_for_event = (!had_ui_dirty and w.ui_dirty) or
-                    (!had_pending_in and soc.usb.hid.hasPendingInterruptIn()) or
-                    soc.usb.hid.hasEthBulkIn();
-                const jump = if (woke_for_event)
-                    @min(elapsed_sleep_us, timer_wait_us)
-                else
-                    @max(elapsed_sleep_us, sleep_us);
-                soc.timer.advance(jump, &soc.intc);
-                soc.arm_timer.advance(jump, &soc.intc);
-                soc.pm.advance(jump);
-                soc.advanceAudio(jump);
-                soc.usb.pollNetwork(soc.ram);
-                soc.usb.wakeIfPending();
+                if (realtime) {
+                    // Guest time catches up with the host clock on the next pass.
+                    soc.usb.pollNetwork(soc.ram);
+                    soc.usb.wakeIfPending();
+                    soc.updateIrqs();
+                    noteRealtimeIdle(&rt_idle_no_deadline_since_ns, timer_wait_us, cpus);
+                } else {
+                    const sleep_end_ns = monotonicNs();
+                    const elapsed_sleep_us = @max((sleep_end_ns -| sleep_start_ns) / 1000, 1);
+                    const woke_for_event = (!had_ui_dirty and w.ui_dirty) or
+                        (!had_pending_in and soc.usb.hid.hasPendingInterruptIn()) or
+                        soc.usb.hid.hasEthBulkIn();
+                    const jump = if (woke_for_event)
+                        @min(elapsed_sleep_us, timer_wait_us)
+                    else
+                        @max(elapsed_sleep_us, sleep_us);
+                    soc.timer.advance(jump, &soc.intc);
+                    soc.arm_timer.advance(jump, &soc.intc);
+                    soc.pm.advance(jump);
+                    soc.advanceAudio(jump);
+                    soc.usb.pollNetwork(soc.ram);
+                    soc.usb.wakeIfPending();
+                    for (0..num_cores) |i| {
+                        if (!cpus[i].halted_spin) {
+                            soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+                        }
+                    }
+                    soc.updateIrqs();
+                }
+            } else if (realtime) {
+                // Headless: sleep until the next timer deadline, guest vblank, or USB poll.
+                var timer_wait_us = @min(
+                    soc.timer.usUntilNextMatch(1_000_000),
+                    @min(
+                        soc.arm_timer.usUntilNextMatch(1_000_000),
+                        soc.pm.usUntilWatchdogExpire(1_000_000),
+                    ),
+                );
                 for (0..num_cores) |i| {
                     if (!cpus[i].halted_spin) {
-                        soc.local_intc.core_timer_lines[i] = cpus[i].mmu.syncGenericTimer(soc.timer.counter);
+                        timer_wait_us = @min(timer_wait_us, cpus[i].mmu.usUntilNextGenericTimer(1_000_000));
                     }
                 }
+                const usb_active = soc.usb.pending_csplit_sof or
+                    (soc.usb.sof_wakeup_frames > 0) or
+                    soc.usb.hid.hasPendingInterruptIn() or
+                    soc.usb.hid.hasEthBulkIn();
+                const until_vblank_us: u64 = 16_667 -| (soc.timer.counter -| last_guest_vblank_us);
+                var sleep_us = @min(timer_wait_us, @max(until_vblank_us, 1));
+                if (usb_active) sleep_us = @min(sleep_us, 1000);
+                host_posix.sleepUs(sleep_us);
+                soc.usb.pollNetwork(soc.ram);
+                soc.usb.wakeIfPending();
                 soc.updateIrqs();
+                noteRealtimeIdle(&rt_idle_no_deadline_since_ns, timer_wait_us, cpus);
             } else {
                 // Fast-forward timer to next compare match, ARM timer, watchdog, or core generic timer during boot / headless mode
                 var timer_wait_us = @min(
@@ -792,7 +902,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         }
 
         const now_ns = monotonicNs();
-        if (now_ns -| last_vblank_ns >= vblank_interval_ns) {
+        // Headless `--clock instructions` runs use only the guest-time vblank above, to stay reproducible.
+        if ((realtime or wl_win != null) and now_ns -| last_vblank_ns >= vblank_interval_ns) {
             last_vblank_ns = now_ns;
             last_guest_vblank_us = soc.timer.counter;
             soc.triggerVblank();
@@ -928,3 +1039,19 @@ test "parseHdmiSize parses WxH strings and rejects malformed dimensions" {
     try testing.expect(parseHdmiSize("abcxdef") == null);
 }
 
+
+test "RealtimeClock follows the host clock and absorbs long host stalls" {
+    const testing = std.testing;
+    var clock = RealtimeClock.start(1_000_000_000);
+    try testing.expectEqual(@as(u64, 0), clock.ticks(1_000_000_000, 0));
+    try testing.expectEqual(@as(u64, 1500), clock.ticks(1_001_500_000, 0));
+    // Guest already caught up: nothing to advance
+    try testing.expectEqual(@as(u64, 0), clock.ticks(1_001_500_000, 1500));
+
+    // A 10 s stall advances guest time by at most `max_step_us`; the rest is absorbed
+    const guest_us: u64 = 1500;
+    try testing.expectEqual(RealtimeClock.max_step_us, clock.ticks(11_001_500_000, guest_us));
+    const after_stall = guest_us + RealtimeClock.max_step_us;
+    try testing.expectEqual(@as(u64, 0), clock.ticks(11_001_500_000, after_stall));
+    try testing.expectEqual(@as(u64, 1000), clock.ticks(11_002_500_000, after_stall));
+}
