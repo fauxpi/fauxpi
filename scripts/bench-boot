@@ -1,0 +1,341 @@
+#!/usr/bin/env python3
+"""Measure how long FauxPi takes to boot a Raspberry Pi OS image.
+
+Usage: scripts/bench-boot <image.img[.xz]> [options] [-- <extra fauxpi arguments>]
+
+The image is prepared once and cached under build/bench/:
+  1. Decompressed (if .xz) and converted to a qcow2 SD card, so guest writes persist.
+  2. A small probe service is added to the root filesystem. Once the serial login
+     prompt is up it prints systemd's boot milestones to the serial console and
+     powers the guest off.
+  3. A warm-up boot runs the image's first-boot work (resizing, key generation, ...),
+     which would otherwise distort the first measured run.
+
+Each measured run boots a fresh copy of the warm image headless and records, in
+seconds of host wall-clock time since FauxPi was launched:
+  kernel    the kernel starts ("Booting Linux")
+  init      the kernel runs the initramfs ("Run /init")
+  login     the serial login prompt appears
+  cpu       host CPU seconds FauxPi used up to the login prompt
+and, from inside the guest (CLOCK_MONOTONIC, real time with --clock realtime):
+  sysinit / basic / getty   when systemd reached sysinit.target, basic.target,
+                            and started the serial getty
+
+Requires: python3, qemu-img, debugfs (e2fsprogs), and xz for .xz images.
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Bump when the probe changes, so cached images are rebuilt.
+PROBE_VERSION = 2
+
+PROBE_SCRIPT = """#!/bin/sh
+# Added by scripts/bench-boot: reports boot milestones on the console, then powers off.
+# The report goes through the kernel log as one critical-level record, so the console prints it
+# even after the serial getty has taken over the port, and /dev/kmsg rate limiting can't drop lines.
+tty=$(basename "$(readlink -f /dev/serial0 2>/dev/null || echo /dev/ttyS0)")
+getty="serial-getty@$tty.service"
+while [ "$(systemctl show -P ActiveEnterTimestampMonotonic "$getty")" = 0 ]; do sleep 1; done
+report="FAUXPI-BENCH uptime=$(cut -d' ' -f1 /proc/uptime)"
+for unit in sysinit.target basic.target "$getty"; do
+  report="$report $unit=$(systemctl show -P ActiveEnterTimestampMonotonic "$unit")"
+done
+blame=$(systemd-analyze blame --no-pager 2>/dev/null | head -10 | sed 's/^ *//' | tr '\\n' ';')
+echo "<2>$report blame=$blame" > /dev/kmsg
+systemctl poweroff
+"""
+
+PROBE_SERVICE = """[Unit]
+Description=FauxPi boot benchmark probe
+
+[Service]
+Type=simple
+ExecStart=/bin/sh /usr/local/sbin/fauxpi-bench-probe
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+UNIT_NAMES = {"sysinit.target": "sysinit", "basic.target": "basic"}
+
+
+def fail(msg):
+    sys.exit("bench-boot: " + msg)
+
+
+def need_tool(name, why):
+    if shutil.which(name) is None:
+        fail("'%s' is required %s" % (name, why))
+
+
+def find_root_partition(image_path):
+    """Returns (byte offset, byte length) of the first Linux (type 0x83) MBR partition."""
+    with open(image_path, "rb") as f:
+        mbr = f.read(512)
+    if mbr[510:512] != b"\x55\xaa":
+        fail("%s has no MBR partition table" % image_path)
+    for i in range(4):
+        entry = mbr[446 + i * 16 : 446 + (i + 1) * 16]
+        if entry[4] == 0x83:
+            start = int.from_bytes(entry[8:12], "little")
+            count = int.from_bytes(entry[12:16], "little")
+            return start * 512, count * 512
+    fail("%s has no Linux root partition" % image_path)
+
+
+def copy_range(src, dst, offset, length, dst_offset=0):
+    with open(src, "rb") as fi, open(dst, "r+b" if os.path.exists(dst) else "wb") as fo:
+        fi.seek(offset)
+        fo.seek(dst_offset)
+        remaining = length
+        while remaining:
+            chunk = fi.read(min(remaining, 16 << 20))
+            if not chunk:
+                break
+            fo.write(chunk)
+            remaining -= len(chunk)
+
+
+def debugfs(fs_path, command):
+    r = subprocess.run(["debugfs", "-w", fs_path, "-R", command], capture_output=True, text=True)
+    if r.returncode != 0:
+        fail("debugfs '%s' failed: %s" % (command, r.stderr.strip()))
+
+
+def install_probe(raw_image, work_dir):
+    offset, length = find_root_partition(raw_image)
+    rootfs = os.path.join(work_dir, "rootfs.ext4")
+    copy_range(raw_image, rootfs, offset, length)
+    script = os.path.join(work_dir, "probe.sh")
+    service = os.path.join(work_dir, "probe.service")
+    with open(script, "w") as f:
+        f.write(PROBE_SCRIPT)
+    with open(service, "w") as f:
+        f.write(PROBE_SERVICE)
+    debugfs(rootfs, "write %s /usr/local/sbin/fauxpi-bench-probe" % script)
+    debugfs(rootfs, "write %s /etc/systemd/system/fauxpi-bench-probe.service" % service)
+    debugfs(
+        rootfs,
+        "symlink /etc/systemd/system/multi-user.target.wants/fauxpi-bench-probe.service "
+        "/etc/systemd/system/fauxpi-bench-probe.service",
+    )
+    copy_range(rootfs, raw_image, 0, length, dst_offset=offset)
+    for p in (rootfs, script, service):
+        os.unlink(p)
+
+
+def run_boot(fauxpi, disk, model, extra_args, log_path, timeout, until_poweroff=False):
+    """Boots `disk` headless and returns the milestones seen on the console.
+
+    Stops once the probe has reported, or with `until_poweroff` once the guest has shut down cleanly."""
+    cmd = [fauxpi, "--sd", disk, "--power", "--headless", "--model", model] + extra_args
+    result = {"kernel": None, "init": None, "login": None, "cpu": None, "units": {}, "uptime": None, "blame": []}
+    t0 = time.monotonic()
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+    os.set_blocking(proc.stdout.fileno(), False)
+    pending = b""
+    done = False
+    clk_tck = os.sysconf("SC_CLK_TCK")
+
+    def elapsed():
+        return round(time.monotonic() - t0, 2)
+
+    with open(log_path, "w") as log:
+        while not done:
+            if time.monotonic() - t0 > timeout:
+                log.write("%8.2f bench-boot: timed out\n" % elapsed())
+                break
+            try:
+                chunk = os.read(proc.stdout.fileno(), 65536)
+            except BlockingIOError:
+                chunk = None
+            if chunk == b"":
+                break
+            if chunk is None:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.005)
+                continue
+            pending += chunk
+            # The login prompt has no trailing newline, so look for it before splitting lines.
+            if result["login"] is None and b" login:" in pending:
+                result["login"] = elapsed()
+                try:
+                    with open("/proc/%d/stat" % proc.pid) as f:
+                        fields = f.read().rsplit(")", 1)[1].split()
+                    result["cpu"] = round((int(fields[11]) + int(fields[12])) / clk_tck, 1)
+                except OSError:
+                    pass
+            *lines, pending = pending.split(b"\n")
+            for raw in lines:
+                line = raw.decode("utf-8", "replace").rstrip("\r")
+                log.write("%8.2f %s\n" % (elapsed(), line))
+                if result["kernel"] is None and "Booting Linux" in line:
+                    result["kernel"] = elapsed()
+                elif result["init"] is None and "Run /init" in line:
+                    result["init"] = elapsed()
+                report = line.partition("FAUXPI-BENCH ")[2]
+                if report:
+                    fields, _, blame = report.partition(" blame=")
+                    for field in fields.split():
+                        k, _, v = field.partition("=")
+                        if k == "uptime":
+                            result["uptime"] = float(v)
+                        elif v.isdigit():
+                            result["units"][k] = int(v) / 1e6
+                    result["blame"] = [b for b in blame.split(";") if b]
+                    done = not until_poweroff
+                if "Kernel panic" in line or "reboot: Power down" in line:
+                    done = True
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    return result
+
+
+def milestone_row(r):
+    units = r["units"]
+    getty = next((v for k, v in units.items() if k.startswith("serial-getty@")), None)
+    return {
+        "kernel": r["kernel"],
+        "init": r["init"],
+        "login": r["login"],
+        "cpu": r["cpu"],
+        "sysinit": units.get("sysinit.target"),
+        "basic": units.get("basic.target"),
+        "getty": getty,
+    }
+
+
+def fmt(v):
+    return "%8.1f" % v if isinstance(v, (int, float)) else "%8s" % "-"
+
+
+def prepare(args, cache_dir):
+    warm = os.path.join(cache_dir, "warm.qcow2")
+    stamp = os.path.join(cache_dir, "stamp.json")
+    key = {
+        "probe": PROBE_VERSION,
+        "image": os.path.abspath(args.image),
+        "mtime": os.path.getmtime(args.image),
+        "model": args.model,
+        "card_size": args.card_size,
+    }
+    if not args.rebuild and os.path.exists(warm) and os.path.exists(stamp):
+        with open(stamp) as f:
+            if json.load(f) == key:
+                print("Using prepared image %s" % warm)
+                return warm
+
+    os.makedirs(cache_dir, exist_ok=True)
+    raw = os.path.join(cache_dir, "image.raw")
+    print("Preparing %s ..." % args.image)
+    if args.image.endswith(".xz"):
+        need_tool("xz", "to decompress .xz images")
+        with open(raw, "wb") as out:
+            subprocess.run(["xz", "-dc", "-T0", args.image], stdout=out, check=True)
+    else:
+        shutil.copyfile(args.image, raw)
+    install_probe(raw, cache_dir)
+    staging = os.path.join(cache_dir, "staging.qcow2")
+    subprocess.run(["qemu-img", "convert", "-O", "qcow2", "-f", "raw", raw, staging], check=True)
+    os.unlink(raw)
+    subprocess.run(["qemu-img", "resize", "-q", staging, args.card_size], check=True)
+
+    print("Warm-up boot (first-boot setup) ...")
+    r = run_boot(args.fauxpi, staging, args.model, args.fauxpi_args, os.path.join(cache_dir, "warmup.log"), args.timeout, until_poweroff=True)
+    if r["login"] is None:
+        fail("warm-up boot never reached the login prompt; see %s" % os.path.join(cache_dir, "warmup.log"))
+    os.replace(staging, warm)
+    with open(stamp, "w") as f:
+        json.dump(key, f)
+    return warm
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Measure FauxPi boot time on a Raspberry Pi OS image.",
+        epilog="Arguments after -- are passed to fauxpi, e.g. -- --clock instructions",
+    )
+    p.add_argument("image", help="Raspberry Pi OS image (.img or .img.xz)")
+    p.add_argument("--runs", type=int, default=3, help="measured boots (default: 3)")
+    p.add_argument("--model", default="3b+", help="board model passed to fauxpi --model (default: 3b+)")
+    p.add_argument("--fauxpi", default=os.path.join(ROOT, "zig-out", "bin", "fauxpi"), help="fauxpi binary (default: zig-out/bin/fauxpi)")
+    p.add_argument("--card-size", default="4G", help="SD card size (default: 4G)")
+    p.add_argument("--timeout", type=float, default=900, help="seconds to allow per boot (default: 900)")
+    p.add_argument("--rebuild", action="store_true", help="prepare the image again instead of using the cached one")
+    p.add_argument("--json", help="also write the results to this JSON file")
+    argv = sys.argv[1:]
+    fauxpi_args = []
+    if "--" in argv:
+        i = argv.index("--")
+        argv, fauxpi_args = argv[:i], argv[i + 1 :]
+    args = p.parse_args(argv)
+    args.fauxpi_args = fauxpi_args
+
+    if not os.path.exists(args.fauxpi):
+        fail("%s not found; build it with: scripts/zig build" % args.fauxpi)
+    if not os.path.exists(args.image):
+        fail("%s not found" % args.image)
+    need_tool("qemu-img", "to create the qcow2 SD card")
+    need_tool("debugfs", "(e2fsprogs) to add the probe service to the image")
+
+    name = re.sub(r"\.img(\.xz)?$", "", os.path.basename(args.image))
+    cache_dir = os.path.join(ROOT, "build", "bench", "%s-%s" % (name, args.model))
+    warm = prepare(args, cache_dir)
+
+    load = os.getloadavg()[0]
+    if load > 1.0:
+        print("Warning: host load average is %.1f; other work on this machine will slow the boots down" % load)
+    rows = []
+    cols = ["kernel", "init", "login", "cpu", "sysinit", "basic", "getty"]
+    print("\n%-4s" % "run" + "".join("%8s" % c for c in cols))
+    with tempfile.TemporaryDirectory(dir=cache_dir) as tmp:
+        for i in range(args.runs):
+            disk = os.path.join(tmp, "run.qcow2")
+            shutil.copyfile(warm, disk)
+            log = os.path.join(cache_dir, "run%d.log" % (i + 1))
+            r = run_boot(args.fauxpi, disk, args.model, args.fauxpi_args, log, args.timeout)
+            os.unlink(disk)
+            row = milestone_row(r)
+            rows.append({"milestones": row, "blame": r["blame"], "log": log, "host_load_before": load})
+            load = os.getloadavg()[0]
+            print("%-4d" % (i + 1) + "".join(fmt(row[c]) for c in cols), flush=True)
+
+    medians = {}
+    for c in cols:
+        vals = [r["milestones"][c] for r in rows if r["milestones"][c] is not None]
+        medians[c] = statistics.median(vals) if vals else None
+    print("%-4s" % "med" + "".join(fmt(medians[c]) for c in cols))
+    print("\nSeconds since launch (kernel/init/login), host CPU seconds to login (cpu), and guest")
+    print("CLOCK_MONOTONIC seconds (sysinit/basic/getty). Logs: %s" % cache_dir)
+    if rows and rows[-1]["blame"]:
+        print("\nSlowest units in the last run (systemd-analyze blame):")
+        for b in rows[-1]["blame"]:
+            print("  " + b)
+
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump(
+                {"image": args.image, "model": args.model, "fauxpi_args": args.fauxpi_args, "runs": rows, "median": medians},
+                f,
+                indent=2,
+            )
+
+
+if __name__ == "__main__":
+    main()
