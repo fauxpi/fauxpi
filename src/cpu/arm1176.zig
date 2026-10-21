@@ -21,7 +21,7 @@ pub const Vfp = vfp_mod.Vfp;
 pub const PsrFlags = dec.PsrFlags;
 pub const PstateFlags = aarch64_mod.PstateFlags;
 
-pub const icache_pages: usize = 64;
+pub const icache_pages: usize = 1024;
 pub const icache_size: usize = icache_pages << 10;
 pub const icache_mask: usize = icache_size - 1;
 
@@ -1583,6 +1583,8 @@ pub fn Arm1176(comptime Bus: type) type {
 
         /// Per-core native x86-64 JIT code buffer
         jit_buf: jit_mod.JitCodeBuffer = .{},
+        /// Number of `Smp.ic_log` entries this core has applied (`syncIcacheInvalidations`)
+        ic_seen: u32 = 0,
 
         pub inline fn icachePageIdx(pbase: u32) usize {
             return @as(usize, (pbase >> 12) ^ (pbase >> 18)) & (icache_pages - 1);
@@ -1660,6 +1662,32 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
+        /// Applies the instruction-cache invalidations posted to `bus.smp` since this core last looked,
+        /// flushing everything if it fell too far behind to read them. Returns true if anything changed.
+        pub inline fn syncIcacheInvalidations(self: *Self, bus: anytype) bool {
+            const B = @TypeOf(bus.*);
+            if (comptime !@hasField(B, "smp")) return false;
+            if (bus.smp.ic_next.load(.acquire) == self.ic_seen) return false;
+            self.syncIcacheInvalidationsSlow(&bus.smp);
+            return true;
+        }
+
+        noinline fn syncIcacheInvalidationsSlow(self: *Self, smp: anytype) void {
+            const Smp = @TypeOf(smp.*);
+            const next = smp.ic_next.load(.acquire);
+            var i = self.ic_seen;
+            self.ic_seen = next;
+            if (next -% i > Smp.ic_log_len / 2) return self.invalidateIcache();
+            while (i != next) : (i +%= 1) {
+                const entry = smp.ic_log[i % Smp.ic_log_len].load(.acquire);
+                // Not written yet (another core is mid-post) or already overwritten: flush everything.
+                if ((entry >> 32) != i) return self.invalidateIcache();
+                const pbase: u32 = @truncate(entry);
+                if (pbase == Smp.ic_all_pages) return self.invalidateIcache();
+                self.invalidateIcachePage(pbase);
+            }
+        }
+
         pub inline fn invalidateInlineTlb(self: *Self) void {
             self.mmu.flushTlb();
         }
@@ -1697,6 +1725,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.thumb_icache_page_tags = @splat(0xffff_ffff);
             self.thumb_icache_page_dirty = @splat(0xffff_ffff);
             self.jit_buf = .{};
+            self.ic_seen = 0;
         }
 
         pub fn initReset(self: *Self, entry_pc: u32, r0: u32, r1: u32, r2: u32) void {

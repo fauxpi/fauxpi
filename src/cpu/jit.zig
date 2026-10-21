@@ -39,12 +39,14 @@ pub const TraceCacheEntry = struct {
 };
 
 pub const JitCodeBuffer = struct {
-    pub const capacity: usize = 16 * 1024 * 1024;
-    pub const trace_cache_size: usize = 512;
+    pub const capacity: usize = 64 * 1024 * 1024;
+    pub const trace_cache_size: usize = 65536;
 
     used: usize = 0,
     loop_counts: [256]u8 = @splat(0),
     call_counts: [256]u8 = @splat(0),
+    /// Hit counters for other block entries: forward branch targets and trace exits.
+    block_counts: [256]u8 = @splat(0),
     spin_hashes: [4]u64 = @splat(0),
     trace_cache: [trace_cache_size]TraceCacheEntry = @splat(.{}),
 
@@ -114,6 +116,7 @@ pub const JitCodeBuffer = struct {
         self.used = 0;
         self.loop_counts = @splat(0);
         self.call_counts = @splat(0);
+        self.block_counts = @splat(0);
         self.spin_hashes = @splat(0);
         self.trace_cache = @splat(.{});
     }
@@ -3102,7 +3105,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                                 em.andRegImm(false, .rax, 0x3c0);
                             },
                             sysRegId(3, 0, 0, 0, 0) => em.movImm32(.rax, 0x410fd034),
-                            sysRegId(3, 3, 0, 0, 1) => em.movImm32(.rax, 0x8444_8004),
+                            sysRegId(3, 3, 0, 0, 1) => em.movImm32(.rax, 0x8444_c004), // CTR_EL0, as in the interpreter
                             sysRegId(3, 3, 0, 0, 7) => em.movImm32(.rax, 4),
                             else => unreachable,
                         }

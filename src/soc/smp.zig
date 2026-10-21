@@ -81,6 +81,22 @@ pub const Smp = struct {
     /// Incremented by `signalEvent()` when a core executes `SEV`, `STLR`, or `STXR` during a parallel slice.
     sev_gen: std.atomic.Value(u32) = .init(0),
     tlb: [max_cores]TlbInbox = @splat(.{}),
+    /// Instruction-cache invalidations (`IC IVAU`, `IC IALLU[IS]`) that every core must apply to its
+    /// decoded-instruction cache, as these broadcast to all cores in the Inner Shareable domain.
+    /// Entry `i` is stored at `ic_log[i % ic_log_len]` as `(i << 32) | pbase`, where
+    /// `pbase == ic_all_pages` invalidates every page.
+    ic_next: std.atomic.Value(u32) = .init(0),
+    ic_log: [ic_log_len]std.atomic.Value(u64) = @splat(.init(std.math.maxInt(u64))),
+
+    pub const ic_log_len = 64;
+    pub const ic_all_pages: u32 = 0xffff_ffff;
+
+    /// Records an instruction-cache invalidation of physical page `pbase` (or `ic_all_pages`)
+    /// for every core, including the caller, to apply with `Cpu.syncIcacheInvalidations`.
+    pub fn postIcacheInvalidate(self: *Smp, pbase: u32) void {
+        const i = self.ic_next.fetchAdd(1, .acq_rel);
+        self.ic_log[i % ic_log_len].store((@as(u64, i) << 32) | pbase, .release);
+    }
 
     /// Signals an event (`SEV` or store-release/store-exclusive) to wake cores waiting in `onSpinWait`.
     pub inline fn signalEvent(self: *Smp) void {

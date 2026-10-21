@@ -1070,7 +1070,48 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         }
                     }
                 }
+            } else if (target_pc > cur_pc and (target_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                noteBlockEntry64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, target_pc);
             }
+        }
+
+        /// Counts an entry into the block at `pc` (in the current code page) that isn't a loop head or
+        /// call target - a forward branch target or where a trace exited - and compiles a trace there
+        /// once it is hot, so execution doesn't stay in the interpreter until the next loop or call.
+        inline fn noteBlockEntry64(
+            cpu: *CpuType,
+            comptime SlotType: type,
+            code_page_idx: usize,
+            code_icache_ptr: [*]SlotType,
+            code_page_ptr: [*]const u8,
+            pc: u64,
+        ) void {
+            const word: u10 = @truncate((pc >> 2) & 0x3ff);
+            if (code_icache_ptr[word].op == @intFromEnum(A64Op.jit_trace)) return;
+            const h: u8 = @truncate((pc >> 2) ^ (pc >> 10));
+            const c = cpu.jit_buf.block_counts[h] +% 1;
+            cpu.jit_buf.block_counts[h] = c;
+            if ((c & 0x1f) == 0) compileBlockEntry64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, word, h);
+        }
+
+        noinline fn compileBlockEntry64(
+            cpu: *CpuType,
+            comptime SlotType: type,
+            code_page_idx: usize,
+            code_icache_ptr: [*]SlotType,
+            code_page_ptr: [*]const u8,
+            word: u10,
+            h: u8,
+        ) void {
+            var start_word = word;
+            // Start after an instruction the JIT can't emit (the interpreter runs it, then enters the trace).
+            const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, word) * 4 ..][0..4], .little);
+            if (!jit_mod.A64Jit(CpuType, Bus).canCompileSlot(SlotType, decodeA64(SlotType, raw_inst))) {
+                if (word == 1023) return;
+                start_word = word + 1;
+                if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) return;
+            }
+            _ = compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, 0, h, 0x20);
         }
 
         inline fn noteCallTarget64(
@@ -2248,6 +2289,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             _ = checkInterrupts64(cpu, bus);
             if (cpu.mmu.halted_wfi) return 0;
 
+            _ = cpu.syncIcacheInvalidations(bus);
             cpu.yield_slice = false;
             cpu.spin_wait_count = 0;
             cpu.last_dmb_pc = 0xffff_ffff;
@@ -2276,7 +2318,8 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     break :step_loop;
                 }
                 if (atomic_ram.busParallel(bus)) {
-                    // Apply TLB invalidations other cores broadcast while this slice runs
+                    // Apply instruction-cache and TLB invalidations other cores broadcast while this slice runs
+                    if (cpu.syncIcacheInvalidations(bus)) code_vbase = 0xffff_ffff_ffff_ffff;
                     if (bus.smp.serviceTlb(cpu.mmu.core_id, &cpu.mmu)) {
                         code_vbase = 0xffff_ffff_ffff_ffff;
                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
@@ -5370,6 +5413,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     chain_count += 1;
                                     continue;
                                 }
+                                noteBlockEntry64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, next_pc);
                                 break;
                             }
                         } else if (batch_end < max_steps and (max_steps - executed) + 1 >= d.rd) {
@@ -5783,11 +5827,25 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             }
                         }
                     } else if (crn == 7 and (crm == 1 or crm == 5)) {
-                        // IC IALLUIS / IC IALLU / IC IVAU
-                        cpu.invalidateIcache();
+                        // IC IALLUIS / IC IALLU: every page. IC IVAU: just the page holding the address
+                        // (every page if it doesn't translate). Applied on all cores, like the hardware broadcast.
+                        var pbase: ?u32 = null;
+                        if (op1 == 3 and crm == 5 and op2 == 1) {
+                            if (cpu.mmu.translate64AtEl(bus.ram, getX(cpu, rt), .read, currentEl(cpu))) |paddr| {
+                                pbase = paddr & ~@as(u32, 0xfff);
+                            } else |_| {}
+                        }
+                        if (comptime @hasField(Bus, "smp")) {
+                            bus.smp.postIcacheInvalidate(pbase orelse @TypeOf(bus.smp).ic_all_pages);
+                            _ = cpu.syncIcacheInvalidations(bus);
+                        } else if (pbase) |pb| {
+                            cpu.invalidateIcachePage(pb);
+                        } else {
+                            cpu.invalidateIcache();
+                        }
                     } else if (crn == 8) {
-                        // TLBI maintenance
-                        cpu.invalidateIcache();
+                        // TLBI maintenance. The decoded-instruction cache and JIT traces are keyed by
+                        // physical page, so remapping can't make them stale; only the TLBs need flushing.
                         if (op1 == 0 and (crm == 3 or crm == 7) and (op2 == 1 or op2 == 3 or op2 == 5 or op2 == 7)) {
                             const va_arg = getX(cpu, rt);
                             cpu.mmu.flushTlbVa64(va_arg);
@@ -5870,7 +5928,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 sysRegId(3, 0, 0, 7, 0) => 0x0000_0000_0010_1122, // ID_AA64MMFR0_EL1 (40-bit PA, 4KB granule supported)
                 sysRegId(3, 0, 0, 7, 1) => 0, // ID_AA64MMFR1_EL1
                 sysRegId(3, 0, 0, 7, 2) => 0, // ID_AA64MMFR2_EL1
-                sysRegId(3, 3, 0, 0, 1) => 0x8444_8004, // CTR_EL0 (64-byte I/D cache lines)
+                // CTR_EL0: 64-byte I/D cache lines and a PIPT L1 I-cache (L1Ip = 0b11), which the decoded-instruction
+                // cache is. A VIPT I-cache that can alias would make Linux flush all of it (IC IALLU) on every new
+                // executable mapping, instead of the per-page IC IVAU fauxpi applies cheaply.
+                sysRegId(3, 3, 0, 0, 1) => 0x8444_c004,
                 sysRegId(3, 3, 0, 0, 7) => 4, // DCZID_EL0 (BS=4 -> 64-byte DC ZVA block, DZP=0)
                 sysRegId(3, 1, 0, 0, 0) => 0x700f_e01a, // CCSIDR_EL1
                 sysRegId(3, 1, 0, 0, 1) => 0x0a20_0023, // CLIDR_EL1
