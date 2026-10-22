@@ -81,6 +81,11 @@ pub const Smp = struct {
     /// Incremented by `signalEvent()` when a core executes `SEV`, `STLR`, or `STXR` during a parallel slice.
     sev_gen: std.atomic.Value(u32) = .init(0),
     tlb: [max_cores]TlbInbox = @splat(.{}),
+    /// Host time (`monotonicNs`) at which the current parallel slice ends, or 0 when slices are
+    /// bounded only by their instruction budget (`--clock instructions`). Set by the main loop
+    /// before each slice, so cores running fast JIT code don't sit at the barrier waiting for
+    /// cores in the interpreter to finish the same number of instructions.
+    slice_deadline_ns: u64 = 0,
     /// Instruction-cache invalidations (`IC IVAU`, `IC IALLU[IS]`) that every core must apply to its
     /// decoded-instruction cache, as these broadcast to all cores in the Inner Shareable domain.
     /// Entry `i` is stored at `ic_log[i % ic_log_len]` as `(i << 32) | pbase`, where
@@ -101,6 +106,10 @@ pub const Smp = struct {
     /// Signals an event (`SEV` or store-release/store-exclusive) to wake cores waiting in `onSpinWait`.
     pub inline fn signalEvent(self: *Smp) void {
         if (self.parallel) _ = self.sev_gen.fetchAdd(1, .release);
+    }
+
+    pub inline fn sliceExpired(self: *const Smp) bool {
+        return self.slice_deadline_ns != 0 and host_posix.monotonicNs() >= self.slice_deadline_ns;
     }
 
     /// True if `core` has a pending IRQ or FIQ in `irq_summary`.

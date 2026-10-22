@@ -50,6 +50,13 @@ pub inline fn shouldWakeWfi(bus: anytype) bool {
     return bus.smp.wake_wfi.load(.acquire) != 0;
 }
 
+/// True once the current parallel slice's time budget (`Smp.slice_deadline_ns`) has run out.
+pub inline fn sliceExpired(bus: anytype) bool {
+    const B = @TypeOf(bus.*);
+    if (comptime !@hasField(B, "smp")) return false;
+    return bus.smp.sliceExpired();
+}
+
 pub inline fn hasPendingSmpInterrupt(bus: anytype, core: u2) bool {
     const B = @TypeOf(bus.*);
     if (comptime !@hasField(B, "smp")) return false;

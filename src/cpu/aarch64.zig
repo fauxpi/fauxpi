@@ -2334,6 +2334,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         }
                         if (cpu.mmu.halted_wfi or cpu.yield_slice) break :step_loop;
                     }
+                    // End a time-budgeted slice at its deadline, but not with IRQs masked, where the
+                    // core may hold a spinlock the other cores would spin on until the next slice.
+                    if ((cpu.pstate & PstateFlags.I) == 0 and atomic_ram.sliceExpired(bus)) break :step_loop;
                 }
                 const batch_end = if (executed >= max_steps)
                     (executed + 1)

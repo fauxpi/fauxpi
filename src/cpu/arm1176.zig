@@ -2516,6 +2516,8 @@ pub fn Arm1176(comptime Bus: type) type {
                         }
                         if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
                     }
+                    // End a time-budgeted slice at its deadline, but not with IRQs masked (see runSteps64).
+                    if ((self.cpsr & PsrFlags.I) == 0 and atomic_ram.sliceExpired(bus)) break :step_loop;
                 }
                 const batch_end = if (executed >= max_steps)
                     (executed + 1)
@@ -6107,6 +6109,8 @@ pub fn Arm1176(comptime Bus: type) type {
                         }
                         if (self.mmu.halted_wfi or self.yield_slice or !self.isThumb()) break;
                     }
+                    // End a time-budgeted slice at its deadline, but not with IRQs masked (see runSteps64).
+                    if ((self.cpsr & PsrFlags.I) == 0 and atomic_ram.sliceExpired(bus)) break;
                 }
                 const batch_end = if (executed >= max_steps)
                     (executed + 1)

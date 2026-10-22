@@ -72,6 +72,9 @@ const CliOptions = struct {
     clock: ClockMode = .realtime,
 };
 
+/// Host time each parallel slice runs for with `--clock realtime` (see `Smp.slice_deadline_ns`).
+const parallel_slice_ns: u64 = 100_000;
+
 const ClockMode = enum {
     /// Guest time follows the host's monotonic clock, and idle cores sleep in real time.
     realtime,
@@ -661,7 +664,11 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         }
         soc.smp.wfi_mask.store(wfi_mask, .release);
         soc.smp.wake_wfi.store(0, .release);
-        const max_slice: u64 = if (@popCount(active) > 1) 16384 else 65536;
+        // With `--clock realtime`, parallel slices end at a shared host-time deadline, so cores finish
+        // together however fast each one runs; the instruction budget is then only an upper bound.
+        const timed_slice = realtime and !opts.sequential_cores and @popCount(active) > 1;
+        soc.smp.slice_deadline_ns = if (timed_slice) monotonicNs() + parallel_slice_ns else 0;
+        const max_slice: u64 = if (timed_slice) 1 << 20 else if (@popCount(active) > 1) 16384 else 65536;
         const batch: usize = if (opts.max_steps != 0)
             @intCast(@min(max_slice, opts.max_steps -| cpus[0].cycles))
         else
