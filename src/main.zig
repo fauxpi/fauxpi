@@ -72,8 +72,11 @@ const CliOptions = struct {
     clock: ClockMode = .realtime,
 };
 
-/// Host time each parallel slice runs for with `--clock realtime` (see `Smp.slice_deadline_ns`).
-const parallel_slice_ns: u64 = 100_000;
+/// Longest a parallel slice runs with `--clock realtime` (see `Smp.slice_deadline_ns`). A guest timer
+/// due sooner ends it earlier.
+const parallel_slice_us: u64 = 100;
+/// Shortest parallel slice, so a timer that is overdue but can't interrupt yet (masked) can't stall progress.
+const min_slice_us: u64 = 20;
 
 const ClockMode = enum {
     /// Guest time follows the host's monotonic clock, and idle cores sleep in real time.
@@ -664,11 +667,25 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         }
         soc.smp.wfi_mask.store(wfi_mask, .release);
         soc.smp.wake_wfi.store(0, .release);
-        // With `--clock realtime`, parallel slices end at a shared host-time deadline, so cores finish
-        // together however fast each one runs; the instruction budget is then only an upper bound.
-        const timed_slice = realtime and !opts.sequential_cores and @popCount(active) > 1;
-        soc.smp.slice_deadline_ns = if (timed_slice) monotonicNs() + parallel_slice_ns else 0;
-        const max_slice: u64 = if (timed_slice) 1 << 20 else if (@popCount(active) > 1) 16384 else 65536;
+        // With `--clock realtime`, parallel slices end at a shared host-time deadline: when the next guest
+        // timer is due, so its interrupt isn't held until the slice ends, or else after the slice budget.
+        // Cores then finish together however fast each one runs; the instruction budget is only an upper
+        // bound. A core running alone keeps its instruction budget: checking the clock every 256
+        // instructions there costs more (shorter JIT runs) than it gains.
+        const multi_core_slice = @popCount(active) > 1;
+        const timed_slice = realtime and multi_core_slice and !opts.sequential_cores;
+        soc.smp.slice_deadline_ns = 0;
+        if (timed_slice) {
+            var wait_us = @min(
+                soc.timer.usUntilNextMatch(parallel_slice_us),
+                @min(soc.arm_timer.usUntilNextMatch(parallel_slice_us), soc.pm.usUntilWatchdogExpire(parallel_slice_us)),
+            );
+            for (0..num_cores) |i| {
+                if (!cpus[i].halted_spin) wait_us = @min(wait_us, cpus[i].mmu.usUntilNextGenericTimer(parallel_slice_us));
+            }
+            soc.smp.slice_deadline_ns = monotonicNs() + @max(wait_us, min_slice_us) * 1000;
+        }
+        const max_slice: u64 = if (timed_slice) 1 << 20 else if (multi_core_slice) 16384 else 65536;
         const batch: usize = if (opts.max_steps != 0)
             @intCast(@min(max_slice, opts.max_steps -| cpus[0].cycles))
         else

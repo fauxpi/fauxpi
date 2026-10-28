@@ -241,6 +241,8 @@ pub fn Runner(comptime Cpu: type, comptime Bus: type) type {
         main_sleeping: std.atomic.Value(u32) = .init(0),
         expected: u32 = 0,
         batch: usize = 0,
+        /// Incremented at the start of every slice, so a worker can tell it was left out of one.
+        slice_seq: std.atomic.Value(u32) = .init(0),
         stop: std.atomic.Value(bool) = .init(false),
 
         pub fn init(cpus: *[max_cores]Cpu, bus: *Bus) Self {
@@ -270,6 +272,7 @@ pub fn Runner(comptime Cpu: type, comptime Bus: type) type {
         /// Runs one slice of `batch` instructions on every core in `active` (bit `n` = core `n`)
         /// and returns the most instructions any core executed.
         pub fn runSlice(self: *Self, active: u4, batch: usize) usize {
+            _ = self.slice_seq.fetchAdd(1, .release);
             const smp = &self.bus.smp;
             var wfi_bits: u8 = 0;
             for (0..max_cores) |i| {
@@ -376,10 +379,16 @@ pub fn Runner(comptime Cpu: type, comptime Bus: type) type {
             // `go` is 0 when the thread is spawned; reading it here instead could miss a
             // slice the main thread dispatched before this thread got scheduled.
             var seen: u32 = 0;
+            // `slice_seq` of the last slice this worker ran.
+            var last_slice: u32 = 0;
             while (true) {
                 var spins: u32 = 0;
                 while (w.go.load(.acquire) == seen) {
-                    if (spins < spin_limit) {
+                    // Spin briefly in case the next slice includes this core again, but sleep at once
+                    // when slices are running without it (its core is idle): slice `last_slice + 1`
+                    // can't have finished without this worker if it had been included.
+                    const left_out = self.slice_seq.load(.acquire) -% last_slice >= 2;
+                    if (!left_out and spins < spin_limit) {
                         spins += 1;
                         std.atomic.spinLoopHint();
                         continue;
@@ -389,6 +398,7 @@ pub fn Runner(comptime Cpu: type, comptime Bus: type) type {
                     w.sleeping.store(0, .release);
                 }
                 seen = w.go.load(.acquire);
+                last_slice = self.slice_seq.load(.acquire);
                 if (self.stop.load(.acquire)) return;
 
                 w.ran = self.cpus[k].runSteps(self.bus, self.batch);
