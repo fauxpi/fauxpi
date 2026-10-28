@@ -449,6 +449,7 @@ pub const Tree = struct {
         cmdline: []const u8,
         initrd: ?InitrdRange,
         enable_vc4_kms: bool,
+        linux_kernel: bool,
     ) !void {
         // 1. Memory size (reserve top 64 MiB at 0x1c000000..0x20000000 for VideoCore framebuffer & allocations)
         const arm_ram_size: u32 = if (enable_vc4_kms and ram_size > 0x1c00_0000) 0x1c00_0000 else ram_size;
@@ -513,9 +514,10 @@ pub const Tree = struct {
             }
         }
 
-        // 3. Ensure USB controller uses mainline dwc2 compatible string
+        // 3. Ensure the USB controller is enabled. Linux gets the mainline dwc2 compatible string
+        // instead of the Raspberry Pi `dwc_otg` one; other kernels see the firmware's tree as is.
         if (self.findNode("usb") orelse self.findNode("/soc/usb@7e980000")) |usb| {
-            try usb.setStringProp(self.allocator, "compatible", "brcm,bcm2835-usb");
+            if (linux_kernel) try usb.setStringProp(self.allocator, "compatible", "brcm,bcm2835-usb");
             try usb.setStringProp(self.allocator, "status", "okay");
         }
 
@@ -529,8 +531,9 @@ pub const Tree = struct {
             }
         }
 
-        // 4. Enable vc4-kms-v3d nodes (equivalent to dtoverlay=vc4-kms-v3d)
-        if (enable_vc4_kms) {
+        // 4. Enable vc4-kms-v3d nodes (equivalent to dtoverlay=vc4-kms-v3d), for Linux only: other kernels
+        // keep the firmware's tree, with its framebuffer node (`brcm,bcm2708-fb`) enabled.
+        if (enable_vc4_kms and linux_kernel) {
             // With firmware KMS (dtoverlay=vc4-fkms-v3d) the firmware drives the display pipeline, so its
             // nodes stay disabled as on hardware; enabling them too gives vc4 a second set of CRTCs whose
             // vblanks never arrive, and the first modeset never completes.
@@ -1246,7 +1249,7 @@ test "FDT roundtrip and Pi Zero patching" {
     const mmcnr = try soc.findOrCreateChild(alloc, "mmcnr@7e300000");
     try mmcnr.setStringProp(alloc, "status", "disabled");
 
-    try tree.patchForPiZero(512 * 1024 * 1024, "console=ttyAMA0,115200", .{ .start = 0x02000000, .end = 0x02500000 }, true);
+    try tree.patchForPiZero(512 * 1024 * 1024, "console=ttyAMA0,115200", .{ .start = 0x02000000, .end = 0x02500000 }, true, true);
     try tree.setWirelessMac(.{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 });
 
     const blob = try tree.serialize(alloc);

@@ -5784,6 +5784,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const esr: u32 = (0b111100 << 26) | (1 << 25) | imm16;
                         takeException64(cpu, @max(currentEl(cpu), 1), 0x000, esr, null, cur_pc);
                     },
+                    0b010 => { // HLT: halting debug isn't enabled, so it is UNDEFINED, as on the board
+                        takeException64(cpu, @max(currentEl(cpu), 1), 0x000, 1 << 25, null, cur_pc);
+                    },
                     else => {},
                 }
                 return;

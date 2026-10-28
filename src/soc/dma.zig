@@ -60,8 +60,14 @@ pub const DmaController = struct {
         return (self.cs_int_mask & (@as(u16, 1) << @intCast(ch))) != 0;
     }
 
-    pub inline fn irqMask13(self: *const DmaController) u32 {
-        return self.cs_int_mask & 0x1fff;
+    /// The DMA interrupt lines, from GPU IRQ 16 (bit 0) up, as the board wires them: one line each
+    /// for channels 0..10 (IRQs 16..26), one shared by channels 11..14 (IRQ 27), and one raised by
+    /// any channel (IRQ 28, `dma-shared-all`).
+    pub inline fn irqLines(self: *const DmaController) u32 {
+        const m: u32 = self.cs_int_mask;
+        return (m & 0x7ff) |
+            (@as(u32, @intFromBool((m & 0x7800) != 0)) << 11) |
+            (@as(u32, @intFromBool((m & 0x7fff) != 0)) << 12);
     }
 
     pub fn read32(self: *const DmaController, offset: u32) u32 {

@@ -444,7 +444,7 @@ pub const Bcm2835 = struct {
         self.intc.raw_level[1] = (self.timer.cs & 0xf) |
             (@as(u32, @intFromBool(self.usb.irqPending())) << 9) |
             (@as(u32, @intFromBool(self.v3d.irqPending())) << 10) |
-            (self.dma.irqMask13() << 16) |
+            (self.dma.irqLines() << 16) |
             (@as(u32, @intFromBool(self.aux_uart.irqPending())) << 29);
     }
 

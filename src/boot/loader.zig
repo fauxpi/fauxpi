@@ -14,6 +14,8 @@ const BoardModel = @import("../ui/board_sheet.zig").BoardModel;
 
 pub const kernel_load_addr: u32 = 0x0000_8000;
 pub const kernel64_load_addr: u32 = 0x0020_0000;
+/// Where the firmware loads a 64-bit kernel without a Linux `Image` header (a bare-metal binary).
+pub const raw_kernel64_load_addr: u32 = 0x0008_0000;
 pub const dtb_load_addr: u32 = 0x03f0_0000;
 pub const initrd_load_addr: u32 = 0x0400_0000;
 pub const arm64_image_magic: u32 = 0x644d_5241; // "ARM\x64" at byte offset 0x38
@@ -21,6 +23,12 @@ pub const arm64_image_magic: u32 = 0x644d_5241; // "ARM\x64" at byte offset 0x38
 pub fn isArm64KernelImage(kernel_bytes: []const u8) bool {
     if (kernel_bytes.len < 64) return false;
     return std.mem.readInt(u32, kernel_bytes[0x38..0x3c], .little) == arm64_image_magic;
+}
+
+/// True for a 32-bit ARM Linux `zImage` (magic `0x016f2818` at byte offset 0x24).
+pub fn isArmZImage(kernel_bytes: []const u8) bool {
+    if (kernel_bytes.len < 0x28) return false;
+    return std.mem.readInt(u32, kernel_bytes[0x24..0x28], .little) == 0x016f2818;
 }
 
 pub fn arm64KernelLoadOffset(kernel_bytes: []const u8) u32 {
@@ -60,6 +68,7 @@ pub const BootConfig = struct {
     kernel: []const u8 = "kernel.img",
     kernel_explicit: bool = false,
     arm_64bit: ?bool = null,
+    kernel_address: ?u32 = null,
     device_tree: ?[]const u8 = null,
     initramfs: ?[]const u8 = null,
     auto_initramfs: bool = false,
@@ -129,6 +138,8 @@ pub const BootConfig = struct {
                 if (!cfg.kernel_explicit and board_model.isBcm2837()) {
                     cfg.kernel = if (is_64) "kernel8.img" else "kernel7.img";
                 }
+            } else if (std.mem.eql(u8, key, "kernel_address")) {
+                cfg.kernel_address = std.fmt.parseInt(u32, val, 0) catch null;
             } else if (std.mem.eql(u8, key, "auto_initramfs")) {
                 cfg.auto_initramfs = std.mem.eql(u8, val, "1") or std.ascii.eqlIgnoreCase(val, "true");
             } else if (std.mem.eql(u8, key, "device_tree")) {
@@ -299,13 +310,19 @@ pub fn loadFromSdImageForModel(
     const config_txt = fs.readFileAlloc(alloc, "config.txt") catch "";
     const cfg = BootConfig.parseForModel(config_txt, board_model);
 
+    // The firmware starts the kernel in AArch64 on 64-bit boards with `arm_64bit=1`, or, when
+    // `arm_64bit` is unset, for its default 64-bit kernel name `kernel8.img`.
+    var kernel_name = cfg.kernel;
     const kernel_bytes = blk: {
         const kernel_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, cfg.kernel });
         if (fs.readFileAlloc(alloc, kernel_path)) |kb| break :blk kb else |err| {
             if (board_model.isBcm2837() and !cfg.kernel_explicit) {
                 for ([_][]const u8{ "kernel7.img", "kernel.img" }) |fb_name| {
                     const fallback_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, fb_name });
-                    if (fs.readFileAlloc(alloc, fallback_path)) |kb| break :blk kb else |_| {}
+                    if (fs.readFileAlloc(alloc, fallback_path)) |kb| {
+                        kernel_name = fb_name;
+                        break :blk kb;
+                    } else |_| {}
                 }
             } else if (!board_model.isBcm2837() and !cfg.kernel_explicit) {
                 const k8_path = try std.fmt.allocPrint(alloc, "{s}kernel8.img", .{cfg.os_prefix});
@@ -369,8 +386,20 @@ pub fn loadFromSdImageForModel(
         };
     }
 
-    return loadDirectWithOverlays(allocator, ram, kernel_bytes, dtb_bytes, initrd_bytes, full_cmdline, cfg.vc4_kms_v3d or true, overlays);
+    const boot64 = board_model.isBcm2837() and (cfg.arm_64bit orelse std.mem.eql(u8, kernel_name, "kernel8.img"));
+    return loadDirectWithOverlays(allocator, ram, kernel_bytes, dtb_bytes, initrd_bytes, full_cmdline, cfg.vc4_kms_v3d or true, overlays, .{
+        .aarch64 = boot64,
+        .kernel_address = cfg.kernel_address,
+    });
 }
+
+/// How the firmware starts a kernel without a Linux `Image` header, which would say for itself.
+pub const KernelStart = struct {
+    /// Start in AArch64 (`arm_64bit=1`, or `kernel8.img` on a 64-bit board).
+    aarch64: bool = false,
+    /// `kernel_address` from config.txt.
+    kernel_address: ?u32 = null,
+};
 
 const SliceLzma2Buffer = struct {
     dest: []u8,
@@ -610,7 +639,7 @@ pub fn loadDirect(
     cmdline: []const u8,
     enable_vc4_kms: bool,
 ) !BootResult {
-    return loadDirectWithOverlays(allocator, ram, raw_kernel_bytes, dtb_bytes, initrd_bytes, cmdline, enable_vc4_kms, &.{});
+    return loadDirectWithOverlays(allocator, ram, raw_kernel_bytes, dtb_bytes, initrd_bytes, cmdline, enable_vc4_kms, &.{}, .{});
 }
 
 /// Like `loadDirect`, also applying `dtoverlay=` / `dtparam=` settings to the device tree.
@@ -623,6 +652,7 @@ pub fn loadDirectWithOverlays(
     cmdline: []const u8,
     enable_vc4_kms: bool,
     overlays: []const DtOverlay,
+    start: KernelStart,
 ) !BootResult {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -640,8 +670,15 @@ pub fn loadDirectWithOverlays(
         break :blk aw.written();
     } else raw_kernel_bytes;
 
-    const is_aarch64 = isArm64KernelImage(kernel_bytes);
-    const load_addr: u32 = if (is_aarch64) arm64KernelLoadOffset(kernel_bytes) else kernel_load_addr;
+    // A Linux arm64 `Image` says where it loads; a bare-metal 64-bit binary loads at `kernel_address`
+    // or the firmware's default, 0x80000, as on the board.
+    const is_aarch64 = isArm64KernelImage(kernel_bytes) or start.aarch64;
+    const load_addr: u32 = if (isArm64KernelImage(kernel_bytes))
+        arm64KernelLoadOffset(kernel_bytes)
+    else if (is_aarch64)
+        start.kernel_address orelse raw_kernel64_load_addr
+    else
+        start.kernel_address orelse kernel_load_addr;
 
     if (load_addr + kernel_bytes.len > ram.len) return error.KernelTooLarge;
     const max_kernel_dest = if (!is_aarch64 and dtb_load_addr <= ram.len and dtb_load_addr > load_addr)
@@ -682,7 +719,8 @@ pub fn loadDirectWithOverlays(
     else
         cmdline;
 
-    try tree.patchForPiZero(@intCast(ram.len), full_cmdline, initrd_range, enable_vc4_kms);
+    const linux_kernel = isArm64KernelImage(kernel_bytes) or isArmZImage(kernel_bytes);
+    try tree.patchForPiZero(@intCast(ram.len), full_cmdline, initrd_range, enable_vc4_kms, linux_kernel);
     if (is_aarch64) {
         try tree.configureSpinTable64();
     }
@@ -799,4 +837,27 @@ test "config.txt dtoverlay and dtparam grouping" {
 
     try std.testing.expectEqualStrings("gpio-fan", overlays[3].name);
     try std.testing.expectEqualStrings("55000", overlays[3].params[1].value);
+}
+
+test "raw AArch64 kernels load at kernel_address or 0x80000" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    try std.testing.expectEqual(@as(?u32, 0x100000), BootConfig.parseForModel("kernel_address=0x100000\n", .pi_3_b_plus).kernel_address);
+
+    var tree = try fdt.Tree.initEmpty(alloc);
+    const dtb = try tree.serialize(alloc);
+    const ram = try alloc.alloc(u8, 0x0800_0000);
+    @memset(ram, 0);
+    const kernel: [128]u8 = @splat(0xaa); // No `Image` header
+
+    const res = try loadDirectWithOverlays(alloc, ram, &kernel, dtb, null, "", false, &.{}, .{ .aarch64 = true });
+    try std.testing.expect(res.is_aarch64);
+    try std.testing.expectEqual(raw_kernel64_load_addr, res.entry_pc);
+    try std.testing.expectEqual(dtb_load_addr, res.r0);
+    try std.testing.expectEqualSlices(u8, &kernel, ram[raw_kernel64_load_addr..][0..kernel.len]);
+
+    const res2 = try loadDirectWithOverlays(alloc, ram, &kernel, dtb, null, "", false, &.{}, .{ .aarch64 = true, .kernel_address = 0x100000 });
+    try std.testing.expectEqual(@as(u32, 0x100000), res2.entry_pc);
 }
