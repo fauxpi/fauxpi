@@ -956,6 +956,33 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             _ = decodeAndFuseA64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, page_word, raw_inst, true);
         }
 
+        /// Re-marks `start_word` as the head of a trace already in the trace cache, for when its
+        /// decoded-instruction-cache page was evicted or invalidated (which drops the markers) but
+        /// the code is unchanged. Returns false if there is no usable cached trace.
+        noinline fn tryReinstallTrace64(
+            cpu: *CpuType,
+            comptime SlotType: type,
+            code_page_idx: usize,
+            code_icache_ptr: [*]SlotType,
+            code_page_ptr: [*]const u8,
+            start_word: u10,
+            end_word_req: u16,
+        ) bool {
+            const entry = &cpu.jit_buf.trace_cache[jit_mod.JitCodeBuffer.traceCacheIdx(code_page_idx, start_word, end_word_req)];
+            if (entry.page_ptr != @intFromPtr(code_page_ptr) or entry.start_word != start_word or
+                entry.end_word_req != end_word_req or entry.failed) return false;
+            const fn_ptr = entry.fn_ptr orelse return false;
+            if (entry.code_hash != jit_mod.JitCodeBuffer.hashLoopWords(code_page_ptr, start_word, end_word_req)) return false;
+            code_icache_ptr[start_word] = .{
+                .raw = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little),
+                .op = @intFromEnum(A64Op.jit_trace),
+                .rd = entry.trace_len,
+                .imm = @intFromPtr(fn_ptr),
+            };
+            cpu.markIcacheDirty(code_page_idx, start_word);
+            return true;
+        }
+
         noinline fn compileHotLoop64(
             cpu: *CpuType,
             comptime SlotType: type,
@@ -1056,8 +1083,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             if (target_pc <= cur_pc and (target_pc & ~@as(u64, 0xfff)) == code_vbase) {
                 const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
                 if (end_word_req > @as(u16, start_word) + 1 and end_word_req - @as(u16, start_word) <= 64) {
-                    if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace) and
-                        code_icache_ptr[start_word].rd >= end_word_req - @as(u16, start_word)) return;
+                    if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) {
+                        if (code_icache_ptr[start_word].rd >= end_word_req - @as(u16, start_word)) return;
+                    } else if (tryReinstallTrace64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req)) {
+                        return;
+                    }
                     const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
                     const c = cpu.jit_buf.loop_counts[h] +% 1;
                     cpu.jit_buf.loop_counts[h] = c;
@@ -1072,7 +1102,35 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 }
             } else if (target_pc > cur_pc and (target_pc & ~@as(u64, 0xfff)) == code_vbase) {
                 noteBlockEntry64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, target_pc);
+            } else if ((target_pc & ~@as(u64, 0xfff)) != code_vbase) {
+                noteJumpTarget64(cpu, SlotType, bus, @intFromBool(currentEl(cpu) != 0), code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target_pc);
             }
+        }
+
+        /// `noteBlockEntry64` for the target of a jump that may be in another page (`ret`, `br`,
+        /// a call, or a branch out of the page): finds the target page's decoded-instruction cache
+        /// through the software TLB, without evicting the page that is executing now.
+        inline fn noteJumpTarget64(
+            cpu: *CpuType,
+            comptime SlotType: type,
+            bus: *Bus,
+            priv: u1,
+            code_vbase: u64,
+            code_page_idx: usize,
+            code_icache_ptr: [*]SlotType,
+            code_page_ptr: [*]const u8,
+            target_pc: u64,
+        ) void {
+            if ((target_pc & 3) != 0) return;
+            if ((target_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                return noteBlockEntry64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, target_pc);
+            }
+            const tslot = cpu.mmu.soft_tlb64[priv][(target_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask];
+            if ((target_pc & ~@as(u64, 0xfff)) != tslot.x_vbase) return;
+            const t_page_idx = CpuType.icachePageIdx(tslot.pbase);
+            if (t_page_idx == code_page_idx) return;
+            const t_icache_ptr = cpu.prepareIcachePage(t_page_idx, tslot.pbase);
+            noteBlockEntry64(cpu, SlotType, t_page_idx, t_icache_ptr, bus.ram.ptr + tslot.pbase, target_pc);
         }
 
         /// Counts an entry into the block at `pc` (in the current code page) that isn't a loop head or
@@ -1088,6 +1146,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
         ) void {
             const word: u10 = @truncate((pc >> 2) & 0x3ff);
             if (code_icache_ptr[word].op == @intFromEnum(A64Op.jit_trace)) return;
+            if (tryReinstallTrace64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, word, 0)) return;
             const h: u8 = @truncate((pc >> 2) ^ (pc >> 10));
             const c = cpu.jit_buf.block_counts[h] +% 1;
             cpu.jit_buf.block_counts[h] = c;
@@ -1127,6 +1186,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return_pc: u64,
         ) void {
             if ((target_pc & 3) != 0) return;
+            noteJumpTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target_pc);
             const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
             const c = cpu.jit_buf.call_counts[h] +% 1;
             cpu.jit_buf.call_counts[h] = c;
@@ -4747,14 +4807,20 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (cpu.yield_slice) break :step_loop;
                         }
                     },
-                    .br_reg => cpu.pc64 = getX(cpu, @truncate(d.rn)),
+                    .br_reg => {
+                        cpu.pc64 = getX(cpu, @truncate(d.rn));
+                        noteJumpTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cpu.pc64);
+                    },
                     .blr_reg => {
                         const target = getX(cpu, @truncate(d.rn));
                         cpu.x[30] = cur_pc +% 4;
                         cpu.pc64 = target;
                         noteCallTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target, cur_pc +% 4);
                     },
-                    .ret => cpu.pc64 = getX(cpu, @truncate(d.rn)),
+                    .ret => {
+                        cpu.pc64 = getX(cpu, @truncate(d.rn));
+                        noteJumpTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cpu.pc64);
+                    },
                     .dp_imm_other => executeDpImm(cpu, inst, cur_pc),
                     .dp_reg_other => executeDpReg(cpu, inst),
                     .load_store_other => {
