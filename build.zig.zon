@@ -1,6 +1,7 @@
 .{
     .name = .fauxpi,
-    .version = "0.1.0",
+    // The release (26.10, 26.10.1, 27.04) as a semantic version: 26.10.0, 26.10.1, 27.4.0
+    .version = "26.10.0",
     .fingerprint = 0xd66fda550e7c5466,
     .minimum_zig_version = "0.17.0",
     .paths = .{

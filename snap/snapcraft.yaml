@@ -1,7 +1,8 @@
 name: fauxpi
 title: FauxPi
 base: core24
-version: '0.1.0'
+# The version is the latest <release> in the AppStream metadata
+adopt-info: fauxpi
 summary: Raspberry Pi hardware simulator
 description: |
   FauxPi is a Raspberry Pi hardware simulator supporting the Raspberry Pi 1
@@ -72,6 +73,7 @@ parts:
     # The committed tree, not the folder: build caches there run to gigabytes
     source: .
     source-type: git
+    parse-info: [usr/share/metainfo/io.github.fauxpi.Fauxpi.metainfo.xml]
     build-packages:
       - ca-certificates
       - curl
