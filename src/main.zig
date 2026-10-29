@@ -8,6 +8,7 @@ pub const loader = @import("boot/loader.zig");
 
 pub const mmu = @import("cpu/mmu.zig");
 pub const vfp = @import("cpu/vfp.zig");
+pub const cp14 = @import("cpu/cp14.zig");
 pub const decoder = @import("cpu/decoder.zig");
 pub const arm1176 = @import("cpu/arm1176.zig");
 pub const atomic_ram = @import("cpu/atomic_ram.zig");

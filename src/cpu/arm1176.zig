@@ -15,6 +15,7 @@ const dec = @import("decoder.zig");
 const aarch64_mod = @import("aarch64.zig");
 const atomic_ram = @import("atomic_ram.zig");
 const jit_mod = @import("jit.zig");
+const cp14 = @import("cp14.zig");
 
 pub const Mmu = mmu_mod.Mmu;
 pub const Vfp = vfp_mod.Vfp;
@@ -1547,6 +1548,8 @@ pub fn Arm1176(comptime Bus: type) type {
         mmu: Mmu = .{},
         /// CP10/CP11 VFPv2 Floating-Point Coprocessor
         vfp: Vfp = .{},
+        /// CP14 debug unit (ARM1176 only)
+        debug: cp14.Arm1176Debug = .{},
 
         /// Exclusive monitor state (`LDREX` / `STREX` / `CLREX`)
         excl_valid: bool = false,
@@ -1709,6 +1712,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.bank_spsr = @splat(0);
             self.mmu = .{};
             self.vfp = .{};
+            self.debug = .{};
             self.excl_valid = false;
             self.excl_paddr = 0;
             self.excl_val = 0;
@@ -5856,7 +5860,32 @@ pub fn Arm1176(comptime Bus: type) type {
                 return;
             }
 
-            // 3. CP10 / CP11 (VFPv2)
+            // 3. CP14 debug unit (MRC / MCR)
+            if (cp_num == 14 and !self.mmu.is_cortex_a53 and (inst & 0x0f00_0010) == 0x0e00_0010) {
+                const opc1: u3 = @truncate((inst >> 21) & 7);
+                const l = (inst & (1 << 20)) != 0;
+                const crn: u4 = @truncate((inst >> 16) & 0xf);
+                const rt: u4 = @truncate((inst >> 12) & 0xf);
+                const crm: u4 = @truncate(inst & 0xf);
+                const opc2: u3 = @truncate((inst >> 5) & 7);
+                if (!self.debug.accessible(opc1, crn, crm, opc2, self.isPrivileged(), l)) {
+                    self.enterException(.und, 0x04, inst_pc +% 4, false);
+                    return;
+                }
+                if (l) {
+                    const val = self.debug.read(crm, opc2);
+                    if (rt == 15) {
+                        self.cpsr = (self.cpsr & 0x0fff_ffff) | (val & 0xf000_0000);
+                    } else {
+                        self.r[rt] = val;
+                    }
+                } else {
+                    self.debug.write(crm, opc2, self.r[rt]);
+                }
+                return;
+            }
+
+            // 4. CP10 / CP11 (VFPv2)
             if (cp_num == 10 or cp_num == 11) {
                 self.executeVfp(bus, inst_pc, inst, cp_num == 11);
                 return;
