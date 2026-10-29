@@ -161,7 +161,7 @@ fn printUsage() void {
         \\Options:
         \\  --sd <path>         Insert a Raspberry Pi SD card image (FAT32 + rootfs)
         \\  --power             Start with the 5V power supply connected
-        \\  --model <model>     Board to emulate: zero (default), zero-w, zero-2-w, 1a+, 1b+, 3a+, 3b+
+        \\  --model <model>     Board to emulate: zero, zero-w, zero-2-w, 1a+, 1b+, 3a+, 3b+ (default)
         \\  --hdmi-size <WxH>   HDMI output size in pixels (default: 1280x720)
         \\  --headless          Run without opening a desktop window
         \\  --max-steps <n>     Stop simulation after <n> ARM instructions
@@ -466,7 +466,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         (sd_image_buf != null or headless_qcow2 != null);
 
     if (initial_power and initial_sd) {
-        const bm = if (wl_win) |w| w.status.board_model else (opts.board_model orelse .pi_zero);
+        const bm = if (wl_win) |w| w.status.board_model else (opts.board_model orelse .pi_3_b_plus);
         const serial = if (wl_win) |w| w.status.serial_u64 else 0x00000000fa000001;
         const mac = if (wl_win) |w| w.status.mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
         const wifi_mac = if (wl_win) |w| w.status.wifi_mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 };

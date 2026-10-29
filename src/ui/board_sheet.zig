@@ -92,7 +92,7 @@ const heavy_w: f32 = 1.75;
 pub const BoardModel = board.BoardModel;
 
 pub const SystemStatus = struct {
-    board_model: BoardModel = .pi_zero,
+    board_model: BoardModel = .pi_3_b_plus,
     serial: []const u8 = "00000000fa000001",
     serial_u64: u64 = 0x00000000fa000001,
     mac_address: [6]u8 = .{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 },
@@ -306,7 +306,7 @@ pub const BoardUi = struct {
     board_menu_btn_hovered: bool = false,
     board_menu_open: bool = false,
     hovered_board_menu_idx: ?usize = null,
-    selected_board_model: BoardModel = .pi_zero,
+    selected_board_model: BoardModel = .pi_3_b_plus,
     serial_field_hovered: bool = false,
     mac_field_hovered: bool = false,
     wifi_mac_field_hovered: bool = false,
@@ -5954,7 +5954,8 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     defer ui.deinit();
 
     var hw: Gpio = .{};
-    var status: SystemStatus = .{};
+    // Positions below are on the Pi Zero's drawing
+    var status: SystemStatus = .{ .board_model = .pi_zero };
 
     // By default at startup, SD card and Power are disconnected, while HDMI, USB Hub, Keyboard, Mouse, and Ethernet are connected
     try testing.expect(!status.sd_connected);
@@ -6511,7 +6512,8 @@ test "GPIO ribbon cable connector and GPIO box outputs LEDs and input switches" 
     defer ui.deinit();
 
     var hw: Gpio = .{};
-    var status: SystemStatus = .{};
+    // Positions below are on the Pi Zero's drawing
+    var status: SystemStatus = .{ .board_model = .pi_zero };
 
     // 1. Disconnected by default
     try testing.expect(!status.gpio_connected);
