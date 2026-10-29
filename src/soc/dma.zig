@@ -169,7 +169,7 @@ pub const DmaController = struct {
     }
 
     fn loadCbHeader(c: *Channel, ram: []const u8) bool {
-        const cb_phys = c.conblk_ad & 0x1FFFFFFF;
+        const cb_phys = c.conblk_ad & 0x3FFFFFFF;
         if (cb_phys + 32 > ram.len) {
             c.cs &= ~CS_ACTIVE;
             c.cb_loaded = false;
@@ -291,7 +291,7 @@ pub const DmaController = struct {
                 if (!s_ign and s_inc and !d_ign and !d_inc and isPeripAddr(c.dest_ad)) {
                     const chunk: u32 = @min(bytes_to_transfer, c.txfr_len) & ~@as(u32, 3);
                     if (chunk >= 4 and !isPeripAddr(c.source_ad) and !isPeripAddr(c.source_ad +% (chunk - 1))) {
-                        const sp: usize = c.source_ad & 0x1FFFFFFF;
+                        const sp: usize = c.source_ad & 0x3FFFFFFF;
                         if (sp + chunk <= ram.len) {
                             if (mmio.writeFifoBulkFn) |bulkWrite| {
                                 if (bulkWrite(mmio.ctx, c.dest_ad, ram[sp .. sp + chunk])) {
@@ -310,7 +310,7 @@ pub const DmaController = struct {
                         if (isPeripAddr(c.source_ad)) {
                             word = mmio.read32Fn(mmio.ctx, c.source_ad);
                         } else {
-                            const sp = c.source_ad & 0x1FFFFFFF;
+                            const sp = c.source_ad & 0x3FFFFFFF;
                             if (sp + 4 <= ram.len) word = std.mem.readInt(u32, ram[sp..][0..4], .little);
                         }
                     }
@@ -318,7 +318,7 @@ pub const DmaController = struct {
                         if (isPeripAddr(c.dest_ad)) {
                             mmio.write32Fn(mmio.ctx, c.dest_ad, word);
                         } else {
-                            const dp = c.dest_ad & 0x1FFFFFFF;
+                            const dp = c.dest_ad & 0x3FFFFFFF;
                             if (dp + 4 <= ram.len) std.mem.writeInt(u32, ram[dp..][0..4], word, .little);
                         }
                     }
@@ -376,7 +376,7 @@ pub const DmaController = struct {
         var y: u32 = 0;
         while (y < y_cnt) : (y += 1) {
             if (x_len > 0 and !d_ign and d_inc and !isPeripAddr(dst) and !isPeripAddr(dst +% (x_len - 1))) {
-                const dp: usize = dst & 0x1FFFFFFF;
+                const dp: usize = dst & 0x3FFFFFFF;
                 if (dp + x_len <= ram.len) {
                     if (s_ign) {
                         @memset(ram[dp .. dp + x_len], 0);
@@ -386,7 +386,7 @@ pub const DmaController = struct {
                         dst = @bitCast(@as(i32, @bitCast(dst)) +% d_stride);
                         continue;
                     } else if (s_inc and !isPeripAddr(src) and !isPeripAddr(src +% (x_len - 1))) {
-                        const sp: usize = src & 0x1FFFFFFF;
+                        const sp: usize = src & 0x3FFFFFFF;
                         if (sp + x_len <= ram.len and (sp + x_len <= dp or dp + x_len <= sp)) {
                             @memcpy(ram[dp .. dp + x_len], ram[sp .. sp + x_len]);
                             src +%= x_len;
@@ -396,7 +396,7 @@ pub const DmaController = struct {
                             continue;
                         }
                     } else if (!s_inc and !isPeripAddr(src) and (src & 3) == 0 and (dst & 3) == 0 and (x_len & 3) == 0) {
-                        const sp: usize = src & 0x1FFFFFFF;
+                        const sp: usize = src & 0x3FFFFFFF;
                         const word: u32 = if (sp + 4 <= ram.len) std.mem.readInt(u32, ram[sp..][0..4], .little) else 0;
                         const b0: u8 = @truncate(word);
                         if (word == @as(u32, b0) * 0x01010101) {
@@ -429,7 +429,7 @@ pub const DmaController = struct {
                     }
                 }
             } else if (x_len > 0 and !s_ign and s_inc and !isPeripAddr(src) and !isPeripAddr(src +% (x_len - 1)) and !d_ign and !d_inc and isPeripAddr(dst) and (x_len & 3) == 0) {
-                const sp: usize = src & 0x1FFFFFFF;
+                const sp: usize = src & 0x3FFFFFFF;
                 if (sp + x_len <= ram.len) {
                     if (mmio) |m| {
                         if (m.writeFifoBulkFn) |bulkWrite| {
@@ -452,7 +452,7 @@ pub const DmaController = struct {
                         if (isPeripAddr(src)) {
                             if (mmio) |m| word = m.read32Fn(m.ctx, src);
                         } else {
-                            const sp = src & 0x1FFFFFFF;
+                            const sp = src & 0x3FFFFFFF;
                             if (sp + 4 <= ram.len) word = std.mem.readInt(u32, ram[sp..][0..4], .little);
                         }
                     }
@@ -460,7 +460,7 @@ pub const DmaController = struct {
                         if (isPeripAddr(dst)) {
                             if (mmio) |m| m.write32Fn(m.ctx, dst, word);
                         } else {
-                            const dp = dst & 0x1FFFFFFF;
+                            const dp = dst & 0x3FFFFFFF;
                             if (dp + 4 <= ram.len) std.mem.writeInt(u32, ram[dp..][0..4], word, .little);
                         }
                     }
@@ -470,11 +470,11 @@ pub const DmaController = struct {
                 } else {
                     var byte: u8 = 0;
                     if (!s_ign and !isPeripAddr(src)) {
-                        const sp = src & 0x1FFFFFFF;
+                        const sp = src & 0x3FFFFFFF;
                         if (sp < ram.len) byte = ram[sp];
                     }
                     if (!d_ign and !isPeripAddr(dst)) {
-                        const dp = dst & 0x1FFFFFFF;
+                        const dp = dst & 0x3FFFFFFF;
                         if (dp < ram.len) ram[dp] = byte;
                     }
                     if (s_inc) src +%= 1;

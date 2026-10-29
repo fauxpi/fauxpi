@@ -528,7 +528,7 @@ pub const Mmu = struct {
 
         const l1_index: u32 = vaddr >> 20;
         const l1_ShiftMask: u32 = if (use_ttbr1) 0xfff else (@as(u32, 0xfff) >> n);
-        const l1_addr: u32 = (table_base | ((l1_index & l1_ShiftMask) << 2)) & 0x1fff_ffff;
+        const l1_addr: u32 = (table_base | ((l1_index & l1_ShiftMask) << 2)) & 0x3fff_ffff;
         if (l1_addr + 4 > ram.len) {
             self.recordFault(vaddr, access, 0x05, 0);
             return error.Abort;
@@ -571,7 +571,7 @@ pub const Mmu = struct {
                 domain = @truncate(l1_desc >> 5);
                 const l2_base = l1_desc & 0xffff_fc00;
                 const l2_index = (vaddr >> 12) & 0xff;
-                const l2_addr = (l2_base | (l2_index << 2)) & 0x1fff_ffff;
+                const l2_addr = (l2_base | (l2_index << 2)) & 0x3fff_ffff;
                 if (l2_addr + 4 > ram.len) {
                     self.recordFault(vaddr, access, 0x07, domain);
                     return error.Abort;
@@ -713,7 +713,7 @@ pub const Mmu = struct {
             const l1_bits: u5 = @intCast(2 - @as(u5, sz));
             const l1_idx: u32 = (vaddr >> 30) & ((@as(u32, 1) << l1_bits) - 1);
             const l1_base: u32 = @as(u32, @truncate(ttbr)) & 0xffff_ffe0;
-            const l1_addr: u32 = (l1_base + l1_idx * 8) & 0x1fff_ffff;
+            const l1_addr: u32 = (l1_base + l1_idx * 8) & 0x3fff_ffff;
             if (l1_addr + 8 > ram.len) {
                 self.recordFault(vaddr, access, 0b000101, 0);
                 return error.Abort;
@@ -741,7 +741,7 @@ pub const Mmu = struct {
         }
 
         if (leaf_level != 1) {
-            const l2_addr: u32 = (l2_table_base + l2_idx * 8) & 0x1fff_ffff;
+            const l2_addr: u32 = (l2_table_base + l2_idx * 8) & 0x3fff_ffff;
             if (l2_addr + 8 > ram.len) {
                 self.recordFault(vaddr, access, 0b000110, 0);
                 return error.Abort;
@@ -768,7 +768,7 @@ pub const Mmu = struct {
 
                     const l3_table_base: u32 = @as(u32, @truncate(l2_desc)) & 0xffff_f000;
                     const l3_idx: u32 = (vaddr >> 12) & 0x1ff;
-                    const l3_addr: u32 = (l3_table_base + l3_idx * 8) & 0x1fff_ffff;
+                    const l3_addr: u32 = (l3_table_base + l3_idx * 8) & 0x3fff_ffff;
                     if (l3_addr + 8 > ram.len) {
                         self.recordFault(vaddr, access, 0b000111, 0);
                         return error.Abort;
@@ -891,7 +891,7 @@ pub const Mmu = struct {
                 break :blk if (idx_bits >= 9) 0x1ff else ((@as(u64, 1) << idx_bits) - 1);
             } else 0x1ff;
             const idx: u32 = @truncate((clean_va >> shift) & idx_mask);
-            const desc_addr: u32 = (table_base + idx * 8) & 0x1fff_ffff;
+            const desc_addr: u32 = (table_base + idx * 8) & 0x3fff_ffff;
             if (desc_addr + 8 > ram.len) {
                 self.recordFault64AtEl(vaddr, access, el, 0b000100 | @as(u6, level));
                 return error.Abort;

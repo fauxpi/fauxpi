@@ -288,12 +288,13 @@ fn loadGuestBoot(
     const saved_hdr_ext_mask = soc.gpio.ext_mask & gpio.Gpio.HEADER_PIN_MASK;
     const saved_hdr_ext_level = soc.gpio.ext_level & gpio.Gpio.HEADER_PIN_MASK;
     soc.usb.hid.net.deinit();
-    @memset(ram, 0);
+    @memset(ram[0..@min(board_model.ramBytes(), ram.len)], 0);
     soc.initInPlace(ram, opts.width, opts.height);
     soc.mailbox.fb_allocated = true;
     soc.gpio.ext_mask = (soc.gpio.ext_mask & ~gpio.Gpio.HEADER_PIN_MASK) | saved_hdr_ext_mask;
     soc.gpio.ext_level = (soc.gpio.ext_level & ~gpio.Gpio.HEADER_PIN_MASK) | saved_hdr_ext_level;
     soc.is_bcm2837 = board_model.isBcm2837();
+    soc.setBoardRam(board_model.ramBytes(), loader.default_gpu_mem_bytes);
     soc.setHdmiConnected(true);
     soc.mailbox.board_revision = board_model.boardRevision();
     soc.mailbox.board_serial = board_serial;
@@ -313,16 +314,16 @@ fn loadGuestBoot(
         soc.sdhost.attachQcow2(disk);
         const boot_vol = try disk.readBootVolumeAlloc(gpa);
         defer gpa.free(boot_vol);
-        break :blk try loader.loadFromSdImageForModel(gpa, ram, boot_vol, board_model);
+        break :blk try loader.loadFromSdImageForModel(gpa, soc.ram, boot_vol, board_model);
     } else if (sd_image_buf) |img| blk: {
         soc.sdhost.attachMutableSlice(img);
-        break :blk try loader.loadFromSdImageForModel(gpa, ram, img, board_model);
+        break :blk try loader.loadFromSdImageForModel(gpa, soc.ram, img, board_model);
     } else return error.MissingSdImage;
 
     const wifi_mac_opt: ?[6]u8 = if (board_model.hasWireless()) wifi_mac_address else null;
     _ = try loader.applyBoardConfigToRamDtb(
         gpa,
-        ram,
+        soc.ram,
         boot_res.dtb_size,
         board_model,
         board_serial,
@@ -390,9 +391,9 @@ fn syncWindowPeripheralsToSoc(w: *const window.Window, soc: *Bcm2835) void {
 }
 
 fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliOptions) !void {
-    const ram = try gpa.alloc(u8, Bcm2835.RAM_SIZE);
+    // Pages are committed as the guest touches them; each boot clears the board's RAM.
+    const ram = try gpa.alloc(u8, Bcm2835.BUS_RAM_SIZE);
     defer gpa.free(ram);
-    @memset(ram, 0);
 
     var headless_qcow2: ?qcow2.Qcow2Disk = null;
     defer if (headless_qcow2) |*d| d.deinit();
@@ -753,7 +754,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         }
 
         if (all_wfi) {
-            soc.usb.pollNetwork(soc.ram);
+            soc.usb.pollNetwork(soc.vc_ram);
             soc.usb.wakeIfPending();
             soc.updateIrqs();
             for (0..num_cores) |i| {
@@ -819,7 +820,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 }
                 if (realtime) {
                     // Guest time catches up with the host clock on the next pass.
-                    soc.usb.pollNetwork(soc.ram);
+                    soc.usb.pollNetwork(soc.vc_ram);
                     soc.usb.wakeIfPending();
                     soc.updateIrqs();
                     noteRealtimeIdle(&rt_idle_no_deadline_since_ns, timer_wait_us, cpus);
@@ -837,7 +838,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     soc.arm_timer.advance(jump, &soc.intc);
                     soc.pm.advance(jump);
                     soc.advanceAudio(jump);
-                    soc.usb.pollNetwork(soc.ram);
+                    soc.usb.pollNetwork(soc.vc_ram);
                     soc.usb.wakeIfPending();
                     for (0..num_cores) |i| {
                         if (!cpus[i].halted_spin) {
@@ -868,7 +869,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 var sleep_us = @min(timer_wait_us, @max(until_vblank_us, 1));
                 if (usb_active) sleep_us = @min(sleep_us, 1000);
                 host_posix.sleepUs(sleep_us);
-                soc.usb.pollNetwork(soc.ram);
+                soc.usb.pollNetwork(soc.vc_ram);
                 soc.usb.wakeIfPending();
                 soc.updateIrqs();
                 noteRealtimeIdle(&rt_idle_no_deadline_since_ns, timer_wait_us, cpus);

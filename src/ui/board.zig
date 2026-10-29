@@ -264,6 +264,11 @@ pub const BoardModel = enum {
         };
     }
 
+    /// SDRAM size, as the board revision code's memory-size field says (256 MiB << n).
+    pub fn ramBytes(self: BoardModel) u32 {
+        return @as(u32, 256 * 1024 * 1024) << @intCast((self.boardRevision() >> 20) & 7);
+    }
+
     pub fn hasWireless(self: BoardModel) bool {
         return switch (self) {
             .pi_1_a_plus, .pi_1_b_plus, .pi_zero => false,
@@ -348,6 +353,13 @@ test "boards by their model" {
     // USB and Ethernet stick out past the edge.
     const r = pi3_b_plus.bounds();
     try testing.expect(r.w > 85 and r.x < 0);
+}
+
+test "board RAM sizes" {
+    try std.testing.expectEqual(@as(u32, 1024 * 1024 * 1024), BoardModel.pi_3_b_plus.ramBytes());
+    for ([_]BoardModel{ .pi_1_a_plus, .pi_1_b_plus, .pi_3_a_plus, .pi_zero, .pi_zero_w, .pi_zero_2_w }) |bm| {
+        try std.testing.expectEqual(@as(u32, 512 * 1024 * 1024), bm.ramBytes());
+    }
 }
 
 test "every part is on or at the edge of its board" {

@@ -455,8 +455,8 @@ pub const V3d = struct {
     }
 
     fn executeBcl(self: *V3d, ram: []const u8, start_bus: u32, end_bus: u32) void {
-        var pc = start_bus & 0x1FFFFFFF;
-        const end = end_bus & 0x1FFFFFFF;
+        var pc = start_bus & 0x3FFFFFFF;
+        const end = end_bus & 0x3FFFFFFF;
         if (end > ram.len) return;
 
         while (pc < end) {
@@ -577,10 +577,10 @@ pub const V3d = struct {
     }
 
     fn warmShaderCache(self: *V3d, ram: []const u8, shader_rec_bus: u32) void {
-        const rec_phys = shader_rec_bus & 0x1FFFFFFF;
+        const rec_phys = shader_rec_bus & 0x3FFFFFFF;
         if (rec_phys + 36 > ram.len) return;
-        const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & 0x1FFFFFFF;
-        const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & 0x1FFFFFFF;
+        const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & 0x3FFFFFFF;
+        const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & 0x3FFFFFFF;
         var vs_buf: [512]qpu.Inst = undefined;
         var fs_buf: [512]qpu.Inst = undefined;
         const vs_code = extractQpuProgram(ram, vs_code_phys, &vs_buf);
@@ -633,15 +633,15 @@ pub const V3d = struct {
         for (self.draws[0..self.draws_len], 0..) |draw, draw_idx| {
             self.prep_draws[draw_idx] = .{};
             if (draw.count < 3) continue;
-            const rec_phys = draw.shader_rec_addr & 0x1FFFFFFF;
+            const rec_phys = draw.shader_rec_addr & 0x3FFFFFFF;
             if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) continue;
 
             const fs_num_varyings = ram[rec_phys + 3];
-            const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & 0x1FFFFFFF;
-            const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & 0x1FFFFFFF;
+            const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & 0x3FFFFFFF;
+            const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & 0x3FFFFFFF;
             const vs_attr_mask = ram[rec_phys + 14];
-            const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & 0x1FFFFFFF;
-            const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & 0x1FFFFFFF;
+            const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & 0x3FFFFFFF;
+            const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & 0x3FFFFFFF;
 
             const vs_code = extractQpuProgram(ram, vs_code_phys, &vs_buf);
             const fs_code = extractQpuProgram(ram, fs_code_phys, &fs_buf);
@@ -717,7 +717,7 @@ pub const V3d = struct {
                 if (draw.mode == 4) {
                     const base_v = tri_idx * 3;
                     if (draw.indexed) {
-                        const idx_base: usize = draw.index_buffer_addr & 0x1FFFFFFF;
+                        const idx_base: usize = draw.index_buffer_addr & 0x3FFFFFFF;
                         if (draw.u16_indices) {
                             const start_off = idx_base + @as(usize, base_v) * 2;
                             if (start_off + batch_verts * 2 <= ram.len) {
@@ -781,7 +781,7 @@ pub const V3d = struct {
                     tri_idx += @intCast(batch_tris);
 
                     if (draw.indexed) {
-                        const idx_base = draw.index_buffer_addr & 0x1FFFFFFF;
+                        const idx_base = draw.index_buffer_addr & 0x3FFFFFFF;
                         if (draw.u16_indices) {
                             for (v_indices[0..batch_verts]) |*vi| {
                                 const off = idx_base + vi.* * 2;
@@ -913,7 +913,7 @@ pub const V3d = struct {
         for (0..num_attrs) |ai| {
             if (vs_attr_mask != 0 and (vs_attr_mask & (@as(u8, 1) << @intCast(ai))) == 0) continue;
             const a_off = rec_phys + 36 + ai * 8;
-            const attr_base = std.mem.readInt(u32, ram[a_off..][0..4], .little) & 0x1FFFFFFF;
+            const attr_base = std.mem.readInt(u32, ram[a_off..][0..4], .little) & 0x3FFFFFFF;
             const attr_bytes: u32 = @as(u32, ram[a_off + 4]) + 1;
             const attr_stride: u32 = ram[a_off + 5];
             const words = (attr_bytes + 3) / 4;
@@ -1152,7 +1152,7 @@ pub const V3d = struct {
         const lf = tb.loaded_from orelse return false;
         const dst_is_565 = (format == 1 or format == 2);
         const src_is_565 = (lf.format == 1 or lf.format == 2);
-        return (lf.addr & 0x1FFFFFFF) == (dst_addr & 0x1FFFFFFF) and
+        return (lf.addr & 0x3FFFFFFF) == (dst_addr & 0x3FFFFFFF) and
             lf.fb_w == fb_w and
             lf.fb_h == fb_h and
             lf.tile_x == tile_x and
@@ -1235,8 +1235,8 @@ pub const V3d = struct {
     }
 
     fn executeRcl(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) void {
-        var pc = start_bus & 0x1FFFFFFF;
-        const end = end_bus & 0x1FFFFFFF;
+        var pc = start_bus & 0x3FFFFFFF;
+        const end = end_bus & 0x3FFFFFFF;
         if (end > ram.len) return;
 
         self.prepareDrawsForFrame(ram);
@@ -1296,7 +1296,7 @@ pub const V3d = struct {
                 1, 4, 5, 8, 18 => pc += 1,
                 16 => { // BRANCH
                     if (pc + 5 > end) break;
-                    pc = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & 0x1FFFFFFF;
+                    pc = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & 0x3FFFFFFF;
                 },
                 17 => { // BRANCH_TO_SUB_LIST (executes binned primitives for the current tile)
                     if (pc + 5 > end) break;
@@ -1487,7 +1487,7 @@ pub const V3d = struct {
         tiling: u2,
         ls_format: u2,
     ) void {
-        const base = base_bus & 0x1FFFFFFF;
+        const base = base_bus & 0x3FFFFFFF;
         const is_565 = (ls_format == 1 or ls_format == 2);
         const fmt: format_mod.Format = if (is_565) .rgb565 else .argb8888;
         const cpp: u32 = if (is_565) 2 else 4;
@@ -1626,7 +1626,7 @@ pub const V3d = struct {
         tiling: u2,
         ls_format: u2,
     ) void {
-        const base = base_bus & 0x1FFFFFFF;
+        const base = base_bus & 0x3FFFFFFF;
         const is_565 = (ls_format == 1 or ls_format == 2);
         const fmt: format_mod.Format = if (is_565) .rgb565 else .argb8888;
         const cpp: u32 = if (is_565) 2 else 4;
@@ -1933,15 +1933,15 @@ pub const V3d = struct {
 
     fn renderDrawIntoTileBuf(tb: *TileBuffer, ram: []const u8, draw: DrawCall, tile_px_x: u32, tile_px_y: u32, tile_size: u32) void {
         if (draw.count < 3) return;
-        const rec_phys = draw.shader_rec_addr & 0x1FFFFFFF;
+        const rec_phys = draw.shader_rec_addr & 0x3FFFFFFF;
         if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) return;
 
         const fs_num_varyings = ram[rec_phys + 3];
-        const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & 0x1FFFFFFF;
-        const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & 0x1FFFFFFF;
+        const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & 0x3FFFFFFF;
+        const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & 0x3FFFFFFF;
         const vs_attr_mask = ram[rec_phys + 14];
-        const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & 0x1FFFFFFF;
-        const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & 0x1FFFFFFF;
+        const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & 0x3FFFFFFF;
+        const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & 0x3FFFFFFF;
 
         var vs_buf: [512]qpu.Inst = undefined;
         var fs_buf: [512]qpu.Inst = undefined;
@@ -2017,7 +2017,7 @@ pub const V3d = struct {
             tri_idx += @intCast(batch_tris);
 
             if (draw.indexed) {
-                const idx_base = draw.index_buffer_addr & 0x1FFFFFFF;
+                const idx_base = draw.index_buffer_addr & 0x3FFFFFFF;
                 if (draw.u16_indices) {
                     for (v_indices[0..batch_verts]) |*vi| {
                         const off = idx_base + vi.* * 2;

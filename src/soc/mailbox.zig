@@ -44,11 +44,14 @@ pub const Mailbox = struct {
     fb_alpha_mode: u32 = 0,
     fb_virt_x: u32 = 0,
     fb_virt_y: u32 = 0,
-    fb_bus_addr: u32 = 0x5c100000, // Bus address in VC RAM region (phys 0x1c100000)
+    fb_bus_addr: u32 = 0x5c100000, // Bus address in VC RAM region (`vc_mem_base + 0x100000`)
     /// Bytes per row when it is not `fb_width * bytes per pixel` (a firmware KMS plane); 0 = packed
     fb_pitch: u32 = 0,
     fb_allocated: bool = false,
 
+    /// The VideoCore's share of SDRAM at the top (`gpu_mem`); the ARM has everything below it.
+    vc_mem_base: u32 = 0x1c000000,
+    vc_mem_size: u32 = 0x04000000,
     /// Bump allocator for VC GPU memory allocations (Property Tag 0x0003000c)
     vc_alloc_next: u32 = 0x1d000000,
 
@@ -68,6 +71,15 @@ pub const Mailbox = struct {
     /// Firmware GPIO expander state (pins 128..135; 128 = ACT LED, 130 = active-low PWR LED on Pi 3 B+, 135 = PWR LED)
     exp_gpio_state: [8]u1 = .{ 0, 1, 0, 1, 1, 1, 1, 1 },
     exp_act_latch: bool = false,
+
+    /// Splits SDRAM between the ARM (`arm_bytes` from address 0) and the VideoCore (`vc_bytes` above
+    /// it), placing the firmware's framebuffer and GPU allocations in the VideoCore's share.
+    pub fn setMemorySplit(self: *Mailbox, arm_bytes: u32, vc_bytes: u32) void {
+        self.vc_mem_base = arm_bytes;
+        self.vc_mem_size = vc_bytes;
+        self.fb_bus_addr = 0x40000000 | (arm_bytes + 0x100000);
+        self.vc_alloc_next = arm_bytes + 0x1000000;
+    }
 
     pub fn irqPending(self: *const Mailbox) bool {
         return (self.config & MBOX_IHAVEDATAIRQEN) != 0 and self.fifo_count > 0;
@@ -150,7 +162,7 @@ pub const Mailbox = struct {
             0x00, 0x20 => {
                 const channel: u4 = @truncate(val & 0xF);
                 const data_bus = val & ~@as(u32, 0xF);
-                const phys = data_bus & 0x1FFFFFFF;
+                const phys = data_bus & 0x3FFFFFFF;
                 if (channel == 8) {
                     self.processPropertyTags(phys, ram, ctx);
                 } else if (channel == 1) {
@@ -275,12 +287,12 @@ pub const Mailbox = struct {
                 },
                 0x00010005 => { // Get ARM memory
                     writeU32(ram, payload, 0, buf_size, 0x00000000);
-                    writeU32(ram, payload, 4, buf_size, 0x1c000000);
+                    writeU32(ram, payload, 4, buf_size, self.vc_mem_base);
                     resp_len = 8;
                 },
                 0x00010006 => { // Get VC memory
-                    writeU32(ram, payload, 0, buf_size, 0x1c000000);
-                    writeU32(ram, payload, 4, buf_size, 0x04000000);
+                    writeU32(ram, payload, 0, buf_size, self.vc_mem_base);
+                    writeU32(ram, payload, 4, buf_size, self.vc_mem_size);
                     resp_len = 8;
                 },
                 0x00010007 => { // Get clocks (parent, id pairs for clock IDs 1..16)

@@ -344,6 +344,7 @@ pub fn loadFromSdImageForModel(
 
     const boot64 = board_model.isBcm2837() and (cfg.arm_64bit orelse std.mem.eql(u8, kernel_name, "kernel8.img"));
     return loadDirectWithOverlays(allocator, ram, kernel_bytes, dtb_bytes, initrd_bytes, full_cmdline, overlays, .{
+        .ram_bytes = board_model.ramBytes(),
         .aarch64 = boot64,
         .kernel_address = cfg.kernel_address,
         .enable_uart = cfg.enable_uart,
@@ -353,8 +354,13 @@ pub fn loadFromSdImageForModel(
     });
 }
 
+/// The VideoCore's share of SDRAM, at the top, when `config.txt` sets no `gpu_mem`.
+pub const default_gpu_mem_bytes: u32 = 64 * 1024 * 1024;
+
 /// config.txt settings that change how the firmware starts the kernel.
 pub const KernelStart = struct {
+    /// The board's SDRAM; the ARM gets all but the VideoCore's `gpu_mem` at the top.
+    ram_bytes: u32 = 512 * 1024 * 1024,
     /// Start a kernel without a Linux `Image` header (which says for itself) in AArch64
     /// (`arm_64bit=1`, or `kernel8.img` on a 64-bit board).
     aarch64: bool = false,
@@ -673,7 +679,7 @@ pub fn loadDirectWithOverlays(
     var tree = try fdt.Tree.parse(alloc, dtb_bytes);
 
     applyDtOverlays(alloc, &tree, overlays);
-    try tree.patchForPiZero(@intCast(ram.len), cmdline, initrd_range, start.enable_uart, start.kms_framebuffer);
+    try tree.patchForPiZero(start.ram_bytes - default_gpu_mem_bytes, cmdline, initrd_range, start.enable_uart, start.kms_framebuffer);
     if (is_aarch64) {
         try tree.configureSpinTable64();
     }

@@ -341,7 +341,7 @@ pub const Vchiq = struct {
 
     /// Handles Mailbox Property Tag `0x00048010` (`RPI_FIRMWARE_VCHIQ_INIT`).
     pub fn initSlotZero(self: *Vchiq, channel_base: u32, ram: []u8) u32 {
-        const base = channel_base & 0x1FFFFFFF;
+        const base = channel_base & 0x3FFFFFFF;
         if (base + 0x1000 > ram.len) return 1;
 
         self.slot_zero_phys = base;

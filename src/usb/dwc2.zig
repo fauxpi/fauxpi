@@ -211,7 +211,7 @@ pub const Dwc2Controller = struct {
         const ch = &self.channels[ch_idx];
         const xfersize: u32 = ch.hctsiz & 0x7ffff;
         const pid: u2 = @truncate((ch.hctsiz >> 29) & 3);
-        const dma_phys: u32 = ch.hcdma & 0x1FFFFFFF;
+        const dma_phys: u32 = ch.hcdma & 0x3FFFFFFF;
         const mps: usize = @max(@as(usize, ch.hcchar & 0x7ff), 1);
 
         if (dma_phys + xfersize > ram.len) {
@@ -428,7 +428,7 @@ pub const Dwc2Controller = struct {
 
         const xfersize: u32 = ch.hctsiz & 0x7ffff;
         const pid: u2 = @truncate((ch.hctsiz >> 29) & 3);
-        const dma_phys: u32 = ch.hcdma & 0x1FFFFFFF;
+        const dma_phys: u32 = ch.hcdma & 0x3FFFFFFF;
 
         const target = self.hid.resolveDevice(devaddr) orelse {
             ch.hcchar &= ~HCCHAR_CHEN;

@@ -1437,7 +1437,7 @@ const PrecomputedTex = struct {
         const tile_w: u32 = @as(u32, 1) << tile_w_shift;
         return .{
             .cfg = p,
-            .base_off = p.offset & 0x1FFFFFFF,
+            .base_off = p.offset & 0x3FFFFFFF,
             .cpp = cpp,
             .fw = @floatFromInt(p.width),
             .fh = @floatFromInt(p.height),

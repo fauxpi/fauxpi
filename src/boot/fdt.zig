@@ -319,16 +319,18 @@ pub const Tree = struct {
         }
     }
 
-    pub fn setSimpleFramebuffer(self: *Tree, width: u32, height: u32) !void {
+    /// Describes the firmware's framebuffer at `base` (ARM physical address).
+    pub fn setSimpleFramebuffer(self: *Tree, base: u32, width: u32, height: u32) !void {
         const chosen = try self.findOrCreateNode("/chosen");
         try chosen.setU32Prop(self.allocator, "#address-cells", 1);
         try chosen.setU32Prop(self.allocator, "#size-cells", 1);
         try chosen.setProp(self.allocator, "ranges", &.{});
-        const fb_node = try chosen.findOrCreateChild(self.allocator, "framebuffer@1c100000");
+        const fb_name = try std.fmt.allocPrint(self.allocator, "framebuffer@{x}", .{base});
+        const fb_node = try chosen.findOrCreateChild(self.allocator, fb_name);
         const stride: u32 = width * 4;
         const fb_size: u32 = stride * height;
         try fb_node.setStringProp(self.allocator, "compatible", "simple-framebuffer");
-        try fb_node.setCellsProp(self.allocator, "reg", &.{ 0x1c10_0000, fb_size });
+        try fb_node.setCellsProp(self.allocator, "reg", &.{ base, fb_size });
         try fb_node.setU32Prop(self.allocator, "width", width);
         try fb_node.setU32Prop(self.allocator, "height", height);
         try fb_node.setU32Prop(self.allocator, "stride", stride);
@@ -337,21 +339,21 @@ pub const Tree = struct {
     }
 
     /// Makes the device-tree changes the firmware (`start.elf`) makes before starting the kernel:
-    /// - `/memory@0` covers the ARM's RAM, below the VideoCore's share at the top (`0x1c000000..`)
+    /// - `/memory@0` covers the ARM's `arm_ram_size` bytes of RAM, below the VideoCore's share at the top
     /// - `/chosen/bootargs` is the tree's own bootargs, then the firmware's `8250.nr_uarts` setting
     ///   when the mini UART is the primary UART, then `cmdline` with `serial0`/`serial1` resolved
     /// - `/chosen` initrd range and `rng-seed`
-    /// - `/chosen/framebuffer@1c100000` for the framebuffer the firmware sets up, with `dtoverlay=vc4-kms-v3d`
+    /// - `/chosen/framebuffer@...` for the framebuffer the firmware sets up 1 MiB into the VideoCore's
+    ///   share, with `dtoverlay=vc4-kms-v3d`
     pub fn patchForPiZero(
         self: *Tree,
-        ram_size: u32,
+        arm_ram_size: u32,
         cmdline: []const u8,
         initrd: ?InitrdRange,
         enable_uart: ?bool,
         kms_framebuffer: bool,
     ) !void {
-        // 1. Memory size (the top 64 MiB at 0x1c000000..0x20000000 is the VideoCore's)
-        const arm_ram_size: u32 = @min(ram_size, 0x1c00_0000);
+        // 1. Memory size (the VideoCore's share starts at `arm_ram_size`)
         const mem_node = self.findNode("/memory@0") orelse self.findNode("/memory") orelse try self.findOrCreateNode("/memory@0");
         try mem_node.setCellsProp(self.allocator, "reg", &.{ 0, arm_ram_size });
 
@@ -411,7 +413,7 @@ pub const Tree = struct {
 
         // 3. With the KMS display driver (`dtoverlay=vc4-kms-v3d`), the framebuffer the firmware set up,
         // for an early console (simplefb / simpledrm) until the driver takes the display over
-        if (kms_framebuffer) try self.setSimpleFramebuffer(1280, 720);
+        if (kms_framebuffer) try self.setSimpleFramebuffer(arm_ram_size + 0x10_0000, 1280, 720);
     }
 
     // Device-tree overlays (`dtoverlay=` / `dtparam=`), following the Raspberry Pi `dtoverlay`
@@ -1073,7 +1075,7 @@ test "FDT roundtrip and firmware patching" {
     try aliases.setStringProp(alloc, "ethernet0", "/soc/usb@7e980000/usb1@1/usb1_1@1");
     try (try tree.findOrCreateNode("/chosen")).setStringProp(alloc, "bootargs", "coherent_pool=1M 8250.nr_uarts=0");
 
-    try tree.patchForPiZero(512 * 1024 * 1024, "console=serial0,115200 root=/dev/mmcblk0p2", .{ .start = 0x02000000, .end = 0x02500000 }, true, true);
+    try tree.patchForPiZero(0x1c00_0000, "console=serial0,115200 root=/dev/mmcblk0p2", .{ .start = 0x02000000, .end = 0x02500000 }, true, true);
     try tree.setEthernetMac(.{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 });
     try tree.setBluetoothAddress(.{ 0x04, 0x61, 0x47, 0xeb, 0x27, 0xb8 });
 
@@ -1102,7 +1104,7 @@ test "FDT roundtrip and firmware patching" {
     // With enable_uart off (the default where the mini UART is primary) the 8250 driver leaves it alone
     var tree2 = try Tree.initEmpty(alloc);
     try (try tree2.findOrCreateNode("/aliases")).setStringProp(alloc, "serial0", "/soc/serial@7e215040");
-    try tree2.patchForPiZero(512 * 1024 * 1024, "console=serial0,115200", null, null, false);
+    try tree2.patchForPiZero(0x1c00_0000, "console=serial0,115200", null, null, false);
     try std.testing.expectEqualStrings("8250.nr_uarts=0 console=ttyS0,115200", tree2.findNode("/chosen").?.getStringProp("bootargs").?);
     // and without the KMS driver there is no simple-framebuffer node
     try std.testing.expect(tree2.findNode("/chosen/framebuffer@1c100000") == null);

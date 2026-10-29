@@ -25,7 +25,11 @@ const smp_mod = @import("smp.zig");
 /// Complete BCM2835 / BCM2837 SoC Bus & Peripherals.
 /// Directly satisfies the `Bus` concept required by `Arm1176(Bcm2835)`.
 pub const Bcm2835 = struct {
-    pub const RAM_SIZE: usize = 512 * 1024 * 1024;
+    /// The VideoCore bus's window onto SDRAM: bits 31:30 of a bus address pick a cache alias, the
+    /// rest address up to 1 GiB. Bus masters see RAM through this window (`vc_ram`).
+    pub const BUS_RAM_SIZE: usize = 1 << 30;
+    /// Where the BCM2837's peripherals start in the ARM's physical address space, hiding the RAM there.
+    pub const BCM2837_PERIPH_PHYS: u32 = 0x3f000000;
     pub const PERIPH_BASE: u32 = 0x20000000;
     pub const PERIPH_END: u32 = 0x21000000;
 
@@ -34,7 +38,11 @@ pub const Bcm2835 = struct {
     pub const INTC_BASE: u32 = 0x2000b200;
     pub const INTC_SIZE: u32 = 0x200;
 
+    /// RAM as the ARM sees it: the board's SDRAM below the peripherals.
     ram: []u8,
+    /// RAM as the VideoCore's bus masters (DMA, USB, V3D, HVS, mailbox) see it, indexed by a bus
+    /// address's low 30 bits; `ram` is its start.
+    vc_ram: []u8,
     is_bcm2837: bool = false,
 
     intc: intc_mod.IntController = .{},
@@ -90,6 +98,7 @@ pub const Bcm2835 = struct {
 
     pub fn initInPlace(self: *Bcm2835, ram: []u8, display_width: u16, display_height: u16) void {
         self.ram = ram;
+        self.vc_ram = ram;
         self.is_bcm2837 = false;
         self.intc = .{};
         self.local_intc = .{};
@@ -148,9 +157,19 @@ pub const Bcm2835 = struct {
         self.usb.hid.target_y = self.usb.hid.guest_y;
     }
 
+    /// Fits the memory map to a board with `ram_bytes` of SDRAM (after `is_bcm2837` is set), of which
+    /// the firmware gives the top `gpu_mem_bytes` to the VideoCore. The ARM sees the RAM below the
+    /// peripherals; the top 16 MiB of a 1 GiB BCM2837 board lies under them, in the VideoCore's share.
+    pub fn setBoardRam(self: *Bcm2835, ram_bytes: u32, gpu_mem_bytes: u32) void {
+        const arm_visible: u32 = @min(ram_bytes, if (self.is_bcm2837) BCM2837_PERIPH_PHYS else PERIPH_BASE);
+        self.ram = self.vc_ram[0..@min(arm_visible, self.vc_ram.len)];
+        self.mailbox.setMemorySplit(ram_bytes - gpu_mem_bytes, gpu_mem_bytes);
+    }
+
     pub fn init(ram: []u8, display_width: u16, display_height: u16) Bcm2835 {
         var soc = Bcm2835{
             .ram = ram,
+            .vc_ram = ram,
             .display_width = display_width,
             .display_height = display_height,
             .bsc2 = i2c_mod.BscController.init(true, display_width, display_height),
@@ -483,8 +502,8 @@ pub const Bcm2835 = struct {
         self.pv2.triggerVblank();
         self.smi.triggerVblank();
         self.hvs.notifyVblank();
-        self.usb.hid.syncCursorFeedback(self.hvs.getCursorHotspot(self.ram));
-        self.usb.tickSof(self.ram);
+        self.usb.hid.syncCursorFeedback(self.hvs.getCursorHotspot(self.vc_ram));
+        self.usb.tickSof(self.vc_ram);
         self.updateIrqs();
     }
 
@@ -517,8 +536,8 @@ pub const Bcm2835 = struct {
     /// Advances paced audio DMA channels (`vc4-hdmi` MAI and `bcm2835-pwm`) and VCHIQ `AUDS` completions.
     pub fn advanceAudio(self: *Bcm2835, elapsed_us: u64) void {
         if (elapsed_us == 0) return;
-        self.dma.advanceAudio(elapsed_us, self.hdmi.maiSampleRate(), self.ram, self.dmaMmio());
-        self.vchiq.advanceAudio(elapsed_us, self.ram);
+        self.dma.advanceAudio(elapsed_us, self.hdmi.maiSampleRate(), self.vc_ram, self.dmaMmio());
+        self.vchiq.advanceAudio(elapsed_us, self.vc_ram);
     }
 
     /// Samples the board `ACT` (green) and `PWR` (red) LED states for the 60 Hz UI frame.
@@ -561,7 +580,7 @@ pub const Bcm2835 = struct {
     /// Composites the current HDMI frame (`width * height` pixels of `0xFFRRGGBB`) from HVS or Mailbox FB.
     pub fn renderDisplayFrame(self: *const Bcm2835, out_argb: []u32, width: u32, height: u32) bool {
         if (!self.hdmi.connected) return false;
-        if (self.hvs.compositeFrame(self.ram, out_argb, width, height)) {
+        if (self.hvs.compositeFrame(self.vc_ram, out_argb, width, height)) {
             return true;
         }
         return self.renderMailboxFb(out_argb, width, height);
@@ -569,7 +588,7 @@ pub const Bcm2835 = struct {
 
     fn renderMailboxFb(self: *const Bcm2835, out_argb: []u32, width: u32, height: u32) bool {
         if (!self.mailbox.fb_allocated) return false;
-        const fb_phys = self.mailbox.fb_bus_addr & 0x1FFFFFFF;
+        const fb_phys = self.mailbox.fb_bus_addr & 0x3FFFFFFF;
         const fb_w = self.mailbox.fb_width;
         const fb_h = self.mailbox.fb_height;
         const bpp = self.mailbox.fb_depth / 8;
@@ -584,8 +603,8 @@ pub const Bcm2835 = struct {
         if (fb_w == width and fb_h == height and pitch == fb_w * bpp) {
             const total_px: usize = @as(usize, width) * @as(usize, height);
             const total_bytes: usize = total_px * bpp;
-            if (@as(usize, fb_phys) + total_bytes <= self.ram.len) {
-                const src_bytes = self.ram[fb_phys..][0..total_bytes];
+            if (@as(usize, fb_phys) + total_bytes <= self.vc_ram.len) {
+                const src_bytes = self.vc_ram[fb_phys..][0..total_bytes];
                 if (bpp == 2) {
                     var i: usize = 0;
                     while (i + 8 <= total_px) : (i += 8) {
@@ -619,11 +638,11 @@ pub const Bcm2835 = struct {
             for (0..width) |x| {
                 const sx = (@as(u32, @intCast(x)) * fb_w) / width;
                 const off = fb_phys + sy * pitch + sx * bpp;
-                if (off + bpp <= self.ram.len) {
+                if (off + bpp <= self.vc_ram.len) {
                     out_argb[y * width + x] = if (bpp == 2)
-                        fmt_mod.fromRgb565(std.mem.readInt(u16, self.ram[off..][0..2], .little))
+                        fmt_mod.fromRgb565(std.mem.readInt(u16, self.vc_ram[off..][0..2], .little))
                     else blk: {
-                        const p = std.mem.readInt(u32, self.ram[off..][0..4], .little);
+                        const p = std.mem.readInt(u32, self.vc_ram[off..][0..4], .little);
                         break :blk (if (rgb) swapRedBlue(p) else p) | 0xFF000000;
                     };
                 }
@@ -666,41 +685,41 @@ pub const Bcm2835 = struct {
                 if (!cpu_was_active) {
                     return .{ .active = true, .changed = false };
                 }
-                const h = self.hvs.computeActivePlanesHash(self.ram, width, height);
+                const h = self.hvs.computeActivePlanesHash(self.vc_ram, width, height);
                 if (h != 0 and h == self.last_display_hash) {
                     return .{ .active = true, .changed = false };
                 }
-                if (self.hvs.compositeFrame(self.ram, out_argb, width, height)) {
+                if (self.hvs.compositeFrame(self.vc_ram, out_argb, width, height)) {
                     self.last_display_hash = h;
                     self.last_display_was_hvs = true;
                     return .{ .active = true, .changed = true };
                 }
-            } else if (self.hvs.compositeFrame(self.ram, out_argb, width, height)) {
-                self.last_display_hash = self.hvs.computeActivePlanesHash(self.ram, width, height);
+            } else if (self.hvs.compositeFrame(self.vc_ram, out_argb, width, height)) {
+                self.last_display_hash = self.hvs.computeActivePlanesHash(self.vc_ram, width, height);
                 self.last_display_was_hvs = true;
                 return .{ .active = true, .changed = true };
             }
         }
 
         if (self.mailbox.fb_allocated) {
-            const fb_phys = self.mailbox.fb_bus_addr & 0x1FFFFFFF;
+            const fb_phys = self.mailbox.fb_bus_addr & 0x3FFFFFFF;
             const fb_w = self.mailbox.fb_width;
             const fb_h = self.mailbox.fb_height;
             const bpp = self.mailbox.fb_depth / 8;
             if (bpp >= 2 and fb_w > 0 and fb_h > 0) {
                 const fb_bytes: usize = @as(usize, self.mailbox.rowBytes()) * @as(usize, fb_h);
                 var h: u64 = 0;
-                if (@as(usize, fb_phys) + fb_bytes <= self.ram.len) {
+                if (@as(usize, fb_phys) + fb_bytes <= self.vc_ram.len) {
                     if (!force and !self.last_display_was_hvs and !v3d_dirty) {
                         if (!cpu_was_active and self.last_display_hash != 0) {
                             return .{ .active = true, .changed = false };
                         }
-                        h = std.hash.Wyhash.hash(0x517CC1B727220A95 ^ @as(u64, self.mailbox.fb_pixel_order), self.ram[fb_phys..][0..fb_bytes]);
+                        h = std.hash.Wyhash.hash(0x517CC1B727220A95 ^ @as(u64, self.mailbox.fb_pixel_order), self.vc_ram[fb_phys..][0..fb_bytes]);
                         if (h == self.last_display_hash) {
                             return .{ .active = true, .changed = false };
                         }
                     } else {
-                        h = std.hash.Wyhash.hash(0x517CC1B727220A95 ^ @as(u64, self.mailbox.fb_pixel_order), self.ram[fb_phys..][0..fb_bytes]);
+                        h = std.hash.Wyhash.hash(0x517CC1B727220A95 ^ @as(u64, self.mailbox.fb_pixel_order), self.vc_ram[fb_phys..][0..fb_bytes]);
                     }
                 }
                 if (self.renderMailboxFb(out_argb, width, height)) {
@@ -734,8 +753,8 @@ pub const Bcm2835 = struct {
     pub fn read8(self: *Bcm2835, raw_addr: u32) u8 {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x1FFFFFFF;
-            if (ram_off < self.ram.len) return self.ram[ram_off];
+            const ram_off = addr & 0x3FFFFFFF;
+            if (ram_off < self.vc_ram.len) return self.vc_ram[ram_off];
             return 0;
         }
         const word = self.cpuReadMmio32(addr & ~@as(u32, 3));
@@ -746,8 +765,8 @@ pub const Bcm2835 = struct {
     pub fn read16(self: *Bcm2835, raw_addr: u32) u16 {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x1FFFFFFF;
-            if (ram_off + 2 <= self.ram.len) return std.mem.readInt(u16, self.ram[ram_off..][0..2], .little);
+            const ram_off = addr & 0x3FFFFFFF;
+            if (ram_off + 2 <= self.vc_ram.len) return std.mem.readInt(u16, self.vc_ram[ram_off..][0..2], .little);
             return 0;
         }
         const word = self.cpuReadMmio32(addr & ~@as(u32, 3));
@@ -758,8 +777,8 @@ pub const Bcm2835 = struct {
     pub fn read32(self: *Bcm2835, raw_addr: u32) u32 {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x1FFFFFFF;
-            if (ram_off + 4 <= self.ram.len) return std.mem.readInt(u32, self.ram[ram_off..][0..4], .little);
+            const ram_off = addr & 0x3FFFFFFF;
+            if (ram_off + 4 <= self.vc_ram.len) return std.mem.readInt(u32, self.vc_ram[ram_off..][0..4], .little);
             return 0;
         }
         return self.cpuReadMmio32(addr & ~@as(u32, 3));
@@ -768,8 +787,8 @@ pub const Bcm2835 = struct {
     pub fn write8(self: *Bcm2835, raw_addr: u32, val: u8) void {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x1FFFFFFF;
-            if (ram_off < self.ram.len) self.ram[ram_off] = val;
+            const ram_off = addr & 0x3FFFFFFF;
+            if (ram_off < self.vc_ram.len) self.vc_ram[ram_off] = val;
             return;
         }
         self.cpuWriteMmio32(addr & ~@as(u32, 3), val);
@@ -778,8 +797,8 @@ pub const Bcm2835 = struct {
     pub fn write16(self: *Bcm2835, raw_addr: u32, val: u16) void {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x1FFFFFFF;
-            if (ram_off + 2 <= self.ram.len) std.mem.writeInt(u16, self.ram[ram_off..][0..2], val, .little);
+            const ram_off = addr & 0x3FFFFFFF;
+            if (ram_off + 2 <= self.vc_ram.len) std.mem.writeInt(u16, self.vc_ram[ram_off..][0..2], val, .little);
             return;
         }
         self.cpuWriteMmio32(addr & ~@as(u32, 3), val);
@@ -788,8 +807,8 @@ pub const Bcm2835 = struct {
     pub fn write32(self: *Bcm2835, raw_addr: u32, val: u32) void {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x1FFFFFFF;
-            if (ram_off + 4 <= self.ram.len) std.mem.writeInt(u32, self.ram[ram_off..][0..4], val, .little);
+            const ram_off = addr & 0x3FFFFFFF;
+            if (ram_off + 4 <= self.vc_ram.len) std.mem.writeInt(u32, self.vc_ram[ram_off..][0..4], val, .little);
             return;
         }
         self.cpuWriteMmio32(addr & ~@as(u32, 3), val);
@@ -893,7 +912,7 @@ pub const Bcm2835 = struct {
                     self.txp.write32(addr - hdmi_mod.Txp.BASE_ADDR, val);
                 },
                 .dma => {
-                    self.dma.write32(addr - dma_mod.DmaController.BASE_ADDR, val, self.ram, self.dmaMmio());
+                    self.dma.write32(addr - dma_mod.DmaController.BASE_ADDR, val, self.vc_ram, self.dmaMmio());
                     if (!self.dma.stepping) {
                         self.updateIrqsBank1();
                         self.updateIrqsBank2();
@@ -912,14 +931,14 @@ pub const Bcm2835 = struct {
                         self.vchiq.write32(
                             addr - audio_mod.Vchiq.BASE_ADDR,
                             val,
-                            self.ram,
+                            self.vc_ram,
                             &self.audio_fifo,
                             self.audio_connected,
                             self.hdmi.connected,
                         );
                         self.updateIrqsBank0();
                     } else if (addr -% mailbox_mod.Mailbox.BASE_ADDR < mailbox_mod.Mailbox.SIZE) {
-                        self.mailbox.write32WithContext(addr - mailbox_mod.Mailbox.BASE_ADDR, val, self.ram, .{
+                        self.mailbox.write32WithContext(addr - mailbox_mod.Mailbox.BASE_ADDR, val, self.vc_ram, .{
                             .vchiq = &self.vchiq,
                             .hdmi_connected = self.hdmi.connected,
                             .hdmi_edid = &self.bsc2.edid,
@@ -954,7 +973,7 @@ pub const Bcm2835 = struct {
                     self.sdhost.write32(offset, val);
                     if (!self.dma.stepping) {
                         if (offset == 0x00 and self.sdhost.dreqReady()) {
-                            self.dma.stepAllActive(self.ram, self.dmaMmio());
+                            self.dma.stepAllActive(self.vc_ram, self.dmaMmio());
                             self.updateIrqsBank1();
                         }
                         self.updateIrqsBank2();
@@ -964,7 +983,7 @@ pub const Bcm2835 = struct {
                     self.i2s.write32(addr - audio_mod.I2sPcm.BASE_ADDR, val, &self.audio_fifo, self.audio_connected);
                     if (!self.dma.stepping) {
                         if (self.i2s.rxDreqReady()) {
-                            self.dma.stepAllActive(self.ram, self.dmaMmio());
+                            self.dma.stepAllActive(self.vc_ram, self.dmaMmio());
                             self.updateIrqsBank1();
                         }
                         self.updateIrqsBank2();
@@ -974,7 +993,7 @@ pub const Bcm2835 = struct {
                     self.spi0.write32(addr - spi_mod.Spi0.BASE_ADDR, val);
                     if (!self.dma.stepping) {
                         if (self.spi0.txDreqReady() or self.spi0.rxDreqReady()) {
-                            self.dma.stepAllActive(self.ram, self.dmaMmio());
+                            self.dma.stepAllActive(self.vc_ram, self.dmaMmio());
                             self.updateIrqsBank1();
                         }
                         self.updateIrqsBank2();
@@ -1012,7 +1031,7 @@ pub const Bcm2835 = struct {
                     self.sdhci.write32WithSd(offset, val, &self.sdhost);
                     if (!self.dma.stepping) {
                         if (offset == 0x0c and self.sdhci.dreqReady()) {
-                            self.dma.stepAllActive(self.ram, self.dmaMmio());
+                            self.dma.stepAllActive(self.vc_ram, self.dmaMmio());
                             self.updateIrqsBank1();
                         }
                         self.updateIrqsBank2();
@@ -1041,11 +1060,11 @@ pub const Bcm2835 = struct {
                     self.hdmi.writeHdmi32(addr - hdmi_mod.Hdmi.HDMI_BASE, val);
                 },
                 .usb => {
-                    self.usb.write32(addr - dwc2_mod.Dwc2Controller.BASE_ADDR, val, self.ram);
+                    self.usb.write32(addr - dwc2_mod.Dwc2Controller.BASE_ADDR, val, self.vc_ram);
                     self.updateIrqsBank1();
                 },
                 .v3d => {
-                    self.v3d.write32(addr - v3d_mod.V3d.BASE_ADDR, val, self.ram);
+                    self.v3d.write32(addr - v3d_mod.V3d.BASE_ADDR, val, self.vc_ram);
                     self.updateIrqsBank1();
                 },
             }
@@ -1094,6 +1113,30 @@ test "Bcm2835 DMA block write to SDHOST (CMD24) completes without recursion" {
     try std.testing.expectEqual(@as(u32, 0xCAFEBABE), std.mem.readInt(u32, disk[512..516], .little));
     try std.testing.expectEqual(@as(u32, 0xDEADBEEF), std.mem.readInt(u32, disk[1020..1024], .little));
     try std.testing.expect(soc.dma.channelIrqPending(0));
+}
+
+test "Bcm2835 memory map follows the board's RAM" {
+    const ram = try std.heap.page_allocator.alloc(u8, Bcm2835.BUS_RAM_SIZE);
+    defer std.heap.page_allocator.free(ram);
+    var soc = Bcm2835.init(ram, 1280, 720);
+
+    // 512 MiB BCM2835: the ARM sees it all, below the peripherals at 0x20000000
+    soc.setBoardRam(512 * 1024 * 1024, 64 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 0x2000_0000), soc.ram.len);
+    try std.testing.expectEqual(@as(u32, 0x1c00_0000), soc.mailbox.vc_mem_base);
+    try std.testing.expectEqual(@as(u32, 0x5c10_0000), soc.mailbox.fb_bus_addr);
+
+    // 1 GiB BCM2837: the peripherals at 0x3f000000 hide the top 16 MiB from the ARM
+    soc.is_bcm2837 = true;
+    soc.setBoardRam(1024 * 1024 * 1024, 64 * 1024 * 1024);
+    try std.testing.expectEqual(@as(usize, 0x3f00_0000), soc.ram.len);
+    try std.testing.expectEqual(@as(u32, 0x3c00_0000), soc.mailbox.vc_mem_base);
+    try std.testing.expectEqual(@as(u32, 0x0400_0000), soc.mailbox.vc_mem_size);
+    try std.testing.expectEqual(@as(u32, 0x7c10_0000), soc.mailbox.fb_bus_addr);
+
+    // A bus master reaches RAM above 512 MiB through the 0xc0000000 alias
+    std.mem.writeInt(u32, ram[0x3000_0010..][0..4], 0x1234_5678, .little);
+    try std.testing.expectEqual(@as(u32, 0x1234_5678), soc.read32(0xf000_0010));
 }
 
 test "Bcm2835 cyclic vc4-hdmi audio DMA (PERMAP 17 -> HD_MAI_DATA) unpacks IEC958 stereo frames" {

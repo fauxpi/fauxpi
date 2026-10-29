@@ -271,7 +271,7 @@ pub const Hvs = struct {
 
                 const ptr0_idx = if (unity) idx + 4 else idx + 5;
                 if (src_w > 0 and src_h > 0 and dst_w > 0 and dst_h > 0 and ptr0_idx + 2 < DLIST_WORDS) {
-                    const ptr0 = self.dlist[ptr0_idx] & 0x1FFFFFFF;
+                    const ptr0 = self.dlist[ptr0_idx] & 0x3FFFFFFF;
                     const pitch0 = self.dlist[ptr0_idx + 2];
                     const is_565 = (pix_fmt == 0) or (pix_fmt == 4);
                     const cpp: u32 = if (is_565) 2 else 4;
@@ -496,7 +496,7 @@ pub const Hvs = struct {
 
         const ptr0_idx = if (unity) idx + 4 else idx + 5;
         if (ptr0_idx + 2 >= DLIST_WORDS) return;
-        const ptr0 = self.dlist[ptr0_idx] & 0x1FFFFFFF;
+        const ptr0 = self.dlist[ptr0_idx] & 0x3FFFFFFF;
         const pitch0 = self.dlist[ptr0_idx + 2];
 
         const raw_pitch: u32 = pitch0 & 0xffff;
@@ -871,7 +871,7 @@ pub const Hvs = struct {
 
                 const ptr0_idx = if (unity) idx + 4 else idx + 5;
                 if (unity and tiling == 0 and src_w > 0 and src_w <= 32 and src_h > 0 and src_h <= 32 and ptr0_idx + 2 < DLIST_WORDS) {
-                    const ptr0 = self.dlist[ptr0_idx] & 0x1FFFFFFF;
+                    const ptr0 = self.dlist[ptr0_idx] & 0x3FFFFFFF;
                     const pitch0 = self.dlist[ptr0_idx + 2] & 0xffff;
                     if (pitch0 == 128) {
                         const bo_base = ptr0 & ~@as(u32, 0xfff);

@@ -260,7 +260,7 @@ pub fn detileTextureToBgra(ram: []const u8, cfg: Config, out_bgra: []u32) void {
     const total_px = @as(usize, w) * @as(usize, h);
     if (w == 0 or h == 0 or out_bgra.len < total_px) return;
 
-    const base = cfg.offset & 0x1FFFFFFF;
+    const base = cfg.offset & 0x3FFFFFFF;
 
     // Fast path 1: Linear 32-bit RGBA32R
     if (cfg.type == .rgba32r) {
@@ -524,7 +524,7 @@ test "detileTextureToBgra matches per-texel reference across T-tiled, LT-tiled, 
             else => .argb8888,
         };
         const cpp = fmt.bytesPerPixel();
-        const base = cfg.offset & 0x1FFFFFFF;
+        const base = cfg.offset & 0x3FFFFFFF;
 
         for (0..h) |y| {
             for (0..w) |x| {
