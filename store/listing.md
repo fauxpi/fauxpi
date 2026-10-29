@@ -27,10 +27,10 @@ own copy wins after it is edited there. These files are the dashboard's
 copy, so they can say more than the snap's one-paragraph description and
 the AppStream metadata in `data/`.
 
-`icon.png` is `data/io.github.robert_ancell.FauxPi.svg` drawn at 256 × 256:
+`icon.png` is `data/io.github.fauxpi.Fauxpi.svg` drawn at 256 × 256:
 
 ```sh
-inkscape data/io.github.robert_ancell.FauxPi.svg --export-type=png \
+inkscape data/io.github.fauxpi.Fauxpi.svg --export-type=png \
   --export-width=256 --export-height=256 --export-filename=store/snapcraft/icon.png
 ```
 

@@ -21,7 +21,7 @@ issues: https://github.com/robert-ancell/fauxpi/issues
 contact: https://github.com/robert-ancell/fauxpi/issues
 grade: stable
 confinement: strict
-icon: data/io.github.robert_ancell.FauxPi.svg
+icon: data/io.github.fauxpi.Fauxpi.svg
 
 # FauxPi loads its audio libraries with dlopen, which the linter can't see
 lint:
@@ -54,8 +54,8 @@ apps:
     command-chain:
       - bin/desktop-sockets
       - bin/gpu-2404-wrapper
-    desktop: usr/share/applications/io.github.robert_ancell.FauxPi.desktop
-    common-id: io.github.robert_ancell.FauxPi
+    desktop: usr/share/applications/io.github.fauxpi.Fauxpi.desktop
+    common-id: io.github.fauxpi.Fauxpi
     environment:
       XDG_DATA_HOME: $SNAP_USER_DATA/.local/share
       LD_LIBRARY_PATH: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR:$SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pulseaudio${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
@@ -83,12 +83,12 @@ parts:
       - libasound2t64
     override-build: |
       ./scripts/zig build -Doptimize=ReleaseFast --prefix "$CRAFT_PART_INSTALL/usr"
-      install -Dm644 data/io.github.robert_ancell.FauxPi.desktop \
-        "$CRAFT_PART_INSTALL/usr/share/applications/io.github.robert_ancell.FauxPi.desktop"
-      install -Dm644 data/io.github.robert_ancell.FauxPi.svg \
-        "$CRAFT_PART_INSTALL/usr/share/icons/hicolor/scalable/apps/io.github.robert_ancell.FauxPi.svg"
-      install -Dm644 data/io.github.robert_ancell.FauxPi.metainfo.xml \
-        "$CRAFT_PART_INSTALL/usr/share/metainfo/io.github.robert_ancell.FauxPi.metainfo.xml"
+      install -Dm644 data/io.github.fauxpi.Fauxpi.desktop \
+        "$CRAFT_PART_INSTALL/usr/share/applications/io.github.fauxpi.Fauxpi.desktop"
+      install -Dm644 data/io.github.fauxpi.Fauxpi.svg \
+        "$CRAFT_PART_INSTALL/usr/share/icons/hicolor/scalable/apps/io.github.fauxpi.Fauxpi.svg"
+      install -Dm644 data/io.github.fauxpi.Fauxpi.metainfo.xml \
+        "$CRAFT_PART_INSTALL/usr/share/metainfo/io.github.fauxpi.Fauxpi.metainfo.xml"
 
   gpu-2404:
     after: [fauxpi]

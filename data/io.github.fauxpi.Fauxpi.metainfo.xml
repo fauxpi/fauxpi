@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.robert_ancell.FauxPi</id>
+  <id>io.github.fauxpi.Fauxpi</id>
   <name>FauxPi</name>
   <summary>Raspberry Pi hardware simulator</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
-  <developer id="io.github.robert_ancell">
+  <developer id="io.github.fauxpi">
     <name>FauxPi Contributors</name>
   </developer>
   <description>
@@ -21,7 +21,7 @@
       <li>USB HID keyboard/mouse, user-mode NAT Ethernet &amp; Wi-Fi, and HDMI/PWM audio</li>
     </ul>
   </description>
-  <launchable type="desktop-id">io.github.robert_ancell.FauxPi.desktop</launchable>
+  <launchable type="desktop-id">io.github.fauxpi.Fauxpi.desktop</launchable>
   <url type="homepage">https://github.com/robert-ancell/fauxpi</url>
   <url type="bugtracker">https://github.com/robert-ancell/fauxpi/issues</url>
   <url type="vcs-browser">https://github.com/robert-ancell/fauxpi</url>

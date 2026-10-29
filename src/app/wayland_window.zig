@@ -188,8 +188,9 @@ pub const WaylandWindow = struct {
             m.string(win.ui.title).end();
         }
         {
+            // The desktop file's ID, so the shell shows the window with FauxPi's name and icon
             var m = try win.toplevel.request(protocol.xdg_toplevel.request.set_app_id);
-            m.string("fauxpi").end();
+            m.string("io.github.fauxpi.Fauxpi").end();
         }
         {
             var m = try win.surface.request(protocol.wl_surface.request.commit);
