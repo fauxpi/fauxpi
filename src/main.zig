@@ -154,16 +154,37 @@ fn parseHdmiSize(spec: []const u8) ?struct { width: u16, height: u16 } {
     return .{ .width = w, .height = h };
 }
 
-fn printUsage() void {
-    const msg =
+/// Whether FauxPi runs in a snap or Flatpak sandbox, where it can open only the files the user
+/// picks through the desktop's file chooser, so not an SD card image named on the command line.
+fn isSandboxed(environ: std.process.Environ) bool {
+    if (builtin.os.tag == .linux) {
+        return std.process.Environ.getPosix(environ, "SNAP_NAME") != null or
+            std.process.Environ.getPosix(environ, "FLATPAK_ID") != null;
+    } else return false;
+}
+
+fn printUsage(sandboxed: bool) void {
+    host_posix.writeStdout(
         \\Usage: fauxpi [options]
         \\
         \\Options:
+        \\
+    );
+    if (!sandboxed) host_posix.writeStdout(
         \\  --sd <path>         Insert a Raspberry Pi SD card image (FAT32 + rootfs)
+        \\
+    );
+    host_posix.writeStdout(
         \\  --power             Start with the 5V power supply connected
         \\  --model <model>     Board to emulate: zero, zero-w, zero-2-w, 1a+, 1b+, 3a+, 3b+ (default)
         \\  --hdmi-size <WxH>   HDMI output size in pixels (default: 1280x720)
-        \\  --headless          Run without opening a desktop window
+        \\
+    );
+    if (!sandboxed) host_posix.writeStdout(
+        \\  --headless          Run without opening a desktop window (needs --sd)
+        \\
+    );
+    host_posix.writeStdout(
         \\  --max-steps <n>     Stop simulation after <n> ARM instructions
         \\  --clock <mode>      Guest clock: realtime (default) follows the host clock; instructions
         \\                      counts executed instructions and skips idle time (reproducible --max-steps runs)
@@ -171,8 +192,7 @@ fn printUsage() void {
         \\  --strict            Stop if the guest uses firmware calls or peripherals fauxpi does not emulate
         \\  --help              Show this help message
         \\
-    ;
-    host_posix.writeStdout(msg);
+    );
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -187,18 +207,23 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         init.args.iterate();
     defer if (builtin.os.tag == .windows) args.deinit();
     _ = args.next(); // program name
+    const sandboxed = isSandboxed(init.environ);
 
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--sd")) {
+        if (sandboxed and (std.mem.eql(u8, arg, "--sd") or std.mem.eql(u8, arg, "--headless"))) {
+            std.debug.print("{s} is not available in the snap or Flatpak, which can't open SD card images named " ++
+                "on the command line: choose the card in FauxPi's window instead\n", .{arg});
+            return 1;
+        } else if (std.mem.eql(u8, arg, "--sd")) {
             opts.sd_path = args.next() orelse {
-                printUsage();
+                printUsage(sandboxed);
                 return 1;
             };
         } else if (std.mem.eql(u8, arg, "--power")) {
             opts.power = true;
         } else if (std.mem.eql(u8, arg, "--model")) {
             const m = args.next() orelse {
-                printUsage();
+                printUsage(sandboxed);
                 return 1;
             };
             if (std.mem.eql(u8, m, "zero") or std.mem.eql(u8, m, "pi_zero")) {
@@ -221,7 +246,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             }
         } else if (std.mem.eql(u8, arg, "--hdmi-size")) {
             const s = args.next() orelse {
-                printUsage();
+                printUsage(sandboxed);
                 return 1;
             };
             const sz = parseHdmiSize(s) orelse {
@@ -237,7 +262,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             opts.max_steps = std.fmt.parseInt(u64, s, 10) catch return 1;
         } else if (std.mem.eql(u8, arg, "--clock")) {
             const c = args.next() orelse {
-                printUsage();
+                printUsage(sandboxed);
                 return 1;
             };
             opts.clock = std.meta.stringToEnum(ClockMode, c) orelse {
@@ -249,11 +274,11 @@ pub fn main(init: std.process.Init.Minimal) u8 {
         } else if (std.mem.eql(u8, arg, "--strict")) {
             opts.strict = true;
         } else if (std.mem.eql(u8, arg, "--help")) {
-            printUsage();
+            printUsage(sandboxed);
             return 0;
         } else {
             std.debug.print("Unknown option: {s}\n", .{arg});
-            printUsage();
+            printUsage(sandboxed);
             return 1;
         }
     }
@@ -262,7 +287,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
     host_posix.deterministic_random = opts.clock == .instructions;
 
     if (opts.headless and opts.sd_path == null) {
-        printUsage();
+        printUsage(sandboxed);
         return 1;
     }
 

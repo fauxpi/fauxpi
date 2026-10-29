@@ -65,7 +65,6 @@ apps:
       - opengl
       - audio-playback
       - network
-      - home
 
 parts:
   fauxpi:
