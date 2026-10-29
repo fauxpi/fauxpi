@@ -577,6 +577,8 @@ pub const Bcm2835 = struct {
         if (bpp < 2 or fb_w == 0 or fb_h == 0 or out_argb.len < width * height) return false;
 
         const fmt_mod = @import("../vc4/format.zig");
+        // 32bpp pixels are B, G, R in memory unless the guest set the RGB pixel order
+        const rgb = self.mailbox.fb_pixel_order == 1;
 
         // Fast path: 1:1 unscaled, packed Mailbox framebuffer (8-wide SIMD)
         if (fb_w == width and fb_h == height and pitch == fb_w * bpp) {
@@ -599,11 +601,13 @@ pub const Bcm2835 = struct {
                     const opaque_mask8: @Vector(8, u32) = @splat(0xFF000000);
                     var i: usize = 0;
                     while (i + 8 <= total_px) : (i += 8) {
-                        const src_v: @Vector(8, u32) = @bitCast(src_bytes[i * 4 ..][0..32].*);
+                        var src_v: @Vector(8, u32) = @bitCast(src_bytes[i * 4 ..][0..32].*);
+                        if (rgb) src_v = swapRedBlueVec8(src_v);
                         out_argb[i..][0..8].* = @bitCast(src_v | opaque_mask8);
                     }
                     while (i < total_px) : (i += 1) {
-                        out_argb[i] = std.mem.readInt(u32, src_bytes[i * 4 ..][0..4], .little) | 0xFF000000;
+                        const p = std.mem.readInt(u32, src_bytes[i * 4 ..][0..4], .little);
+                        out_argb[i] = (if (rgb) swapRedBlue(p) else p) | 0xFF000000;
                     }
                     return true;
                 }
@@ -618,12 +622,24 @@ pub const Bcm2835 = struct {
                 if (off + bpp <= self.ram.len) {
                     out_argb[y * width + x] = if (bpp == 2)
                         fmt_mod.fromRgb565(std.mem.readInt(u16, self.ram[off..][0..2], .little))
-                    else
-                        std.mem.readInt(u32, self.ram[off..][0..4], .little) | 0xFF000000;
+                    else blk: {
+                        const p = std.mem.readInt(u32, self.ram[off..][0..4], .little);
+                        break :blk (if (rgb) swapRedBlue(p) else p) | 0xFF000000;
+                    };
                 }
             }
         }
         return true;
+    }
+
+    fn swapRedBlue(p: u32) u32 {
+        return (p & 0xFF00FF00) | ((p & 0xFF) << 16) | ((p >> 16) & 0xFF);
+    }
+
+    fn swapRedBlueVec8(v: @Vector(8, u32)) @Vector(8, u32) {
+        const ga: @Vector(8, u32) = @splat(0xFF00FF00);
+        const lo: @Vector(8, u32) = @splat(0xFF);
+        return (v & ga) | ((v & lo) << @splat(16)) | ((v >> @splat(16)) & lo);
     }
 
     /// Composites the current HDMI frame only if the display list, V3D output, or scanout RAM changed.
@@ -679,12 +695,12 @@ pub const Bcm2835 = struct {
                         if (!cpu_was_active and self.last_display_hash != 0) {
                             return .{ .active = true, .changed = false };
                         }
-                        h = std.hash.Wyhash.hash(0x517CC1B727220A95, self.ram[fb_phys..][0..fb_bytes]);
+                        h = std.hash.Wyhash.hash(0x517CC1B727220A95 ^ @as(u64, self.mailbox.fb_pixel_order), self.ram[fb_phys..][0..fb_bytes]);
                         if (h == self.last_display_hash) {
                             return .{ .active = true, .changed = false };
                         }
                     } else {
-                        h = std.hash.Wyhash.hash(0x517CC1B727220A95, self.ram[fb_phys..][0..fb_bytes]);
+                        h = std.hash.Wyhash.hash(0x517CC1B727220A95 ^ @as(u64, self.mailbox.fb_pixel_order), self.ram[fb_phys..][0..fb_bytes]);
                     }
                 }
                 if (self.renderMailboxFb(out_argb, width, height)) {
@@ -1361,3 +1377,40 @@ test "Bcm2835 renderDisplayFrameIfChanged dirty-frame detection and SIMD Mailbox
 
 
 
+
+test "Bcm2835 Mailbox FB scanout follows the pixel order" {
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 16 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    const w: u16 = 16;
+    const h: u16 = 8;
+    var soc = Bcm2835.init(ram, w, h);
+    var out: [16 * 8]u32 = @splat(0);
+
+    soc.mailbox.fb_allocated = true;
+    soc.mailbox.fb_bus_addr = 0x40001000;
+    soc.mailbox.fb_width = w;
+    soc.mailbox.fb_height = h;
+    soc.mailbox.fb_depth = 32;
+    // Pure red written as bytes R, G, B, X
+    for ([_]usize{ 0, 9 }) |px| @memcpy(ram[0x1000 + px * 4 ..][0..4], &[_]u8{ 0xff, 0x00, 0x00, 0x00 });
+
+    // Default BGR order: byte 0 is blue
+    try std.testing.expectEqual(@as(u32, 0), soc.mailbox.fb_pixel_order);
+    try std.testing.expect(soc.renderDisplayFrameIfChanged(&out, w, h, true, true).changed);
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), out[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), out[9]);
+
+    // RGB order: byte 0 is red, and changing the order alone redraws the frame
+    soc.mailbox.fb_pixel_order = 1;
+    try std.testing.expect(soc.renderDisplayFrameIfChanged(&out, w, h, false, true).changed);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), out[0]);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), out[9]);
+
+    // Scaled scanout path honours it too
+    var big: [32 * 16]u32 = @splat(0);
+    try std.testing.expect(soc.renderDisplayFrame(&big, 32, 16));
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), big[0]);
+}

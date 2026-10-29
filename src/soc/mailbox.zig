@@ -39,7 +39,8 @@ pub const Mailbox = struct {
     fb_virt_width: u32 = 1280,
     fb_virt_height: u32 = 720,
     fb_depth: u32 = 32,
-    fb_pixel_order: u32 = 1, // RGB
+    // 0 = BGR (bytes B, G, R in memory: x8r8g8b8), the firmware default; 1 = RGB (bytes R, G, B)
+    fb_pixel_order: u32 = 0,
     fb_alpha_mode: u32 = 0,
     fb_virt_x: u32 = 0,
     fb_virt_y: u32 = 0,
