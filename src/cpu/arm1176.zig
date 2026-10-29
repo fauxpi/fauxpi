@@ -1844,6 +1844,18 @@ pub fn Arm1176(comptime Bus: type) type {
             const new_mode: u5 = @truncate(new_cpsr & 0x1f);
             self.switchMode(new_mode);
             self.cpsr = new_cpsr;
+            if ((new_cpsr & PsrFlags.E) != 0) self.yield_slice = true;
+        }
+
+        /// Sets `CPSR.E`. Big-endian data accesses run outside the pre-decoded loop and the JIT,
+        /// which access RAM directly, so leave the current slice.
+        fn setDataEndianness(self: *Self, big: bool) void {
+            if (big) {
+                self.cpsr |= PsrFlags.E;
+                self.yield_slice = true;
+            } else {
+                self.cpsr &= ~PsrFlags.E;
+            }
         }
 
         fn readUserReg(self: *const Self, reg: u4) u32 {
@@ -1882,8 +1894,9 @@ pub fn Arm1176(comptime Bus: type) type {
             self.setSpsr(saved_cpsr);
             self.r[14] = lr_val;
 
-            // Clear T (enter ARM state), set I (disable IRQ), set A on abort/irq
-            self.cpsr &= ~PsrFlags.T;
+            // Clear T (enter ARM state), set I (disable IRQ), set A on abort/irq, E from SCTLR.EE
+            self.cpsr &= ~(PsrFlags.T | PsrFlags.E);
+            if ((self.mmu.sctlr & (1 << 25)) != 0) self.cpsr |= PsrFlags.E;
             self.cpsr |= PsrFlags.I;
             if (disable_fiq) self.cpsr |= PsrFlags.F;
             if (target_mode == .abt or target_mode == .irq or target_mode == .fiq) {
@@ -1931,7 +1944,19 @@ pub fn Arm1176(comptime Bus: type) type {
 
         // --- Memory Access via SoftMMU & Bus ---
 
+        /// Data load; with `CPSR.E` set (`SETEND BE`) the bytes are reversed.
         pub inline fn read64(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u64 {
+            if ((self.cpsr & PsrFlags.E) != 0) return self.read64BigEndian(bus, vaddr);
+            return self.read64Le(bus, vaddr);
+        }
+
+        noinline fn read64BigEndian(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u64 {
+            const lo: u64 = @byteSwap(try self.read32Le(bus, vaddr));
+            const hi: u64 = @byteSwap(try self.read32Le(bus, vaddr +% 4));
+            return lo | (hi << 32);
+        }
+
+        inline fn read64Le(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u64 {
             const priv: u1 = @intFromBool(self.isPrivileged());
             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
             if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
@@ -1942,8 +1967,8 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         noinline fn read64Slow(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u64 {
-            const lo: u64 = try self.read32(bus, vaddr);
-            const hi: u64 = try self.read32(bus, vaddr +% 4);
+            const lo: u64 = try self.read32Le(bus, vaddr);
+            const hi: u64 = try self.read32Le(bus, vaddr +% 4);
             return lo | (hi << 32);
         }
 
@@ -1984,7 +2009,18 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
+        /// Data store; with `CPSR.E` set (`SETEND BE`) the bytes are reversed.
         pub inline fn write64(self: *Self, bus: *Bus, vaddr: u32, val: u64) error{Abort}!void {
+            if ((self.cpsr & PsrFlags.E) != 0) return self.write64BigEndian(bus, vaddr, val);
+            return self.write64Le(bus, vaddr, val);
+        }
+
+        noinline fn write64BigEndian(self: *Self, bus: *Bus, vaddr: u32, val: u64) error{Abort}!void {
+            try self.write32Le(bus, vaddr, @byteSwap(@as(u32, @truncate(val))));
+            try self.write32Le(bus, vaddr +% 4, @byteSwap(@as(u32, @truncate(val >> 32))));
+        }
+
+        inline fn write64Le(self: *Self, bus: *Bus, vaddr: u32, val: u64) error{Abort}!void {
             const priv: u1 = @intFromBool(self.isPrivileged());
             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
             if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
@@ -1996,11 +2032,21 @@ pub fn Arm1176(comptime Bus: type) type {
         }
 
         noinline fn write64Slow(self: *Self, bus: *Bus, vaddr: u32, val: u64) error{Abort}!void {
-            try self.write32(bus, vaddr, @truncate(val));
-            try self.write32(bus, vaddr +% 4, @truncate(val >> 32));
+            try self.write32Le(bus, vaddr, @truncate(val));
+            try self.write32Le(bus, vaddr +% 4, @truncate(val >> 32));
         }
 
+        /// Data load; with `CPSR.E` set (`SETEND BE`) the bytes are reversed.
         pub inline fn read32(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u32 {
+            if ((self.cpsr & PsrFlags.E) != 0) return self.read32BigEndian(bus, vaddr);
+            return self.read32Le(bus, vaddr);
+        }
+
+        noinline fn read32BigEndian(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u32 {
+            return @byteSwap(try self.read32Le(bus, vaddr));
+        }
+
+        inline fn read32Le(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u32 {
             const priv: u1 = @intFromBool(self.isPrivileged());
             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
             if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
@@ -2032,7 +2078,17 @@ pub fn Arm1176(comptime Bus: type) type {
             return aligned_val;
         }
 
+        /// Data store; with `CPSR.E` set (`SETEND BE`) the bytes are reversed.
         pub inline fn write32(self: *Self, bus: *Bus, vaddr: u32, val: u32) error{Abort}!void {
+            if ((self.cpsr & PsrFlags.E) != 0) return self.write32BigEndian(bus, vaddr, val);
+            return self.write32Le(bus, vaddr, val);
+        }
+
+        noinline fn write32BigEndian(self: *Self, bus: *Bus, vaddr: u32, val: u32) error{Abort}!void {
+            return self.write32Le(bus, vaddr, @byteSwap(val));
+        }
+
+        inline fn write32Le(self: *Self, bus: *Bus, vaddr: u32, val: u32) error{Abort}!void {
             const priv: u1 = @intFromBool(self.isPrivileged());
             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
             if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
@@ -2059,7 +2115,17 @@ pub fn Arm1176(comptime Bus: type) type {
             bus.write32(paddr & ~@as(u32, 3), val);
         }
 
+        /// Data load; with `CPSR.E` set (`SETEND BE`) the bytes are reversed.
         pub inline fn read16(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u16 {
+            if ((self.cpsr & PsrFlags.E) != 0) return self.read16BigEndian(bus, vaddr);
+            return self.read16Le(bus, vaddr);
+        }
+
+        noinline fn read16BigEndian(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u16 {
+            return @byteSwap(try self.read16Le(bus, vaddr));
+        }
+
+        inline fn read16Le(self: *Self, bus: *Bus, vaddr: u32) error{Abort}!u16 {
             const priv: u1 = @intFromBool(self.isPrivileged());
             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
             if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
@@ -2082,7 +2148,17 @@ pub fn Arm1176(comptime Bus: type) type {
             return bus.read16(paddr);
         }
 
+        /// Data store; with `CPSR.E` set (`SETEND BE`) the bytes are reversed.
         pub inline fn write16(self: *Self, bus: *Bus, vaddr: u32, val: u16) error{Abort}!void {
+            if ((self.cpsr & PsrFlags.E) != 0) return self.write16BigEndian(bus, vaddr, val);
+            return self.write16Le(bus, vaddr, val);
+        }
+
+        noinline fn write16BigEndian(self: *Self, bus: *Bus, vaddr: u32, val: u16) error{Abort}!void {
+            return self.write16Le(bus, vaddr, @byteSwap(val));
+        }
+
+        inline fn write16Le(self: *Self, bus: *Bus, vaddr: u32, val: u16) error{Abort}!void {
             const priv: u1 = @intFromBool(self.isPrivileged());
             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
             if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
@@ -2473,6 +2549,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
             _ = self.checkInterrupts(bus);
             if (self.mmu.halted_wfi) return 0;
+            if ((self.cpsr & PsrFlags.E) != 0) return self.runBigEndianSteps(bus, max_steps);
 
             self.yield_slice = false;
             self.spin_wait_count = 0;
@@ -2500,6 +2577,7 @@ pub fn Arm1176(comptime Bus: type) type {
                 if (executed >= max_steps) {
                     if (executed >= limit or (self.cpsr & PsrFlags.I) == 0) break;
                 }
+                if ((self.cpsr & PsrFlags.E) != 0) break;
                 if (atomic_ram.shouldWakeWfi(bus)) {
                     self.yield_slice = true;
                     break :step_loop;
@@ -4640,6 +4718,23 @@ pub fn Arm1176(comptime Bus: type) type {
             return executed;
         }
 
+        /// Runs instructions one at a time through the generic interpreter while `CPSR.E` is set.
+        noinline fn runBigEndianSteps(self: *Self, bus: *Bus, max_steps: usize) usize {
+            var executed: usize = 0;
+            defer {
+                self.cycles +%= executed;
+                self.mmu.pmccntr +%= @truncate(executed);
+            }
+            while (executed < max_steps and (self.cpsr & PsrFlags.E) != 0) {
+                self.stepOne(bus);
+                executed += 1;
+                _ = self.checkInterrupts(bus);
+                if (self.mmu.halted_wfi) break;
+            }
+            self.yield_slice = false;
+            return executed;
+        }
+
         pub inline fn stepOne(self: *Self, bus: *Bus) void {
             if (self.is_aarch64) {
                 aarch64_mod.Aarch64Exec(Self, Bus).step64(self, bus);
@@ -4791,6 +4886,9 @@ pub fn Arm1176(comptime Bus: type) type {
                         const new_mode: u5 = @truncate(inst & 0x1f);
                         self.switchMode(new_mode);
                     }
+                } else if ((inst & 0x000f_fdff) == 0x0001_0000) {
+                    // SETEND: data accesses become big-endian (E = 1) or little-endian (E = 0)
+                    self.setDataEndianness((inst & (1 << 9)) != 0);
                 }
                 return;
             }
@@ -5616,8 +5714,9 @@ pub fn Arm1176(comptime Bus: type) type {
             const user_bank = s and (!l or (reg_list & (1 << 15)) == 0);
             const priv: u1 = @intFromBool(self.isPrivileged());
 
+            const little_endian = (self.cpsr & PsrFlags.E) == 0;
             if (l) {
-                if (!user_bank and count > 0) {
+                if (!user_bank and count > 0 and little_endian) {
                     const last_addr = start_addr +% total_bytes -% 4;
                     const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
                     if ((start_addr & ~@as(u32, 0xffc)) == slot.r_vbase and
@@ -5679,7 +5778,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     }
                 }
             } else {
-                if (!user_bank and count > 0) {
+                if (!user_bank and count > 0 and little_endian) {
                     const last_addr = start_addr +% total_bytes -% 4;
                     const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
                     if ((start_addr & ~@as(u32, 0xffc)) == slot.w_vbase and
@@ -8474,4 +8573,128 @@ test "ARM1176 runs glibc's ARMv6 strlen (LDRD post-index, UQSUB8, REV, CLZ)" {
             };
         }
     }
+}
+
+test "ARM1176 unaligned word and halfword access with SCTLR.U" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+    for (ram, 0..) |*b, i| b.* = @truncate(i);
+
+    // 0x1000: ldr r2, [r0]           0x1004: ldr r3, [r0, #4]      0x1008: ldr r4, [r0], #4
+    // 0x100c: ldr r5, [r0, r1]       0x1010: ldrh r6, [r0, #1]     0x1014: ldr r7, [r0, #8]!
+    const prog = [_]u32{ 0xe5902000, 0xe5903004, 0xe4904004, 0xe7905001, 0xe1d060b1, 0xe5b07008 };
+    for (0..4) |alignment| {
+        for (prog, 0..) |inst, i| std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+        var bus: TestBus = .{ .ram = ram };
+        var cpu: Arm1176(TestBus) = .{};
+        cpu.initReset(0x1000, 0, 0xffffffff, 0x2000);
+        cpu.mmu.sctlr |= 1 << 22;
+        const base: u32 = 0x4001 + @as(u32, @intCast(alignment));
+        cpu.r[0] = base;
+        cpu.r[1] = 3;
+        _ = cpu.runSteps(&bus, prog.len);
+        const at = struct {
+            fn word(r: []const u8, a: u32) u32 {
+                return std.mem.readInt(u32, r[a..][0..4], .little);
+            }
+        };
+        try std.testing.expectEqual(at.word(ram, base), cpu.r[2]);
+        try std.testing.expectEqual(at.word(ram, base + 4), cpu.r[3]);
+        try std.testing.expectEqual(at.word(ram, base), cpu.r[4]);
+        try std.testing.expectEqual(at.word(ram, base + 4 + 3), cpu.r[5]);
+        try std.testing.expectEqual(@as(u32, std.mem.readInt(u16, ram[base + 5 ..][0..2], .little)), cpu.r[6]);
+        try std.testing.expectEqual(at.word(ram, base + 12), cpu.r[7]);
+        try std.testing.expectEqual(base + 12, cpu.r[0]);
+    }
+}
+
+test "ARM1176 SETEND switches data accesses to big-endian" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+    @memset(ram, 0);
+    @memcpy(ram[0x4000..0x4010], &[_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00 });
+
+    // 0x1000: setend be                0x1004: ldr r1, [r0]            0x1008: ldrh r2, [r0, #2]
+    // 0x100c: ldrd r4, r5, [r0]        0x1010: ldm r0, {r6, r7, r8}    0x1014: str r1, [r0, #16]
+    // 0x1018: setend le                0x101c: ldr r9, [r0]            0x1020: ldr r10, [r0, #16]
+    // 0x1024: b .
+    const prog = [_]u32{ 0xf1010200, 0xe5901000, 0xe1d020b2, 0xe1c040d0, 0xe89001c0, 0xe5801010, 0xf1010000, 0xe5909000, 0xe590a010, 0xeafffffe };
+    for (prog, 0..) |inst, i| std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+
+    var bus: TestBus = .{ .ram = ram };
+    var cpu: Arm1176(TestBus) = .{};
+    cpu.initReset(0x1000, 0, 0xffffffff, 0x2000);
+    cpu.r[0] = 0x4000;
+    var steps: usize = 0;
+    while (cpu.r[15] != 0x1024 and steps < 100) : (steps += 1) _ = cpu.runSteps(&bus, 1);
+
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), cpu.r[1]);
+    try std.testing.expectEqual(@as(u32, 0x3344), cpu.r[2]);
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), cpu.r[4]);
+    try std.testing.expectEqual(@as(u32, 0x5566_7788), cpu.r[5]);
+    try std.testing.expectEqual(@as(u32, 0x1122_3344), cpu.r[6]);
+    try std.testing.expectEqual(@as(u32, 0x99aa_bbcc), cpu.r[8]);
+    // Stored big-endian, then read back little-endian after SETEND LE
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 0x11, 0x22, 0x33, 0x44 }, ram[0x4010..0x4014]);
+    try std.testing.expectEqual(@as(u32, 0x4433_2211), cpu.r[9]);
+    try std.testing.expectEqual(@as(u32, 0x4433_2211), cpu.r[10]);
+    try std.testing.expectEqual(@as(u32, 0), cpu.cpsr & PsrFlags.E);
 }
