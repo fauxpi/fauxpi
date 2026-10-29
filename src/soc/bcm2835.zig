@@ -1,4 +1,5 @@
 const std = @import("std");
+const vc_bus = @import("vc_bus.zig");
 const intc_mod = @import("intc.zig");
 const timer_mod = @import("timer.zig");
 const mailbox_mod = @import("mailbox.zig");
@@ -25,8 +26,8 @@ const smp_mod = @import("smp.zig");
 /// Complete BCM2835 / BCM2837 SoC Bus & Peripherals.
 /// Directly satisfies the `Bus` concept required by `Arm1176(Bcm2835)`.
 pub const Bcm2835 = struct {
-    /// The VideoCore bus's window onto SDRAM: bits 31:30 of a bus address pick a cache alias, the
-    /// rest address up to 1 GiB. Bus masters see RAM through this window (`vc_ram`).
+    /// The most SDRAM the VideoCore bus can address: bits 31:30 of a bus address pick a cache alias,
+    /// the rest address up to 1 GiB.
     pub const BUS_RAM_SIZE: usize = 1 << 30;
     /// Where the BCM2837's peripherals start in the ARM's physical address space, hiding the RAM there.
     pub const BCM2837_PERIPH_PHYS: u32 = 0x3f000000;
@@ -40,9 +41,11 @@ pub const Bcm2835 = struct {
 
     /// RAM as the ARM sees it: the board's SDRAM below the peripherals.
     ram: []u8,
-    /// RAM as the VideoCore's bus masters (DMA, USB, V3D, HVS, mailbox) see it, indexed by a bus
-    /// address's low 30 bits; `ram` is its start.
+    /// RAM as the VideoCore's bus masters (DMA, USB, V3D, HVS, mailbox) see it: all of the board's
+    /// SDRAM, indexed by a bus address wrapped at its size (`vc_bus.ramMask`); `ram` is its start.
     vc_ram: []u8,
+    /// The host memory behind `vc_ram`, sized for the largest board.
+    ram_backing: []u8,
     is_bcm2837: bool = false,
 
     intc: intc_mod.IntController = .{},
@@ -99,6 +102,7 @@ pub const Bcm2835 = struct {
     pub fn initInPlace(self: *Bcm2835, ram: []u8, display_width: u16, display_height: u16) void {
         self.ram = ram;
         self.vc_ram = ram;
+        self.ram_backing = ram;
         self.is_bcm2837 = false;
         self.intc = .{};
         self.local_intc = .{};
@@ -158,10 +162,12 @@ pub const Bcm2835 = struct {
     }
 
     /// Fits the memory map to a board with `ram_bytes` of SDRAM (after `is_bcm2837` is set), of which
-    /// the firmware gives the top `gpu_mem_bytes` to the VideoCore. The ARM sees the RAM below the
-    /// peripherals; the top 16 MiB of a 1 GiB BCM2837 board lies under them, in the VideoCore's share.
+    /// the firmware gives the top `gpu_mem_bytes` to the VideoCore. Bus masters see all of it; the ARM
+    /// sees the RAM below the peripherals, so the top 16 MiB of a 1 GiB BCM2837 board, in the
+    /// VideoCore's share, lies under them.
     pub fn setBoardRam(self: *Bcm2835, ram_bytes: u32, gpu_mem_bytes: u32) void {
         const arm_visible: u32 = @min(ram_bytes, if (self.is_bcm2837) BCM2837_PERIPH_PHYS else PERIPH_BASE);
+        self.vc_ram = self.ram_backing[0..@min(ram_bytes, self.ram_backing.len)];
         self.ram = self.vc_ram[0..@min(arm_visible, self.vc_ram.len)];
         self.mailbox.setMemorySplit(ram_bytes - gpu_mem_bytes, gpu_mem_bytes);
     }
@@ -170,6 +176,7 @@ pub const Bcm2835 = struct {
         var soc = Bcm2835{
             .ram = ram,
             .vc_ram = ram,
+            .ram_backing = ram,
             .display_width = display_width,
             .display_height = display_height,
             .bsc2 = i2c_mod.BscController.init(true, display_width, display_height),
@@ -588,7 +595,7 @@ pub const Bcm2835 = struct {
 
     fn renderMailboxFb(self: *const Bcm2835, out_argb: []u32, width: u32, height: u32) bool {
         if (!self.mailbox.fb_allocated) return false;
-        const fb_phys = self.mailbox.fb_bus_addr & 0x3FFFFFFF;
+        const fb_phys = self.mailbox.fb_bus_addr & vc_bus.ramMask(self.vc_ram.len);
         const fb_w = self.mailbox.fb_width;
         const fb_h = self.mailbox.fb_height;
         const bpp = self.mailbox.fb_depth / 8;
@@ -702,7 +709,7 @@ pub const Bcm2835 = struct {
         }
 
         if (self.mailbox.fb_allocated) {
-            const fb_phys = self.mailbox.fb_bus_addr & 0x3FFFFFFF;
+            const fb_phys = self.mailbox.fb_bus_addr & vc_bus.ramMask(self.vc_ram.len);
             const fb_w = self.mailbox.fb_width;
             const fb_h = self.mailbox.fb_height;
             const bpp = self.mailbox.fb_depth / 8;
@@ -753,7 +760,7 @@ pub const Bcm2835 = struct {
     pub fn read8(self: *Bcm2835, raw_addr: u32) u8 {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x3FFFFFFF;
+            const ram_off = addr & vc_bus.ramMask(self.vc_ram.len);
             if (ram_off < self.vc_ram.len) return self.vc_ram[ram_off];
             return 0;
         }
@@ -765,7 +772,7 @@ pub const Bcm2835 = struct {
     pub fn read16(self: *Bcm2835, raw_addr: u32) u16 {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x3FFFFFFF;
+            const ram_off = addr & vc_bus.ramMask(self.vc_ram.len);
             if (ram_off + 2 <= self.vc_ram.len) return std.mem.readInt(u16, self.vc_ram[ram_off..][0..2], .little);
             return 0;
         }
@@ -777,7 +784,7 @@ pub const Bcm2835 = struct {
     pub fn read32(self: *Bcm2835, raw_addr: u32) u32 {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x3FFFFFFF;
+            const ram_off = addr & vc_bus.ramMask(self.vc_ram.len);
             if (ram_off + 4 <= self.vc_ram.len) return std.mem.readInt(u32, self.vc_ram[ram_off..][0..4], .little);
             return 0;
         }
@@ -787,7 +794,7 @@ pub const Bcm2835 = struct {
     pub fn write8(self: *Bcm2835, raw_addr: u32, val: u8) void {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x3FFFFFFF;
+            const ram_off = addr & vc_bus.ramMask(self.vc_ram.len);
             if (ram_off < self.vc_ram.len) self.vc_ram[ram_off] = val;
             return;
         }
@@ -797,7 +804,7 @@ pub const Bcm2835 = struct {
     pub fn write16(self: *Bcm2835, raw_addr: u32, val: u16) void {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x3FFFFFFF;
+            const ram_off = addr & vc_bus.ramMask(self.vc_ram.len);
             if (ram_off + 2 <= self.vc_ram.len) std.mem.writeInt(u16, self.vc_ram[ram_off..][0..2], val, .little);
             return;
         }
@@ -807,7 +814,7 @@ pub const Bcm2835 = struct {
     pub fn write32(self: *Bcm2835, raw_addr: u32, val: u32) void {
         const addr = normalizeAddr(raw_addr);
         if (!isMmioAddr(addr)) {
-            const ram_off = addr & 0x3FFFFFFF;
+            const ram_off = addr & vc_bus.ramMask(self.vc_ram.len);
             if (ram_off + 4 <= self.vc_ram.len) std.mem.writeInt(u32, self.vc_ram[ram_off..][0..4], val, .little);
             return;
         }
@@ -1125,6 +1132,10 @@ test "Bcm2835 memory map follows the board's RAM" {
     try std.testing.expectEqual(@as(usize, 0x2000_0000), soc.ram.len);
     try std.testing.expectEqual(@as(u32, 0x1c00_0000), soc.mailbox.vc_mem_base);
     try std.testing.expectEqual(@as(u32, 0x5c10_0000), soc.mailbox.fb_bus_addr);
+
+    // Bus addresses wrap at the 512 MiB that is fitted
+    std.mem.writeInt(u32, ram[0x10..][0..4], 0x8765_4321, .little);
+    try std.testing.expectEqual(@as(u32, 0x8765_4321), soc.read32(0xe000_0010));
 
     // 1 GiB BCM2837: the peripherals at 0x3f000000 hide the top 16 MiB from the ARM
     soc.is_bcm2837 = true;

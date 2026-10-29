@@ -1,4 +1,5 @@
 const std = @import("std");
+const vc_bus = @import("vc_bus.zig");
 const host_posix = @import("../host/posix.zig");
 
 /// Lock-free Single-Producer Single-Consumer (SPSC) stereo 16-bit PCM FIFO at 48 kHz.
@@ -341,7 +342,7 @@ pub const Vchiq = struct {
 
     /// Handles Mailbox Property Tag `0x00048010` (`RPI_FIRMWARE_VCHIQ_INIT`).
     pub fn initSlotZero(self: *Vchiq, channel_base: u32, ram: []u8) u32 {
-        const base = channel_base & 0x3FFFFFFF;
+        const base = channel_base & vc_bus.ramMask(ram.len);
         if (base + 0x1000 > ram.len) return 1;
 
         self.slot_zero_phys = base;

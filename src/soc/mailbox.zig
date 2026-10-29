@@ -1,4 +1,5 @@
 const std = @import("std");
+const vc_bus = @import("vc_bus.zig");
 const audio_mod = @import("audio.zig");
 
 /// BCM2835 VideoCore Mailbox (`0x2000b880`) and Property Tags (`channel 8`)
@@ -206,7 +207,7 @@ pub const Mailbox = struct {
             0x00, 0x20 => {
                 const channel: u4 = @truncate(val & 0xF);
                 const data_bus = val & ~@as(u32, 0xF);
-                const phys = data_bus & 0x3FFFFFFF;
+                const phys = data_bus & vc_bus.ramMask(ram.len);
                 if (channel == 8) {
                     self.processPropertyTags(phys, ram, ctx);
                 } else if (channel == 1) {

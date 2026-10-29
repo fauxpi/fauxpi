@@ -1,6 +1,7 @@
 //! Functional 16-lane SIMD simulator for the VideoCore IV QPU instruction set.
 
 const std = @import("std");
+const vc_bus = @import("../soc/vc_bus.zig");
 const qpu = @import("qpu.zig");
 const texture = @import("texture.zig");
 const pixel = @import("format.zig");
@@ -1219,7 +1220,7 @@ fn sampleTmuVec(
     if (cache_slot.p0 != p0 or cache_slot.p1 != p1) {
         cache_slot.p0 = p0;
         cache_slot.p1 = p1;
-        if (PrecomputedTex.init(texture.decodeConfig(p0, p1))) |inited| {
+        if (PrecomputedTex.init(texture.decodeConfig(p0, p1), memory.len)) |inited| {
             cache_slot.pt = inited;
             cache_slot.valid = true;
         } else |_| {
@@ -1416,7 +1417,7 @@ const PrecomputedTex = struct {
     tile_h_shift: u5,
     tiles_per_row: u32,
 
-    inline fn init(p: texture.Config) Error!PrecomputedTex {
+    inline fn init(p: texture.Config, memory_len: usize) Error!PrecomputedTex {
         const cpp: u32 = switch (p.type) {
             .rgba8888, .rgbx8888, .rgba32r => 4,
             .rgb565 => 2,
@@ -1437,7 +1438,7 @@ const PrecomputedTex = struct {
         const tile_w: u32 = @as(u32, 1) << tile_w_shift;
         return .{
             .cfg = p,
-            .base_off = p.offset & 0x3FFFFFFF,
+            .base_off = p.offset & vc_bus.ramMask(memory_len),
             .cpp = cpp,
             .fw = @floatFromInt(p.width),
             .fh = @floatFromInt(p.height),
@@ -1625,7 +1626,7 @@ pub fn sample(memory: []const u8, p0: u32, p1: u32, s: f32, t: f32) Error!u32 {
 }
 
 fn sampleConfig(memory: []const u8, p: texture.Config, s: f32, t: f32) Error!u32 {
-    const pt = try PrecomputedTex.init(p);
+    const pt = try PrecomputedTex.init(p, memory.len);
     return pt.sample(memory, s, t);
 }
 
@@ -1711,7 +1712,7 @@ test "QPU TMU bilinear same-utile and cross-utile sampling" {
         .wrap_s = .clamp,
         .wrap_t = .clamp,
     };
-    const pt = try PrecomputedTex.init(cfg);
+    const pt = try PrecomputedTex.init(cfg, mem.len);
     for (0..8) |y| {
         for (0..8) |x| {
             const off = pt.texelOffset(@intCast(x), @intCast(y));
@@ -1839,7 +1840,7 @@ test "QPU TexCache memoization, nearest coordinate deduplication, and exact texe
     const p1_nearest = texture.p1(cfg_nearest);
 
     // Exact texel center at (0.5/2.0, 0.5/2.0) -> (0.25, 0.25) hits texel (0,0) with fx_frac == 0, fy_frac == 0
-    const pt_lin = try PrecomputedTex.init(cfg_linear);
+    const pt_lin = try PrecomputedTex.init(cfg_linear, mem.len);
     std.mem.writeInt(u32, mem[pt_lin.texelOffset(0, 0)..][0..4], 0xff102030, .little);
     std.mem.writeInt(u32, mem[pt_lin.texelOffset(1, 0)..][0..4], 0xff304050, .little);
     std.mem.writeInt(u32, mem[pt_lin.texelOffset(0, 1)..][0..4], 0xff506070, .little);
@@ -1933,7 +1934,7 @@ test "QPU fused varying linterp and fast-path fragment shader compilation" {
         .wrap_s = .clamp,
         .wrap_t = .clamp,
     };
-    const pt = try PrecomputedTex.init(cfg_nearest);
+    const pt = try PrecomputedTex.init(cfg_nearest, mem.len);
     std.mem.writeInt(u32, mem[pt.texelOffset(1, 0)..][0..4], 0xff804020, .little);
 
     var p_tex: qpu.Program(16) = .{};
