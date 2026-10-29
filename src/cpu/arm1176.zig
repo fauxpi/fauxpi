@@ -1972,6 +1972,19 @@ pub fn Arm1176(comptime Bus: type) type {
             return lo | (hi << 32);
         }
 
+        /// Converts a register value to the byte order it has in RAM: unchanged for little-endian data,
+        /// and byte-reversed per element for big-endian data (each word of a doubleword separately,
+        /// with the first register still at the lower address).
+        inline fn dataToMemoryOrder(comptime T: type, val: T, big: bool) T {
+            if (!big or T == u8) return val;
+            if (T == u64) {
+                const lo: u64 = @byteSwap(@as(u32, @truncate(val)));
+                const hi: u64 = @byteSwap(@as(u32, @truncate(val >> 32)));
+                return lo | (hi << 32);
+            }
+            return @byteSwap(val);
+        }
+
         /// Completes a store-exclusive of `val` at `vaddr` and returns the `STREX` status (0 = stored).
         /// RAM stores are a compare-and-swap against the value the load-exclusive returned.
         noinline fn storeExclusive(self: *Self, bus: *Bus, comptime T: type, vaddr: u32, val: T, privileged: bool) error{Abort}!u32 {
@@ -1979,7 +1992,10 @@ pub fn Arm1176(comptime Bus: type) type {
             if (!self.excl_valid) return 1;
             self.excl_valid = false;
             if (paddr < bus.ram.len) {
-                const stored = atomic_ram.compareAndSwap(T, bus.ram, paddr, @truncate(self.excl_val), val);
+                // The load-exclusive value and the new value are in register order; RAM holds memory order
+                const big = (self.cpsr & PsrFlags.E) != 0;
+                const expected = dataToMemoryOrder(T, @truncate(self.excl_val), big);
+                const stored = atomic_ram.compareAndSwap(T, bus.ram, paddr, expected, dataToMemoryOrder(T, val, big));
                 if (stored) atomic_ram.signalEvent(bus);
                 return if (stored) 0 else 1;
             }
@@ -4751,7 +4767,12 @@ pub fn Arm1176(comptime Bus: type) type {
                 var data_w_vbase: [2]u32 = .{ 0xffff_ffff, 0xffff_ffff };
                 var data_r_page_ptr: [2][*]const u8 = .{ bus.ram.ptr, bus.ram.ptr };
                 var data_w_page_ptr: [2][*]u8 = .{ bus.ram.ptr, bus.ram.ptr };
-                _ = self.executeThumb(bus, pc, inst16, @intFromBool(self.isPrivileged()), 0xffff_ffff, 0, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr);
+                const thumb_priv = @intFromBool(self.isPrivileged());
+                if ((self.cpsr & PsrFlags.E) != 0) {
+                    _ = self.executeThumb(bus, pc, inst16, thumb_priv, 0xffff_ffff, 0, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr, true);
+                } else {
+                    _ = self.executeThumb(bus, pc, inst16, thumb_priv, 0xffff_ffff, 0, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr, false);
+                }
                 return;
             }
 
@@ -6279,7 +6300,7 @@ pub fn Arm1176(comptime Bus: type) type {
                         }
                         self.r[15] = pc +% 2;
                         executed += 1;
-                        if (self.executeThumb(bus, pc, inst16, priv, 0xffff_ffff, 0, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr)) {
+                        if (self.executeThumb(bus, pc, inst16, priv, 0xffff_ffff, 0, &data_r_vbase, &data_w_vbase, &data_r_page_ptr, &data_w_page_ptr, false)) {
                             if (self.mmu.halted_wfi or self.yield_slice) return executed;
                             _ = self.checkInterrupts(bus);
                             priv = @intFromBool(self.isPrivileged());
@@ -6341,7 +6362,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             return true;
                         }
                     }
-                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr);
+                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr, false);
                 },
                 .lsl_imm => {
                     const carry_in: u1 = @truncate((self.cpsr >> 29) & 1);
@@ -6889,7 +6910,7 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.r[13] = start_sp;
                         return false;
                     }
-                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr);
+                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr, false);
                 },
                 .pop, .pop_pc => {
                     const pop_pc = td.op == .pop_pc;
@@ -6925,10 +6946,10 @@ pub fn Arm1176(comptime Bus: type) type {
                         }
                         return false;
                     }
-                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr);
+                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr, false);
                 },
                 .stmia, .ldmia, .slow => {
-                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr);
+                    return self.executeThumb(bus, inst_pc, td.raw, priv, code_vbase, code_pbase, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr, false);
                 },
             }
         }
@@ -6947,6 +6968,8 @@ pub fn Arm1176(comptime Bus: type) type {
             data_w_vbase: *[2]u32,
             data_r_page_ptr: *[2][*]const u8,
             data_w_page_ptr: *[2][*]u8,
+            /// `CPSR.E` is set: skip the direct-RAM paths so data goes through the byte-reversing accessors
+            comptime big_endian: bool,
         ) bool {
             const top3: u3 = @truncate(inst >> 13);
             switch (top3) {
@@ -7113,7 +7136,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             return false;
                         }
                         const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                        if ((addr & 0xffff_f000) == slot.r_vbase) {
+                        if (!big_endian and (addr & 0xffff_f000) == slot.r_vbase) {
                             data_r_vbase[0] = slot.r_vbase;
                             data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
                             self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
@@ -7139,7 +7162,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                                if ((addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                                if (!big_endian and (addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
                                     data_w_vbase[0] = slot.w_vbase;
                                     data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                     std.mem.writeInt(u32, data_w_page_ptr[0][addr & 0xffc ..][0..4], self.r[rd], .little);
@@ -7157,7 +7180,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                                if ((addr & ~@as(u32, 0xffe)) == slot.w_vbase) {
+                                if (!big_endian and (addr & ~@as(u32, 0xffe)) == slot.w_vbase) {
                                     data_w_vbase[0] = slot.w_vbase;
                                     data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                     std.mem.writeInt(u16, data_w_page_ptr[0][addr & 0xffe ..][0..2], @truncate(self.r[rd]), .little);
@@ -7175,7 +7198,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                                if ((addr & 0xffff_f000) == slot.w_vbase) {
+                                if (!big_endian and (addr & 0xffff_f000) == slot.w_vbase) {
                                     data_w_vbase[0] = slot.w_vbase;
                                     data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                     data_w_page_ptr[0][addr & 0xfff] = @truncate(self.r[rd]);
@@ -7194,7 +7217,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                                if ((addr & 0xffff_f000) == slot.r_vbase) {
+                                if (!big_endian and (addr & 0xffff_f000) == slot.r_vbase) {
                                     data_r_vbase[0] = slot.r_vbase;
                                     data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                     const bval = data_r_page_ptr[0][addr & 0xfff];
@@ -7214,7 +7237,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                                if ((addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                if (!big_endian and (addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
                                     data_r_vbase[0] = slot.r_vbase;
                                     data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                     self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
@@ -7232,7 +7255,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                                if ((addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                                if (!big_endian and (addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
                                     data_r_vbase[0] = slot.r_vbase;
                                     data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                     self.r[rd] = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
@@ -7250,7 +7273,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                                if ((addr & 0xffff_f000) == slot.r_vbase) {
+                                if (!big_endian and (addr & 0xffff_f000) == slot.r_vbase) {
                                     data_r_vbase[0] = slot.r_vbase;
                                     data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                     self.r[rd] = data_r_page_ptr[0][addr & 0xfff];
@@ -7269,7 +7292,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                     return false;
                                 }
                                 const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                                if ((addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                                if (!big_endian and (addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
                                     data_r_vbase[0] = slot.r_vbase;
                                     data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                     const hval = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
@@ -7301,7 +7324,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                            if ((addr & 0xffff_f000) == slot.r_vbase) {
+                            if (!big_endian and (addr & 0xffff_f000) == slot.r_vbase) {
                                 data_r_vbase[0] = slot.r_vbase;
                                 data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                 self.r[rd] = data_r_page_ptr[0][addr & 0xfff];
@@ -7317,7 +7340,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                            if ((addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                            if (!big_endian and (addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
                                 data_r_vbase[0] = slot.r_vbase;
                                 data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                 self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[0][addr & 0xffc ..][0..4], .little);
@@ -7336,7 +7359,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                            if ((addr & 0xffff_f000) == slot.w_vbase) {
+                            if (!big_endian and (addr & 0xffff_f000) == slot.w_vbase) {
                                 data_w_vbase[0] = slot.w_vbase;
                                 data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                 data_w_page_ptr[0][addr & 0xfff] = @truncate(self.r[rd]);
@@ -7353,7 +7376,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                            if ((addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                            if (!big_endian and (addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
                                 data_w_vbase[0] = slot.w_vbase;
                                 data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                 std.mem.writeInt(u32, data_w_page_ptr[0][addr & 0xffc ..][0..4], self.r[rd], .little);
@@ -7381,7 +7404,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                            if ((addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                            if (!big_endian and (addr & ~@as(u32, 0xffe)) == slot.r_vbase) {
                                 data_r_vbase[0] = slot.r_vbase;
                                 data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                 self.r[rd] = std.mem.readInt(u16, data_r_page_ptr[0][addr & 0xffe ..][0..2], .little);
@@ -7398,7 +7421,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                            if ((addr & ~@as(u32, 0xffe)) == slot.w_vbase) {
+                            if (!big_endian and (addr & ~@as(u32, 0xffe)) == slot.w_vbase) {
                                 data_w_vbase[0] = slot.w_vbase;
                                 data_w_page_ptr[0] = bus.ram.ptr + slot.pbase;
                                 std.mem.writeInt(u16, data_w_page_ptr[0][addr & 0xffe ..][0..2], @truncate(self.r[rd]), .little);
@@ -7422,7 +7445,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                            if ((addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                            if (!big_endian and (addr & ~@as(u32, 0xffc)) == slot.r_vbase) {
                                 data_r_vbase[1] = slot.r_vbase;
                                 data_r_page_ptr[1] = bus.ram.ptr + slot.pbase;
                                 self.r[rd] = std.mem.readInt(u32, data_r_page_ptr[1][addr & 0xffc ..][0..4], .little);
@@ -7439,7 +7462,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                 return false;
                             }
                             const slot = self.mmu.soft_tlb32[priv][(addr >> 12) & Mmu.soft_tlb_mask];
-                            if ((addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                            if (!big_endian and (addr & ~@as(u32, 0xffc)) == slot.w_vbase) {
                                 data_w_vbase[1] = slot.w_vbase;
                                 data_w_page_ptr[1] = bus.ram.ptr + slot.pbase;
                                 std.mem.writeInt(u32, data_w_page_ptr[1][addr & 0xffc ..][0..4], self.r[rd], .little);
@@ -7464,7 +7487,7 @@ pub fn Arm1176(comptime Bus: type) type {
                         return false;
                     } else {
                         // Misc 16-bit Thumb (ADD/SUB SP, SXTH/SXTB/UXTH/UXTB, PUSH/POP, REV, BKPT)
-                        return self.executeThumbMisc(bus, inst_pc, inst, priv, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr);
+                        return self.executeThumbMisc(bus, inst_pc, inst, priv, data_r_vbase, data_w_vbase, data_r_page_ptr, data_w_page_ptr, big_endian);
                     }
                 },
                 0b110 => {
@@ -7484,7 +7507,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                     data_r_page_ptr[0]
                                 else blk: {
                                     const slot = self.mmu.soft_tlb32[priv][(base_val >> 12) & Mmu.soft_tlb_mask];
-                                    if ((base_val & ~@as(u32, 0xffc)) == slot.r_vbase and
+                                    if (!big_endian and (base_val & ~@as(u32, 0xffc)) == slot.r_vbase and
                                         (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
                                     {
                                         data_r_vbase[0] = slot.r_vbase;
@@ -7510,7 +7533,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                     data_w_page_ptr[0]
                                 else blk: {
                                     const slot = self.mmu.soft_tlb32[priv][(base_val >> 12) & Mmu.soft_tlb_mask];
-                                    if ((base_val & ~@as(u32, 0xffc)) == slot.w_vbase and
+                                    if (!big_endian and (base_val & ~@as(u32, 0xffc)) == slot.w_vbase and
                                         (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
                                     {
                                         data_w_vbase[0] = slot.w_vbase;
@@ -7623,6 +7646,7 @@ pub fn Arm1176(comptime Bus: type) type {
             data_w_vbase: *[2]u32,
             data_r_page_ptr: *[2][*]const u8,
             data_w_page_ptr: *[2][*]u8,
+            comptime big_endian: bool,
         ) bool {
             const sub: u4 = @truncate((inst >> 8) & 0xf);
             switch (sub) {
@@ -7657,7 +7681,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             data_w_page_ptr[1]
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(start_sp >> 12) & Mmu.soft_tlb_mask];
-                            if ((start_sp & ~@as(u32, 0xffc)) == slot.w_vbase and
+                            if (!big_endian and (start_sp & ~@as(u32, 0xffc)) == slot.w_vbase and
                                 (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
                             {
                                 data_w_vbase[1] = slot.w_vbase;
@@ -7691,6 +7715,14 @@ pub fn Arm1176(comptime Bus: type) type {
                     self.r[13] = start_sp;
                     return true;
                 },
+                0b0110 => {
+                    // SETEND (0xb650 / 0xb658): data accesses become big-endian (E = 1) or little-endian
+                    if ((inst & 0xfff7) == 0xb650) {
+                        self.setDataEndianness((inst & (1 << 3)) != 0);
+                        return true;
+                    }
+                    return false;
+                },
                 0b1010 => { // REV / REV16 / REVSH
                     const op: u2 = @truncate((inst >> 6) & 3);
                     const rm: u4 = @truncate((inst >> 3) & 7);
@@ -7716,7 +7748,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             data_r_page_ptr[1]
                         else blk: {
                             const slot = self.mmu.soft_tlb32[priv][(start_sp >> 12) & Mmu.soft_tlb_mask];
-                            if ((start_sp & ~@as(u32, 0xffc)) == slot.r_vbase and
+                            if (!big_endian and (start_sp & ~@as(u32, 0xffc)) == slot.r_vbase and
                                 (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
                             {
                                 data_r_vbase[1] = slot.r_vbase;
@@ -8697,4 +8729,89 @@ test "ARM1176 SETEND switches data accesses to big-endian" {
     try std.testing.expectEqual(@as(u32, 0x4433_2211), cpu.r[9]);
     try std.testing.expectEqual(@as(u32, 0x4433_2211), cpu.r[10]);
     try std.testing.expectEqual(@as(u32, 0), cpu.cpsr & PsrFlags.E);
+}
+
+test "ARM1176 big-endian exclusives and Thumb SETEND" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+    const pattern = [_]u8{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00 };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+
+    // ARM: setend be; ldrex r1, [r0]; add r1, #1; strex r2, r1, [r0]; add r7, r0, #8;
+    // ldrexd r4, r5, [r7]; add r4, #1; strexd r6, r4, r5, [r7]; setend le; ldr r3, [r0]; b .
+    {
+        @memset(ram, 0);
+        @memcpy(ram[0x4000..0x4010], &pattern);
+        const prog = [_]u32{ 0xf1010200, 0xe1901f9f, 0xe2811001, 0xe1802f91, 0xe2807008, 0xe1b74f9f, 0xe2844001, 0xe1a76f94, 0xf1010000, 0xe5903000, 0xeafffffe };
+        for (prog, 0..) |inst, i| std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+        var bus: TestBus = .{ .ram = ram };
+        var cpu: Arm1176(TestBus) = .{};
+        cpu.initReset(0x1000, 0, 0xffffffff, 0x2000);
+        cpu.r[0] = 0x4000;
+        // Long slices: SETEND must leave the pre-decoded loop part-way through
+        for (0..4) |_| _ = cpu.runSteps(&bus, 500);
+        try std.testing.expectEqual(@as(u32, 0x1028), cpu.r[15]);
+
+        try std.testing.expectEqual(@as(u32, 0x1122_3345), cpu.r[1]);
+        try std.testing.expectEqual(@as(u32, 0), cpu.r[2]); // STREX succeeded
+        try std.testing.expectEqual(@as(u32, 0), cpu.r[6]); // STREXD succeeded
+        try std.testing.expectEqual(@as(u32, 0xddee_ff00), cpu.r[5]);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x11, 0x22, 0x33, 0x45 }, ram[0x4000..0x4004]);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x99, 0xaa, 0xbb, 0xcd, 0xdd, 0xee, 0xff, 0x00 }, ram[0x4008..0x4010]);
+        try std.testing.expectEqual(@as(u32, 0x4533_2211), cpu.r[3]);
+    }
+
+    // Thumb: setend be; ldr r1, [r0]; ldrh r2, [r0, #2]; str r1, [r0, #16]; push {r1, r2};
+    // pop {r4, r5}; setend le; ldr r3, [r0]; b .
+    {
+        @memset(ram, 0);
+        @memcpy(ram[0x4000..0x4010], &pattern);
+        const prog = [_]u16{ 0xb658, 0x6801, 0x8842, 0x6101, 0xb406, 0xbc30, 0xb650, 0x6803, 0xe7fe };
+        for (prog, 0..) |inst, i| std.mem.writeInt(u16, ram[0x1100 + i * 2 ..][0..2], inst, .little);
+        var bus: TestBus = .{ .ram = ram };
+        var cpu: Arm1176(TestBus) = .{};
+        cpu.initReset(0x1100, 0, 0xffffffff, 0x2000);
+        cpu.cpsr |= PsrFlags.T;
+        cpu.r[0] = 0x4000;
+        cpu.r[13] = 0x8000;
+        for (0..4) |_| _ = cpu.runSteps(&bus, 500);
+        try std.testing.expectEqual(@as(u32, 0x1110), cpu.r[15]);
+
+        try std.testing.expectEqual(@as(u32, 0x1122_3344), cpu.r[1]);
+        try std.testing.expectEqual(@as(u32, 0x3344), cpu.r[2]);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x11, 0x22, 0x33, 0x44 }, ram[0x4010..0x4014]);
+        try std.testing.expectEqualSlices(u8, &[_]u8{ 0x11, 0x22, 0x33, 0x44, 0x00, 0x00, 0x33, 0x44 }, ram[0x7ff8..0x8000]);
+        try std.testing.expectEqual(@as(u32, 0x1122_3344), cpu.r[4]);
+        try std.testing.expectEqual(@as(u32, 0x3344), cpu.r[5]);
+        try std.testing.expectEqual(@as(u32, 0x4433_2211), cpu.r[3]);
+        try std.testing.expectEqual(@as(u32, 0), cpu.cpsr & PsrFlags.E);
+    }
 }
