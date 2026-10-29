@@ -95,6 +95,18 @@ pub const VirtualNetwork = struct {
         self.rx_count += 1;
     }
 
+    /// The next frame queued for the guest, left in the queue.
+    pub fn peekRxFrame(self: *const VirtualNetwork) ?[]const u8 {
+        if (self.rx_count == 0) return null;
+        return self.rx_frames[self.rx_head][0..self.rx_lens[self.rx_head]];
+    }
+
+    pub fn dropRxFrame(self: *VirtualNetwork) void {
+        if (self.rx_count == 0) return;
+        self.rx_head +%= 1;
+        self.rx_count -= 1;
+    }
+
     pub fn popRxFrame(self: *VirtualNetwork, dest: []u8) ?usize {
         if (self.rx_count == 0) return null;
         const frame_len: usize = self.rx_lens[self.rx_head];

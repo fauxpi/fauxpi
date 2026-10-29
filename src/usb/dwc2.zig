@@ -198,7 +198,7 @@ pub const Dwc2Controller = struct {
                 const epdir_in = ((ch.hcchar >> 15) & 1) != 0;
                 const eptype: u2 = @truncate((ch.hcchar >> 18) & 3);
                 const devaddr: u7 = @truncate((ch.hcchar >> 22) & 0x7f);
-                if (eptype == 2 and epdir_in and (epnum == 2 or epnum == 4)) {
+                if (eptype == 2 and epdir_in and self.hid.isEthBulkEndpoint(epnum)) {
                     if (self.hid.resolveDevice(devaddr) == .eth) {
                         if (!self.tryCompleteBulkIn(ch_idx, ram)) break;
                     }
@@ -521,6 +521,9 @@ pub const Dwc2Controller = struct {
                 }
             } else {
                 // Control OUT (data stage or 0-length status stage)
+                if (xfersize > 0 and dma_phys + xfersize <= ram.len) {
+                    self.hid.writeTargetControlData(target, ram[dma_phys .. dma_phys + xfersize]);
+                }
                 ch.hctsiz = (@as(u32, pid) << 29);
                 ch.hcdma +%= xfersize;
                 ch.hcdmab = ch.hcdma;
@@ -529,8 +532,8 @@ pub const Dwc2Controller = struct {
             return;
         }
 
-        // Bulk endpoints (EP2 IN / OUT on CDC-ECM Ethernet device)
-        if (eptype == 2 and target == .eth and (epnum == 2 or epnum == 4)) {
+        // Bulk endpoints on the Ethernet device (EP2 IN / OUT for CDC-ECM, EP1 IN / EP2 OUT for LAN7800)
+        if (eptype == 2 and target == .eth and self.hid.isEthBulkEndpoint(epnum)) {
             if (epdir_in) {
                 // In DWC2 DMA mode, Bulk IN channels stay enabled (HCCHAR_CHEN) until an RX frame arrives
                 // or the host driver aborts the channel with HCCHAR_CHDIS.
@@ -567,7 +570,7 @@ pub const Dwc2Controller = struct {
 
         // Interrupt IN endpoints on each device:
         // - Hub (.hub): EP1 IN (Status Change Bitmap)
-        // - Ethernet (.eth): EP1 IN (CDC-ECM Notifications)
+        // - Ethernet (.eth): EP1 IN (CDC-ECM Notifications) or EP3 IN (LAN7800 interrupt status)
         // - Keyboard (.kbd): EP1 IN (8-byte Boot Keyboard Report)
         // - Mouse (.mouse): EP1 IN (4-byte Boot Mouse Report)
         // Note: Raspberry Pi's downstream DWC2 driver (`linux-rpi/drivers/usb/dwc2/hcd.c`)
@@ -596,9 +599,9 @@ pub const Dwc2Controller = struct {
                     }
                 },
                 .eth => {
-                    if (epnum == 1 or epnum == 3) {
+                    if (self.hid.isEthInterruptEndpoint(epnum)) {
                         if (dma_phys + xfersize <= ram.len) {
-                            if (self.hid.popCdcNotification(ram[dma_phys .. dma_phys + xfersize])) |copy_len| {
+                            if (self.hid.popEthInterrupt(ram[dma_phys .. dma_phys + xfersize])) |copy_len| {
                                 const rem: u32 = xfersize - @as(u32, @intCast(copy_len));
                                 const next_pid: u32 = if (pid == 0) 2 else 0;
                                 ch.hctsiz = (next_pid << 29) | rem;
