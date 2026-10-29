@@ -154,12 +154,11 @@ fn parseHdmiSize(spec: []const u8) ?struct { width: u16, height: u16 } {
     return .{ .width = w, .height = h };
 }
 
-/// Whether FauxPi runs in a snap or Flatpak sandbox, where it can open only the files the user
-/// picks through the desktop's file chooser, so not an SD card image named on the command line.
+/// Whether FauxPi runs in a snap, where it can open only the files the user picks through the
+/// desktop's file chooser, so not an SD card image named on the command line.
 fn isSandboxed(environ: std.process.Environ) bool {
     if (builtin.os.tag == .linux) {
-        return std.process.Environ.getPosix(environ, "SNAP_NAME") != null or
-            std.process.Environ.getPosix(environ, "FLATPAK_ID") != null;
+        return std.process.Environ.getPosix(environ, "SNAP_NAME") != null;
     } else return false;
 }
 
@@ -211,7 +210,7 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     while (args.next()) |arg| {
         if (sandboxed and (std.mem.eql(u8, arg, "--sd") or std.mem.eql(u8, arg, "--headless"))) {
-            std.debug.print("{s} is not available in the snap or Flatpak, which can't open SD card images named " ++
+            std.debug.print("{s} is not available in the snap, which can't open SD card images named " ++
                 "on the command line: choose the card in FauxPi's window instead\n", .{arg});
             return 1;
         } else if (std.mem.eql(u8, arg, "--sd")) {

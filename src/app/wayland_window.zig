@@ -188,9 +188,8 @@ pub const WaylandWindow = struct {
             m.string(win.ui.title).end();
         }
         {
-            const app_id = std.process.Environ.getPosix(environ, "FLATPAK_ID") orelse "fauxpi";
             var m = try win.toplevel.request(protocol.xdg_toplevel.request.set_app_id);
-            m.string(app_id).end();
+            m.string("fauxpi").end();
         }
         {
             var m = try win.surface.request(protocol.wl_surface.request.commit);

@@ -1,6 +1,5 @@
 zig-out/
 .zig-cache/
 build/
-.flatpak-builder/
 *.snap
 
