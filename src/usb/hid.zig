@@ -1,6 +1,7 @@
 const std = @import("std");
 const net_mod = @import("net.zig");
 const Lan7800 = @import("lan78xx.zig").Lan7800;
+const Lan9514 = @import("smsc95xx.zig").Lan9514;
 
 /// USB Hub hardware topology variant:
 /// - `.external`: External 3-port USB 2.0 Hub with Ethernet (Pi Zero / Zero W / Zero 2 W / Model A+)
@@ -133,6 +134,8 @@ pub const UsbHidComposite = struct {
     cdc_packet_filter: u16 = 0,
     // Microchip LAN7800 controller state (built-in Ethernet on `.lan7515`)
     lan7800: Lan7800 = .{},
+    // SMSC LAN9514 Ethernet controller state (built-in Ethernet on `.lan9514`)
+    lan9514: Lan9514 = .{},
 
     kbd_addr: u7 = 0,
     kbd_configured: bool = false,
@@ -233,6 +236,7 @@ pub const UsbHidComposite = struct {
         self.cdc_notif_tail = 0;
         self.cdc_notif_count = 0;
         self.lan7800.reset();
+        self.lan9514.reset();
         self.ctrl[@intFromEnum(TargetDevice.eth)] = .{};
     }
 
@@ -360,6 +364,8 @@ pub const UsbHidComposite = struct {
         }
         if (self.eth_configured and self.hub_kind == .lan7515) {
             if (self.lan7800.hasInterrupt(self.isEthernetLinkUp())) return true;
+        } else if (self.eth_configured and self.hub_kind == .lan9514) {
+            if (self.lan9514.hasInterrupt(self.isEthernetLinkUp())) return true;
         } else if (self.eth_configured and self.eth_notif_polled) {
             const link_up = self.isEthernetLinkUp();
             if (self.reported_link_up == null or self.reported_link_up.? != link_up or self.cdc_notif_count > 0) {
@@ -390,10 +396,14 @@ pub const UsbHidComposite = struct {
     }
 
     /// Returns the Ethernet controller's next Interrupt IN report: CDC notifications, or the
-    /// LAN7800's interrupt status word.
+    /// LAN7800's or LAN9514's interrupt status word.
     pub fn popEthInterrupt(self: *UsbHidComposite, dest: []u8) ?usize {
         if (!self.isHubPresent()) return null;
-        if (self.hub_kind == .lan7515) return self.lan7800.popInterrupt(self.isEthernetLinkUp(), dest);
+        switch (self.hub_kind) {
+            .lan7515 => return self.lan7800.popInterrupt(self.isEthernetLinkUp(), dest),
+            .lan9514 => return self.lan9514.popInterrupt(self.isEthernetLinkUp(), dest),
+            else => {},
+        }
         self.eth_notif_polled = true;
         const link_up = self.isEthernetLinkUp();
         if (self.reported_link_up == null or self.reported_link_up.? != link_up) {
@@ -412,7 +422,7 @@ pub const UsbHidComposite = struct {
     /// Whether `ep` (endpoint number) is a Bulk endpoint of the Ethernet controller.
     pub fn isEthBulkEndpoint(self: *const UsbHidComposite, ep: u4) bool {
         return switch (self.hub_kind) {
-            .lan7515 => ep == 1 or ep == 2,
+            .lan9514, .lan7515 => ep == 1 or ep == 2,
             else => ep == 2,
         };
     }
@@ -420,7 +430,7 @@ pub const UsbHidComposite = struct {
     /// Whether `ep` (endpoint number) is the Interrupt IN endpoint of the Ethernet controller.
     pub fn isEthInterruptEndpoint(self: *const UsbHidComposite, ep: u4) bool {
         return switch (self.hub_kind) {
-            .lan7515 => ep == 3,
+            .lan9514, .lan7515 => ep == 3,
             else => ep == 1,
         };
     }
@@ -429,15 +439,20 @@ pub const UsbHidComposite = struct {
         if (!self.isEthernetLinkUp()) return;
         switch (self.hub_kind) {
             .lan7515 => self.lan7800.handleBulkOut(data, &self.net),
+            .lan9514 => self.lan9514.handleBulkOut(data, &self.net),
             else => self.net.handleTxFrame(data),
         }
     }
 
     /// Discards frames the controller would not pass to the host (receiver off or filtered out).
     fn dropRejectedRxFrames(self: *UsbHidComposite) void {
-        if (self.hub_kind != .lan7515) return;
         while (self.net.peekRxFrame()) |frame| {
-            if (self.lan7800.rxEnabled() and self.lan7800.acceptsFrame(frame)) break;
+            const accepted = switch (self.hub_kind) {
+                .lan7515 => self.lan7800.rxEnabled() and self.lan7800.acceptsFrame(frame),
+                .lan9514 => self.lan9514.rxEnabled() and self.lan9514.acceptsFrame(frame),
+                else => return,
+            };
+            if (accepted) break;
             self.net.dropRxFrame();
         }
     }
@@ -450,7 +465,11 @@ pub const UsbHidComposite = struct {
 
     pub fn popEthBulkIn(self: *UsbHidComposite, dest: []u8) ?usize {
         if (!self.isEthernetLinkUp()) return null;
-        if (self.hub_kind != .lan7515) return self.net.popRxFrame(dest);
+        switch (self.hub_kind) {
+            .lan7515 => {},
+            .lan9514 => return self.popLan9514BulkIn(dest),
+            else => return self.net.popRxFrame(dest),
+        }
 
         // The LAN7800 packs as many received frames as fit into one transfer, up to its burst cap
         const limit = self.lan7800.bulkInLimit(dest.len);
@@ -461,6 +480,22 @@ pub const UsbHidComposite = struct {
             if (len + Lan7800.rxRecordLen(len, frame.len) > limit) break;
             len = self.lan7800.encodeRxFrame(frame, dest, len);
             self.net.dropRxFrame();
+        }
+        return if (len == 0) null else len;
+    }
+
+    /// The LAN9514 delivers one frame per transfer, or with `HW_CFG.MEF` packs as many as fit, up
+    /// to its burst cap.
+    fn popLan9514BulkIn(self: *UsbHidComposite, dest: []u8) ?usize {
+        const limit = self.lan9514.bulkInLimit(dest.len);
+        var len: usize = 0;
+        while (true) {
+            self.dropRejectedRxFrames();
+            const frame = self.net.peekRxFrame() orelse break;
+            if (len + self.lan9514.rxRecordLen(len, frame.len) > limit) break;
+            len = self.lan9514.encodeRxFrame(frame, dest, len);
+            self.net.dropRxFrame();
+            if (!self.lan9514.multipleFrames()) break;
         }
         return if (len == 0) null else len;
     }
@@ -970,7 +1005,7 @@ pub const UsbHidComposite = struct {
                 },
                 else => {},
             }
-        } else if (req_type == 1 and self.hub_kind != .lan7515) { // CDC Class request
+        } else if (req_type == 1 and self.hub_kind == .external) { // CDC Class request
             if (bRequest == 0x43) { // USB_CDC_SET_ETHERNET_PACKET_FILTER
                 self.cdc_packet_filter = wValue;
                 self.reported_link_up = null;
@@ -998,6 +1033,28 @@ pub const UsbHidComposite = struct {
                 },
                 else => {},
             }
+        } else if (req_type == 2 and self.hub_kind == .lan9514 and recipient == 0) { // LAN9514 vendor request
+            const out = (bmRequestType & 0x80) == 0;
+            switch (bRequest) {
+                Lan9514.VENDOR_REQUEST_WRITE_REGISTER => {
+                    if (!out or wLength != 4) return false;
+                    cs.out_setup = setup;
+                    return true;
+                },
+                Lan9514.VENDOR_REQUEST_READ_REGISTER => {
+                    if (out) return false;
+                    const value = self.lan9514.readRegister(wIndex, self.isEthernetLinkUp());
+                    std.mem.writeInt(u32, cs.buf[0..4], value, .little);
+                    cs.len = @min(@as(usize, wLength), 4);
+                    return true;
+                },
+                Lan9514.VENDOR_REQUEST_GET_STATS => {
+                    if (out) return false;
+                    cs.len = self.lan9514.readStats(cs.buf[0..@min(@as(usize, wLength), cs.buf.len)]);
+                    return true;
+                },
+                else => {},
+            }
         }
         return false;
     }
@@ -1006,6 +1063,9 @@ pub const UsbHidComposite = struct {
         const wIndex = std.mem.readInt(u16, setup[4..6], .little);
         if (self.hub_kind == .lan7515 and setup[1] == Lan7800.VENDOR_REQUEST_WRITE_REGISTER and data.len == 4) {
             self.lan7800.writeRegister(wIndex, std.mem.readInt(u32, data[0..4], .little), self.isEthernetLinkUp());
+        }
+        if (self.hub_kind == .lan9514 and setup[1] == Lan9514.VENDOR_REQUEST_WRITE_REGISTER and data.len == 4) {
+            self.lan9514.writeRegister(wIndex, std.mem.readInt(u32, data[0..4], .little), self.isEthernetLinkUp());
         }
     }
 
@@ -1016,11 +1076,11 @@ pub const UsbHidComposite = struct {
                 const pid = self.hub_kind.ethProductId();
                 const bcd = self.hub_kind.ethBcdDevice();
                 const has_strings = !self.hub_kind.isBuiltIn();
-                const vendor = self.hub_kind == .lan7515;
+                const vendor = self.hub_kind != .external;
                 const desc = [18]u8{
                     18, // bLength
                     0x01, // bDescriptorType (Device)
-                    if (vendor) 0x10 else 0x00, 0x02, // bcdUSB 2.10 (USB 3.0 device at High-Speed) or 2.00
+                    if (self.hub_kind == .lan7515) 0x10 else 0x00, 0x02, // bcdUSB 2.10 (USB 3.0 device at High-Speed) or 2.00
                     if (vendor) 0xff else 0x00, // bDeviceClass (vendor-specific, or per-interface: Interface 0 is 0x02 CDC Control)
                     0x00, // bDeviceSubClass
                     if (vendor) 0xff else 0x00, // bDeviceProtocol
@@ -1041,7 +1101,11 @@ pub const UsbHidComposite = struct {
                 return true;
             },
             0x02 => { // CONFIGURATION descriptor
-                const desc: []const u8 = if (self.hub_kind == .lan7515) &LAN7800_CONFIG_DESC else &ETH_CONFIG_DESC;
+                const desc: []const u8 = switch (self.hub_kind) {
+                    .lan7515 => &LAN7800_CONFIG_DESC,
+                    .lan9514 => &LAN9514_CONFIG_DESC,
+                    else => &ETH_CONFIG_DESC,
+                };
                 @memcpy(cs.buf[0..desc.len], desc);
                 cs.len = @min(@as(usize, wLength), desc.len);
                 return true;
@@ -1281,6 +1345,21 @@ pub const UsbHidComposite = struct {
     pub const LAN7800_CONFIG_DESC = [39]u8{
         // Configuration Descriptor (9 bytes, wTotalLength = 39, bNumInterfaces = 1, remote wakeup)
         9, 0x02, 39, 0, 1, 1, 0, 0xa0, 50,
+        // Interface 0 Descriptor: vendor-specific class and protocol (9 bytes)
+        9, 0x04, 0, 0, 3, 0xff, 0x00, 0xff, 0,
+        // Endpoint 1 IN Bulk Descriptor (7 bytes, wMaxPacketSize = 512)
+        7, 0x05, 0x81, 0x02, 0x00, 0x02, 0,
+        // Endpoint 2 OUT Bulk Descriptor (7 bytes, wMaxPacketSize = 512)
+        7, 0x05, 0x02, 0x02, 0x00, 0x02, 0,
+        // Endpoint 3 IN Interrupt Descriptor (7 bytes, wMaxPacketSize = 16, bInterval = 4 -> 1ms)
+        7, 0x05, 0x83, 0x03, 16, 0, 4,
+    };
+
+    /// SMSC LAN9514: one vendor-specific interface with Bulk IN (EP1), Bulk OUT (EP2) and
+    /// Interrupt IN (EP3) endpoints.
+    pub const LAN9514_CONFIG_DESC = [39]u8{
+        // Configuration Descriptor (9 bytes, wTotalLength = 39, bNumInterfaces = 1, self-powered, remote wakeup, 2mA)
+        9, 0x02, 39, 0, 1, 1, 0, 0xe0, 1,
         // Interface 0 Descriptor: vendor-specific class and protocol (9 bytes)
         9, 0x04, 0, 0, 3, 0xff, 0x00, 0xff, 0,
         // Endpoint 1 IN Bulk Descriptor (7 bytes, wMaxPacketSize = 512)
@@ -1534,6 +1613,7 @@ pub const UsbHidComposite = struct {
 
 test {
     _ = @import("lan78xx.zig");
+    _ = @import("smsc95xx.zig");
 }
 
 test "USB HID mouse target tracking and HVS hotspot sync" {
@@ -1637,5 +1717,46 @@ test "USB LAN7515 Ethernet presents a LAN7800 with vendor register access" {
     try std.testing.expectEqual(Lan7800.STATS_LEN, hid.readTargetControlData(.eth, &stats));
 
     // CDC class requests are not part of the LAN7800
+    try std.testing.expect(!hid.handleTargetSetup(.eth, .{ 0x21, 0x43, 0x0e, 0x00, 0x00, 0x00, 0, 0x00 }));
+}
+
+test "USB LAN9514 Ethernet presents an SMSC LAN9514 with vendor register access" {
+    var hid = UsbHidComposite{};
+    hid.setHubKind(.lan9514);
+    hid.reset();
+
+    // Device descriptor: 0424:ec00, vendor-specific class, USB 2.00
+    try std.testing.expect(hid.handleTargetSetup(.eth, .{ 0x80, 0x06, 0x00, 0x01, 0x00, 0x00, 18, 0x00 }));
+    var dev_desc: [18]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 18), hid.readTargetControlData(.eth, &dev_desc));
+    try std.testing.expectEqual(@as(u16, 0x0200), std.mem.readInt(u16, dev_desc[2..4], .little));
+    try std.testing.expectEqual(@as(u8, 0xff), dev_desc[4]);
+    try std.testing.expectEqual(@as(u16, 0xec00), std.mem.readInt(u16, dev_desc[10..12], .little));
+    try std.testing.expect(!hid.handleTargetSetup(.eth, .{ 0x80, 0x06, 0x00, 0x0f, 0x00, 0x00, 5, 0x00 }));
+
+    // Configuration: one vendor interface with Bulk IN EP1, Bulk OUT EP2, Interrupt IN EP3
+    try std.testing.expect(hid.handleTargetSetup(.eth, .{ 0x80, 0x06, 0x00, 0x02, 0x00, 0x00, 0xff, 0x00 }));
+    var cfg: [64]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 39), hid.readTargetControlData(.eth, &cfg));
+    try std.testing.expectEqual(@as(u8, 0xff), cfg[9 + 5]);
+    try std.testing.expectEqual(@as(u8, 0x81), cfg[18 + 2]);
+    try std.testing.expectEqual(@as(u8, 0x02), cfg[25 + 2]);
+    try std.testing.expectEqual(@as(u8, 0x83), cfg[32 + 2]);
+    try std.testing.expect(hid.isEthBulkEndpoint(1) and hid.isEthBulkEndpoint(2) and hid.isEthInterruptEndpoint(3));
+
+    // Read ID_REV (vendor request 0xA1)
+    try std.testing.expect(hid.handleTargetSetup(.eth, .{ 0xc0, 0xa1, 0x00, 0x00, 0x00, 0x00, 4, 0x00 }));
+    var reg: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 4), hid.readTargetControlData(.eth, &reg));
+    try std.testing.expectEqual(@as(u32, 0xec00), std.mem.readInt(u32, &reg, .little) >> 16);
+
+    // Write ADDRL (vendor request 0xA0 with a 4-byte DATA OUT stage), then read it back
+    try std.testing.expect(hid.handleTargetSetup(.eth, .{ 0x40, 0xa0, 0x00, 0x00, 0x08, 0x01, 4, 0x00 }));
+    hid.writeTargetControlData(.eth, &.{ 0xb8, 0x27, 0xeb, 0x12 });
+    try std.testing.expect(hid.handleTargetSetup(.eth, .{ 0xc0, 0xa1, 0x00, 0x00, 0x08, 0x01, 4, 0x00 }));
+    try std.testing.expectEqual(@as(usize, 4), hid.readTargetControlData(.eth, &reg));
+    try std.testing.expectEqual(@as(u32, 0x12eb27b8), std.mem.readInt(u32, &reg, .little));
+
+    // CDC class requests are not part of the LAN9514
     try std.testing.expect(!hid.handleTargetSetup(.eth, .{ 0x21, 0x43, 0x0e, 0x00, 0x00, 0x00, 0, 0x00 }));
 }

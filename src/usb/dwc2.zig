@@ -532,7 +532,7 @@ pub const Dwc2Controller = struct {
             return;
         }
 
-        // Bulk endpoints on the Ethernet device (EP2 IN / OUT for CDC-ECM, EP1 IN / EP2 OUT for LAN7800)
+        // Bulk endpoints on the Ethernet device (EP2 IN / OUT for CDC-ECM, EP1 IN / EP2 OUT for LAN7800 and LAN9514)
         if (eptype == 2 and target == .eth and self.hid.isEthBulkEndpoint(epnum)) {
             if (epdir_in) {
                 // In DWC2 DMA mode, Bulk IN channels stay enabled (HCCHAR_CHEN) until an RX frame arrives
@@ -570,7 +570,7 @@ pub const Dwc2Controller = struct {
 
         // Interrupt IN endpoints on each device:
         // - Hub (.hub): EP1 IN (Status Change Bitmap)
-        // - Ethernet (.eth): EP1 IN (CDC-ECM Notifications) or EP3 IN (LAN7800 interrupt status)
+        // - Ethernet (.eth): EP1 IN (CDC-ECM Notifications) or EP3 IN (LAN7800 / LAN9514 interrupt status)
         // - Keyboard (.kbd): EP1 IN (8-byte Boot Keyboard Report)
         // - Mouse (.mouse): EP1 IN (4-byte Boot Mouse Report)
         // Note: Raspberry Pi's downstream DWC2 driver (`linux-rpi/drivers/usb/dwc2/hcd.c`)
