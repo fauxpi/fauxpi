@@ -52,13 +52,13 @@ apps:
   fauxpi:
     command: usr/bin/fauxpi
     command-chain:
+      - bin/desktop-sockets
       - bin/gpu-2404-wrapper
     desktop: usr/share/applications/io.github.robert_ancell.FauxPi.desktop
     common-id: io.github.robert_ancell.FauxPi
     environment:
       XDG_DATA_HOME: $SNAP_USER_DATA/.local/share
       LD_LIBRARY_PATH: $SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR:$SNAP/usr/lib/$CRAFT_ARCH_TRIPLET_BUILD_FOR/pulseaudio${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
-      PULSE_SERVER: unix:$XDG_RUNTIME_DIR/pulse/native
     plugs:
       - wayland
       - desktop
@@ -100,3 +100,7 @@ parts:
       ${CRAFT_PART_SRC}/bin/gpu-2404-cleanup mesa-2404
     prime:
       - bin/gpu-2404-wrapper
+
+  desktop-sockets:
+    plugin: dump
+    source: snap/local

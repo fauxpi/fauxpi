@@ -1,0 +1,16 @@
+#!/bin/sh
+# Points FauxPi at the desktop's Wayland and PulseAudio sockets. Under strict
+# confinement XDG_RUNTIME_DIR is the snap's own directory inside the user's,
+# while the sockets stay in the user's, where the wayland and audio-playback
+# interfaces let the snap reach them.
+user_runtime_dir=$(dirname "$XDG_RUNTIME_DIR")
+
+case ${WAYLAND_DISPLAY:=wayland-0} in
+/*) ;;
+*) WAYLAND_DISPLAY="$user_runtime_dir/$WAYLAND_DISPLAY" ;;
+esac
+export WAYLAND_DISPLAY
+
+export PULSE_SERVER="${PULSE_SERVER:-unix:$user_runtime_dir/pulse/native}"
+
+exec "$@"
