@@ -74,6 +74,10 @@ parts:
     source: .
     source-type: git
     parse-info: [usr/share/metainfo/io.github.fauxpi.Fauxpi.metainfo.xml]
+    # Zig from the Zig snap: ziglang.org downloads take minutes. If the channel moves past the
+    # version scripts/zig pins, the script downloads that version instead.
+    build-snaps:
+      - zig/latest/beta
     build-packages:
       - ca-certificates
       - curl
