@@ -2,6 +2,8 @@
 
 FauxPi is a Raspberry Pi hardware simulator application.
 
+[![Get it from the Snap Store](https://snapcraft.io/static/images/badges/en/snap-store-black.svg)](https://snapcraft.io/fauxpi)
+
 ![FauxPi running with the board sheet open](screenshot.png)
 
 ## Features
