@@ -7721,6 +7721,16 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.setDataEndianness((inst & (1 << 3)) != 0);
                         return true;
                     }
+                    // CPSIE / CPSID (0xb660 / 0xb670 | A I F): unmask or mask exceptions; no effect in User mode
+                    if ((inst & 0xffe8) == 0xb660) {
+                        if (!self.isPrivileged()) return false;
+                        var mask: u32 = 0;
+                        if ((inst & (1 << 2)) != 0) mask |= PsrFlags.A;
+                        if ((inst & (1 << 1)) != 0) mask |= PsrFlags.I;
+                        if ((inst & (1 << 0)) != 0) mask |= PsrFlags.F;
+                        if ((inst & (1 << 4)) != 0) self.cpsr |= mask else self.cpsr &= ~mask;
+                        return true;
+                    }
                     return false;
                 },
                 0b1010 => { // REV / REV16 / REVSH
@@ -8814,4 +8824,72 @@ test "ARM1176 big-endian exclusives and Thumb SETEND" {
         try std.testing.expectEqual(@as(u32, 0x4433_2211), cpu.r[3]);
         try std.testing.expectEqual(@as(u32, 0), cpu.cpsr & PsrFlags.E);
     }
+}
+
+test "ARM1176 Thumb CPSIE/CPSID mask and unmask exceptions" {
+    const TestBus = struct {
+        ram: []u8,
+        irq: bool = false,
+        pub fn hasPendingIrq(self: *const @This()) bool {
+            return self.irq;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+    @memset(ram, 0);
+    // 0x1100: cpsid if; cpsid a; cpsie i; nop; b .
+    const prog = [_]u16{ 0xb673, 0xb674, 0xb662, 0x46c0, 0xe7fe };
+    for (prog, 0..) |inst, i| std.mem.writeInt(u16, ram[0x1100 + i * 2 ..][0..2], inst, .little);
+    // IRQ vector: b .
+    std.mem.writeInt(u32, ram[0x18..][0..4], 0xeafffffe, .little);
+
+    var bus: TestBus = .{ .ram = ram };
+    var cpu: Arm1176(TestBus) = .{};
+    cpu.initReset(0x1100, 0, 0xffffffff, 0x2000);
+    cpu.cpsr = (cpu.cpsr & ~(PsrFlags.I | PsrFlags.F | PsrFlags.A)) | PsrFlags.T;
+
+    _ = cpu.runSteps(&bus, 1);
+    try std.testing.expectEqual(PsrFlags.I | PsrFlags.F, cpu.cpsr & (PsrFlags.A | PsrFlags.I | PsrFlags.F));
+    _ = cpu.runSteps(&bus, 1);
+    try std.testing.expectEqual(PsrFlags.A | PsrFlags.I | PsrFlags.F, cpu.cpsr & (PsrFlags.A | PsrFlags.I | PsrFlags.F));
+
+    // With an IRQ pending, unmasking takes it before the next instruction
+    bus.irq = true;
+    _ = cpu.runSteps(&bus, 1);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(Mode.irq)), cpu.cpsr & PsrFlags.MODE_MASK);
+    try std.testing.expectEqual(@as(u32, 0x18), cpu.r[15]);
+    try std.testing.expectEqual(@as(u32, 0), cpu.cpsr & PsrFlags.T);
+    try std.testing.expectEqual(PsrFlags.A | PsrFlags.F, cpu.getSpsr() & (PsrFlags.A | PsrFlags.I | PsrFlags.F));
+
+    // In User mode CPS has no effect
+    var user: Arm1176(TestBus) = .{};
+    bus.irq = false;
+    user.initReset(0x1100, 0, 0xffffffff, 0x2000);
+    user.setCpsr(@intFromEnum(Mode.usr) | PsrFlags.T);
+    _ = user.runSteps(&bus, 1);
+    try std.testing.expectEqual(@as(u32, 0), user.cpsr & (PsrFlags.A | PsrFlags.I | PsrFlags.F));
+    try std.testing.expectEqual(@as(u32, 0x1102), user.r[15]);
 }
