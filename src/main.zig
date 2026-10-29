@@ -25,6 +25,7 @@ pub const qcow2 = @import("soc/qcow2.zig");
 pub const sdhost = @import("soc/sdhost.zig");
 pub const cyw43430 = @import("soc/cyw43430.zig");
 pub const bluetooth = @import("soc/bluetooth.zig");
+pub const mphi = @import("soc/mphi.zig");
 pub const i2c = @import("soc/i2c.zig");
 pub const soc_audio = @import("soc/audio.zig");
 pub const bcm2835 = @import("soc/bcm2835.zig");
@@ -324,6 +325,7 @@ fn loadGuestBoot(
         boot_res.dtb_size,
         board_model,
         board_serial,
+        mac_address,
         wifi_mac_opt,
     );
     return boot_res;

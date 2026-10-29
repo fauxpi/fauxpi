@@ -19,6 +19,7 @@ const audio_mod = @import("audio.zig");
 const local_intc_mod = @import("local_intc.zig");
 const spi_mod = @import("spi.zig");
 const smi_mod = @import("smi.zig");
+const mphi_mod = @import("mphi.zig");
 const smp_mod = @import("smp.zig");
 
 /// Complete BCM2835 / BCM2837 SoC Bus & Peripherals.
@@ -72,6 +73,7 @@ pub const Bcm2835 = struct {
     i2s: audio_mod.I2sPcm = .{},
     spi0: spi_mod.Spi0 = .{},
     smi: smi_mod.Smi = .{},
+    mphi: mphi_mod.Mphi = .{},
     smp: smp_mod.Smp = .{},
 
     /// Unemulated peripheral pages the guest touched (each is logged once per boot)
@@ -124,6 +126,7 @@ pub const Bcm2835 = struct {
         self.i2s = .{};
         self.spi0 = .{};
         self.smi = .{};
+        self.mphi = .{};
         self.smp = .{};
         self.unmapped_pages = @splat(0);
         self.unmapped_page_count = 0;
@@ -362,6 +365,7 @@ pub const Bcm2835 = struct {
         pm,
         cprman,
         rng,
+        mphi,
         gpio,
         uart0,
         sdhost,
@@ -400,6 +404,7 @@ pub const Bcm2835 = struct {
             .{ .base = pm_mod.PowerManager.BASE_ADDR, .size = pm_mod.PowerManager.SIZE, .tag = .pm },
             .{ .base = cprman_mod.Cprman.BASE_ADDR, .size = cprman_mod.Cprman.SIZE, .tag = .cprman },
             .{ .base = pm_mod.Rng.BASE_ADDR, .size = pm_mod.Rng.SIZE, .tag = .rng },
+            .{ .base = mphi_mod.Mphi.BASE_ADDR, .size = mphi_mod.Mphi.SIZE, .tag = .mphi },
             .{ .base = gpio_mod.Gpio.BASE_ADDR, .size = gpio_mod.Gpio.SIZE, .tag = .gpio },
             .{ .base = uart_mod.Pl011Uart.BASE_ADDR, .size = uart_mod.Pl011Uart.SIZE, .tag = .uart0 },
             .{ .base = sdhost_mod.SdHost.BASE_ADDR, .size = sdhost_mod.SdHost.SIZE, .tag = .sdhost },
@@ -449,7 +454,8 @@ pub const Bcm2835 = struct {
     }
 
     pub inline fn updateIrqsBank2(self: *Bcm2835) void {
-        self.intc.raw_level[2] = (@as(u32, @intFromBool(self.hvs.irqPending())) << 1) |
+        self.intc.raw_level[2] = @as(u32, @intFromBool(self.mphi.irqPending())) |
+            (@as(u32, @intFromBool(self.hvs.irqPending())) << 1) |
             (@as(u32, @intFromBool(self.pv2.irqPending())) << 10) |
             (@as(u32, @intFromBool(self.pv0.irqPending())) << 13) |
             (@as(u32, @intFromBool(self.pv1.irqPending())) << 14) |
@@ -804,6 +810,7 @@ pub const Bcm2835 = struct {
                 .pm => if (addr -% pm_mod.PowerManager.BASE_ADDR < pm_mod.PowerManager.SIZE) self.pm.read32(addr - pm_mod.PowerManager.BASE_ADDR) else 0,
                 .cprman => self.cprman.read32(addr - cprman_mod.Cprman.BASE_ADDR),
                 .rng => if (addr -% pm_mod.Rng.BASE_ADDR < pm_mod.Rng.SIZE) self.rng.read32(addr - pm_mod.Rng.BASE_ADDR) else 0,
+                .mphi => self.mphi.read32(addr - mphi_mod.Mphi.BASE_ADDR),
                 .gpio => if (addr -% gpio_mod.Gpio.BASE_ADDR < gpio_mod.Gpio.SIZE) self.gpio.read32(addr - gpio_mod.Gpio.BASE_ADDR) else 0,
                 .uart0 => blk: {
                     const v = self.uart0.read32(addr - uart_mod.Pl011Uart.BASE_ADDR);
@@ -910,6 +917,10 @@ pub const Bcm2835 = struct {
                 .cprman => self.cprman.write32(addr - cprman_mod.Cprman.BASE_ADDR, val),
                 .rng => if (addr -% pm_mod.Rng.BASE_ADDR < pm_mod.Rng.SIZE) {
                     self.rng.write32(addr - pm_mod.Rng.BASE_ADDR, val);
+                },
+                .mphi => {
+                    self.mphi.write32(addr - mphi_mod.Mphi.BASE_ADDR, val);
+                    self.updateIrqsBank2();
                 },
                 .gpio => if (addr -% gpio_mod.Gpio.BASE_ADDR < gpio_mod.Gpio.SIZE) {
                     self.gpio.write32(addr - gpio_mod.Gpio.BASE_ADDR, val);
