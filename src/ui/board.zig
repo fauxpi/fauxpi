@@ -5,6 +5,7 @@
 //! outlines.
 
 const std = @import("std");
+const BoardClocks = @import("../soc/mailbox.zig").BoardClocks;
 
 pub const Rect = struct { x: f32, y: f32, w: f32, h: f32 };
 
@@ -269,6 +270,44 @@ pub const BoardModel = enum {
         return @as(u32, 256 * 1024 * 1024) << @intCast((self.boardRevision() >> 20) & 7);
     }
 
+    /// The firmware's default clocks (`arm_freq`, `core_freq`, ... and their `_min`), in MHz.
+    pub fn clocks(self: BoardModel) BoardClocks {
+        return switch (self) {
+            .pi_1_a_plus, .pi_1_b_plus => .{
+                .arm = .mhz(700, 700),
+                .core = .mhz(250, 250),
+                .v3d = .mhz(250, 250),
+                .h264 = .mhz(250, 250),
+                .isp = .mhz(250, 250),
+                .sdram = .mhz(400, 400),
+            },
+            .pi_zero, .pi_zero_w => .{
+                .arm = .mhz(700, 1000),
+                .core = .mhz(250, 400),
+                .v3d = .mhz(250, 300),
+                .h264 = .mhz(250, 300),
+                .isp = .mhz(250, 300),
+                .sdram = .mhz(400, 450),
+            },
+            .pi_zero_2_w => .{
+                .arm = .mhz(600, 1000),
+                .core = .mhz(250, 400),
+                .v3d = .mhz(250, 300),
+                .h264 = .mhz(250, 300),
+                .isp = .mhz(250, 300),
+                .sdram = .mhz(400, 450),
+            },
+            .pi_3_a_plus, .pi_3_b_plus => .{
+                .arm = .mhz(600, 1400),
+                .core = .mhz(250, 400),
+                .v3d = .mhz(250, 400),
+                .h264 = .mhz(250, 400),
+                .isp = .mhz(250, 400),
+                .sdram = .mhz(400, 500),
+            },
+        };
+    }
+
     pub fn hasWireless(self: BoardModel) bool {
         return switch (self) {
             .pi_1_a_plus, .pi_1_b_plus, .pi_zero => false,
@@ -360,6 +399,13 @@ test "board RAM sizes" {
     for ([_]BoardModel{ .pi_1_a_plus, .pi_1_b_plus, .pi_3_a_plus, .pi_zero, .pi_zero_w, .pi_zero_2_w }) |bm| {
         try std.testing.expectEqual(@as(u32, 512 * 1024 * 1024), bm.ramBytes());
     }
+}
+
+test "board ARM clocks" {
+    try std.testing.expectEqual(@as(u32, 700_000_000), BoardModel.pi_1_b_plus.clocks().arm.max_hz);
+    try std.testing.expectEqual(@as(u32, 1_000_000_000), BoardModel.pi_zero_w.clocks().arm.max_hz);
+    try std.testing.expectEqual(@as(u32, 1_400_000_000), BoardModel.pi_3_b_plus.clocks().arm.max_hz);
+    try std.testing.expectEqual(@as(u32, 600_000_000), BoardModel.pi_zero_2_w.clocks().arm.min_hz);
 }
 
 test "every part is on or at the edge of its board" {

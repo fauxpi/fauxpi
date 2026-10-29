@@ -3,6 +3,32 @@ const audio_mod = @import("audio.zig");
 
 /// BCM2835 VideoCore Mailbox (`0x2000b880`) and Property Tags (`channel 8`)
 /// Also tracks legacy/simple framebuffer configuration if requested by firmware fb drivers.
+/// A clock the firmware scales between its `config.txt` `*_freq_min` and `*_freq` settings.
+pub const ScaledClock = struct {
+    rate_hz: u32,
+    min_hz: u32,
+    max_hz: u32,
+
+    /// Starts at the maximum.
+    pub fn mhz(min: u32, max: u32) ScaledClock {
+        return .{ .rate_hz = max * 1_000_000, .min_hz = min * 1_000_000, .max_hz = max * 1_000_000 };
+    }
+
+    fn set(self: *ScaledClock, rate_hz: u32) void {
+        self.rate_hz = std.math.clamp(rate_hz, self.min_hz, self.max_hz);
+    }
+};
+
+/// The firmware's default clocks for a board.
+pub const BoardClocks = struct {
+    arm: ScaledClock,
+    core: ScaledClock,
+    v3d: ScaledClock,
+    h264: ScaledClock,
+    isp: ScaledClock,
+    sdram: ScaledClock,
+};
+
 pub const Mailbox = struct {
     pub const BASE_ADDR: u32 = 0x2000b880;
     pub const SIZE: u32 = 0x40;
@@ -56,9 +82,15 @@ pub const Mailbox = struct {
     vc_alloc_next: u32 = 0x1d000000,
 
     /// Tracked clock rates (modifiable by Set Clock Rate tag)
-    arm_rate_hz: u32 = 1_000_000_000,
-    core_rate_hz: u32 = 250_000_000,
-    v3d_rate_hz: u32 = 250_000_000,
+    /// Clocks the firmware scales (Pi Zero defaults until `setBoardClocks`)
+    clocks: BoardClocks = .{
+        .arm = .mhz(700, 1000),
+        .core = .mhz(250, 400),
+        .v3d = .mhz(250, 300),
+        .h264 = .mhz(250, 300),
+        .isp = .mhz(250, 300),
+        .sdram = .mhz(400, 450),
+    },
     uart_rate_hz: u32 = 48_000_000,
     emmc_rate_hz: u32 = 250_000_000,
     pixel_rate_hz: u32 = 74_250_000,
@@ -71,6 +103,18 @@ pub const Mailbox = struct {
     /// Firmware GPIO expander state (pins 128..135; 128 = ACT LED, 130 = active-low PWR LED on Pi 3 B+, 135 = PWR LED)
     exp_gpio_state: [8]u1 = .{ 0, 1, 0, 1, 1, 1, 1, 1 },
     exp_act_latch: bool = false,
+
+    /// Sets the board's clocks. They start at their maximum: the firmware runs in turbo from boot
+    /// (`initial_turbo`) until cpufreq sets a frequency.
+    pub fn setBoardClocks(self: *Mailbox, clocks: BoardClocks) void {
+        self.clocks = clocks;
+    }
+
+    /// Fixes the VPU core clock at `hz`, as the firmware does with `enable_uart=1` when the mini
+    /// UART, whose baud rate follows the core clock, is the primary UART.
+    pub fn fixCoreClock(self: *Mailbox, hz: u32) void {
+        self.clocks.core = .{ .rate_hz = hz, .min_hz = hz, .max_hz = hz };
+    }
 
     /// Splits SDRAM between the ARM (`arm_bytes` from address 0) and the VideoCore (`vc_bytes` above
     /// it), placing the firmware's framebuffer and GPU allocations in the VideoCore's share.
@@ -200,20 +244,27 @@ pub const Mailbox = struct {
         }
     }
 
-    fn getClockRate(self: *const Mailbox, clock_id: u32) u32 {
+    fn getClockRate(self: *Mailbox, clock_id: u32) u32 {
         return switch (clock_id) {
             1 => self.emmc_rate_hz, // EMMC
             2 => self.uart_rate_hz, // UART
-            3 => self.arm_rate_hz, // ARM
-            4 => self.core_rate_hz, // CORE
-            5 => self.v3d_rate_hz, // V3D
-            6 => 250_000_000, // H264
-            7 => 250_000_000, // ISP
-            8 => 400_000_000, // SDRAM
             9 => self.pixel_rate_hz, // PIXEL
             10 => 100_000_000, // PWM
             12 => 250_000_000, // EMMC2
-            else => 250_000_000,
+            else => if (self.scaledClock(clock_id)) |c| c.rate_hz else 250_000_000,
+        };
+    }
+
+    /// The clocks the firmware scales: ARM, CORE, V3D, H264, ISP and SDRAM.
+    fn scaledClock(self: *Mailbox, clock_id: u32) ?*ScaledClock {
+        return switch (clock_id) {
+            3 => &self.clocks.arm,
+            4 => &self.clocks.core,
+            5 => &self.clocks.v3d,
+            6 => &self.clocks.h264,
+            7 => &self.clocks.isp,
+            8 => &self.clocks.sdram,
+            else => null,
         };
     }
 
@@ -334,11 +385,8 @@ pub const Mailbox = struct {
                         switch (clk_id) {
                             1 => self.emmc_rate_hz = rate,
                             2 => self.uart_rate_hz = rate,
-                            3 => self.arm_rate_hz = rate,
-                            4 => self.core_rate_hz = rate,
-                            5 => self.v3d_rate_hz = rate,
                             9 => self.pixel_rate_hz = rate,
-                            else => {},
+                            else => if (self.scaledClock(clk_id)) |c| c.set(rate),
                         }
                     }
                     writeU32(ram, payload, 0, buf_size, clk_id);
@@ -347,8 +395,7 @@ pub const Mailbox = struct {
                 },
                 0x00030004 => { // Get max clock rate
                     const clk_id = readU32(ram, payload, 0, buf_size);
-                    const max_rate: u32 = switch (clk_id) {
-                        3 => 1_000_000_000,
+                    const max_rate: u32 = if (self.scaledClock(clk_id)) |c| c.max_hz else switch (clk_id) {
                         9 => 162_000_000,
                         else => self.getClockRate(clk_id),
                     };
@@ -358,8 +405,7 @@ pub const Mailbox = struct {
                 },
                 0x00030007 => { // Get min clock rate
                     const clk_id = readU32(ram, payload, 0, buf_size);
-                    const min_rate: u32 = switch (clk_id) {
-                        3 => 700_000_000,
+                    const min_rate: u32 = if (self.scaledClock(clk_id)) |c| c.min_hz else switch (clk_id) {
                         9 => 25_000_000,
                         else => self.getClockRate(clk_id),
                     };
@@ -655,6 +701,48 @@ test "Mailbox property tags: board revision and clock rate" {
     try std.testing.expectEqual(@as(u32, 0x80000000), std.mem.readInt(u32, ram[base + 4 ..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 0x00900093), std.mem.readInt(u32, ram[base + 20 ..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 1_000_000_000), std.mem.readInt(u32, ram[base + 40 ..][0..4], .little));
+}
+
+test "Mailbox property tags: clocks scale within the board's limits" {
+    var mbox = Mailbox{};
+    var ram: [256]u8 = @splat(0);
+    mbox.setBoardClocks(.{
+        .arm = .mhz(600, 1400),
+        .core = .mhz(250, 400),
+        .v3d = .mhz(250, 400),
+        .h264 = .mhz(250, 400),
+        .isp = .mhz(250, 400),
+        .sdram = .mhz(400, 500),
+    });
+
+    const Tag = struct {
+        fn call(m: *Mailbox, r: *[256]u8, tag: u32, clock_id: u32, rate: u32) u32 {
+            const base: u32 = 0x40;
+            std.mem.writeInt(u32, r[base + 0 ..][0..4], 32, .little);
+            std.mem.writeInt(u32, r[base + 4 ..][0..4], 0, .little);
+            std.mem.writeInt(u32, r[base + 8 ..][0..4], tag, .little);
+            std.mem.writeInt(u32, r[base + 12 ..][0..4], 8, .little);
+            std.mem.writeInt(u32, r[base + 16 ..][0..4], 8, .little);
+            std.mem.writeInt(u32, r[base + 20 ..][0..4], clock_id, .little);
+            std.mem.writeInt(u32, r[base + 24 ..][0..4], rate, .little);
+            std.mem.writeInt(u32, r[base + 28 ..][0..4], 0, .little);
+            m.write32(0x20, base | 8, r);
+            _ = m.read32(0x00);
+            return std.mem.readInt(u32, r[base + 24 ..][0..4], .little);
+        }
+    };
+
+    try std.testing.expectEqual(@as(u32, 1_400_000_000), Tag.call(&mbox, &ram, 0x00030002, 3, 0)); // turbo from boot
+    try std.testing.expectEqual(@as(u32, 1_400_000_000), Tag.call(&mbox, &ram, 0x00030004, 3, 0));
+    try std.testing.expectEqual(@as(u32, 600_000_000), Tag.call(&mbox, &ram, 0x00030007, 3, 0));
+    try std.testing.expectEqual(@as(u32, 600_000_000), Tag.call(&mbox, &ram, 0x00038002, 3, 100_000_000));
+    try std.testing.expectEqual(@as(u32, 1_400_000_000), Tag.call(&mbox, &ram, 0x00038002, 3, 2_000_000_000));
+    try std.testing.expectEqual(@as(u32, 500_000_000), Tag.call(&mbox, &ram, 0x00030002, 8, 0));
+
+    // enable_uart=1 with the mini UART primary fixes the core clock
+    mbox.fixCoreClock(250_000_000);
+    try std.testing.expectEqual(@as(u32, 250_000_000), Tag.call(&mbox, &ram, 0x00030004, 4, 0));
+    try std.testing.expectEqual(@as(u32, 250_000_000), Tag.call(&mbox, &ram, 0x00038002, 4, 400_000_000));
 }
 
 test "Mailbox property tags: display enumeration" {

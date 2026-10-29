@@ -320,6 +320,9 @@ fn loadGuestBoot(
         break :blk try loader.loadFromSdImageForModel(gpa, soc.ram, img, board_model);
     } else return error.MissingSdImage;
 
+    soc.mailbox.setBoardClocks(board_model.clocks());
+    if (boot_res.core_clock_fixed) soc.mailbox.fixCoreClock(250_000_000);
+
     const wifi_mac_opt: ?[6]u8 = if (board_model.hasWireless()) wifi_mac_address else null;
     _ = try loader.applyBoardConfigToRamDtb(
         gpa,

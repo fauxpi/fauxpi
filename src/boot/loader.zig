@@ -231,6 +231,9 @@ pub const BootResult = struct {
     kernel_size: usize,
     dtb_size: usize,
     initrd_size: usize,
+    /// `enable_uart=1` with the mini UART as the primary UART: the firmware fixes the VPU core clock,
+    /// which the mini UART's baud rate follows, at 250 MHz.
+    core_clock_fixed: bool = false,
 };
 
 /// The device tree the firmware loads for each board (unless config.txt names one with `device_tree=`).
@@ -697,6 +700,7 @@ pub fn loadDirectWithOverlays(
         .kernel_size = loaded_kernel_size,
         .dtb_size = patched_dtb.len,
         .initrd_size = initrd_len,
+        .core_clock_fixed = (start.enable_uart orelse false) and tree.serial0IsMiniUart(),
     };
 }
 

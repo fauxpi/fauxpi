@@ -338,6 +338,13 @@ pub const Tree = struct {
         try fb_node.setStringProp(self.allocator, "status", "okay");
     }
 
+    /// Whether the primary UART (`serial0`) is the mini UART rather than the PL011.
+    pub fn serial0IsMiniUart(self: *const Tree) bool {
+        const aliases = self.findNode("/aliases") orelse return false;
+        const target = aliases.getStringProp("serial0") orelse return false;
+        return std.mem.indexOf(u8, target, "7e215040") != null;
+    }
+
     /// Makes the device-tree changes the firmware (`start.elf`) makes before starting the kernel:
     /// - `/memory@0` covers the ARM's `arm_ram_size` bytes of RAM, below the VideoCore's share at the top
     /// - `/chosen/bootargs` is the tree's own bootargs, then the firmware's `8250.nr_uarts` setting
@@ -359,14 +366,7 @@ pub const Tree = struct {
 
         // 2. /chosen bootargs, initrd, and rng-seed (initializes kernel CRNG immediately at boot)
         const chosen = try self.findOrCreateNode("/chosen");
-        const serial0_target = if (self.findNode("/aliases")) |aliases|
-            aliases.getStringProp("serial0")
-        else
-            null;
-        const serial0_is_aux = if (serial0_target) |st|
-            std.mem.indexOf(u8, st, "7e215040") != null
-        else
-            false;
+        const serial0_is_aux = self.serial0IsMiniUart();
         const serial0_tty = if (serial0_is_aux) "ttyS0" else "ttyAMA0";
         const serial1_tty = if (serial0_is_aux) "ttyAMA0" else "ttyS0";
 
