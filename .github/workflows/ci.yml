@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['*'] # a release, e.g. 26.10 or 26.10.1
   pull_request:
 
 jobs:
@@ -28,6 +29,7 @@ jobs:
 
   snap:
     name: Build snap (${{ matrix.arch }})
+    needs: [format, test] # nothing reaches the store unless these pass
     strategy:
       fail-fast: false
       matrix:
@@ -45,3 +47,11 @@ jobs:
         with:
           name: fauxpi-snap-${{ matrix.arch }}
           path: ${{ steps.build.outputs.snap }}
+      # Pushes to main go to the edge channel and release tags to stable. Pull requests only build.
+      - if: github.event_name == 'push'
+        uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.build.outputs.snap }}
+          release: ${{ startsWith(github.ref, 'refs/tags/') && 'stable' || 'edge' }}
