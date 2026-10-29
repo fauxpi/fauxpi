@@ -352,9 +352,10 @@ pub const DmaController = struct {
         }
     }
 
+    /// Peripherals are at `0x7e000000` on the VideoCore bus; every other bus address is RAM
+    /// (`0x20000000` is the ARM's physical address for them on the BCM2835, not the DMA's).
     fn isPeripAddr(bus_addr: u32) bool {
-        if ((bus_addr & 0xFF000000) == 0x7E000000) return true;
-        return bus_addr >= 0x20000000 and bus_addr < 0x21000000;
+        return (bus_addr & 0xFF000000) == 0x7E000000;
     }
 
     fn executeTransfer(self: *DmaController, c: *Channel, ram: []u8, mmio: ?MmioIo) void {
@@ -514,6 +515,27 @@ test "DMA 1D memory-to-memory copy" {
     try std.testing.expectEqual(@as(u32, 0xCAFEBABE), std.mem.readInt(u32, ram[0x200..0x204], .little));
     try std.testing.expectEqual(@as(u32, 0x12345678), std.mem.readInt(u32, ram[0x204..0x208], .little));
     try std.testing.expect(dma.channelIrqPending(0));
+}
+
+test "DMA reaches RAM at bus address 0x20000000" {
+    var dma = DmaController{};
+    const ram = try std.heap.page_allocator.alloc(u8, 0x2000_1000);
+    defer std.heap.page_allocator.free(ram);
+
+    std.mem.writeInt(u32, ram[0x2000_0100..][0..4], 0xCAFEBABE, .little);
+
+    const cb: u32 = 0x20;
+    std.mem.writeInt(u32, ram[cb + 0 ..][0..4], DmaController.TI_S_INC | DmaController.TI_D_INC, .little);
+    std.mem.writeInt(u32, ram[cb + 4 ..][0..4], 0x2000_0100, .little); // src: RAM through the 0x00000000 alias
+    std.mem.writeInt(u32, ram[cb + 8 ..][0..4], 0xc000_0200, .little);
+    std.mem.writeInt(u32, ram[cb + 12 ..][0..4], 4, .little);
+    std.mem.writeInt(u32, ram[cb + 16 ..][0..4], 0, .little);
+    std.mem.writeInt(u32, ram[cb + 20 ..][0..4], 0, .little);
+
+    dma.write32(0x04, 0xc0000020, ram, null);
+    dma.write32(0x00, DmaController.CS_ACTIVE, ram, null);
+
+    try std.testing.expectEqual(@as(u32, 0xCAFEBABE), std.mem.readInt(u32, ram[0x200..0x204], .little));
 }
 
 test "DMA zero-fill and constant-word fill fast paths" {
