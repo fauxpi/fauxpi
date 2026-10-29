@@ -325,8 +325,8 @@ pub fn decodeInst(inst: qpu.Inst) DecodedInst {
     }
 
     const ws = qpu.getWs(inst);
-    const cond_add: qpu.Cond = @enumFromInt(@as(u3, @truncate(inst >> 49)));
-    const cond_mul: qpu.Cond = @enumFromInt(@as(u3, @truncate(inst >> 46)));
+    const cond_add: qpu.Cond = @fromBackingInt(@intCast(@as(u3, @truncate(inst >> 49))));
+    const cond_mul: qpu.Cond = @fromBackingInt(@intCast(@as(u3, @truncate(inst >> 46))));
     const pm = (inst >> 56) & 1 != 0;
     const pack: u4 = @truncate(inst >> 52);
     const unpack_mode: u3 = @truncate(inst >> 57);
@@ -334,10 +334,10 @@ pub fn decodeInst(inst: qpu.Inst) DecodedInst {
     const mul_op: qpu.MulOp = if (sig == .load_imm) .nop else qpu.getMulOp(inst);
     const raddr_a = qpu.getRaddrA(inst);
     const raddr_b = qpu.getRaddrB(inst);
-    const mux0: qpu.Mux = @enumFromInt(@as(u3, @truncate(inst >> 9)));
-    const mux1: qpu.Mux = @enumFromInt(@as(u3, @truncate(inst >> 6)));
-    const mux2: qpu.Mux = @enumFromInt(@as(u3, @truncate(inst >> 3)));
-    const mux3: qpu.Mux = @enumFromInt(@as(u3, @truncate(inst)));
+    const mux0: qpu.Mux = @fromBackingInt(@intCast(@as(u3, @truncate(inst >> 9))));
+    const mux1: qpu.Mux = @fromBackingInt(@intCast(@as(u3, @truncate(inst >> 6))));
+    const mux2: qpu.Mux = @fromBackingInt(@intCast(@as(u3, @truncate(inst >> 3))));
+    const mux3: qpu.Mux = @fromBackingInt(@intCast(@as(u3, @truncate(inst))));
 
     const uses_a = (add_op != .nop and (mux0 == .a or mux1 == .a)) or
         (mul_op != .nop and (mux2 == .a or mux3 == .a));
@@ -422,7 +422,7 @@ pub fn decodeProgram(code: []const qpu.Inst, out_buf: []DecodedInst) []const Dec
             d1.add_op == .fadd and d1.cond_add == .always and d1.add_pack_a == 0 and
             (d1.flags & (DecodedInst.FLAG_HAS_UNPACK | DecodedInst.FLAG_SF)) == 0)
         {
-            const acc_mux: qpu.Mux = @enumFromInt(d0.waddr_mul - qpu.W.acc0);
+            const acc_mux: qpu.Mux = @fromBackingInt(@intCast(d0.waddr_mul - qpu.W.acc0));
             if ((d1.mux0 == acc_mux and d1.mux1 == .r5) or (d1.mux0 == .r5 and d1.mux1 == acc_mux)) {
                 out_buf[i].flags |= DecodedInst.FLAG_FUSED_LINTERP;
                 out_buf[i].waddr_add = d1.waddr_add;
@@ -751,8 +751,8 @@ pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: []const u32
                     if (d.mul_op != .nop) mul_sym = .unknown;
                 } else {
                     if (d.add_op != .nop) {
-                        const in0 = acc_sym[@intFromEnum(d.mux0)];
-                        const in1 = acc_sym[@intFromEnum(d.mux1)];
+                        const in0 = acc_sym[@backingInt(d.mux0)];
+                        const in1 = acc_sym[@backingInt(d.mux1)];
                         if (d.add_op == .@"or" and d.mux0 == d.mux1) {
                             add_sym = in0;
                         } else if (in0 == .constant and in1 == .constant) {
@@ -762,8 +762,8 @@ pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: []const u32
                         }
                     }
                     if (d.mul_op != .nop) {
-                        const in2 = acc_sym[@intFromEnum(d.mux2)];
-                        const in3 = acc_sym[@intFromEnum(d.mux3)];
+                        const in2 = acc_sym[@backingInt(d.mux2)];
+                        const in3 = acc_sym[@backingInt(d.mux3)];
                         if (in2 == .constant and in3 == .constant) {
                             mul_sym = .{ .constant = mulOpVec(d.mul_op, splat(in2.constant), splat(in3.constant))[0] };
                         } else if (d.mul_op == .fmul) {
@@ -967,7 +967,7 @@ inline fn resolveMuxSlow(
     return switch (m) {
         .r4 => if (unpack_r4 != 0) unpackVec(s.acc[4], unpack_r4, float_input) else s.acc[4],
         .a => if (unpack_a != 0) unpackVec(s.acc[6], unpack_a, float_input) else s.acc[6],
-        else => s.acc[@intFromEnum(m)],
+        else => s.acc[@backingInt(m)],
     };
 }
 
@@ -1053,12 +1053,12 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
 
             if ((d.flags & DecodedInst.FLAG_HAS_UNPACK) == 0) {
                 if (d.add_op != .nop) {
-                    add_result = addOpVec(d.add_op, s.acc[@intFromEnum(d.mux0)], s.acc[@intFromEnum(d.mux1)]);
+                    add_result = addOpVec(d.add_op, s.acc[@backingInt(d.mux0)], s.acc[@backingInt(d.mux1)]);
                 } else if (d.waddr_add != qpu.W.nop) {
                     add_result = splat(0);
                 }
                 if (d.mul_op != .nop) {
-                    mul_result = mulOpVec(d.mul_op, s.acc[@intFromEnum(d.mux2)], s.acc[@intFromEnum(d.mux3)]);
+                    mul_result = mulOpVec(d.mul_op, s.acc[@backingInt(d.mux2)], s.acc[@backingInt(d.mux3)]);
                 } else if (d.waddr_mul != qpu.W.nop or (d.flags & DecodedInst.FLAG_SF) != 0) {
                     mul_result = splat(0);
                 }
@@ -1968,5 +1968,3 @@ test "QPU fused varying linterp and fast-path fragment shader compilation" {
     const res_tex_dec = try runFragmentDecoded(dec_tex, &env_tex);
     try std.testing.expectEqual(res_tex_dec.tlb_color.?[0], res_tex_fast.tlb_color.?[0]);
 }
-
-

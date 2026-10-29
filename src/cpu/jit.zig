@@ -150,11 +150,11 @@ pub const Reg = enum(u4) {
     r15 = 15,
 
     pub inline fn low3(self: Reg) u8 {
-        return @intCast(@intFromEnum(self) & 7);
+        return @intCast(@backingInt(self) & 7);
     }
 
     pub inline fn isExt(self: Reg) bool {
-        return (@intFromEnum(self) & 8) != 0;
+        return (@backingInt(self) & 8) != 0;
     }
 };
 
@@ -165,7 +165,7 @@ pub const Xmm = enum(u4) {
     xmm3 = 3,
 
     pub inline fn low3(self: Xmm) u8 {
-        return @intCast(@intFromEnum(self) & 7);
+        return @intCast(@backingInt(self) & 7);
     }
 };
 
@@ -479,7 +479,7 @@ pub const X64Emitter = struct {
     }
 
     pub fn movSib8Reg(self: *X64Emitter, base: Reg, index: Reg, scale_shift: u2, disp: i32, src: Reg) void {
-        const force_rex = (@intFromEnum(src) >= 4 and @intFromEnum(src) <= 7);
+        const force_rex = (@backingInt(src) >= 4 and @backingInt(src) <= 7);
         self.emitRex(false, src.isExt(), index.isExt(), base.isExt(), force_rex);
         self.emit8(0x88);
         self.emitModRmSib(src.low3(), base, index, scale_shift, disp);
@@ -680,7 +680,7 @@ pub const X64Emitter = struct {
     }
 
     pub fn movzx8(self: *X64Emitter, is64: bool, dst: Reg, src: Reg) void {
-        const force_rex = (@intFromEnum(src) >= 4 and @intFromEnum(src) <= 7);
+        const force_rex = (@backingInt(src) >= 4 and @backingInt(src) <= 7);
         self.emitRex(is64, dst.isExt(), false, src.isExt(), force_rex);
         self.emit8(0x0f);
         self.emit8(0xb6);
@@ -695,7 +695,7 @@ pub const X64Emitter = struct {
     }
 
     pub fn movsx8(self: *X64Emitter, is64: bool, dst: Reg, src: Reg) void {
-        const force_rex = (@intFromEnum(src) >= 4 and @intFromEnum(src) <= 7);
+        const force_rex = (@backingInt(src) >= 4 and @backingInt(src) <= 7);
         self.emitRex(is64, dst.isExt(), false, src.isExt(), force_rex);
         self.emit8(0x0f);
         self.emit8(0xbe);
@@ -716,10 +716,10 @@ pub const X64Emitter = struct {
     }
 
     pub fn setcc(self: *X64Emitter, cc: Cond, dst: Reg) void {
-        const force_rex = (@intFromEnum(dst) >= 4 and @intFromEnum(dst) <= 7);
+        const force_rex = (@backingInt(dst) >= 4 and @backingInt(dst) <= 7);
         self.emitRex(false, false, false, dst.isExt(), force_rex);
         self.emit8(0x0f);
-        self.emit8(0x90 + @as(u8, @intFromEnum(cc)));
+        self.emit8(0x90 + @as(u8, @backingInt(cc)));
         self.emitModRmReg(0, dst.low3());
     }
 
@@ -735,7 +735,7 @@ pub const X64Emitter = struct {
 
     pub fn jccLabel(self: *X64Emitter, cc: Cond, label: u16) void {
         self.emit8(0x0f);
-        self.emit8(0x80 + @as(u8, @intFromEnum(cc)));
+        self.emit8(0x80 + @as(u8, @backingInt(cc)));
         self.fixups[self.fixup_count] = .{
             .disp_offset = @intCast(self.len),
             .label = label,
@@ -2285,7 +2285,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
         }
 
         pub fn canCompileSlot(comptime SlotType: type, d: SlotType) bool {
-            const op: A64Op = @enumFromInt(d.op);
+            const op: A64Op = @fromBackingInt(@intCast(d.op));
             if (canCompileOp(op)) return true;
             return switch (op) {
                 .mrs_sys => switch (slotSysRegId(SlotType, d)) {
@@ -2327,7 +2327,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                 }
             }.add;
             for (decoded) |d| {
-                const op: A64Op = @enumFromInt(d.op);
+                const op: A64Op = @fromBackingInt(@intCast(d.op));
                 switch (op) {
                     .nop => {},
                     .adr, .adrp, .mov_wide, .mrs_tpidr_el0, .ldr_lit32, .ldr_lit64, .ldrsw_lit, .cbz64, .cbnz64, .cbz32, .cbnz32, .tbz, .tbnz => bump(&counts, d.rd),
@@ -2412,7 +2412,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
         }
 
         fn a64FlagSetKind(comptime SlotType: type, d: SlotType) FlagSetKind {
-            const op: A64Op = @enumFromInt(d.op);
+            const op: A64Op = @fromBackingInt(@intCast(d.op));
             return switch (op) {
                 .adds_imm64, .adds_imm32, .adds_reg64, .adds_reg32 => .add,
                 .subs_imm64, .subs_imm32, .subs_reg64, .subs_reg32 => .sub,
@@ -2450,7 +2450,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
         ) bool {
             if (kind == .none or idx + 1 >= decoded.len) return false;
             const next_d = decoded[idx + 1];
-            const next_op: A64Op = @enumFromInt(next_d.op);
+            const next_op: A64Op = @fromBackingInt(@intCast(next_d.op));
             if (next_op != .b_cond) return false;
             const cond: u4 = @intCast(next_d.rd & 0xf);
             if (armCondToX86Cond(cond, kind, false) == null) return false;
@@ -2469,7 +2469,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
             // and no branch in the trace targets `idx + 1` directly.
             for (0..decoded.len) |j| {
                 const jd = decoded[j];
-                const jop: A64Op = @enumFromInt(jd.op);
+                const jop: A64Op = @fromBackingInt(@intCast(jd.op));
                 switch (jop) {
                     .b_imm, .bl_imm, .b_cond, .cbz64, .cbnz64, .cbz32, .cbnz32, .tbz, .tbnz => {
                         const jw: u16 = start_word + @as(u16, @intCast(j));
@@ -2518,7 +2518,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                 const raw = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
                 if ((raw & 0x3f00_0000) == 0x0800_0000) return true;
                 const d = A64.decodeA64(SlotType, raw);
-                const op: A64Op = @enumFromInt(d.op);
+                const op: A64Op = @fromBackingInt(@intCast(d.op));
                 switch (op) {
                     .msr_safe => if (d.rn == 1 or d.rn == 2) return true else {
                         has_side_effect = true;
@@ -2598,7 +2598,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                     const w = start_word + @as(u16, @intCast(i));
                     const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
                     const d = A64.decodeA64(SlotType, raw_inst);
-                    const op: A64Op = @enumFromInt(d.op);
+                    const op: A64Op = @fromBackingInt(@intCast(d.op));
                     if (!canCompileSlot(SlotType, d)) return null;
                     if (trace_len <= 8 and op == .load_store_other and (raw_inst & 0x3f40_7c00) == 0x0840_7c00) return null;
                     if ((op == .bl_imm or op == .blr_reg or op == .ret or op == .br_reg) and !can_bypass) return null;
@@ -2620,7 +2620,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                     const w = start_word + trace_len;
                     const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
                     const d = A64.decodeA64(SlotType, raw_inst);
-                    const op: A64Op = @enumFromInt(d.op);
+                    const op: A64Op = @fromBackingInt(@intCast(d.op));
                     if (!canCompileSlot(SlotType, d)) break;
                     switch (op) {
                         .b_imm, .b_cond, .cbz64, .cbnz64, .cbz32, .cbnz32, .tbz, .tbnz => {
@@ -2635,7 +2635,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                                     if (isSpinLoop(SlotType, code_page_ptr, loop_start, w + 1)) return null;
                                     if (w + 1 - @as(u16, loop_start) <= 8) {
                                         for (loop_start - start_word..trace_len) |li| {
-                                            if (decoded[li].op == @intFromEnum(A64Op.load_store_other) and (decoded[li].raw & 0x3f40_7c00) == 0x0840_7c00) return null;
+                                            if (decoded[li].op == @backingInt(A64Op.load_store_other) and (decoded[li].raw & 0x3f40_7c00) == 0x0840_7c00) return null;
                                         }
                                     }
                                     has_backward_branch = true;
@@ -2686,7 +2686,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                 const w: u16 = start_word + @as(u16, @intCast(idx));
                 const pc_page_off: u32 = @as(u32, w) * 4;
                 const d = decoded[idx];
-                const op: A64Op = @enumFromInt(d.op);
+                const op: A64Op = @fromBackingInt(@intCast(d.op));
                 const flag_kind = a64FlagSetKind(SlotType, d);
                 const fuse_flags = canFuseA64BackwardBranch(SlotType, decoded[0..trace_len], start_word, end_word, idx, flag_kind);
 
@@ -3967,7 +3967,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
                 }
             }
 
-            const last_op: A64Op = @enumFromInt(decoded[trace_len - 1].op);
+            const last_op: A64Op = @fromBackingInt(@intCast(decoded[trace_len - 1].op));
             if (!isTerminator(last_op)) {
                 em.addMemImm32(true, .rbx, off_pc64, @intCast(@as(u32, end_word) * 4));
                 em.jmpLabel(epilogue_label);
@@ -4252,7 +4252,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
 
         pub fn canCompileSlot(d: DecodedSlot) bool {
             const raw = d.raw;
-            const op: ArmOp = @enumFromInt(d.op);
+            const op: ArmOp = @fromBackingInt(@intCast(d.op));
             if ((raw >> 28) == 0xf) return op == .nop_al or op == .clrex_al;
             return switch (op) {
                 .nop_al,
@@ -4440,7 +4440,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                 }
             }.add;
             for (decoded) |d| {
-                const op: ArmOp = @enumFromInt(d.op);
+                const op: ArmOp = @fromBackingInt(@intCast(d.op));
                 switch (op) {
                     .nop_al, .b_al => {},
                     .bl_al, .bx_lr_al => bump(&counts, 14),
@@ -4543,7 +4543,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
 
         fn arm32FlagSetKind(d: DecodedSlot) FlagSetKind {
             if ((d.raw >> 28) != 0xe) return .none;
-            const op: ArmOp = @enumFromInt(d.op);
+            const op: ArmOp = @fromBackingInt(@intCast(d.op));
             return switch (op) {
                 .adds_imm_al, .cmn_imm_al, .adds_reg_al, .cmn_reg_al => .add,
                 .subs_imm_al, .cmp_imm_al, .subs_reg_al, .cmp_reg_al, .cmp_lsl_reg_al, .cmp_lsr_reg_al => .sub,
@@ -4561,7 +4561,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
         ) bool {
             if (kind == .none or idx + 1 >= decoded.len) return false;
             const next_d = decoded[idx + 1];
-            const next_op: ArmOp = @enumFromInt(next_d.op);
+            const next_op: ArmOp = @fromBackingInt(@intCast(next_d.op));
             const next_cond: u4 = @intCast(next_d.raw >> 28);
             if (next_op != .b_al or next_cond >= 0xe) return false;
             if (armCondToX86Cond(next_cond, kind, false) == null) return false;
@@ -4578,7 +4578,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
 
             for (0..decoded.len) |j| {
                 const jd = decoded[j];
-                const jop: ArmOp = @enumFromInt(jd.op);
+                const jop: ArmOp = @fromBackingInt(@intCast(jd.op));
                 if (jop == .b_al or jop == .bl_al) {
                     const jw: u16 = start_word + @as(u16, @intCast(j));
                     const jdelta: i32 = @as(i32, @intCast(@as(u32, jw) * 4 + 8)) + @as(i32, @bitCast(@as(u32, @truncate(jd.imm))));
@@ -4588,12 +4588,31 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                     if ((jd.raw >> 28) != 0xe and jop != .nop_al and jop != .clrex_al and jop != .cpsid_al and jop != .cpsie_al) return false;
                     if (arm32FlagSetKind(jd) != .none) return false;
                     switch (jop) {
-                        .b_al, .bl_al, .bx_lr_al, .bx_reg_al, .blx_reg_al, .ldm_pc_al,
-                        .adc_imm_al, .sbc_imm_al, .rsc_imm_al, .adcs_imm_al, .sbcs_imm_al,
-                        .adc_reg_al, .sbc_reg_al, .rsc_reg_al, .adcs_reg_al, .sbcs_reg_al,
-                        .tst_lsl_reg_al, .tst_lsr_reg_al,
-                        .mrs_cpsr_al, .msr_cpsr_c_al, .cpsid_al, .cpsie_al, .vmrs_apsr_al,
-                        .dp_imm_general, .dp_reg_general,
+                        .b_al,
+                        .bl_al,
+                        .bx_lr_al,
+                        .bx_reg_al,
+                        .blx_reg_al,
+                        .ldm_pc_al,
+                        .adc_imm_al,
+                        .sbc_imm_al,
+                        .rsc_imm_al,
+                        .adcs_imm_al,
+                        .sbcs_imm_al,
+                        .adc_reg_al,
+                        .sbc_reg_al,
+                        .rsc_reg_al,
+                        .adcs_reg_al,
+                        .sbcs_reg_al,
+                        .tst_lsl_reg_al,
+                        .tst_lsr_reg_al,
+                        .mrs_cpsr_al,
+                        .msr_cpsr_c_al,
+                        .cpsid_al,
+                        .cpsie_al,
+                        .vmrs_apsr_al,
+                        .dp_imm_general,
+                        .dp_reg_general,
                         => return false,
                         .ldr_wb_al => if (jd.rd == 15) return false,
                         else => {},
@@ -4634,11 +4653,20 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                 const w = start_word + @as(u16, @intCast(i));
                 const raw = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
                 const d = arm1176_mod.decodeArm32(raw);
-                const op: ArmOp = @enumFromInt(d.op);
+                const op: ArmOp = @fromBackingInt(@intCast(d.op));
                 const cond: u4 = @truncate(raw >> 28);
                 switch (op) {
-                    .mcr_barrier_al, .yield_wfe_al, .dmb_dsb_v7_al,
-                    .ldrex_al, .strex_al, .ldrexd_al, .strexd_al, .ldrexb_al, .strexb_al, .ldrexh_al, .strexh_al,
+                    .mcr_barrier_al,
+                    .yield_wfe_al,
+                    .dmb_dsb_v7_al,
+                    .ldrex_al,
+                    .strex_al,
+                    .ldrexd_al,
+                    .strexd_al,
+                    .ldrexb_al,
+                    .strexb_al,
+                    .ldrexh_al,
+                    .strexh_al,
                     => return true,
                     .nop_al, .b_al, .bx_lr_al, .bx_reg_al, .ldm_pc_al => {},
                     .ldr_wb_al => if (d.rd != 15) {
@@ -4746,7 +4774,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                     const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
                     const d = arm1176_mod.decodeArm32(raw_inst);
                     if (!canCompileSlot(d)) return null;
-                    const op: ArmOp = @enumFromInt(d.op);
+                    const op: ArmOp = @fromBackingInt(@intCast(d.op));
                     if (op == .b_al or op == .bl_al) {
                         if (w + 1 < 1024) {
                             const next_raw = std.mem.readInt(u32, code_page_ptr[@as(usize, w + 1) * 4 ..][0..4], .little);
@@ -4762,7 +4790,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                         var can_bypass = false;
                         for (0..i) |j| {
                             const jd = decoded[j];
-                            const jop: ArmOp = @enumFromInt(jd.op);
+                            const jop: ArmOp = @fromBackingInt(@intCast(jd.op));
                             if (jop == .b_al) {
                                 const jw: i32 = @intCast(start_word + @as(u16, @intCast(j)));
                                 const jdelta: i32 = @bitCast(@as(u32, @truncate(jd.imm)));
@@ -4786,7 +4814,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                     const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, w) * 4 ..][0..4], .little);
                     const d = arm1176_mod.decodeArm32(raw_inst);
                     if (!canCompileSlot(d)) break;
-                    const op: ArmOp = @enumFromInt(d.op);
+                    const op: ArmOp = @fromBackingInt(@intCast(d.op));
                     if (op == .b_al or op == .bl_al) {
                         if (w + 1 < 1024) {
                             const next_raw = std.mem.readInt(u32, code_page_ptr[@as(usize, w + 1) * 4 ..][0..4], .little);
@@ -4841,7 +4869,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                 const d = decoded[idx];
                 const raw = d.raw;
                 const cond: u4 = @intCast(raw >> 28);
-                const op: ArmOp = @enumFromInt(d.op);
+                const op: ArmOp = @fromBackingInt(@intCast(d.op));
                 const imm32: u32 = @truncate(d.imm);
                 const flag_kind = arm32FlagSetKind(d);
                 const fuse_flags = canFuseArm32BackwardBranch(decoded[0..trace_len], start_word, end_word, idx, flag_kind);
@@ -6212,7 +6240,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
             }
 
             const last_d = decoded[trace_len - 1];
-            const last_op: ArmOp = @enumFromInt(last_d.op);
+            const last_op: ArmOp = @fromBackingInt(@intCast(last_d.op));
             if (!isTerminator(last_op, last_d.raw)) {
                 em.addMemImm32(false, .rbx, off_r15, @intCast(@as(u32, end_word) * 4));
                 em.jmpLabel(epilogue_label);
@@ -6912,6 +6940,3 @@ test "X64Emitter encodes basic arithmetic and branches" {
         try std.testing.expectEqual(@as(usize, 5), ran);
     }
 }
-
-
-

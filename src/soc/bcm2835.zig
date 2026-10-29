@@ -1428,10 +1428,6 @@ test "Bcm2835 renderDisplayFrameIfChanged dirty-frame detection and SIMD Mailbox
     try std.testing.expectEqual(@as(u32, 0xFFAABBCC), out[15]);
 }
 
-
-
-
-
 test "Bcm2835 Mailbox FB scanout follows the pixel order" {
     const gpa = std.testing.allocator;
     const ram = try gpa.alloc(u8, 16 * 1024);

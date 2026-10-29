@@ -418,5 +418,3 @@ test "every part is on or at the edge of its board" {
         }
     }
 }
-
-

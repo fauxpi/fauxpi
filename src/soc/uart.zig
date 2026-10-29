@@ -293,4 +293,3 @@ pub const AuxMiniUart = struct {
         }
     }
 };
-

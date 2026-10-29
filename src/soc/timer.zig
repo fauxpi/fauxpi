@@ -305,4 +305,3 @@ test "BCM2835 ArmTimer countdown, reload, free-running counter, and Basic IRQ 0"
     try std.testing.expectEqual(@as(u32, 0), arm_timer.read32(0x10));
     try std.testing.expect(!intc.hasPendingIrq());
 }
-

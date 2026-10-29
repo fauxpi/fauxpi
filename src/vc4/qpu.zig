@@ -289,7 +289,7 @@ const Ports = struct {
 
     fn mux(p: *Ports, s: Src) EncodeError!Mux {
         switch (s) {
-            .acc => |n| return @enumFromInt(n),
+            .acc => |n| return @fromBackingInt(@intCast(n)),
             .a => |addr| {
                 if (p.raddr_a) |cur| if (cur != addr) return error.ReadPortConflict;
                 p.raddr_a = addr;
@@ -339,12 +339,12 @@ pub fn alu(i: Alu) EncodeError!Inst {
         .none => {},
         .mul => |m| {
             pm = true;
-            pack = @intFromEnum(m);
+            pack = @backingInt(m);
         },
         .regfile_a => |m| {
             const a_dst = if (ws) i.mul.dst else i.add.dst;
             if (a_dst != .a) return error.PackNeedsRegfileA;
-            pack = @intFromEnum(m);
+            pack = @backingInt(m);
         },
     }
 
@@ -353,36 +353,36 @@ pub fn alu(i: Alu) EncodeError!Inst {
         .none => {},
         .regfile_a => |m| {
             if (pm) return error.PackUnpackConflict;
-            unpack = @intFromEnum(m);
+            unpack = @backingInt(m);
         },
         .r4 => |m| {
             if (i.pack == .regfile_a) return error.PackUnpackConflict;
             pm = true;
-            unpack = @intFromEnum(m);
+            unpack = @backingInt(m);
         },
     }
 
     const cond_add: Cond = if (i.add.op == .nop) .never else i.add.cond;
     const cond_mul: Cond = if (i.mul.op == .nop) .never else i.mul.cond;
 
-    return field(@intFromEnum(sig), 60) |
+    return field(@backingInt(sig), 60) |
         field(unpack, 57) |
         field(@intFromBool(pm), 56) |
         field(pack, 52) |
-        field(@intFromEnum(cond_add), 49) |
-        field(@intFromEnum(cond_mul), 46) |
+        field(@backingInt(cond_add), 49) |
+        field(@backingInt(cond_mul), 46) |
         field(@intFromBool(i.sf), 45) |
         field(@intFromBool(ws), 44) |
         field(i.add.dst.waddr(), 38) |
         field(i.mul.dst.waddr(), 32) |
-        field(@intFromEnum(i.mul.op), 29) |
-        field(@intFromEnum(i.add.op), 24) |
+        field(@backingInt(i.mul.op), 29) |
+        field(@backingInt(i.add.op), 24) |
         field(ports.raddr_a orelse R.nop, 18) |
         field(ports.raddr_b orelse R.nop, 12) |
-        field(@intFromEnum(add_a), 9) |
-        field(@intFromEnum(add_b), 6) |
-        field(@intFromEnum(mul_a), 3) |
-        field(@intFromEnum(mul_b), 0);
+        field(@backingInt(add_a), 9) |
+        field(@backingInt(add_b), 6) |
+        field(@backingInt(mul_a), 3) |
+        field(@backingInt(mul_b), 0);
 }
 
 pub const LoadImm = struct {
@@ -398,9 +398,9 @@ pub fn loadImm(i: LoadImm) EncodeError!Inst {
     if (ws and (add_file == .a or mul_file == .b)) return error.WritePortConflict;
     const cond_add: Cond = if (i.add_dst == .nop) .never else .always;
     const cond_mul: Cond = if (i.mul_dst == .nop) .never else .always;
-    return field(@intFromEnum(Sig.load_imm), 60) |
-        field(@intFromEnum(cond_add), 49) |
-        field(@intFromEnum(cond_mul), 46) |
+    return field(@backingInt(Sig.load_imm), 60) |
+        field(@backingInt(cond_add), 49) |
+        field(@backingInt(cond_mul), 46) |
         field(@intFromBool(ws), 44) |
         field(i.add_dst.waddr(), 38) |
         field(i.mul_dst.waddr(), 32) |
@@ -416,7 +416,7 @@ pub fn mov(dst: Dst, src: Src) EncodeError!Inst {
 }
 
 pub fn getSig(i: Inst) Sig {
-    return @enumFromInt(@as(u4, @truncate(i >> 60)));
+    return @fromBackingInt(@intCast(@as(u4, @truncate(i >> 60))));
 }
 pub fn getWaddrAdd(i: Inst) u6 {
     return @truncate(i >> 38);
@@ -434,22 +434,22 @@ pub fn getRaddrB(i: Inst) u6 {
     return @truncate(i >> 12);
 }
 pub fn getAddOp(i: Inst) AddOp {
-    return @enumFromInt(@as(u5, @truncate(i >> 24)));
+    return @fromBackingInt(@intCast(@as(u5, @truncate(i >> 24))));
 }
 pub fn getMulOp(i: Inst) MulOp {
-    return @enumFromInt(@as(u3, @truncate(i >> 29)));
+    return @fromBackingInt(@intCast(@as(u3, @truncate(i >> 29))));
 }
 pub fn getMuxAddA(i: Inst) Mux {
-    return @enumFromInt(@as(u3, @truncate(i >> 9)));
+    return @fromBackingInt(@intCast(@as(u3, @truncate(i >> 9))));
 }
 pub fn getMuxAddB(i: Inst) Mux {
-    return @enumFromInt(@as(u3, @truncate(i >> 6)));
+    return @fromBackingInt(@intCast(@as(u3, @truncate(i >> 6))));
 }
 pub fn getMuxMulA(i: Inst) Mux {
-    return @enumFromInt(@as(u3, @truncate(i >> 3)));
+    return @fromBackingInt(@intCast(@as(u3, @truncate(i >> 3))));
 }
 pub fn getMuxMulB(i: Inst) Mux {
-    return @enumFromInt(@as(u3, @truncate(i >> 0)));
+    return @fromBackingInt(@intCast(@as(u3, @truncate(i >> 0))));
 }
 
 pub const Stage = enum { vertex, coordinate, fragment };

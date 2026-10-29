@@ -1538,4 +1538,3 @@ test "AArch64 VMSAv8-64 4-level (48-bit VA) and 3-level (39-bit VA) page table t
     try std.testing.expectEqual(@as(u64, 0), mmu.soft_tlb64_dirty_chunks);
     try std.testing.expectEqual(@as(u64, 0xffff_ffff_ffff_ffff), mmu.soft_tlb64[0][4].r_vbase);
 }
-

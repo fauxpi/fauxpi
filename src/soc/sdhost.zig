@@ -1380,5 +1380,3 @@ test "ArasanSdhci secondary SD card routing (GPIO 48..53 ALT3) supports SDHC ide
     }
     try std.testing.expect((sdhci.read32WithSd(0x30, &sd) & ArasanSdhci.SDHCI_INT_DATA_END) != 0);
 }
-
-

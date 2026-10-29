@@ -252,4 +252,3 @@ test "BCM2835 PowerManager PM_WDOG 65536 Hz countdown, petting, disarming, and e
     try std.testing.expect(pm.reboot_requested);
     try std.testing.expect((pm.read32(PowerManager.PM_RSTS) & PowerManager.PM_RSTS_HADWRH_SET) != 0);
 }
-

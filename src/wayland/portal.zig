@@ -401,7 +401,7 @@ pub const MessageBuilder = struct {
         if (buf.len < 16) return error.BufferFull;
         @memset(buf[0..16], 0);
         buf[0] = 'l';
-        buf[1] = @intFromEnum(msg_type);
+        buf[1] = @backingInt(msg_type);
         buf[2] = flags;
         buf[3] = 1;
         std.mem.writeInt(u32, buf[8..12], serial, .little);
@@ -448,7 +448,7 @@ pub const MessageBuilder = struct {
 
     pub fn writeHeaderFieldString(self: *MessageBuilder, field: HeaderField, sig_char: u8, value: []const u8) Error!void {
         try self.padTo(8);
-        try self.writeByte(@intFromEnum(field));
+        try self.writeByte(@backingInt(field));
         const sig_slice = [1]u8{sig_char};
         try self.writeSignature(&sig_slice);
         if (sig_char == 'g') {
@@ -631,15 +631,15 @@ pub fn parseMessage(buf: []const u8) Error!?ParsedMessage {
         const code = buf[pos];
         pos += 1;
         const sig = try readSignature(buf, &pos, fields_end);
-        if (code == @intFromEnum(HeaderField.path) and std.mem.eql(u8, sig, "o")) {
+        if (code == @backingInt(HeaderField.path) and std.mem.eql(u8, sig, "o")) {
             res.path = try readString(buf, &pos, fields_end);
-        } else if (code == @intFromEnum(HeaderField.interface) and std.mem.eql(u8, sig, "s")) {
+        } else if (code == @backingInt(HeaderField.interface) and std.mem.eql(u8, sig, "s")) {
             res.interface = try readString(buf, &pos, fields_end);
-        } else if (code == @intFromEnum(HeaderField.member) and std.mem.eql(u8, sig, "s")) {
+        } else if (code == @backingInt(HeaderField.member) and std.mem.eql(u8, sig, "s")) {
             res.member = try readString(buf, &pos, fields_end);
-        } else if (code == @intFromEnum(HeaderField.reply_serial) and std.mem.eql(u8, sig, "u")) {
+        } else if (code == @backingInt(HeaderField.reply_serial) and std.mem.eql(u8, sig, "u")) {
             res.reply_serial = try readU32(buf, &pos, fields_end);
-        } else if (code == @intFromEnum(HeaderField.signature) and std.mem.eql(u8, sig, "g")) {
+        } else if (code == @backingInt(HeaderField.signature) and std.mem.eql(u8, sig, "g")) {
             res.signature = try readSignature(buf, &pos, fields_end);
         } else {
             var sig_idx: usize = 0;

@@ -106,7 +106,7 @@ pub const Icon = enum(u21) {
     usb = 0xe1e0,
 
     pub fn text(icon: Icon, buf: *[4]u8) []const u8 {
-        const len = std.unicode.utf8Encode(@intFromEnum(icon), buf) catch return "";
+        const len = std.unicode.utf8Encode(@backingInt(icon), buf) catch return "";
         return buf[0..len];
     }
 };
@@ -460,11 +460,11 @@ test "canvas shapes and icons draw anti-aliased pixels at 1x and 2x scale" {
     c.strokeCircle(.{ 75, 30 }, 12, 2, Theme.dark.on_surface);
     try testing.expectEqual(@as(u32, 0xff141218), pixels[30 * 100 + 75]);
 
-    try testing.expect(ic.glyphIndex(@intFromEnum(Icon.bolt)) != 0);
-    try testing.expect(ic.glyphIndex(@intFromEnum(Icon.check)) != 0);
-    try testing.expect(ic.glyphIndex(@intFromEnum(Icon.edit)) != 0);
-    try testing.expect(ic.glyphIndex(@intFromEnum(Icon.monitor)) != 0);
-    try testing.expect(ic.glyphIndex(@intFromEnum(Icon.thermostat)) != 0);
+    try testing.expect(ic.glyphIndex(@backingInt(Icon.bolt)) != 0);
+    try testing.expect(ic.glyphIndex(@backingInt(Icon.check)) != 0);
+    try testing.expect(ic.glyphIndex(@backingInt(Icon.edit)) != 0);
+    try testing.expect(ic.glyphIndex(@backingInt(Icon.monitor)) != 0);
+    try testing.expect(ic.glyphIndex(@backingInt(Icon.thermostat)) != 0);
 
     c.drawIcon(.developer_board, 10, 34, 20, Theme.dark.on_surface);
     var icon_lit: usize = 0;

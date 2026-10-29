@@ -764,7 +764,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
         };
 
         pub inline fn tryFusePairA64(comptime SlotType: type, d: SlotType, next_inst: u32) ?SlotType {
-            const op: A64Op = @enumFromInt(d.op);
+            const op: A64Op = @fromBackingInt(@intCast(d.op));
             switch (op) {
                 .adrp => {
                     if (d.rd != 31) {
@@ -775,7 +775,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const imm12: u64 = (next_inst >> 10) & 0xfff;
                                 return .{
                                     .raw = d.raw,
-                                    .op = @intFromEnum(A64Op.adrp_add),
+                                    .op = @backingInt(A64Op.adrp_add),
                                     .rd = d.rd,
                                     .imm = d.imm | imm12,
                                 };
@@ -788,7 +788,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const imm12: u64 = (next_inst >> 10) & 0xfff;
                                 return .{
                                     .raw = d.raw,
-                                    .op = @intFromEnum(if (is_64) A64Op.adrp_ldr64 else A64Op.adrp_ldr32),
+                                    .op = @backingInt(if (is_64) A64Op.adrp_ldr64 else A64Op.adrp_ldr32),
                                     .rd = rt2,
                                     .rn = d.rd,
                                     .imm = d.imm | imm12,
@@ -806,7 +806,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const sub_bit: u8 = if (op == .subs_imm64 or op == .subs_imm32) 0x40 else 0;
                         return .{
                             .raw = d.raw,
-                            .op = @intFromEnum(A64Op.cmp_imm_bcond),
+                            .op = @backingInt(A64Op.cmp_imm_bcond),
                             .rd = cond,
                             .rn = d.rn,
                             .rm = (d.rd & 0x1f) | sf_bit | sub_bit,
@@ -822,7 +822,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const sf_bit: u8 = if (op == .subs_reg64) 0x10 else 0;
                         return .{
                             .raw = d.raw,
-                            .op = @intFromEnum(A64Op.cmp_reg_bcond),
+                            .op = @backingInt(A64Op.cmp_reg_bcond),
                             .rd = cond | sf_bit,
                             .rn = d.rn,
                             .rm = d.rm,
@@ -838,7 +838,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const sf_bit: u8 = if (op == .ands_imm64) 0x10 else 0;
                         return .{
                             .raw = d.raw,
-                            .op = @intFromEnum(A64Op.tst_imm_bcond),
+                            .op = @backingInt(A64Op.tst_imm_bcond),
                             .rd = cond | sf_bit,
                             .rn = d.rn,
                             .imm = (@as(u64, target_off) << 32) | @as(u32, @truncate(d.imm)),
@@ -853,7 +853,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const sf_bit: u8 = if (op == .ands_reg64) 0x10 else 0;
                         return .{
                             .raw = d.raw,
-                            .op = @intFromEnum(A64Op.tst_reg_bcond),
+                            .op = @backingInt(A64Op.tst_reg_bcond),
                             .rd = cond | sf_bit,
                             .rn = d.rn,
                             .rm = d.rm,
@@ -876,7 +876,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const is_32: u8 = if ((next_inst >> 31) == 0) 2 else 0;
                         return .{
                             .raw = d.raw,
-                            .op = @intFromEnum(A64Op.ldr_cbz),
+                            .op = @backingInt(A64Op.ldr_cbz),
                             .rd = d.rd,
                             .rn = d.rn,
                             .rm = is_cbnz | is_32,
@@ -889,7 +889,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (rn2 == d.rn and d.rd != d.rn and d.rd != rt2 and (d.imm >> 32) == 0) {
                             return .{
                                 .raw = d.raw,
-                                .op = @intFromEnum(A64Op.ldr64_pair_uimm),
+                                .op = @backingInt(A64Op.ldr64_pair_uimm),
                                 .rd = d.rd,
                                 .rn = d.rn,
                                 .rm = rt2,
@@ -905,7 +905,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const is_cbnz: u8 = @truncate((next_inst >> 24) & 1);
                         return .{
                             .raw = d.raw,
-                            .op = @intFromEnum(A64Op.ldr_cbz),
+                            .op = @backingInt(A64Op.ldr_cbz),
                             .rd = d.rd,
                             .rn = d.rn,
                             .rm = is_cbnz | 4,
@@ -975,7 +975,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             if (entry.code_hash != jit_mod.JitCodeBuffer.hashLoopWords(code_page_ptr, start_word, end_word_req)) return false;
             code_icache_ptr[start_word] = .{
                 .raw = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little),
-                .op = @intFromEnum(A64Op.jit_trace),
+                .op = @backingInt(A64Op.jit_trace),
                 .rd = entry.trace_len,
                 .imm = @intFromPtr(fn_ptr),
             };
@@ -994,7 +994,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             h: u8,
             count: u8,
         ) bool {
-            if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) return false;
+            if (code_icache_ptr[start_word].op == @backingInt(A64Op.jit_trace)) return false;
             const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdx(code_page_idx, start_word, end_word_req);
             const code_hash = jit_mod.JitCodeBuffer.hashLoopWords(code_page_ptr, start_word, end_word_req);
             const entry = &cpu.jit_buf.trace_cache[tc_idx];
@@ -1008,7 +1008,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     const raw_inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
                     code_icache_ptr[start_word] = .{
                         .raw = raw_inst,
-                        .op = @intFromEnum(A64Op.jit_trace),
+                        .op = @backingInt(A64Op.jit_trace),
                         .rd = entry.trace_len,
                         .imm = @intFromPtr(fn_ptr),
                     };
@@ -1048,7 +1048,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                 };
                 code_icache_ptr[start_word] = .{
                     .raw = raw_inst,
-                    .op = @intFromEnum(A64Op.jit_trace),
+                    .op = @backingInt(A64Op.jit_trace),
                     .rd = trace_len,
                     .imm = @intFromPtr(fn_ptr),
                 };
@@ -1083,7 +1083,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             if (target_pc <= cur_pc and (target_pc & ~@as(u64, 0xfff)) == code_vbase) {
                 const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
                 if (end_word_req > @as(u16, start_word) + 1 and end_word_req - @as(u16, start_word) <= 64) {
-                    if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) {
+                    if (code_icache_ptr[start_word].op == @backingInt(A64Op.jit_trace)) {
                         if (code_icache_ptr[start_word].rd >= end_word_req - @as(u16, start_word)) return;
                     } else if (tryReinstallTrace64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, end_word_req)) {
                         return;
@@ -1145,7 +1145,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             pc: u64,
         ) void {
             const word: u10 = @truncate((pc >> 2) & 0x3ff);
-            if (code_icache_ptr[word].op == @intFromEnum(A64Op.jit_trace)) return;
+            if (code_icache_ptr[word].op == @backingInt(A64Op.jit_trace)) return;
             if (tryReinstallTrace64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, word, 0)) return;
             const h: u8 = @truncate((pc >> 2) ^ (pc >> 10));
             const c = cpu.jit_buf.block_counts[h] +% 1;
@@ -1168,7 +1168,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             if (!jit_mod.A64Jit(CpuType, Bus).canCompileSlot(SlotType, decodeA64(SlotType, raw_inst))) {
                 if (word == 1023) return;
                 start_word = word + 1;
-                if (code_icache_ptr[start_word].op == @intFromEnum(A64Op.jit_trace)) return;
+                if (code_icache_ptr[start_word].op == @backingInt(A64Op.jit_trace)) return;
             }
             _ = compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, 0, h, 0x20);
         }
@@ -1210,14 +1210,14 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
         ) void {
             if ((return_pc & ~@as(u64, 0xfff)) == code_vbase) {
                 const ret_word: u10 = @truncate((return_pc >> 2) & 0x3ff);
-                if (code_icache_ptr[ret_word].op != @intFromEnum(A64Op.jit_trace)) {
+                if (code_icache_ptr[ret_word].op != @backingInt(A64Op.jit_trace)) {
                     const rh: u8 = @truncate((return_pc >> 2) ^ (return_pc >> 10));
                     _ = compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, ret_word, 0, rh, 0x20);
                 }
             }
             const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
             if ((target_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                if (code_icache_ptr[start_word].op != @intFromEnum(A64Op.jit_trace)) {
+                if (code_icache_ptr[start_word].op != @backingInt(A64Op.jit_trace)) {
                     _ = compileHotLoop64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, start_word, 0, h, 0x20);
                 }
             } else {
@@ -1227,7 +1227,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     const t_page_idx = CpuType.icachePageIdx(t_pbase);
                     if (t_page_idx != code_page_idx) {
                         const t_icache_ptr = cpu.prepareIcachePage(t_page_idx, t_pbase);
-                        if (t_icache_ptr[start_word].op != @intFromEnum(A64Op.jit_trace)) {
+                        if (t_icache_ptr[start_word].op != @backingInt(A64Op.jit_trace)) {
                             _ = compileHotLoop64(cpu, SlotType, t_page_idx, t_icache_ptr, bus.ram.ptr + t_pbase, start_word, 0, h, 0x20);
                         }
                     }
@@ -1249,9 +1249,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const immhi: i64 = @as(i19, @bitCast(@as(u19, @truncate(inst >> 5))));
                             const raw_imm: u64 = (@as(u64, @bitCast(immhi)) << 2) | immlo;
                             return if (sf == 0)
-                                .{ .raw = inst, .op = @intFromEnum(A64Op.adr), .rd = rd, .imm = raw_imm }
+                                .{ .raw = inst, .op = @backingInt(A64Op.adr), .rd = rd, .imm = raw_imm }
                             else
-                                .{ .raw = inst, .op = @intFromEnum(A64Op.adrp), .rd = rd, .imm = raw_imm << 12 };
+                                .{ .raw = inst, .op = @backingInt(A64Op.adrp), .rd = rd, .imm = raw_imm << 12 };
                         },
                         0b010, 0b011 => {
                             const op_sub = ((inst >> 30) & 1) != 0;
@@ -1260,7 +1260,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const imm12: u64 = (inst >> 10) & 0xfff;
                             const imm: u64 = if (sh) (imm12 << 12) else imm12;
                             const op: A64Op = if (sf == 1) (if (set_flags) (if (op_sub) .subs_imm64 else .adds_imm64) else (if (op_sub) .sub_imm64 else .add_imm64)) else (if (set_flags) (if (op_sub) .subs_imm32 else .adds_imm32) else (if (op_sub) .sub_imm32 else .add_imm32));
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .imm = imm };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rd, .rn = rn, .imm = imm };
                         },
                         0b100 => {
                             const opc: u2 = @truncate(inst >> 29);
@@ -1279,7 +1279,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 0b10 => .eor_imm32,
                                 0b11 => .ands_imm32,
                             };
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .imm = imm };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rd, .rn = rn, .imm = imm };
                         },
                         0b101 => {
                             const opc: u2 = @truncate(inst >> 29);
@@ -1289,11 +1289,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (opc == 0b00 or opc == 0b10) {
                                 var val: u64 = if (opc == 0b00) ~(imm16 << shift) else (imm16 << shift);
                                 if (sf == 0) val &= 0xffff_ffff;
-                                return .{ .raw = inst, .op = @intFromEnum(A64Op.mov_wide), .rd = rd, .imm = val };
+                                return .{ .raw = inst, .op = @backingInt(A64Op.mov_wide), .rd = rd, .imm = val };
                             } else if (opc == 0b11) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (sf == 1) A64Op.movk64 else A64Op.movk32),
+                                    .op = @backingInt(if (sf == 1) A64Op.movk64 else A64Op.movk32),
                                     .rd = rd,
                                     .rm = shift,
                                     .imm = imm16 << shift,
@@ -1310,44 +1310,44 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 if (imms >= immr) {
                                     const width: u7 = @as(u7, imms - immr) + 1;
                                     const wmask: u64 = if (width >= 64) 0xffff_ffff_ffff_ffff else ((@as(u64, 1) << @intCast(width)) - 1);
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.ubfm_r), .rd = rd, .rn = rn, .rm = immr, .imm = wmask & reg_mask };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.ubfm_r), .rd = rd, .rn = rn, .rm = immr, .imm = wmask & reg_mask };
                                 } else {
                                     const width: u7 = @as(u7, imms) + 1;
                                     const lshift: u6 = @intCast(reg_bits - @as(u7, immr));
                                     const wmask: u64 = if (width >= 64) 0xffff_ffff_ffff_ffff else ((@as(u64, 1) << @intCast(width)) - 1);
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.ubfm_l), .rd = rd, .rn = rn, .rm = lshift, .imm = (wmask << lshift) & reg_mask };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.ubfm_l), .rd = rd, .rn = rn, .rm = lshift, .imm = (wmask << lshift) & reg_mask };
                                 }
                             } else if (opc == 0b01) {
                                 if (imms >= immr) {
                                     const width: u7 = @as(u7, imms - immr) + 1;
                                     const wmask: u64 = if (width >= 64) 0xffff_ffff_ffff_ffff else ((@as(u64, 1) << @intCast(width)) - 1);
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.bfm_r), .rd = rd, .rn = rn, .rm = immr | (@as(u8, sf) << 6), .imm = wmask & reg_mask };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.bfm_r), .rd = rd, .rn = rn, .rm = immr | (@as(u8, sf) << 6), .imm = wmask & reg_mask };
                                 } else {
                                     const width: u7 = @as(u7, imms) + 1;
                                     const lshift: u6 = @intCast(reg_bits - @as(u7, immr));
                                     const wmask: u64 = if (width >= 64) 0xffff_ffff_ffff_ffff else ((@as(u64, 1) << @intCast(width)) - 1);
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.bfm_l), .rd = rd, .rn = rn, .rm = @as(u8, lshift) | (@as(u8, sf) << 6), .imm = (wmask << lshift) & reg_mask };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.bfm_l), .rd = rd, .rn = rn, .rm = @as(u8, lshift) | (@as(u8, sf) << 6), .imm = (wmask << lshift) & reg_mask };
                                 }
                             } else if (opc == 0b00) {
                                 if (imms >= immr) {
                                     if (sf == 1) {
                                         const lsh: u8 = @intCast(63 - imms);
                                         const rsh: u64 = @intCast(63 - (imms - immr));
-                                        return .{ .raw = inst, .op = @intFromEnum(A64Op.sbfm64_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
+                                        return .{ .raw = inst, .op = @backingInt(A64Op.sbfm64_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
                                     } else if (imms < 32) {
                                         const lsh: u8 = @intCast(31 - imms);
                                         const rsh: u64 = @intCast(31 - (imms - immr));
-                                        return .{ .raw = inst, .op = @intFromEnum(A64Op.sbfm32_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
+                                        return .{ .raw = inst, .op = @backingInt(A64Op.sbfm32_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
                                     }
                                 } else {
                                     if (sf == 1) {
                                         const lsh: u8 = @intCast(63 - imms);
                                         const rsh: u64 = @intCast(immr - imms - 1);
-                                        return .{ .raw = inst, .op = @intFromEnum(A64Op.sbfm64_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
+                                        return .{ .raw = inst, .op = @backingInt(A64Op.sbfm64_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
                                     } else if (immr < 32) {
                                         const lsh: u8 = @intCast(31 - imms);
                                         const rsh: u64 = @intCast(immr - imms - 1);
-                                        return .{ .raw = inst, .op = @intFromEnum(A64Op.sbfm32_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
+                                        return .{ .raw = inst, .op = @backingInt(A64Op.sbfm32_r), .rd = rd, .rn = rn, .rm = lsh, .imm = rsh };
                                     }
                                 }
                             }
@@ -1360,7 +1360,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const imms: u6 = @truncate(inst >> 10);
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (sf == 1) A64Op.extr64 else A64Op.extr32),
+                                    .op = @backingInt(if (sf == 1) A64Op.extr64 else A64Op.extr32),
                                     .rd = rd,
                                     .rn = rn,
                                     .rm = rm,
@@ -1369,7 +1369,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             }
                         },
                     }
-                    return .{ .raw = inst, .op = @intFromEnum(A64Op.dp_imm_other) };
+                    return .{ .raw = inst, .op = @backingInt(A64Op.dp_imm_other) };
                 },
                 0b0101, 0b1101 => {
                     const sf: u1 = @truncate(inst >> 31);
@@ -1391,7 +1391,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     const packed_imm: u64 = (@as(u64, option) << 3) | imm3;
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(if (op0 == 1) A64Op.sub_ext64 else A64Op.add_ext64),
+                                        .op = @backingInt(if (op0 == 1) A64Op.sub_ext64 else A64Op.add_ext64),
                                         .rd = rd,
                                         .rn = rn,
                                         .rm = rm,
@@ -1401,7 +1401,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const packed_ext: u64 = @as(u64, imm3) | (@as(u64, option) << 3) | (@as(u64, s) << 6) | (@as(u64, op0) << 7) | (@as(u64, sf) << 8);
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(A64Op.add_sub_ext),
+                                    .op = @backingInt(A64Op.add_sub_ext),
                                     .rd = rd,
                                     .rn = rn,
                                     .rm = rm,
@@ -1423,13 +1423,13 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     0b10 => .eor_reg32,
                                     0b11 => .ands_reg32,
                                 };
-                                return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .rm = rm };
+                                return .{ .raw = inst, .op = @backingInt(op), .rd = rd, .rn = rn, .rm = rm };
                             } else if ((op2 & 0b1001) == 0b0001 and op0 == 0) {
                                 // Unshifted BIC (s=0) / ORN (`MVN`, s=1)
                                 if (s == 0) {
-                                    return .{ .raw = inst, .op = @intFromEnum(if (sf == 1) A64Op.bic_reg64 else A64Op.bic_reg32), .rd = rd, .rn = rn, .rm = rm };
+                                    return .{ .raw = inst, .op = @backingInt(if (sf == 1) A64Op.bic_reg64 else A64Op.bic_reg32), .rd = rd, .rn = rn, .rm = rm };
                                 } else {
-                                    return .{ .raw = inst, .op = @intFromEnum(if (sf == 1) A64Op.orn_reg64 else A64Op.orn_reg32), .rd = rd, .rn = rn, .rm = rm };
+                                    return .{ .raw = inst, .op = @backingInt(if (sf == 1) A64Op.orn_reg64 else A64Op.orn_reg32), .rd = rd, .rn = rn, .rm = rm };
                                 }
                             } else if ((op2 & 0b1001) == 0b1000) {
                                 // Unshifted add/sub register
@@ -1437,43 +1437,43 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     (if (s == 1) (if (op0 == 1) .subs_reg64 else .adds_reg64) else (if (op0 == 1) .sub_reg64 else .add_reg64))
                                 else
                                     (if (s == 1) (if (op0 == 1) .subs_reg32 else .adds_reg32) else (if (op0 == 1) .sub_reg32 else .add_reg32));
-                                return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .rm = rm };
+                                return .{ .raw = inst, .op = @backingInt(op), .rd = rd, .rn = rn, .rm = rm };
                             }
                         } else {
                             const shift_type: u2 = @truncate(inst >> 22);
                             if (s == 0 and (op2 & 0b1001) == 0b1000 and shift_type == 0b00) {
                                 const op: A64Op = if (sf == 1) (if (op0 == 1) .sub_lsl64 else .add_lsl64) else (if (op0 == 1) .sub_lsl32 else .add_lsl32);
-                                return .{ .raw = inst, .op = @intFromEnum(op), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
+                                return .{ .raw = inst, .op = @backingInt(op), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
                             } else if ((op2 & 0b1001) == 0 and sf == 1 and op0 == 0 and s == 1) {
                                 if (shift_type == 0b00) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.orr_lsl64), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.orr_lsl64), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
                                 } else if (shift_type == 0b01) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.orr_lsr64), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.orr_lsr64), .rd = rd, .rn = rn, .rm = rm, .imm = imm6 };
                                 }
                             }
                         }
                         // General shifted logical or add/sub register
                         const shift_type: u2 = @truncate(inst >> 22);
                         const packed_shift: u64 = @as(u64, imm6) | (@as(u64, shift_type) << 6) | (@as(u64, op2) << 8) | (@as(u64, s) << 12) | (@as(u64, op0) << 13) | (@as(u64, sf) << 14);
-                        return .{ .raw = inst, .op = @intFromEnum(A64Op.dp_shift_reg), .rd = rd, .rn = rn, .rm = rm, .imm = packed_shift };
+                        return .{ .raw = inst, .op = @backingInt(A64Op.dp_shift_reg), .rd = rd, .rn = rn, .rm = rm, .imm = packed_shift };
                     } else if (op2 == 0b0000) {
                         // Add/subtract (with carry): ADC, ADCS, SBC, SBCS
                         const packed_adc: u64 = (@as(u64, sf) << 2) | (@as(u64, op0) << 1) | s;
-                        return .{ .raw = inst, .op = @intFromEnum(A64Op.adc_sbc), .rd = rd, .rn = rn, .rm = rm, .imm = packed_adc };
+                        return .{ .raw = inst, .op = @backingInt(A64Op.adc_sbc), .rd = rd, .rn = rn, .rm = rm, .imm = packed_adc };
                     } else if (s == 1 and op2 == 0b0010) {
                         // Conditional compare (register / immediate): CCMP, CCMN
                         const cond: u64 = (inst >> 12) & 0xf;
                         const nzcv: u64 = inst & 0xf;
                         const is_imm: u64 = (inst >> 11) & 1;
                         const packed_ccmp: u64 = cond | (nzcv << 4) | (is_imm << 8) | (@as(u64, op0) << 9) | (@as(u64, sf) << 10);
-                        return .{ .raw = inst, .op = @intFromEnum(A64Op.ccmp), .rn = rn, .rm = rm, .imm = packed_ccmp };
+                        return .{ .raw = inst, .op = @backingInt(A64Op.ccmp), .rn = rn, .rm = rm, .imm = packed_ccmp };
                     } else if (s == 0) {
                         if (op2 == 0b0100) {
                             // CSEL / CSINC / CSINV / CSNEG
                             const cond: u64 = (inst >> 12) & 0xf;
                             const o2: u64 = (inst >> 10) & 1;
                             const packed_imm: u64 = cond | (@as(u64, op0) << 4) | (o2 << 5) | (@as(u64, sf) << 6);
-                            return .{ .raw = inst, .op = @intFromEnum(A64Op.csel), .rd = rd, .rn = rn, .rm = rm, .imm = packed_imm };
+                            return .{ .raw = inst, .op = @backingInt(A64Op.csel), .rd = rd, .rn = rn, .rm = rm, .imm = packed_imm };
                         } else if ((op2 & 0b1000) != 0 and op0 == 0) {
                             const op31: u3 = @truncate(inst >> 21);
                             const o0: u64 = (inst >> 15) & 1;
@@ -1481,11 +1481,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (op31 == 0b000) {
                                 // MADD / MSUB
                                 const packed_imm: u64 = ra | (o0 << 5) | (@as(u64, sf) << 6);
-                                return .{ .raw = inst, .op = @intFromEnum(A64Op.madd_msub), .rd = rd, .rn = rn, .rm = rm, .imm = packed_imm };
+                                return .{ .raw = inst, .op = @backingInt(A64Op.madd_msub), .rd = rd, .rn = rn, .rm = rm, .imm = packed_imm };
                             } else if (sf == 1 and (op31 == 0b001 or op31 == 0b010 or op31 == 0b101 or op31 == 0b110)) {
                                 // SMADDL, SMSUBL, SMULH, UMADDL, UMSUBL, UMULH
                                 const packed_imm: u64 = ra | (o0 << 5) | (@as(u64, op31) << 6);
-                                return .{ .raw = inst, .op = @intFromEnum(A64Op.maddl_mulh), .rd = rd, .rn = rn, .rm = rm, .imm = packed_imm };
+                                return .{ .raw = inst, .op = @backingInt(A64Op.maddl_mulh), .rd = rd, .rn = rn, .rm = rm, .imm = packed_imm };
                             }
                         } else if (op2 == 0b0110) {
                             if (op0 == 0) {
@@ -1498,7 +1498,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     else => null,
                                 };
                                 if (vop) |vo| {
-                                    return .{ .raw = inst, .op = @intFromEnum(vo), .rd = rd, .rn = rn, .rm = rm };
+                                    return .{ .raw = inst, .op = @backingInt(vo), .rd = rd, .rn = rn, .rm = rm };
                                 }
                             } else {
                                 const op1src: ?A64Op = switch (imm6) {
@@ -1508,12 +1508,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     else => null,
                                 };
                                 if (op1src) |o1s| {
-                                    return .{ .raw = inst, .op = @intFromEnum(o1s), .rd = rd, .rn = rn };
+                                    return .{ .raw = inst, .op = @backingInt(o1s), .rd = rd, .rn = rn };
                                 }
                             }
                         }
                     }
-                    return .{ .raw = inst, .op = @intFromEnum(A64Op.dp_reg_other) };
+                    return .{ .raw = inst, .op = @backingInt(A64Op.dp_reg_other) };
                 },
                 0b0100, 0b0110, 0b1100, 0b1110 => {
                     // Check unsigned immediate LDR/STR or unscaled LDUR/STUR (non-FP)
@@ -1534,7 +1534,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 2 => .str32_uimm,
                                 3 => .str64_uimm,
                             };
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .imm = imm };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .imm = imm };
                         } else if (opc == 0b01) {
                             const op: A64Op = switch (size) {
                                 0 => .ldr8_uimm,
@@ -1542,7 +1542,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 2 => .ldr32_uimm,
                                 3 => .ldr64_uimm,
                             };
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .imm = imm };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .imm = imm };
                         } else if (opc == 0b10) {
                             const op: A64Op = switch (size) {
                                 0 => .ldrsb64_uimm,
@@ -1550,10 +1550,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 2 => .ldrsw_uimm,
                                 3 => .nop, // PRFM
                             };
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .imm = imm };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .imm = imm };
                         } else if (size == 0 or size == 1) {
                             const op: A64Op = if (size == 0) .ldrsb32_uimm else .ldrsh32_uimm;
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .imm = imm };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .imm = imm };
                         }
                     } else if ((inst & 0x3b00_0000) == 0x1800_0000) {
                         // PC-relative Load register (literal)
@@ -1573,7 +1573,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             0b10 => .ldr_fp128_lit,
                             0b11 => .nop,
                         };
-                        return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .imm = offset };
+                        return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .imm = offset };
                     } else if ((inst & 0x3f20_0400) == 0x3800_0400) {
                         // Pre-index (mode2 == 0b11) or Post-index (mode2 == 0b01) 9-bit signed immediate LDR/STR (non-FP)
                         const size: u2 = @truncate(inst >> 30);
@@ -1587,7 +1587,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 (if (opc == 0b01) (if (is_pre) .ldr64_pre else .ldr64_post) else (if (is_pre) .str64_pre else .str64_post))
                             else
                                 (if (opc == 0b01) (if (is_pre) .ldr32_pre else .ldr32_post) else (if (is_pre) .str32_pre else .str32_post));
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .imm = @bitCast(imm9) };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .imm = @bitCast(imm9) };
                         }
                     } else if ((inst & 0x3f20_0c00) == 0x3820_0800) {
                         // Register offset [Xn, Xm, LSL #shift] (option == 0b011)
@@ -1605,7 +1605,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 2 => if (opc == 0b01) .ldr32_reg_lsl else .str32_reg_lsl,
                                 else => if (opc == 0b01) .ldr64_reg_lsl else .str64_reg_lsl,
                             };
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .rm = rm, .imm = shift };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .rm = rm, .imm = shift };
                         }
                     } else if ((inst & 0x3f00_0000) == 0x0800_0000) {
                         // Load/Store Exclusive & Load-Acquire/Store-Release
@@ -1630,13 +1630,13 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     2 => .str32_uimm,
                                     3 => .str64_uimm,
                                 };
-                                return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .imm = 0 };
+                                return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .imm = 0 };
                             } else if (size == 2 or size == 3) {
                                 const op: A64Op = if (size == 3)
                                     (if (is_load) .ldxr64 else .stxr64)
                                 else
                                     (if (is_load) .ldxr32 else .stxr32);
-                                return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .rm = rs };
+                                return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .rm = rs };
                             }
                         }
                     } else if ((inst & 0x3e00_0000) == 0x2800_0000) {
@@ -1659,7 +1659,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (op != .load_store_other) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(op),
+                                    .op = @backingInt(op),
                                     .rd = rt,
                                     .rn = rn,
                                     .rm = rt2,
@@ -1676,7 +1676,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (op != .load_store_other) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(op),
+                                    .op = @backingInt(op),
                                     .rd = rt,
                                     .rn = rn,
                                     .rm = rt2,
@@ -1693,7 +1693,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (op != .load_store_other) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(op),
+                                    .op = @backingInt(op),
                                     .rd = rt,
                                     .rn = rn,
                                     .rm = rt2,
@@ -1718,14 +1718,14 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 (if (is_load) .ldr_fp64_uimm else .str_fp64_uimm)
                             else
                                 (if (is_load) .ldr_fp32_uimm else .str_fp32_uimm);
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .imm = imm };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .imm = imm };
                         } else if ((opc & 2) != 0 and size == 0) {
                             const imm: u64 = if (is_uimm)
                                 (@as(u64, (inst >> 10) & 0xfff) << 4)
                             else
                                 @bitCast(@as(i64, @as(i9, @bitCast(@as(u9, @truncate(inst >> 12))))));
                             const op: A64Op = if (is_load) .ldr_fp128_uimm else .str_fp128_uimm;
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .imm = imm };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .imm = imm };
                         }
                     } else if ((inst & 0x3f20_0400) == 0x3c00_0400) {
                         // Pre-index or Post-index 9-bit signed immediate FP/SIMD LDR/STR (D/Q)
@@ -1741,13 +1741,13 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 (if (is_pre) .ldr_fp64_pre else .ldr_fp64_post)
                             else
                                 (if (is_pre) .str_fp64_pre else .str_fp64_post);
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .imm = @bitCast(imm9) };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .imm = @bitCast(imm9) };
                         } else if ((opc & 2) != 0 and size == 0) {
                             const op: A64Op = if (is_load)
                                 (if (is_pre) .ldr_fp128_pre else .ldr_fp128_post)
                             else
                                 (if (is_pre) .str_fp128_pre else .str_fp128_post);
-                            return .{ .raw = inst, .op = @intFromEnum(op), .rd = rt, .rn = rn, .imm = @bitCast(imm9) };
+                            return .{ .raw = inst, .op = @backingInt(op), .rd = rt, .rn = rn, .imm = @bitCast(imm9) };
                         }
                     } else if ((inst & 0x3f20_0c00) == 0x3c20_0800) {
                         // Register offset FP/SIMD LDR/STR (D/Q) [Xn, Xm, LSL #shift] (option == 0b011)
@@ -1763,7 +1763,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if ((opc & 2) == 0 and size == 3) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (is_load) A64Op.ldr_fp64_reg_lsl else A64Op.str_fp64_reg_lsl),
+                                    .op = @backingInt(if (is_load) A64Op.ldr_fp64_reg_lsl else A64Op.str_fp64_reg_lsl),
                                     .rd = rt,
                                     .rn = rn,
                                     .rm = rm,
@@ -1772,7 +1772,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             } else if ((opc & 2) != 0 and size == 0) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (is_load) A64Op.ldr_fp128_reg_lsl else A64Op.str_fp128_reg_lsl),
+                                    .op = @backingInt(if (is_load) A64Op.ldr_fp128_reg_lsl else A64Op.str_fp128_reg_lsl),
                                     .rd = rt,
                                     .rn = rn,
                                     .rm = rm,
@@ -1800,7 +1800,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 if (op != .load_store_other) {
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(op),
+                                        .op = @backingInt(op),
                                         .rd = rt,
                                         .rn = rn,
                                         .rm = rt2,
@@ -1817,7 +1817,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 if (op != .load_store_other) {
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(op),
+                                        .op = @backingInt(op),
                                         .rd = rt,
                                         .rn = rn,
                                         .rm = rt2,
@@ -1846,7 +1846,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (rpt != 0) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (is_load) A64Op.simd_ld1_mult else A64Op.simd_st1_mult),
+                                    .op = @backingInt(if (is_load) A64Op.simd_ld1_mult else A64Op.simd_st1_mult),
                                     .rd = rt,
                                     .rn = rn,
                                     .rm = if (is_post) rm else 32,
@@ -1855,7 +1855,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             }
                         }
                     }
-                    return .{ .raw = inst, .op = @intFromEnum(A64Op.load_store_other) };
+                    return .{ .raw = inst, .op = @backingInt(A64Op.load_store_other) };
                 },
                 0b1010, 0b1011 => {
                     if ((inst & 0x7c00_0000) == 0x1400_0000) {
@@ -1863,7 +1863,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const imm26: i64 = @as(i26, @bitCast(@as(u26, @truncate(inst))));
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(if (is_bl) A64Op.bl_imm else A64Op.b_imm),
+                            .op = @backingInt(if (is_bl) A64Op.bl_imm else A64Op.b_imm),
                             .imm = @bitCast(imm26 << 2),
                         };
                     }
@@ -1871,7 +1871,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const imm19: i64 = @as(i19, @bitCast(@as(u19, @truncate(inst >> 5))));
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(A64Op.b_cond),
+                            .op = @backingInt(A64Op.b_cond),
                             .rd = @truncate(inst & 0xf),
                             .imm = @bitCast(imm19 << 2),
                         };
@@ -1883,7 +1883,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const op: A64Op = if (sf == 1) (if (is_nz) .cbnz64 else .cbz64) else (if (is_nz) .cbnz32 else .cbz32);
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(op),
+                            .op = @backingInt(op),
                             .rd = @truncate(inst & 0x1f),
                             .imm = @bitCast(imm19 << 2),
                         };
@@ -1895,7 +1895,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const imm14: i64 = @as(i14, @bitCast(@as(u14, @truncate(inst >> 5))));
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(if (is_nz) A64Op.tbnz else A64Op.tbz),
+                            .op = @backingInt(if (is_nz) A64Op.tbnz else A64Op.tbz),
                             .rd = @truncate(inst & 0x1f),
                             .rm = b5 | b40,
                             .imm = @bitCast(imm14 << 2),
@@ -1904,21 +1904,21 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     if ((inst & 0xffff_fc1f) == 0xd65f_0000) {
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(A64Op.ret),
+                            .op = @backingInt(A64Op.ret),
                             .rn = @truncate((inst >> 5) & 0x1f),
                         };
                     }
                     if ((inst & 0xffff_fc1f) == 0xd61f_0000) {
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(A64Op.br_reg),
+                            .op = @backingInt(A64Op.br_reg),
                             .rn = @truncate((inst >> 5) & 0x1f),
                         };
                     }
                     if ((inst & 0xffff_fc1f) == 0xd63f_0000) {
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(A64Op.blr_reg),
+                            .op = @backingInt(A64Op.blr_reg),
                             .rn = @truncate((inst >> 5) & 0x1f),
                         };
                     }
@@ -1934,39 +1934,39 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (crn == 2) {
                                 const hint = (@as(u8, crm) << 3) | op2_sys;
                                 if (hint == 4) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 12 }; // SEV
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rn = 12 }; // SEV
                                 } else if (hint == 0 or hint > 3) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.nop) };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.nop) };
                                 } else if (hint == 1 or hint == 2) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 1 };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rn = 1 };
                                 }
                             } else if (crn == 3) {
                                 if (op2_sys == 2) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 0 }; // CLREX
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rn = 0 }; // CLREX
                                 } else if (op2_sys == 4 or op2_sys == 5) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 2, .imm = op2_sys }; // DSB / DMB
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rn = 2, .imm = op2_sys }; // DSB / DMB
                                 } else if (op2_sys == 6) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 11 }; // ISB
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rn = 11 }; // ISB
                                 }
                             } else if (crn == 4 and op1_sys == 3) {
                                 if (op2_sys == 6) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 3, .imm = @as(u64, crm) << 6 }; // MSR DAIFSet
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rn = 3, .imm = @as(u64, crm) << 6 }; // MSR DAIFSet
                                 } else if (op2_sys == 7) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rn = 4, .imm = ~(@as(u64, crm) << 6) }; // MSR DAIFClr
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rn = 4, .imm = ~(@as(u64, crm) << 6) }; // MSR DAIFClr
                                 }
                             }
                         } else if (op0_sys == 1) {
                             if (!l and op1_sys == 3 and crn == 7 and crm == 4 and op2_sys == 1) {
-                                return .{ .raw = inst, .op = @intFromEnum(A64Op.dc_zva), .rd = rt };
+                                return .{ .raw = inst, .op = @backingInt(A64Op.dc_zva), .rd = rt };
                             }
                         } else if (l) {
                             const id = sysRegId(op0_sys, op1_sys, crn, crm, op2_sys);
                             if (id == sysRegId(3, 3, 13, 0, 2)) {
-                                return .{ .raw = inst, .op = @intFromEnum(A64Op.mrs_tpidr_el0), .rd = rt };
+                                return .{ .raw = inst, .op = @backingInt(A64Op.mrs_tpidr_el0), .rd = rt };
                             }
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(A64Op.mrs_sys),
+                                .op = @backingInt(A64Op.mrs_sys),
                                 .rd = rt,
                                 .rn = (@as(u8, op0_sys) << 3) | op1_sys,
                                 .rm = (@as(u8, crn) << 4) | crm,
@@ -1974,18 +1974,18 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             };
                         } else {
                             switch (sysRegId(op0_sys, op1_sys, crn, crm, op2_sys)) {
-                                sysRegId(3, 3, 4, 2, 1) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 5 }, // DAIF
-                                sysRegId(3, 3, 4, 2, 0) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 6 }, // NZCV
-                                sysRegId(3, 3, 13, 0, 2) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 7 }, // TPIDR_EL0
-                                sysRegId(3, 0, 13, 0, 4) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 8 }, // TPIDR_EL1
-                                sysRegId(3, 0, 4, 1, 0) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 9 }, // SP_EL0
-                                sysRegId(3, 3, 4, 4, 0) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 10, .imm = 0 }, // FPCR
-                                sysRegId(3, 3, 4, 4, 1) => return .{ .raw = inst, .op = @intFromEnum(A64Op.msr_safe), .rd = rt, .rn = 10, .imm = 1 }, // FPSR
+                                sysRegId(3, 3, 4, 2, 1) => return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rd = rt, .rn = 5 }, // DAIF
+                                sysRegId(3, 3, 4, 2, 0) => return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rd = rt, .rn = 6 }, // NZCV
+                                sysRegId(3, 3, 13, 0, 2) => return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rd = rt, .rn = 7 }, // TPIDR_EL0
+                                sysRegId(3, 0, 13, 0, 4) => return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rd = rt, .rn = 8 }, // TPIDR_EL1
+                                sysRegId(3, 0, 4, 1, 0) => return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rd = rt, .rn = 9 }, // SP_EL0
+                                sysRegId(3, 3, 4, 4, 0) => return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rd = rt, .rn = 10, .imm = 0 }, // FPCR
+                                sysRegId(3, 3, 4, 4, 1) => return .{ .raw = inst, .op = @backingInt(A64Op.msr_safe), .rd = rt, .rn = 10, .imm = 1 }, // FPSR
                                 else => {},
                             }
                         }
                     }
-                    return .{ .raw = inst, .op = @intFromEnum(A64Op.branch_sys_other) };
+                    return .{ .raw = inst, .op = @backingInt(A64Op.branch_sys_other) };
                 },
                 0b0111, 0b1111 => {
                     const rd: u8 = @truncate(inst & 0x1f);
@@ -2002,17 +2002,17 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 const rmode: u2 = @truncate(inst >> 19);
                                 const opcode: u3 = @truncate(inst >> 16);
                                 if (opcode == 0b110 and rmode == 0b00) {
-                                    return .{ .raw = inst, .op = @intFromEnum(if (sf) A64Op.fmov_x_d else A64Op.fmov_w_s), .rd = rd, .rn = rn };
+                                    return .{ .raw = inst, .op = @backingInt(if (sf) A64Op.fmov_x_d else A64Op.fmov_w_s), .rd = rd, .rn = rn };
                                 } else if (opcode == 0b111 and rmode == 0b00) {
-                                    return .{ .raw = inst, .op = @intFromEnum(if (sf) A64Op.fmov_d_x else A64Op.fmov_s_w), .rd = rd, .rn = rn };
+                                    return .{ .raw = inst, .op = @backingInt(if (sf) A64Op.fmov_d_x else A64Op.fmov_s_w), .rd = rd, .rn = rn };
                                 } else if (opcode == 0b110 and rmode == 0b01 and sf) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.fmov_x_d_hi), .rd = rd, .rn = rn };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.fmov_x_d_hi), .rd = rd, .rn = rn };
                                 } else if (opcode == 0b111 and rmode == 0b01 and sf) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.fmov_d_hi_x), .rd = rd, .rn = rn };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.fmov_d_hi_x), .rd = rd, .rn = rn };
                                 } else if ((opcode == 0b010 or opcode == 0b011) and rmode == 0b00) {
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(A64Op.fcvt_int),
+                                        .op = @backingInt(A64Op.fcvt_int),
                                         .rd = rd,
                                         .rn = rn,
                                         .imm = (@as(u64, opcode) << 2) | (@as(u64, @intFromBool(sf)) << 1) | @intFromBool(is_dbl),
@@ -2020,7 +2020,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 } else if ((opcode == 0b000 or opcode == 0b001) and rmode == 0b11) {
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(A64Op.fcvt_int),
+                                        .op = @backingInt(A64Op.fcvt_int),
                                         .rd = rd,
                                         .rn = rn,
                                         .imm = (@as(u64, opcode) << 2) | (@as(u64, @intFromBool(sf)) << 1) | @intFromBool(is_dbl),
@@ -2029,7 +2029,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             } else if ((inst & 0xffa0_1fe0) == 0x1e20_1000) {
                                 const imm8: u8 = @truncate(inst >> 13);
                                 const val64: u64 = if (is_dbl) expandFpImm64(imm8) else expandFpImm32(imm8);
-                                return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_movi), .rd = rd, .rn = 0, .imm = val64 };
+                                return .{ .raw = inst, .op = @backingInt(A64Op.simd_movi), .rd = rd, .rn = 0, .imm = val64 };
                             } else if ((inst & 0xffe0_0c00) == 0x1e20_0800 or (inst & 0xffe0_0c00) == 0x1e60_0800) {
                                 const opc: u4 = @truncate(inst >> 12);
                                 const fp2_op: ?A64Op = switch (opc) {
@@ -2040,7 +2040,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     else => null,
                                 };
                                 if (fp2_op) |fop| {
-                                    return .{ .raw = inst, .op = @intFromEnum(fop), .rd = rd, .rn = rn, .rm = rm };
+                                    return .{ .raw = inst, .op = @backingInt(fop), .rd = rd, .rn = rn, .rm = rm };
                                 }
                                 if (opc >= 4 and opc <= 8) {
                                     const sub_op: u64 = switch (opc) {
@@ -2048,12 +2048,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                         5, 7 => 2, // FMIN / FMINNM
                                         else => 3, // FNMUL
                                     };
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.fop_misc), .rd = rd, .rn = rn, .rm = rm, .imm = (sub_op << 1) | @intFromBool(is_dbl) };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.fop_misc), .rd = rd, .rn = rn, .rm = rm, .imm = (sub_op << 1) | @intFromBool(is_dbl) };
                                 }
                             } else if ((inst & 0xffa0_7c00) == 0x1e20_4000) {
                                 const opc: u6 = @truncate(inst >> 15);
                                 if (opc == 3) {
-                                    return .{ .raw = inst, .op = @intFromEnum(A64Op.fop_misc), .rd = rd, .rn = rn, .imm = @intFromBool(is_dbl) };
+                                    return .{ .raw = inst, .op = @backingInt(A64Op.fop_misc), .rd = rd, .rn = rn, .imm = @intFromBool(is_dbl) };
                                 }
                                 const fp1_op: ?A64Op = switch (opc) {
                                     0 => if (is_dbl) .fmov_f64 else .fmov_f32,
@@ -2064,7 +2064,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     else => null,
                                 };
                                 if (fp1_op) |fop| {
-                                    return .{ .raw = inst, .op = @intFromEnum(fop), .rd = rd, .rn = rn };
+                                    return .{ .raw = inst, .op = @backingInt(fop), .rd = rd, .rn = rn };
                                 }
                             } else if ((inst & 0xffa0_fc07) == 0x1e20_2000) {
                                 const cmp_zero = ((inst >> 3) & 1) != 0;
@@ -2072,10 +2072,10 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     (if (cmp_zero) .fcmpz_f64 else .fcmp_f64)
                                 else
                                     (if (cmp_zero) .fcmpz_f32 else .fcmp_f32);
-                                return .{ .raw = inst, .op = @intFromEnum(fcmp_op), .rn = rn, .rm = rm };
+                                return .{ .raw = inst, .op = @backingInt(fcmp_op), .rn = rn, .rm = rm };
                             } else if ((inst & 0xffa0_0c00) == 0x1e20_0c00) {
                                 const cond: u64 = (inst >> 12) & 0xf;
-                                return .{ .raw = inst, .op = @intFromEnum(A64Op.fop_misc), .rd = rd, .rn = rn, .rm = rm, .imm = (@as(u64, 4) << 1) | @as(u64, @intFromBool(is_dbl)) | (cond << 4) };
+                                return .{ .raw = inst, .op = @backingInt(A64Op.fop_misc), .rd = rd, .rn = rn, .rm = rm, .imm = (@as(u64, 4) << 1) | @as(u64, @intFromBool(is_dbl)) | (cond << 4) };
                             }
                         }
                     } else if ((inst & 0x5f00_0000) == 0x1f00_0000) {
@@ -2089,7 +2089,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 (if (o0) .fmsub_f64 else .fmadd_f64)
                             else
                                 (if (o0) .fmsub_f32 else .fmadd_f32);
-                            return .{ .raw = inst, .op = @intFromEnum(fop), .rd = rd, .rn = rn, .rm = rm, .imm = ra };
+                            return .{ .raw = inst, .op = @backingInt(fop), .rd = rd, .rn = rn, .rm = rm, .imm = ra };
                         }
                     } else if ((inst & 0x9ff8_0400) == 0x0f00_0400) {
                         // 2. AdvSIMD modified immediate (`MOVI`, `MVNI`, `FMOV`)
@@ -2136,7 +2136,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             }
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(A64Op.simd_movi),
+                                .op = @backingInt(A64Op.simd_movi),
                                 .rd = rd,
                                 .rn = @intFromBool(q),
                                 .imm = val64,
@@ -2156,7 +2156,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             if (imm4 == 0b0000) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(A64Op.simd_dup_elem),
+                                    .op = @backingInt(A64Op.simd_dup_elem),
                                     .rd = rd,
                                     .rn = rn,
                                     .rm = shift_bits,
@@ -2165,7 +2165,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             } else if (imm4 == 0b0001) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(A64Op.simd_dup_gpr),
+                                    .op = @backingInt(A64Op.simd_dup_gpr),
                                     .rd = rd,
                                     .rn = rn,
                                     .rm = esize_bytes,
@@ -2174,7 +2174,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             } else if (imm4 == 0b0111 and (esize_bytes == 4 or esize_bytes == 8)) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (esize_bytes == 8) A64Op.simd_umov64 else A64Op.simd_umov32),
+                                    .op = @backingInt(if (esize_bytes == 8) A64Op.simd_umov64 else A64Op.simd_umov32),
                                     .rd = rd,
                                     .rn = rn,
                                     .rm = shift_bits,
@@ -2200,7 +2200,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 else => null,
                             };
                             if (log_op) |lop| {
-                                return .{ .raw = inst, .op = @intFromEnum(lop), .rd = rd, .rn = rn, .rm = rm, .imm = q_imm };
+                                return .{ .raw = inst, .op = @backingInt(lop), .rd = rd, .rn = rn, .rm = rm, .imm = q_imm };
                             }
                         } else if (opcode == 0b10000) {
                             const add_op: A64Op = switch (size) {
@@ -2209,11 +2209,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 2 => if (u) .simd_sub_32 else .simd_add_32,
                                 3 => if (u) .simd_sub_64 else .simd_add_64,
                             };
-                            return .{ .raw = inst, .op = @intFromEnum(add_op), .rd = rd, .rn = rn, .rm = rm, .imm = q_imm };
+                            return .{ .raw = inst, .op = @backingInt(add_op), .rd = rd, .rn = rn, .rm = rm, .imm = q_imm };
                         } else if (opcode == 0b10001 and size == 0) {
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(if (u) A64Op.simd_cmeq_8 else A64Op.simd_cmtst_8),
+                                .op = @backingInt(if (u) A64Op.simd_cmeq_8 else A64Op.simd_cmtst_8),
                                 .rd = rd,
                                 .rn = rn,
                                 .rm = rm,
@@ -2223,7 +2223,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const kind: u64 = if (opcode == 0b10011) 0 else if (!u) 1 else 2; // 0=MUL, 1=MLA, 2=MLS
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(A64Op.simd_mul_mla),
+                                .op = @backingInt(A64Op.simd_mul_mla),
                                 .rd = rd,
                                 .rn = rn,
                                 .rm = rm,
@@ -2238,14 +2238,14 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         const opcode: u5 = @truncate(inst >> 12);
                         const q_imm: u64 = @intFromBool(q);
                         if (opcode == 0b00101 and u and size == 0) {
-                            return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_not), .rd = rd, .rn = rn, .imm = q_imm };
+                            return .{ .raw = inst, .op = @backingInt(A64Op.simd_not), .rd = rd, .rn = rn, .imm = q_imm };
                         } else if (opcode == 0b01001 and !u and size == 0) {
-                            return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_cmeqz_8), .rd = rd, .rn = rn, .imm = q_imm };
+                            return .{ .raw = inst, .op = @backingInt(A64Op.simd_cmeqz_8), .rd = rd, .rn = rn, .imm = q_imm };
                         } else if (opcode == 0b10010 and !u and size < 3) {
-                            return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_xtn_shrn), .rd = rd, .rn = rn, .rm = size, .imm = q_imm };
+                            return .{ .raw = inst, .op = @backingInt(A64Op.simd_xtn_shrn), .rd = rd, .rn = rn, .rm = size, .imm = q_imm };
                         } else if (opcode == 0b10011 and u and size < 3) {
                             const src_bits: u8 = @as(u8, 8) << size;
-                            return .{ .raw = inst, .op = @intFromEnum(A64Op.simd_shll), .rd = rd, .rn = rn, .rm = src_bits, .imm = (@as(u64, size) << 2) | 2 | q_imm };
+                            return .{ .raw = inst, .op = @backingInt(A64Op.simd_shll), .rd = rd, .rn = rn, .rm = src_bits, .imm = (@as(u64, size) << 2) | 2 | q_imm };
                         }
                     } else if ((inst & 0xbf20_8400) == 0x2e00_0000) {
                         // 6. AdvSIMD EXT (`EXT Vd.<T>, Vn.<T>, Vm.<T>, #imm4`)
@@ -2254,7 +2254,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                         if (q or imm4 < 8) {
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(if (q) A64Op.simd_ext_q else A64Op.simd_ext_d),
+                                .op = @backingInt(if (q) A64Op.simd_ext_q else A64Op.simd_ext_d),
                                 .rd = rd,
                                 .rn = rn,
                                 .rm = rm,
@@ -2283,7 +2283,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             };
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(A64Op.simd_ushr),
+                                .op = @backingInt(A64Op.simd_ushr),
                                 .rd = rd,
                                 .rn = rn,
                                 .rm = (@as(u8, @intFromBool(q)) << 6) | sh_u8,
@@ -2301,7 +2301,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             };
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(A64Op.simd_shl),
+                                .op = @backingInt(A64Op.simd_shl),
                                 .rd = rd,
                                 .rn = rn,
                                 .rm = (@as(u8, @intFromBool(q)) << 6) | @as(u8, lshift),
@@ -2314,7 +2314,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const round: u64 = if ((opcode & 1) != 0 and rshift > 0) (@as(u64, 1) << (rshift - 1)) else 0;
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(A64Op.simd_xtn_shrn),
+                                .op = @backingInt(A64Op.simd_xtn_shrn),
                                 .rd = rd,
                                 .rn = rn,
                                 .rm = size_idx | (@as(u8, rshift) << 2),
@@ -2326,7 +2326,7 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             const lshift: u8 = @intCast(immhb - esize);
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(A64Op.simd_shll),
+                                .op = @backingInt(A64Op.simd_shll),
                                 .rd = rd,
                                 .rn = rn,
                                 .rm = lshift,
@@ -2334,9 +2334,9 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             };
                         }
                     }
-                    return .{ .raw = inst, .op = @intFromEnum(A64Op.fp_simd) };
+                    return .{ .raw = inst, .op = @backingInt(A64Op.fp_simd) };
                 },
-                else => return .{ .raw = inst, .op = @intFromEnum(A64Op.nop) },
+                else => return .{ .raw = inst, .op = @backingInt(A64Op.nop) },
             }
         }
 
@@ -2455,38 +2455,241 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                     cpu.pc64 = cur_pc +% 4;
                     executed += 1;
 
-                const op: A64Op = @enumFromInt(d.op);
-                switch (op) {
-                    .adr => setX(cpu, @truncate(d.rd), cur_pc +% d.imm),
-                    .adrp => setX(cpu, @truncate(d.rd), (cur_pc & ~@as(u64, 0xfff)) +% d.imm),
-                    .adrp_add => {
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                            setX(cpu, @truncate(d.rd), (cur_pc & ~@as(u64, 0xfff)) +% d.imm);
-                            cpu.pc64 = cur_pc +% 8;
-                            executed += 1;
-                        } else {
-                            setX(cpu, @truncate(d.rd), (cur_pc & ~@as(u64, 0xfff)) +% (d.imm & ~@as(u64, 0xfff)));
-                        }
-                    },
-                    .adrp_ldr64, .adrp_ldr32 => {
-                        const base = (cur_pc & ~@as(u64, 0xfff)) +% (d.imm & ~@as(u64, 0xfff));
-                        setX(cpu, @truncate(d.rn), base);
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                            cpu.pc64 = cur_pc +% 8;
-                            executed += 1;
-                            if (op == .adrp_ldr64) {
-                                const addr = base +% ((d.imm & 0xfff) << 3);
-                                if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[0]) {
-                                    setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xff8))..][0..8], .little));
+                    const op: A64Op = @fromBackingInt(@intCast(d.op));
+                    switch (op) {
+                        .adr => setX(cpu, @truncate(d.rd), cur_pc +% d.imm),
+                        .adrp => setX(cpu, @truncate(d.rd), (cur_pc & ~@as(u64, 0xfff)) +% d.imm),
+                        .adrp_add => {
+                            if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                                setX(cpu, @truncate(d.rd), (cur_pc & ~@as(u64, 0xfff)) +% d.imm);
+                                cpu.pc64 = cur_pc +% 8;
+                                executed += 1;
+                            } else {
+                                setX(cpu, @truncate(d.rd), (cur_pc & ~@as(u64, 0xfff)) +% (d.imm & ~@as(u64, 0xfff)));
+                            }
+                        },
+                        .adrp_ldr64, .adrp_ldr32 => {
+                            const base = (cur_pc & ~@as(u64, 0xfff)) +% (d.imm & ~@as(u64, 0xfff));
+                            setX(cpu, @truncate(d.rn), base);
+                            if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                                cpu.pc64 = cur_pc +% 8;
+                                executed += 1;
+                                if (op == .adrp_ldr64) {
+                                    const addr = base +% ((d.imm & 0xfff) << 3);
+                                    if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[0]) {
+                                        setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xff8))..][0..8], .little));
+                                    } else {
+                                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                            data_r_vbase[0] = dslot.r_vbase;
+                                            data_r_page_ptr[0] = bus.ram.ptr + dslot.pbase;
+                                            setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..8], .little));
+                                        } else {
+                                            const val = readData64(cpu, bus, addr) catch {
+                                                handleAbort64(cpu, cur_pc +% 4);
+                                                priv = 1;
+                                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                                continue;
+                                            };
+                                            setX(cpu, @truncate(d.rd), val);
+                                        }
+                                    }
+                                } else {
+                                    const addr = base +% ((d.imm & 0xfff) << 2);
+                                    if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[0]) {
+                                        setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xffc))..][0..4], .little));
+                                    } else {
+                                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                        if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                            data_r_vbase[0] = dslot.r_vbase;
+                                            data_r_page_ptr[0] = bus.ram.ptr + dslot.pbase;
+                                            setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..4], .little));
+                                        } else {
+                                            const val = readData32(cpu, bus, addr) catch {
+                                                handleAbort64(cpu, cur_pc +% 4);
+                                                priv = 1;
+                                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                                continue;
+                                            };
+                                            setW(cpu, @truncate(d.rd), val);
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .cmp_imm_bcond => {
+                            const cmp_imm: u64 = @as(u32, @truncate(d.imm));
+                            const sf: u1 = @truncate((d.rm >> 5) & 1);
+                            const is_sub = (d.rm & 0x40) != 0;
+                            const dst_rd: u5 = @truncate(d.rm & 0x1f);
+                            addSub(cpu, sf, is_sub, true, dst_rd, getXOrSp(cpu, @truncate(d.rn)), cmp_imm, if (is_sub) 1 else 0, false);
+                            if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                                executed += 1;
+                                if (evalCond(cpu.pstate, @truncate(d.rd))) {
+                                    const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
+                                    const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
+                                    cpu.pc64 = target_pc;
+                                    noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                    if (cpu.yield_slice) break :step_loop;
+                                } else {
+                                    cpu.pc64 = cur_pc +% 8;
+                                }
+                            }
+                        },
+                        .cmp_reg_bcond => {
+                            const sf: u1 = @truncate(d.rd >> 4);
+                            const dst_rd: u5 = @truncate(d.imm >> 32);
+                            addSub(cpu, sf, true, true, dst_rd, getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false);
+                            if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                                executed += 1;
+                                if (evalCond(cpu.pstate, @truncate(d.rd))) {
+                                    const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
+                                    const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
+                                    cpu.pc64 = target_pc;
+                                    noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                    if (cpu.yield_slice) break :step_loop;
+                                } else {
+                                    cpu.pc64 = cur_pc +% 8;
+                                }
+                            }
+                        },
+                        .tst_imm_bcond => {
+                            const mask: u64 = @as(u32, @truncate(d.imm));
+                            const res = getX(cpu, @truncate(d.rn)) & mask;
+                            const sign = if ((d.rd & 0x10) != 0) false else ((res >> 31) != 0);
+                            setNzcv(cpu, sign, res == 0, false, false);
+                            if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                                executed += 1;
+                                if (evalCond(cpu.pstate, @truncate(d.rd))) {
+                                    const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
+                                    const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
+                                    cpu.pc64 = target_pc;
+                                    noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                    if (cpu.yield_slice) break :step_loop;
+                                } else {
+                                    cpu.pc64 = cur_pc +% 8;
+                                }
+                            }
+                        },
+                        .tst_reg_bcond => {
+                            const dst_rd: u5 = @truncate(d.imm >> 32);
+                            if ((d.rd & 0x10) != 0) {
+                                const res = getX(cpu, @truncate(d.rn)) & getX(cpu, @truncate(d.rm));
+                                setNzcv(cpu, (res >> 63) != 0, res == 0, false, false);
+                                setX(cpu, dst_rd, res);
+                            } else {
+                                const res = getW(cpu, @truncate(d.rn)) & getW(cpu, @truncate(d.rm));
+                                setNzcv(cpu, (res >> 31) != 0, res == 0, false, false);
+                                setW(cpu, dst_rd, res);
+                            }
+                            if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                                executed += 1;
+                                if (evalCond(cpu.pstate, @truncate(d.rd))) {
+                                    const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
+                                    const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
+                                    cpu.pc64 = target_pc;
+                                    noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                    if (cpu.yield_slice) break :step_loop;
+                                } else {
+                                    cpu.pc64 = cur_pc +% 8;
+                                }
+                            }
+                        },
+                        .ldr_cbz => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% @as(u32, @truncate(d.imm));
+                            var val: u64 = undefined;
+                            if ((d.rm & 4) == 0) {
+                                if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
+                                    val = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little);
                                 } else {
                                     const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
                                     if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                        data_r_vbase[0] = dslot.r_vbase;
-                                        data_r_page_ptr[0] = bus.ram.ptr + dslot.pbase;
-                                        setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..8], .little));
+                                        data_r_vbase[bank] = dslot.r_vbase;
+                                        data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                        val = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
                                     } else {
-                                        const val = readData64(cpu, bus, addr) catch {
-                                            handleAbort64(cpu, cur_pc +% 4);
+                                        val = readData64(cpu, bus, addr) catch {
+                                            handleAbort64(cpu, cur_pc);
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        };
+                                    }
+                                }
+                                setX(cpu, @truncate(d.rd), val);
+                            } else {
+                                var val32: u32 = undefined;
+                                if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank]) {
+                                    val32 = std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little);
+                                } else {
+                                    const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                    if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                        data_r_vbase[bank] = dslot.r_vbase;
+                                        data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                        val32 = std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
+                                    } else {
+                                        val32 = readData32(cpu, bus, addr) catch {
+                                            handleAbort64(cpu, cur_pc);
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        };
+                                    }
+                                }
+                                setW(cpu, @truncate(d.rd), val32);
+                                val = val32;
+                            }
+                            if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                                executed += 1;
+                                const test_val: u64 = if ((d.rm & 2) != 0) @as(u32, @truncate(val)) else val;
+                                const take = if ((d.rm & 1) != 0) (test_val != 0) else (test_val == 0);
+                                if (take) {
+                                    const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
+                                    const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
+                                    cpu.pc64 = target_pc;
+                                    noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
+                                    if (cpu.yield_slice) break :step_loop;
+                                } else {
+                                    cpu.pc64 = cur_pc +% 8;
+                                }
+                            }
+                        },
+                        .ldr64_pair_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const addr1 = base +% @as(u32, @truncate(d.imm));
+                            const addr2 = base +% (d.imm >> 32);
+                            if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase and
+                                (addr1 & ~@as(u64, 0xff8)) == data_r_vbase[bank] and
+                                (addr2 & ~@as(u64, 0xff8)) == data_r_vbase[bank])
+                            {
+                                setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr1 & 0xff8))..][0..8], .little));
+                                setX(cpu, @truncate(d.rm), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr2 & 0xff8))..][0..8], .little));
+                                cpu.pc64 = cur_pc +% 8;
+                                executed += 1;
+                            } else {
+                                if ((addr1 & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
+                                    setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr1 & 0xff8))..][0..8], .little));
+                                } else {
+                                    const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr1 >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                    if ((addr1 & 0xfff) <= 0xff8 and (addr1 & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                        data_r_vbase[bank] = dslot.r_vbase;
+                                        data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                        setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr1 & 0xfff))..][0..8], .little));
+                                    } else {
+                                        const val = readData64(cpu, bus, addr1) catch {
+                                            handleAbort64(cpu, cur_pc);
                                             priv = 1;
                                             code_vbase = 0xffff_ffff_ffff_ffff;
                                             data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
@@ -2496,199 +2699,282 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                         setX(cpu, @truncate(d.rd), val);
                                     }
                                 }
-                            } else {
-                                const addr = base +% ((d.imm & 0xfff) << 2);
-                                if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[0]) {
-                                    setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xffc))..][0..4], .little));
-                                } else {
-                                    const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                                    if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                        data_r_vbase[0] = dslot.r_vbase;
-                                        data_r_page_ptr[0] = bus.ram.ptr + dslot.pbase;
-                                        setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..4], .little));
-                                    } else {
-                                        const val = readData32(cpu, bus, addr) catch {
-                                            handleAbort64(cpu, cur_pc +% 4);
-                                            priv = 1;
-                                            code_vbase = 0xffff_ffff_ffff_ffff;
-                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                            continue;
-                                        };
-                                        setW(cpu, @truncate(d.rd), val);
-                                    }
-                                }
                             }
-                        }
-                    },
-                    .cmp_imm_bcond => {
-                        const cmp_imm: u64 = @as(u32, @truncate(d.imm));
-                        const sf: u1 = @truncate((d.rm >> 5) & 1);
-                        const is_sub = (d.rm & 0x40) != 0;
-                        const dst_rd: u5 = @truncate(d.rm & 0x1f);
-                        addSub(cpu, sf, is_sub, true, dst_rd, getXOrSp(cpu, @truncate(d.rn)), cmp_imm, if (is_sub) 1 else 0, false);
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                            executed += 1;
-                            if (evalCond(cpu.pstate, @truncate(d.rd))) {
-                                const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
-                                const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
-                                cpu.pc64 = target_pc;
-                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
-                                if (cpu.yield_slice) break :step_loop;
-                            } else {
-                                cpu.pc64 = cur_pc +% 8;
-                            }
-                        }
-                    },
-                    .cmp_reg_bcond => {
-                        const sf: u1 = @truncate(d.rd >> 4);
-                        const dst_rd: u5 = @truncate(d.imm >> 32);
-                        addSub(cpu, sf, true, true, dst_rd, getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false);
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                            executed += 1;
-                            if (evalCond(cpu.pstate, @truncate(d.rd))) {
-                                const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
-                                const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
-                                cpu.pc64 = target_pc;
-                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
-                                if (cpu.yield_slice) break :step_loop;
-                            } else {
-                                cpu.pc64 = cur_pc +% 8;
-                            }
-                        }
-                    },
-                    .tst_imm_bcond => {
-                        const mask: u64 = @as(u32, @truncate(d.imm));
-                        const res = getX(cpu, @truncate(d.rn)) & mask;
-                        const sign = if ((d.rd & 0x10) != 0) false else ((res >> 31) != 0);
-                        setNzcv(cpu, sign, res == 0, false, false);
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                            executed += 1;
-                            if (evalCond(cpu.pstate, @truncate(d.rd))) {
-                                const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
-                                const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
-                                cpu.pc64 = target_pc;
-                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
-                                if (cpu.yield_slice) break :step_loop;
-                            } else {
-                                cpu.pc64 = cur_pc +% 8;
-                            }
-                        }
-                    },
-                    .tst_reg_bcond => {
-                        const dst_rd: u5 = @truncate(d.imm >> 32);
-                        if ((d.rd & 0x10) != 0) {
+                        },
+                        .add_imm64 => setXOrSp(cpu, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)) +% d.imm),
+                        .sub_imm64 => setXOrSp(cpu, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)) -% d.imm),
+                        .adds_imm64 => addSub(cpu, 1, false, true, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)), d.imm, 0, false),
+                        .subs_imm64 => addSub(cpu, 1, true, true, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)), d.imm, 1, false),
+                        .add_imm32 => setWOrSp(cpu, @truncate(d.rd), @as(u32, @truncate(getXOrSp(cpu, @truncate(d.rn)))) +% @as(u32, @truncate(d.imm))),
+                        .sub_imm32 => setWOrSp(cpu, @truncate(d.rd), @as(u32, @truncate(getXOrSp(cpu, @truncate(d.rn)))) -% @as(u32, @truncate(d.imm))),
+                        .adds_imm32 => addSub(cpu, 0, false, true, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)), d.imm, 0, false),
+                        .subs_imm32 => addSub(cpu, 0, true, true, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)), d.imm, 1, false),
+                        .and_imm64 => setXOrSp(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) & d.imm),
+                        .orr_imm64 => setXOrSp(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | d.imm),
+                        .eor_imm64 => setXOrSp(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) ^ d.imm),
+                        .ands_imm64 => {
+                            const res = getX(cpu, @truncate(d.rn)) & d.imm;
+                            setNzcv(cpu, (res >> 63) != 0, res == 0, false, false);
+                            setX(cpu, @truncate(d.rd), res);
+                        },
+                        .and_imm32 => setWOrSp(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) & @as(u32, @truncate(d.imm))),
+                        .orr_imm32 => setWOrSp(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) | @as(u32, @truncate(d.imm))),
+                        .eor_imm32 => setWOrSp(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) ^ @as(u32, @truncate(d.imm))),
+                        .ands_imm32 => {
+                            const res = getW(cpu, @truncate(d.rn)) & @as(u32, @truncate(d.imm));
+                            setNzcv(cpu, (res >> 31) != 0, res == 0, false, false);
+                            setW(cpu, @truncate(d.rd), res);
+                        },
+                        .mov_wide => setX(cpu, @truncate(d.rd), d.imm),
+                        .movk64 => {
+                            const rd: u5 = @truncate(d.rd);
+                            const sh: u6 = @truncate(d.rm);
+                            setX(cpu, rd, (getX(cpu, rd) & ~(@as(u64, 0xffff) << sh)) | d.imm);
+                        },
+                        .movk32 => {
+                            const rd: u5 = @truncate(d.rd);
+                            const sh: u6 = @truncate(d.rm);
+                            setX(cpu, rd, ((getX(cpu, rd) & ~(@as(u64, 0xffff) << sh)) | d.imm) & 0xffff_ffff);
+                        },
+                        .ubfm_r => setX(cpu, @truncate(d.rd), (getX(cpu, @truncate(d.rn)) >> @intCast(d.rm)) & d.imm),
+                        .ubfm_l => setX(cpu, @truncate(d.rd), (getX(cpu, @truncate(d.rn)) << @intCast(d.rm)) & d.imm),
+                        .bfm_r => {
+                            const rmask: u64 = if ((d.rm & 64) != 0) 0xffff_ffff_ffff_ffff else 0xffff_ffff;
+                            const dst = getX(cpu, @truncate(d.rd)) & ~d.imm;
+                            const ext = (getX(cpu, @truncate(d.rn)) >> @intCast(d.rm & 63)) & d.imm;
+                            setX(cpu, @truncate(d.rd), (dst | ext) & rmask);
+                        },
+                        .bfm_l => {
+                            const rmask: u64 = if ((d.rm & 64) != 0) 0xffff_ffff_ffff_ffff else 0xffff_ffff;
+                            const dst = getX(cpu, @truncate(d.rd)) & ~d.imm;
+                            const ins = (getX(cpu, @truncate(d.rn)) << @intCast(d.rm & 63)) & d.imm;
+                            setX(cpu, @truncate(d.rd), (dst | ins) & rmask);
+                        },
+                        .sbfm64_r => {
+                            const sval: i64 = @bitCast(getX(cpu, @truncate(d.rn)));
+                            setX(cpu, @truncate(d.rd), @bitCast((sval << @as(u6, @truncate(d.rm))) >> @as(u6, @truncate(d.imm))));
+                        },
+                        .sbfm32_r => {
+                            const sval: i32 = @bitCast(getW(cpu, @truncate(d.rn)));
+                            setW(cpu, @truncate(d.rd), @bitCast((sval << @as(u5, @truncate(d.rm))) >> @as(u5, @truncate(d.imm))));
+                        },
+                        .extr64 => {
+                            const a: u128 = getX(cpu, @truncate(d.rn));
+                            const b: u128 = getX(cpu, @truncate(d.rm));
+                            setX(cpu, @truncate(d.rd), @truncate(((a << 64) | b) >> @as(u6, @truncate(d.imm))));
+                        },
+                        .extr32 => {
+                            const a: u64 = getW(cpu, @truncate(d.rn));
+                            const b: u64 = getW(cpu, @truncate(d.rm));
+                            setW(cpu, @truncate(d.rd), @truncate(((a << 32) | b) >> @as(u5, @truncate(d.imm))));
+                        },
+                        .orr_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | getX(cpu, @truncate(d.rm))),
+                        .orr_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) | getW(cpu, @truncate(d.rm))),
+                        .orn_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | ~getX(cpu, @truncate(d.rm))),
+                        .orn_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) | ~getW(cpu, @truncate(d.rm))),
+                        .add_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) +% getX(cpu, @truncate(d.rm))),
+                        .add_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) +% getW(cpu, @truncate(d.rm))),
+                        .adds_reg64 => addSub(cpu, 1, false, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 0, false),
+                        .adds_reg32 => addSub(cpu, 0, false, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 0, false),
+                        .sub_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) -% getX(cpu, @truncate(d.rm))),
+                        .sub_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) -% getW(cpu, @truncate(d.rm))),
+                        .subs_reg64 => addSub(cpu, 1, true, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false),
+                        .subs_reg32 => addSub(cpu, 0, true, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false),
+                        .and_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) & getX(cpu, @truncate(d.rm))),
+                        .and_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) & getW(cpu, @truncate(d.rm))),
+                        .bic_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) & ~getX(cpu, @truncate(d.rm))),
+                        .bic_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) & ~getW(cpu, @truncate(d.rm))),
+                        .eor_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) ^ getX(cpu, @truncate(d.rm))),
+                        .eor_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) ^ getW(cpu, @truncate(d.rm))),
+                        .ands_reg64 => {
                             const res = getX(cpu, @truncate(d.rn)) & getX(cpu, @truncate(d.rm));
                             setNzcv(cpu, (res >> 63) != 0, res == 0, false, false);
-                            setX(cpu, dst_rd, res);
-                        } else {
+                            setX(cpu, @truncate(d.rd), res);
+                        },
+                        .ands_reg32 => {
                             const res = getW(cpu, @truncate(d.rn)) & getW(cpu, @truncate(d.rm));
                             setNzcv(cpu, (res >> 31) != 0, res == 0, false, false);
-                            setW(cpu, dst_rd, res);
-                        }
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                            executed += 1;
-                            if (evalCond(cpu.pstate, @truncate(d.rd))) {
-                                const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm))));
-                                const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
-                                cpu.pc64 = target_pc;
-                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
-                                if (cpu.yield_slice) break :step_loop;
+                            setW(cpu, @truncate(d.rd), res);
+                        },
+                        .add_lsl64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @as(u6, @truncate(d.imm)))),
+                        .add_lsl32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) +% (getW(cpu, @truncate(d.rm)) << @as(u5, @truncate(d.imm)))),
+                        .sub_lsl64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) -% (getX(cpu, @truncate(d.rm)) << @as(u6, @truncate(d.imm)))),
+                        .sub_lsl32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) -% (getW(cpu, @truncate(d.rm)) << @as(u5, @truncate(d.imm)))),
+                        .orr_lsl64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | (getX(cpu, @truncate(d.rm)) << @as(u6, @truncate(d.imm)))),
+                        .orr_lsr64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | (getX(cpu, @truncate(d.rm)) >> @as(u6, @truncate(d.imm)))),
+                        .add_ext64 => setXOrSp(cpu, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)) +% extendReg(getX(cpu, @truncate(d.rm)), @truncate(d.imm >> 3), @truncate(d.imm))),
+                        .sub_ext64 => setXOrSp(cpu, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)) -% extendReg(getX(cpu, @truncate(d.rm)), @truncate(d.imm >> 3), @truncate(d.imm))),
+                        .add_sub_ext => {
+                            const imm3: u3 = @truncate(d.imm);
+                            const option: u3 = @truncate(d.imm >> 3);
+                            const s = ((d.imm >> 6) & 1) != 0;
+                            const op0 = ((d.imm >> 7) & 1) != 0;
+                            const sf: u1 = @truncate(d.imm >> 8);
+                            const a = getXOrSp(cpu, @truncate(d.rn));
+                            const b = extendReg(getX(cpu, @truncate(d.rm)), option, imm3);
+                            addSub(cpu, sf, op0, s, @truncate(d.rd), a, b, if (op0) 1 else 0, !s);
+                        },
+                        .dp_shift_reg => {
+                            const imm6: u6 = @truncate(d.imm);
+                            const shift_type: u2 = @truncate(d.imm >> 6);
+                            const op2: u4 = @truncate(d.imm >> 8);
+                            const s: u1 = @truncate(d.imm >> 12);
+                            const op0: u1 = @truncate(d.imm >> 13);
+                            const sf: u1 = @truncate(d.imm >> 14);
+                            const a = getX(cpu, @truncate(d.rn));
+                            var b = shiftReg(sf, getX(cpu, @truncate(d.rm)), shift_type, imm6);
+                            if ((op2 & 0b1000) == 0) {
+                                if ((op2 & 1) != 0) b = ~b;
+                                const opc: u2 = (@as(u2, op0) << 1) | s;
+                                var res: u64 = switch (opc) {
+                                    0b00 => a & b,
+                                    0b01 => a | b,
+                                    0b10 => a ^ b,
+                                    0b11 => a & b,
+                                };
+                                if (sf == 0) res &= 0xffff_ffff;
+                                if (opc == 0b11) {
+                                    const sign_bit: u6 = if (sf == 1) 63 else 31;
+                                    setNzcv(cpu, ((res >> sign_bit) & 1) != 0, res == 0, false, false);
+                                }
+                                setX(cpu, @truncate(d.rd), res);
                             } else {
-                                cpu.pc64 = cur_pc +% 8;
+                                addSub(cpu, sf, op0 == 1, s == 1, @truncate(d.rd), a, b, if (op0 == 1) 1 else 0, false);
                             }
-                        }
-                    },
-                    .ldr_cbz => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% @as(u32, @truncate(d.imm));
-                        var val: u64 = undefined;
-                        if ((d.rm & 4) == 0) {
+                        },
+                        .lslv64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) << @as(u6, @truncate(getX(cpu, @truncate(d.rm))))),
+                        .lsrv64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) >> @as(u6, @truncate(getX(cpu, @truncate(d.rm))))),
+                        .asrv64 => setX(cpu, @truncate(d.rd), @bitCast(@as(i64, @bitCast(getX(cpu, @truncate(d.rn)))) >> @as(u6, @truncate(getX(cpu, @truncate(d.rm)))))),
+                        .lslv32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) << @as(u5, @truncate(getW(cpu, @truncate(d.rm))))),
+                        .lsrv32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) >> @as(u5, @truncate(getW(cpu, @truncate(d.rm))))),
+                        .asrv32 => setW(cpu, @truncate(d.rd), @bitCast(@as(i32, @bitCast(getW(cpu, @truncate(d.rn)))) >> @as(u5, @truncate(getW(cpu, @truncate(d.rm)))))),
+                        .udiv64 => {
+                            const a = getX(cpu, @truncate(d.rn));
+                            const b = getX(cpu, @truncate(d.rm));
+                            setX(cpu, @truncate(d.rd), if (b == 0) 0 else a / b);
+                        },
+                        .sdiv64 => {
+                            const a = getX(cpu, @truncate(d.rn));
+                            const b = getX(cpu, @truncate(d.rm));
+                            const res: u64 = if (b == 0) 0 else blk: {
+                                const sa: i64 = @bitCast(a);
+                                const sb: i64 = @bitCast(b);
+                                if (sa == std.math.minInt(i64) and sb == -1) break :blk @bitCast(sa);
+                                break :blk @bitCast(@divTrunc(sa, sb));
+                            };
+                            setX(cpu, @truncate(d.rd), res);
+                        },
+                        .udiv32 => {
+                            const a = getW(cpu, @truncate(d.rn));
+                            const b = getW(cpu, @truncate(d.rm));
+                            setW(cpu, @truncate(d.rd), if (b == 0) 0 else a / b);
+                        },
+                        .sdiv32 => {
+                            const a = getW(cpu, @truncate(d.rn));
+                            const b = getW(cpu, @truncate(d.rm));
+                            const res: u32 = if (b == 0) 0 else blk: {
+                                const sa: i32 = @bitCast(a);
+                                const sb: i32 = @bitCast(b);
+                                if (sa == std.math.minInt(i32) and sb == -1) break :blk @bitCast(sa);
+                                break :blk @bitCast(@divTrunc(sa, sb));
+                            };
+                            setW(cpu, @truncate(d.rd), res);
+                        },
+                        .clz64 => setX(cpu, @truncate(d.rd), @clz(getX(cpu, @truncate(d.rn)))),
+                        .clz32 => setW(cpu, @truncate(d.rd), @clz(getW(cpu, @truncate(d.rn)))),
+                        .rev64 => setX(cpu, @truncate(d.rd), @byteSwap(getX(cpu, @truncate(d.rn)))),
+                        .rev32 => setW(cpu, @truncate(d.rd), @byteSwap(getW(cpu, @truncate(d.rn)))),
+                        .csel => {
+                            const cond: u4 = @truncate(d.imm);
+                            const inv = ((d.imm >> 4) & 1) != 0;
+                            const inc = ((d.imm >> 5) & 1) != 0;
+                            const sf = ((d.imm >> 6) & 1) != 0;
+                            var res: u64 = if (evalCond(cpu.pstate, cond))
+                                getX(cpu, @truncate(d.rn))
+                            else blk: {
+                                var v = getX(cpu, @truncate(d.rm));
+                                if (inv) v = ~v;
+                                if (inc) v +%= 1;
+                                break :blk v;
+                            };
+                            if (!sf) res &= 0xffff_ffff;
+                            setX(cpu, @truncate(d.rd), res);
+                        },
+                        .adc_sbc => {
+                            const c_in: u1 = if ((cpu.pstate & PstateFlags.C) != 0) 1 else 0;
+                            addSub(cpu, @truncate(d.imm >> 2), ((d.imm >> 1) & 1) != 0, (d.imm & 1) != 0, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), c_in, false);
+                        },
+                        .ccmp => {
+                            const cond: u4 = @truncate(d.imm);
+                            const nzcv_imm: u32 = @as(u32, @truncate((d.imm >> 4) & 0xf)) << 28;
+                            const is_imm = ((d.imm >> 8) & 1) != 0;
+                            const is_sub = ((d.imm >> 9) & 1) != 0;
+                            const sf: u1 = @truncate(d.imm >> 10);
+                            if (evalCond(cpu.pstate, cond)) {
+                                const b: u64 = if (is_imm) d.rm else getX(cpu, @truncate(d.rm));
+                                addSub(cpu, sf, is_sub, true, 31, getX(cpu, @truncate(d.rn)), b, if (is_sub) 1 else 0, false);
+                            } else {
+                                cpu.pstate = (cpu.pstate & 0x0fff_ffff) | nzcv_imm;
+                            }
+                        },
+                        .madd_msub => {
+                            const ra: u5 = @truncate(d.imm);
+                            const is_sub = ((d.imm >> 5) & 1) != 0;
+                            const sf = ((d.imm >> 6) & 1) != 0;
+                            const a = getX(cpu, @truncate(d.rn));
+                            const b = getX(cpu, @truncate(d.rm));
+                            const c = getX(cpu, ra);
+                            const res = if (is_sub) (c -% (a *% b)) else (c +% (a *% b));
+                            if (sf) setX(cpu, @truncate(d.rd), res) else setW(cpu, @truncate(d.rd), @truncate(res));
+                        },
+                        .maddl_mulh => {
+                            const ra: u5 = @truncate(d.imm);
+                            const o0 = ((d.imm >> 5) & 1) != 0;
+                            const op31: u3 = @truncate(d.imm >> 6);
+                            const rn: u5 = @truncate(d.rn);
+                            const rm: u5 = @truncate(d.rm);
+                            const rd: u5 = @truncate(d.rd);
+                            switch (op31) {
+                                0b001 => { // SMADDL / SMSUBL
+                                    const a: i64 = @as(i32, @bitCast(getW(cpu, rn)));
+                                    const b: i64 = @as(i32, @bitCast(getW(cpu, rm)));
+                                    const c: i64 = @bitCast(getX(cpu, ra));
+                                    const res: i64 = if (o0) (c -% (a * b)) else (c +% (a * b));
+                                    setX(cpu, rd, @bitCast(res));
+                                },
+                                0b010 => { // SMULH
+                                    const a: i128 = @as(i64, @bitCast(getX(cpu, rn)));
+                                    const b: i128 = @as(i64, @bitCast(getX(cpu, rm)));
+                                    setX(cpu, rd, @truncate(@as(u128, @bitCast(a * b)) >> 64));
+                                },
+                                0b101 => { // UMADDL / UMSUBL
+                                    const a: u64 = getW(cpu, rn);
+                                    const b: u64 = getW(cpu, rm);
+                                    const c: u64 = getX(cpu, ra);
+                                    const res: u64 = if (o0) (c -% (a * b)) else (c +% (a * b));
+                                    setX(cpu, rd, res);
+                                },
+                                else => { // UMULH
+                                    const a: u128 = getX(cpu, rn);
+                                    const b: u128 = getX(cpu, rm);
+                                    setX(cpu, rd, @truncate((a * b) >> 64));
+                                },
+                            }
+                        },
+                        .ldr64_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
                             if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
-                                val = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little);
+                                setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little));
                             } else {
                                 const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
                                 if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
                                     data_r_vbase[bank] = dslot.r_vbase;
                                     data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                    val = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                                    setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little));
                                 } else {
-                                    val = readData64(cpu, bus, addr) catch {
-                                        handleAbort64(cpu, cur_pc);
-                                        priv = 1;
-                                        code_vbase = 0xffff_ffff_ffff_ffff;
-                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                        continue;
-                                    };
-                                }
-                            }
-                            setX(cpu, @truncate(d.rd), val);
-                        } else {
-                            var val32: u32 = undefined;
-                            if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank]) {
-                                val32 = std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little);
-                            } else {
-                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                    data_r_vbase[bank] = dslot.r_vbase;
-                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                    val32 = std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
-                                } else {
-                                    val32 = readData32(cpu, bus, addr) catch {
-                                        handleAbort64(cpu, cur_pc);
-                                        priv = 1;
-                                        code_vbase = 0xffff_ffff_ffff_ffff;
-                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                        continue;
-                                    };
-                                }
-                            }
-                            setW(cpu, @truncate(d.rd), val32);
-                            val = val32;
-                        }
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                            executed += 1;
-                            const test_val: u64 = if ((d.rm & 2) != 0) @as(u32, @truncate(val)) else val;
-                            const take = if ((d.rm & 1) != 0) (test_val != 0) else (test_val == 0);
-                            if (take) {
-                                const target_off: i64 = @as(i32, @bitCast(@as(u32, @truncate(d.imm >> 32))));
-                                const target_pc = cur_pc +% @as(u64, @bitCast(target_off));
-                                cpu.pc64 = target_pc;
-                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 2));
-                                if (cpu.yield_slice) break :step_loop;
-                            } else {
-                                cpu.pc64 = cur_pc +% 8;
-                            }
-                        }
-                    },
-                    .ldr64_pair_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const addr1 = base +% @as(u32, @truncate(d.imm));
-                        const addr2 = base +% (d.imm >> 32);
-                        if (executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase and
-                            (addr1 & ~@as(u64, 0xff8)) == data_r_vbase[bank] and
-                            (addr2 & ~@as(u64, 0xff8)) == data_r_vbase[bank])
-                        {
-                            setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr1 & 0xff8))..][0..8], .little));
-                            setX(cpu, @truncate(d.rm), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr2 & 0xff8))..][0..8], .little));
-                            cpu.pc64 = cur_pc +% 8;
-                            executed += 1;
-                        } else {
-                            if ((addr1 & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
-                                setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr1 & 0xff8))..][0..8], .little));
-                            } else {
-                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr1 >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                                if ((addr1 & 0xfff) <= 0xff8 and (addr1 & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                    data_r_vbase[bank] = dslot.r_vbase;
-                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                    setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr1 & 0xfff))..][0..8], .little));
-                                } else {
-                                    const val = readData64(cpu, bus, addr1) catch {
+                                    const val = readData64(cpu, bus, addr) catch {
                                         handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
@@ -2699,483 +2985,114 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     setX(cpu, @truncate(d.rd), val);
                                 }
                             }
-                        }
-                    },
-                    .add_imm64 => setXOrSp(cpu, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)) +% d.imm),
-                    .sub_imm64 => setXOrSp(cpu, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)) -% d.imm),
-                    .adds_imm64 => addSub(cpu, 1, false, true, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)), d.imm, 0, false),
-                    .subs_imm64 => addSub(cpu, 1, true, true, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)), d.imm, 1, false),
-                    .add_imm32 => setWOrSp(cpu, @truncate(d.rd), @as(u32, @truncate(getXOrSp(cpu, @truncate(d.rn)))) +% @as(u32, @truncate(d.imm))),
-                    .sub_imm32 => setWOrSp(cpu, @truncate(d.rd), @as(u32, @truncate(getXOrSp(cpu, @truncate(d.rn)))) -% @as(u32, @truncate(d.imm))),
-                    .adds_imm32 => addSub(cpu, 0, false, true, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)), d.imm, 0, false),
-                    .subs_imm32 => addSub(cpu, 0, true, true, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)), d.imm, 1, false),
-                    .and_imm64 => setXOrSp(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) & d.imm),
-                    .orr_imm64 => setXOrSp(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | d.imm),
-                    .eor_imm64 => setXOrSp(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) ^ d.imm),
-                    .ands_imm64 => {
-                        const res = getX(cpu, @truncate(d.rn)) & d.imm;
-                        setNzcv(cpu, (res >> 63) != 0, res == 0, false, false);
-                        setX(cpu, @truncate(d.rd), res);
-                    },
-                    .and_imm32 => setWOrSp(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) & @as(u32, @truncate(d.imm))),
-                    .orr_imm32 => setWOrSp(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) | @as(u32, @truncate(d.imm))),
-                    .eor_imm32 => setWOrSp(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) ^ @as(u32, @truncate(d.imm))),
-                    .ands_imm32 => {
-                        const res = getW(cpu, @truncate(d.rn)) & @as(u32, @truncate(d.imm));
-                        setNzcv(cpu, (res >> 31) != 0, res == 0, false, false);
-                        setW(cpu, @truncate(d.rd), res);
-                    },
-                    .mov_wide => setX(cpu, @truncate(d.rd), d.imm),
-                    .movk64 => {
-                        const rd: u5 = @truncate(d.rd);
-                        const sh: u6 = @truncate(d.rm);
-                        setX(cpu, rd, (getX(cpu, rd) & ~(@as(u64, 0xffff) << sh)) | d.imm);
-                    },
-                    .movk32 => {
-                        const rd: u5 = @truncate(d.rd);
-                        const sh: u6 = @truncate(d.rm);
-                        setX(cpu, rd, ((getX(cpu, rd) & ~(@as(u64, 0xffff) << sh)) | d.imm) & 0xffff_ffff);
-                    },
-                    .ubfm_r => setX(cpu, @truncate(d.rd), (getX(cpu, @truncate(d.rn)) >> @intCast(d.rm)) & d.imm),
-                    .ubfm_l => setX(cpu, @truncate(d.rd), (getX(cpu, @truncate(d.rn)) << @intCast(d.rm)) & d.imm),
-                    .bfm_r => {
-                        const rmask: u64 = if ((d.rm & 64) != 0) 0xffff_ffff_ffff_ffff else 0xffff_ffff;
-                        const dst = getX(cpu, @truncate(d.rd)) & ~d.imm;
-                        const ext = (getX(cpu, @truncate(d.rn)) >> @intCast(d.rm & 63)) & d.imm;
-                        setX(cpu, @truncate(d.rd), (dst | ext) & rmask);
-                    },
-                    .bfm_l => {
-                        const rmask: u64 = if ((d.rm & 64) != 0) 0xffff_ffff_ffff_ffff else 0xffff_ffff;
-                        const dst = getX(cpu, @truncate(d.rd)) & ~d.imm;
-                        const ins = (getX(cpu, @truncate(d.rn)) << @intCast(d.rm & 63)) & d.imm;
-                        setX(cpu, @truncate(d.rd), (dst | ins) & rmask);
-                    },
-                    .sbfm64_r => {
-                        const sval: i64 = @bitCast(getX(cpu, @truncate(d.rn)));
-                        setX(cpu, @truncate(d.rd), @bitCast((sval << @as(u6, @truncate(d.rm))) >> @as(u6, @truncate(d.imm))));
-                    },
-                    .sbfm32_r => {
-                        const sval: i32 = @bitCast(getW(cpu, @truncate(d.rn)));
-                        setW(cpu, @truncate(d.rd), @bitCast((sval << @as(u5, @truncate(d.rm))) >> @as(u5, @truncate(d.imm))));
-                    },
-                    .extr64 => {
-                        const a: u128 = getX(cpu, @truncate(d.rn));
-                        const b: u128 = getX(cpu, @truncate(d.rm));
-                        setX(cpu, @truncate(d.rd), @truncate(((a << 64) | b) >> @as(u6, @truncate(d.imm))));
-                    },
-                    .extr32 => {
-                        const a: u64 = getW(cpu, @truncate(d.rn));
-                        const b: u64 = getW(cpu, @truncate(d.rm));
-                        setW(cpu, @truncate(d.rd), @truncate(((a << 32) | b) >> @as(u5, @truncate(d.imm))));
-                    },
-                    .orr_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | getX(cpu, @truncate(d.rm))),
-                    .orr_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) | getW(cpu, @truncate(d.rm))),
-                    .orn_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | ~getX(cpu, @truncate(d.rm))),
-                    .orn_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) | ~getW(cpu, @truncate(d.rm))),
-                    .add_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) +% getX(cpu, @truncate(d.rm))),
-                    .add_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) +% getW(cpu, @truncate(d.rm))),
-                    .adds_reg64 => addSub(cpu, 1, false, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 0, false),
-                    .adds_reg32 => addSub(cpu, 0, false, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 0, false),
-                    .sub_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) -% getX(cpu, @truncate(d.rm))),
-                    .sub_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) -% getW(cpu, @truncate(d.rm))),
-                    .subs_reg64 => addSub(cpu, 1, true, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false),
-                    .subs_reg32 => addSub(cpu, 0, true, true, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), 1, false),
-                    .and_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) & getX(cpu, @truncate(d.rm))),
-                    .and_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) & getW(cpu, @truncate(d.rm))),
-                    .bic_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) & ~getX(cpu, @truncate(d.rm))),
-                    .bic_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) & ~getW(cpu, @truncate(d.rm))),
-                    .eor_reg64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) ^ getX(cpu, @truncate(d.rm))),
-                    .eor_reg32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) ^ getW(cpu, @truncate(d.rm))),
-                    .ands_reg64 => {
-                        const res = getX(cpu, @truncate(d.rn)) & getX(cpu, @truncate(d.rm));
-                        setNzcv(cpu, (res >> 63) != 0, res == 0, false, false);
-                        setX(cpu, @truncate(d.rd), res);
-                    },
-                    .ands_reg32 => {
-                        const res = getW(cpu, @truncate(d.rn)) & getW(cpu, @truncate(d.rm));
-                        setNzcv(cpu, (res >> 31) != 0, res == 0, false, false);
-                        setW(cpu, @truncate(d.rd), res);
-                    },
-                    .add_lsl64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) +% (getX(cpu, @truncate(d.rm)) << @as(u6, @truncate(d.imm)))),
-                    .add_lsl32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) +% (getW(cpu, @truncate(d.rm)) << @as(u5, @truncate(d.imm)))),
-                    .sub_lsl64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) -% (getX(cpu, @truncate(d.rm)) << @as(u6, @truncate(d.imm)))),
-                    .sub_lsl32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) -% (getW(cpu, @truncate(d.rm)) << @as(u5, @truncate(d.imm)))),
-                    .orr_lsl64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | (getX(cpu, @truncate(d.rm)) << @as(u6, @truncate(d.imm)))),
-                    .orr_lsr64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) | (getX(cpu, @truncate(d.rm)) >> @as(u6, @truncate(d.imm)))),
-                    .add_ext64 => setXOrSp(cpu, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)) +% extendReg(getX(cpu, @truncate(d.rm)), @truncate(d.imm >> 3), @truncate(d.imm))),
-                    .sub_ext64 => setXOrSp(cpu, @truncate(d.rd), getXOrSp(cpu, @truncate(d.rn)) -% extendReg(getX(cpu, @truncate(d.rm)), @truncate(d.imm >> 3), @truncate(d.imm))),
-                    .add_sub_ext => {
-                        const imm3: u3 = @truncate(d.imm);
-                        const option: u3 = @truncate(d.imm >> 3);
-                        const s = ((d.imm >> 6) & 1) != 0;
-                        const op0 = ((d.imm >> 7) & 1) != 0;
-                        const sf: u1 = @truncate(d.imm >> 8);
-                        const a = getXOrSp(cpu, @truncate(d.rn));
-                        const b = extendReg(getX(cpu, @truncate(d.rm)), option, imm3);
-                        addSub(cpu, sf, op0, s, @truncate(d.rd), a, b, if (op0) 1 else 0, !s);
-                    },
-                    .dp_shift_reg => {
-                        const imm6: u6 = @truncate(d.imm);
-                        const shift_type: u2 = @truncate(d.imm >> 6);
-                        const op2: u4 = @truncate(d.imm >> 8);
-                        const s: u1 = @truncate(d.imm >> 12);
-                        const op0: u1 = @truncate(d.imm >> 13);
-                        const sf: u1 = @truncate(d.imm >> 14);
-                        const a = getX(cpu, @truncate(d.rn));
-                        var b = shiftReg(sf, getX(cpu, @truncate(d.rm)), shift_type, imm6);
-                        if ((op2 & 0b1000) == 0) {
-                            if ((op2 & 1) != 0) b = ~b;
-                            const opc: u2 = (@as(u2, op0) << 1) | s;
-                            var res: u64 = switch (opc) {
-                                0b00 => a & b,
-                                0b01 => a | b,
-                                0b10 => a ^ b,
-                                0b11 => a & b,
-                            };
-                            if (sf == 0) res &= 0xffff_ffff;
-                            if (opc == 0b11) {
-                                const sign_bit: u6 = if (sf == 1) 63 else 31;
-                                setNzcv(cpu, ((res >> sign_bit) & 1) != 0, res == 0, false, false);
-                            }
-                            setX(cpu, @truncate(d.rd), res);
-                        } else {
-                            addSub(cpu, sf, op0 == 1, s == 1, @truncate(d.rd), a, b, if (op0 == 1) 1 else 0, false);
-                        }
-                    },
-                    .lslv64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) << @as(u6, @truncate(getX(cpu, @truncate(d.rm))))),
-                    .lsrv64 => setX(cpu, @truncate(d.rd), getX(cpu, @truncate(d.rn)) >> @as(u6, @truncate(getX(cpu, @truncate(d.rm))))),
-                    .asrv64 => setX(cpu, @truncate(d.rd), @bitCast(@as(i64, @bitCast(getX(cpu, @truncate(d.rn)))) >> @as(u6, @truncate(getX(cpu, @truncate(d.rm)))))),
-                    .lslv32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) << @as(u5, @truncate(getW(cpu, @truncate(d.rm))))),
-                    .lsrv32 => setW(cpu, @truncate(d.rd), getW(cpu, @truncate(d.rn)) >> @as(u5, @truncate(getW(cpu, @truncate(d.rm))))),
-                    .asrv32 => setW(cpu, @truncate(d.rd), @bitCast(@as(i32, @bitCast(getW(cpu, @truncate(d.rn)))) >> @as(u5, @truncate(getW(cpu, @truncate(d.rm)))))),
-                    .udiv64 => {
-                        const a = getX(cpu, @truncate(d.rn));
-                        const b = getX(cpu, @truncate(d.rm));
-                        setX(cpu, @truncate(d.rd), if (b == 0) 0 else a / b);
-                    },
-                    .sdiv64 => {
-                        const a = getX(cpu, @truncate(d.rn));
-                        const b = getX(cpu, @truncate(d.rm));
-                        const res: u64 = if (b == 0) 0 else blk: {
-                            const sa: i64 = @bitCast(a);
-                            const sb: i64 = @bitCast(b);
-                            if (sa == std.math.minInt(i64) and sb == -1) break :blk @bitCast(sa);
-                            break :blk @bitCast(@divTrunc(sa, sb));
-                        };
-                        setX(cpu, @truncate(d.rd), res);
-                    },
-                    .udiv32 => {
-                        const a = getW(cpu, @truncate(d.rn));
-                        const b = getW(cpu, @truncate(d.rm));
-                        setW(cpu, @truncate(d.rd), if (b == 0) 0 else a / b);
-                    },
-                    .sdiv32 => {
-                        const a = getW(cpu, @truncate(d.rn));
-                        const b = getW(cpu, @truncate(d.rm));
-                        const res: u32 = if (b == 0) 0 else blk: {
-                            const sa: i32 = @bitCast(a);
-                            const sb: i32 = @bitCast(b);
-                            if (sa == std.math.minInt(i32) and sb == -1) break :blk @bitCast(sa);
-                            break :blk @bitCast(@divTrunc(sa, sb));
-                        };
-                        setW(cpu, @truncate(d.rd), res);
-                    },
-                    .clz64 => setX(cpu, @truncate(d.rd), @clz(getX(cpu, @truncate(d.rn)))),
-                    .clz32 => setW(cpu, @truncate(d.rd), @clz(getW(cpu, @truncate(d.rn)))),
-                    .rev64 => setX(cpu, @truncate(d.rd), @byteSwap(getX(cpu, @truncate(d.rn)))),
-                    .rev32 => setW(cpu, @truncate(d.rd), @byteSwap(getW(cpu, @truncate(d.rn)))),
-                    .csel => {
-                        const cond: u4 = @truncate(d.imm);
-                        const inv = ((d.imm >> 4) & 1) != 0;
-                        const inc = ((d.imm >> 5) & 1) != 0;
-                        const sf = ((d.imm >> 6) & 1) != 0;
-                        var res: u64 = if (evalCond(cpu.pstate, cond))
-                            getX(cpu, @truncate(d.rn))
-                        else blk: {
-                            var v = getX(cpu, @truncate(d.rm));
-                            if (inv) v = ~v;
-                            if (inc) v +%= 1;
-                            break :blk v;
-                        };
-                        if (!sf) res &= 0xffff_ffff;
-                        setX(cpu, @truncate(d.rd), res);
-                    },
-                    .adc_sbc => {
-                        const c_in: u1 = if ((cpu.pstate & PstateFlags.C) != 0) 1 else 0;
-                        addSub(cpu, @truncate(d.imm >> 2), ((d.imm >> 1) & 1) != 0, (d.imm & 1) != 0, @truncate(d.rd), getX(cpu, @truncate(d.rn)), getX(cpu, @truncate(d.rm)), c_in, false);
-                    },
-                    .ccmp => {
-                        const cond: u4 = @truncate(d.imm);
-                        const nzcv_imm: u32 = @as(u32, @truncate((d.imm >> 4) & 0xf)) << 28;
-                        const is_imm = ((d.imm >> 8) & 1) != 0;
-                        const is_sub = ((d.imm >> 9) & 1) != 0;
-                        const sf: u1 = @truncate(d.imm >> 10);
-                        if (evalCond(cpu.pstate, cond)) {
-                            const b: u64 = if (is_imm) d.rm else getX(cpu, @truncate(d.rm));
-                            addSub(cpu, sf, is_sub, true, 31, getX(cpu, @truncate(d.rn)), b, if (is_sub) 1 else 0, false);
-                        } else {
-                            cpu.pstate = (cpu.pstate & 0x0fff_ffff) | nzcv_imm;
-                        }
-                    },
-                    .madd_msub => {
-                        const ra: u5 = @truncate(d.imm);
-                        const is_sub = ((d.imm >> 5) & 1) != 0;
-                        const sf = ((d.imm >> 6) & 1) != 0;
-                        const a = getX(cpu, @truncate(d.rn));
-                        const b = getX(cpu, @truncate(d.rm));
-                        const c = getX(cpu, ra);
-                        const res = if (is_sub) (c -% (a *% b)) else (c +% (a *% b));
-                        if (sf) setX(cpu, @truncate(d.rd), res) else setW(cpu, @truncate(d.rd), @truncate(res));
-                    },
-                    .maddl_mulh => {
-                        const ra: u5 = @truncate(d.imm);
-                        const o0 = ((d.imm >> 5) & 1) != 0;
-                        const op31: u3 = @truncate(d.imm >> 6);
-                        const rn: u5 = @truncate(d.rn);
-                        const rm: u5 = @truncate(d.rm);
-                        const rd: u5 = @truncate(d.rd);
-                        switch (op31) {
-                            0b001 => { // SMADDL / SMSUBL
-                                const a: i64 = @as(i32, @bitCast(getW(cpu, rn)));
-                                const b: i64 = @as(i32, @bitCast(getW(cpu, rm)));
-                                const c: i64 = @bitCast(getX(cpu, ra));
-                                const res: i64 = if (o0) (c -% (a * b)) else (c +% (a * b));
-                                setX(cpu, rd, @bitCast(res));
-                            },
-                            0b010 => { // SMULH
-                                const a: i128 = @as(i64, @bitCast(getX(cpu, rn)));
-                                const b: i128 = @as(i64, @bitCast(getX(cpu, rm)));
-                                setX(cpu, rd, @truncate(@as(u128, @bitCast(a * b)) >> 64));
-                            },
-                            0b101 => { // UMADDL / UMSUBL
-                                const a: u64 = getW(cpu, rn);
-                                const b: u64 = getW(cpu, rm);
-                                const c: u64 = getX(cpu, ra);
-                                const res: u64 = if (o0) (c -% (a * b)) else (c +% (a * b));
-                                setX(cpu, rd, res);
-                            },
-                            else => { // UMULH
-                                const a: u128 = getX(cpu, rn);
-                                const b: u128 = getX(cpu, rm);
-                                setX(cpu, rd, @truncate((a * b) >> 64));
-                            },
-                        }
-                    },
-                    .ldr64_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
-                            setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little));
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little));
+                        },
+                        .str64_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            const val = getX(cpu, @truncate(d.rd));
+                            if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
                             } else {
-                                const val = readData64(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setX(cpu, @truncate(d.rd), val);
-                            }
-                        }
-                    },
-                    .str64_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        const val = getX(cpu, @truncate(d.rd));
-                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
-                            } else {
-                                writeData64(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                                } else {
+                                    writeData64(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr32_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank]) {
-                            setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little));
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little));
+                        },
+                        .ldr32_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank]) {
+                                setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little));
                             } else {
-                                const val = readData32(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setW(cpu, @truncate(d.rd), val);
-                            }
-                        }
-                    },
-                    .str32_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        const val = getW(cpu, @truncate(d.rd));
-                        if ((addr & ~@as(u64, 0xffc)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
-                            } else {
-                                writeData32(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little));
+                                } else {
+                                    const val = readData32(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
-                                    }
+                                    };
+                                    setW(cpu, @truncate(d.rd), val);
                                 }
                             }
-                        }
-                    },
-                    .ldrsw_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        const val32: u32 = if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank])
-                            std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little)
-                        else blk: {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                break :blk std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
-                            }
-                            break :blk readData32(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
-                            };
-                        };
-                        setX(cpu, @truncate(d.rd), @bitCast(@as(i64, @as(i32, @bitCast(val32)))));
-                    },
-                    .ldr16_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        if ((addr & ~@as(u64, 0xffe)) == data_r_vbase[bank]) {
-                            setW(cpu, @truncate(d.rd), std.mem.readInt(u16, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffe))..][0..2], .little));
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffe and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                setW(cpu, @truncate(d.rd), std.mem.readInt(u16, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..2], .little));
+                        },
+                        .str32_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            const val = getW(cpu, @truncate(d.rd));
+                            if ((addr & ~@as(u64, 0xffc)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
                             } else {
-                                const val = readData16(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setW(cpu, @truncate(d.rd), val);
-                            }
-                        }
-                    },
-                    .str16_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        const val: u16 = @truncate(getW(cpu, @truncate(d.rd)));
-                        if ((addr & ~@as(u64, 0xffe)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u16, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xffe))..][0..2], val, .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffe and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u16, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..2], val, .little);
-                            } else {
-                                writeData16(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
+                                } else {
+                                    writeData32(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr8_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        if ((addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            setW(cpu, @truncate(d.rd), data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))]);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                setW(cpu, @truncate(d.rd), data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))]);
-                            } else {
-                                const val = readData8(cpu, bus, addr) catch {
+                        },
+                        .ldrsw_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            const val32: u32 = if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank])
+                                std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little)
+                            else blk: {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    break :blk std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
+                                }
+                                break :blk readData32(cpu, bus, addr) catch {
                                     handleAbort64(cpu, cur_pc);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff_ffff_ffff;
@@ -3183,1435 +3100,1504 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                     continue;
                                 };
-                                setW(cpu, @truncate(d.rd), val);
-                            }
-                        }
-                    },
-                    .str8_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        const val: u8 = @truncate(getW(cpu, @truncate(d.rd)));
-                        if ((addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
-                            data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))] = val;
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))] = val;
-                            } else {
-                                writeData8(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
-                                        priv = 1;
-                                        code_vbase = 0xffff_ffff_ffff_ffff;
-                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    .ldrsb64_uimm, .ldrsb32_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        const val8: u8 = if ((addr & ~@as(u64, 0xfff)) == data_r_vbase[bank])
-                            data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))]
-                        else blk: {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                break :blk data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))];
-                            }
-                            break :blk readData8(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
                             };
-                        };
-                        const s8: i8 = @bitCast(val8);
-                        if (op == .ldrsb64_uimm) {
-                            setX(cpu, @truncate(d.rd), @bitCast(@as(i64, s8)));
-                        } else {
-                            setW(cpu, @truncate(d.rd), @bitCast(@as(i32, s8)));
-                        }
-                    },
-                    .ldrsh64_uimm, .ldrsh32_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        const val16: u16 = if ((addr & ~@as(u64, 0xffe)) == data_r_vbase[bank])
-                            std.mem.readInt(u16, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffe))..][0..2], .little)
-                        else blk: {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffe and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                break :blk std.mem.readInt(u16, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..2], .little);
-                            }
-                            break :blk readData16(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
-                            };
-                        };
-                        const s16: i16 = @bitCast(val16);
-                        if (op == .ldrsh64_uimm) {
-                            setX(cpu, @truncate(d.rd), @bitCast(@as(i64, s16)));
-                        } else {
-                            setW(cpu, @truncate(d.rd), @bitCast(@as(i32, s16)));
-                        }
-                    },
-                    .ldr_lit32, .ldrsw_lit, .ldr_fp32_lit => {
-                        const addr = cur_pc +% d.imm;
-                        const val32: u32 = if ((addr & ~@as(u64, 0xffc)) == code_vbase)
-                            std.mem.readInt(u32, code_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], .little)
-                        else if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[0])
-                            std.mem.readInt(u32, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xffc))..][0..4], .little)
-                        else blk: {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[0] = dslot.r_vbase;
-                                data_r_page_ptr[0] = bus.ram.ptr + dslot.pbase;
-                                break :blk std.mem.readInt(u32, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
-                            }
-                            break :blk readData32(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
-                            };
-                        };
-                        if (op == .ldr_lit32) {
-                            setW(cpu, @truncate(d.rd), val32);
-                        } else if (op == .ldrsw_lit) {
                             setX(cpu, @truncate(d.rd), @bitCast(@as(i64, @as(i32, @bitCast(val32)))));
-                        } else {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = val32;
-                        }
-                    },
-                    .ldr_lit64, .ldr_fp64_lit => {
-                        const addr = cur_pc +% d.imm;
-                        const val64: u64 = if ((addr & ~@as(u64, 0xff8)) == code_vbase)
-                            std.mem.readInt(u64, code_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], .little)
-                        else if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[0])
-                            std.mem.readInt(u64, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xff8))..][0..8], .little)
-                        else blk: {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[0] = dslot.r_vbase;
-                                data_r_page_ptr[0] = bus.ram.ptr + dslot.pbase;
-                                break :blk std.mem.readInt(u64, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
-                            }
-                            break :blk readData64(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
-                            };
-                        };
-                        if (op == .ldr_lit64) {
-                            setX(cpu, @truncate(d.rd), val64);
-                        } else {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = val64;
-                        }
-                    },
-                    .ldr_fp128_lit => {
-                        const addr = cur_pc +% d.imm;
-                        const val128: u128 = if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == code_vbase)
-                            std.mem.readInt(u128, code_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], .little)
-                        else if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[0])
-                            std.mem.readInt(u128, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..16], .little)
-                        else blk: {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[0] = dslot.r_vbase;
-                                data_r_page_ptr[0] = bus.ram.ptr + dslot.pbase;
-                                break :blk std.mem.readInt(u128, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
-                            }
-                            break :blk readData128(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
-                            };
-                        };
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = val128;
-                    },
-                    .ldr64_pre, .ldr64_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .ldr64_post) base else wb_addr;
-                        const val: u64 = if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank])
-                            std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little)
-                        else blk: {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                break :blk std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
-                            }
-                            break :blk readData64(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
-                            };
-                        };
-                        setX(cpu, @truncate(d.rd), val);
-                        setXOrSp(cpu, rn, wb_addr);
-                    },
-                    .str64_pre, .str64_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .str64_post) base else wb_addr;
-                        const val = getX(cpu, @truncate(d.rd));
-                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
-                            setXOrSp(cpu, rn, wb_addr);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
-                                setXOrSp(cpu, rn, wb_addr);
+                        },
+                        .ldr16_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            if ((addr & ~@as(u64, 0xffe)) == data_r_vbase[bank]) {
+                                setW(cpu, @truncate(d.rd), std.mem.readInt(u16, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffe))..][0..2], .little));
                             } else {
-                                writeData64(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setXOrSp(cpu, rn, wb_addr);
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffe and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    setW(cpu, @truncate(d.rd), std.mem.readInt(u16, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..2], .little));
+                                } else {
+                                    const val = readData16(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
-                                    }
+                                    };
+                                    setW(cpu, @truncate(d.rd), val);
                                 }
                             }
-                        }
-                    },
-                    .ldr32_pre, .ldr32_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .ldr32_post) base else wb_addr;
-                        const val: u32 = if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank])
-                            std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little)
-                        else blk: {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                break :blk std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
-                            }
-                            break :blk readData32(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
-                            };
-                        };
-                        setW(cpu, @truncate(d.rd), val);
-                        setXOrSp(cpu, rn, wb_addr);
-                    },
-                    .str32_pre, .str32_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .str32_post) base else wb_addr;
-                        const val = getW(cpu, @truncate(d.rd));
-                        if ((addr & ~@as(u64, 0xffc)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
-                            setXOrSp(cpu, rn, wb_addr);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
-                                setXOrSp(cpu, rn, wb_addr);
+                        },
+                        .str16_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            const val: u16 = @truncate(getW(cpu, @truncate(d.rd)));
+                            if ((addr & ~@as(u64, 0xffe)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u16, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xffe))..][0..2], val, .little);
                             } else {
-                                writeData32(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setXOrSp(cpu, rn, wb_addr);
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffe and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u16, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..2], val, .little);
+                                } else {
+                                    writeData16(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr64_reg_lsl => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
-                        if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
-                            setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little));
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little));
-                            } else {
-                                const val = readData64(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setX(cpu, @truncate(d.rd), val);
-                            }
-                        }
-                    },
-                    .str64_reg_lsl => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
-                        const val = getX(cpu, @truncate(d.rd));
-                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
-                            } else {
-                                writeData64(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
-                                        priv = 1;
-                                        code_vbase = 0xffff_ffff_ffff_ffff;
-                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    .ldr32_reg_lsl => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
-                        if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank]) {
-                            setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little));
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little));
-                            } else {
-                                const val = readData32(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setW(cpu, @truncate(d.rd), val);
-                            }
-                        }
-                    },
-                    .str32_reg_lsl => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
-                        const val = getW(cpu, @truncate(d.rd));
-                        if ((addr & ~@as(u64, 0xffc)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
-                            } else {
-                                writeData32(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
-                                        priv = 1;
-                                        code_vbase = 0xffff_ffff_ffff_ffff;
-                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    .ldr8_reg_lsl => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% getX(cpu, @truncate(d.rm));
-                        if ((addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            setW(cpu, @truncate(d.rd), data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))]);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .ldr8_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            if ((addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
                                 setW(cpu, @truncate(d.rd), data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))]);
                             } else {
-                                const val = readData8(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setW(cpu, @truncate(d.rd), val);
-                            }
-                        }
-                    },
-                    .str8_reg_lsl => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% getX(cpu, @truncate(d.rm));
-                        const val: u8 = @truncate(getW(cpu, @truncate(d.rd)));
-                        if ((addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
-                            data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))] = val;
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))] = val;
-                            } else {
-                                writeData8(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    setW(cpu, @truncate(d.rd), data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))]);
+                                } else {
+                                    const val = readData8(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    setW(cpu, @truncate(d.rd), val);
+                                }
+                            }
+                        },
+                        .str8_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            const val: u8 = @truncate(getW(cpu, @truncate(d.rd)));
+                            if ((addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
+                                data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))] = val;
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))] = val;
+                                } else {
+                                    writeData8(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldxr64 => {
-                        const addr = getXOrSp(cpu, @truncate(d.rn));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            const loaded = std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
-                            cpu.excl_valid = true;
-                            cpu.excl_paddr = paddr & ~@as(u32, 7);
-                            cpu.excl_val = loaded;
-                            setX(cpu, @truncate(d.rd), loaded);
-                        } else {
-                            executeLoadStoreExcl(cpu, bus, inst) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
+                        },
+                        .ldrsb64_uimm, .ldrsb32_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            const val8: u8 = if ((addr & ~@as(u64, 0xfff)) == data_r_vbase[bank])
+                                data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))]
+                            else blk: {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    break :blk data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))];
+                                }
+                                break :blk readData8(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
                             };
-                        }
-                    },
-                    .stxr64 => {
-                        const addr = getXOrSp(cpu, @truncate(d.rn));
-                        const val = getX(cpu, @truncate(d.rd));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            if (cpu.excl_valid and (paddr & ~@as(u32, 7)) == cpu.excl_paddr) {
-                                const stored = atomic_ram.compareAndSwap(u64, bus.ram, paddr, cpu.excl_val, val);
-                                cpu.excl_valid = false;
-                                if (stored) atomic_ram.signalEvent(bus);
-                                setW(cpu, @truncate(d.rm), if (stored) 0 else 1);
+                            const s8: i8 = @bitCast(val8);
+                            if (op == .ldrsb64_uimm) {
+                                setX(cpu, @truncate(d.rd), @bitCast(@as(i64, s8)));
                             } else {
-                                cpu.excl_valid = false;
-                                setW(cpu, @truncate(d.rm), 1);
+                                setW(cpu, @truncate(d.rd), @bitCast(@as(i32, s8)));
                             }
-                        } else {
-                            executeLoadStoreExcl(cpu, bus, inst) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
+                        },
+                        .ldrsh64_uimm, .ldrsh32_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            const val16: u16 = if ((addr & ~@as(u64, 0xffe)) == data_r_vbase[bank])
+                                std.mem.readInt(u16, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffe))..][0..2], .little)
+                            else blk: {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffe and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    break :blk std.mem.readInt(u16, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..2], .little);
+                                }
+                                break :blk readData16(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
                             };
-                        }
-                    },
-                    .ldxr32 => {
-                        const addr = getXOrSp(cpu, @truncate(d.rn));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            const loaded = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
-                            cpu.excl_valid = true;
-                            cpu.excl_paddr = paddr & ~@as(u32, 7);
-                            cpu.excl_val = loaded;
-                            setW(cpu, @truncate(d.rd), loaded);
-                        } else {
-                            executeLoadStoreExcl(cpu, bus, inst) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
-                            };
-                        }
-                    },
-                    .stxr32 => {
-                        const addr = getXOrSp(cpu, @truncate(d.rn));
-                        const val = getW(cpu, @truncate(d.rd));
-                        const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                        if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                            const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
-                            if (cpu.excl_valid and (paddr & ~@as(u32, 7)) == cpu.excl_paddr) {
-                                const stored = atomic_ram.compareAndSwap(u32, bus.ram, paddr, @truncate(cpu.excl_val), val);
-                                cpu.excl_valid = false;
-                                if (stored) atomic_ram.signalEvent(bus);
-                                setW(cpu, @truncate(d.rm), if (stored) 0 else 1);
+                            const s16: i16 = @bitCast(val16);
+                            if (op == .ldrsh64_uimm) {
+                                setX(cpu, @truncate(d.rd), @bitCast(@as(i64, s16)));
                             } else {
-                                cpu.excl_valid = false;
-                                setW(cpu, @truncate(d.rm), 1);
+                                setW(cpu, @truncate(d.rd), @bitCast(@as(i32, s16)));
                             }
-                        } else {
-                            executeLoadStoreExcl(cpu, bus, inst) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
+                        },
+                        .ldr_lit32, .ldrsw_lit, .ldr_fp32_lit => {
+                            const addr = cur_pc +% d.imm;
+                            const val32: u32 = if ((addr & ~@as(u64, 0xffc)) == code_vbase)
+                                std.mem.readInt(u32, code_page_ptr[@as(usize, @truncate(addr & 0xffc))..][0..4], .little)
+                            else if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[0])
+                                std.mem.readInt(u32, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xffc))..][0..4], .little)
+                            else blk: {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[0] = dslot.r_vbase;
+                                    data_r_page_ptr[0] = bus.ram.ptr + dslot.pbase;
+                                    break :blk std.mem.readInt(u32, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
+                                }
+                                break :blk readData32(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
                             };
-                        }
-                    },
-                    .ldp64_off, .ldp64_pre, .ldp64_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .ldp64_post) base else wb_addr;
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            const off: usize = @truncate(addr & 0xfff);
-                            const v1 = std.mem.readInt(u64, data_r_page_ptr[bank][off..][0..8], .little);
-                            const v2 = std.mem.readInt(u64, data_r_page_ptr[bank][off + 8 ..][0..8], .little);
-                            setX(cpu, @truncate(d.rd), v1);
-                            setX(cpu, @truncate(d.rm), v2);
-                        } else {
+                            if (op == .ldr_lit32) {
+                                setW(cpu, @truncate(d.rd), val32);
+                            } else if (op == .ldrsw_lit) {
+                                setX(cpu, @truncate(d.rd), @bitCast(@as(i64, @as(i32, @bitCast(val32)))));
+                            } else {
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = val32;
+                            }
+                        },
+                        .ldr_lit64, .ldr_fp64_lit => {
+                            const addr = cur_pc +% d.imm;
+                            const val64: u64 = if ((addr & ~@as(u64, 0xff8)) == code_vbase)
+                                std.mem.readInt(u64, code_page_ptr[@as(usize, @truncate(addr & 0xff8))..][0..8], .little)
+                            else if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[0])
+                                std.mem.readInt(u64, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xff8))..][0..8], .little)
+                            else blk: {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[0] = dslot.r_vbase;
+                                    data_r_page_ptr[0] = bus.ram.ptr + dslot.pbase;
+                                    break :blk std.mem.readInt(u64, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                                }
+                                break :blk readData64(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
+                            };
+                            if (op == .ldr_lit64) {
+                                setX(cpu, @truncate(d.rd), val64);
+                            } else {
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = val64;
+                            }
+                        },
+                        .ldr_fp128_lit => {
+                            const addr = cur_pc +% d.imm;
+                            const val128: u128 = if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == code_vbase)
+                                std.mem.readInt(u128, code_page_ptr[@as(usize, @truncate(addr & 0xfff))..][0..16], .little)
+                            else if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[0])
+                                std.mem.readInt(u128, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..16], .little)
+                            else blk: {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[0] = dslot.r_vbase;
+                                    data_r_page_ptr[0] = bus.ram.ptr + dslot.pbase;
+                                    break :blk std.mem.readInt(u128, data_r_page_ptr[0][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
+                                }
+                                break :blk readData128(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
+                            };
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = val128;
+                        },
+                        .ldr64_pre, .ldr64_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .ldr64_post) base else wb_addr;
+                            const val: u64 = if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank])
+                                std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little)
+                            else blk: {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    break :blk std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                                }
+                                break :blk readData64(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
+                            };
+                            setX(cpu, @truncate(d.rd), val);
+                            setXOrSp(cpu, rn, wb_addr);
+                        },
+                        .str64_pre, .str64_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .str64_post) base else wb_addr;
+                            const val = getX(cpu, @truncate(d.rd));
+                            if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
+                                setXOrSp(cpu, rn, wb_addr);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                                    setXOrSp(cpu, rn, wb_addr);
+                                } else {
+                                    writeData64(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    setXOrSp(cpu, rn, wb_addr);
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .ldr32_pre, .ldr32_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .ldr32_post) base else wb_addr;
+                            const val: u32 = if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank])
+                                std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little)
+                            else blk: {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    break :blk std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
+                                }
+                                break :blk readData32(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
+                            };
+                            setW(cpu, @truncate(d.rd), val);
+                            setXOrSp(cpu, rn, wb_addr);
+                        },
+                        .str32_pre, .str32_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .str32_post) base else wb_addr;
+                            const val = getW(cpu, @truncate(d.rd));
+                            if ((addr & ~@as(u64, 0xffc)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
+                                setXOrSp(cpu, rn, wb_addr);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
+                                    setXOrSp(cpu, rn, wb_addr);
+                                } else {
+                                    writeData32(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    setXOrSp(cpu, rn, wb_addr);
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .ldr64_reg_lsl => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
+                            if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
+                                setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little));
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    setX(cpu, @truncate(d.rd), std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little));
+                                } else {
+                                    const val = readData64(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    setX(cpu, @truncate(d.rd), val);
+                                }
+                            }
+                        },
+                        .str64_reg_lsl => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
+                            const val = getX(cpu, @truncate(d.rd));
+                            if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                                } else {
+                                    writeData64(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .ldr32_reg_lsl => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
+                            if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank]) {
+                                setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little));
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    setW(cpu, @truncate(d.rd), std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little));
+                                } else {
+                                    const val = readData32(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    setW(cpu, @truncate(d.rd), val);
+                                }
+                            }
+                        },
+                        .str32_reg_lsl => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @as(u3, @truncate(d.imm)));
+                            const val = getW(cpu, @truncate(d.rd));
+                            if ((addr & ~@as(u64, 0xffc)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
+                                } else {
+                                    writeData32(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .ldr8_reg_lsl => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% getX(cpu, @truncate(d.rm));
+                            if ((addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
+                                setW(cpu, @truncate(d.rd), data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))]);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    setW(cpu, @truncate(d.rd), data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))]);
+                                } else {
+                                    const val = readData8(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    setW(cpu, @truncate(d.rd), val);
+                                }
+                            }
+                        },
+                        .str8_reg_lsl => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% getX(cpu, @truncate(d.rm));
+                            const val: u8 = @truncate(getW(cpu, @truncate(d.rd)));
+                            if ((addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
+                                data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))] = val;
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))] = val;
+                                } else {
+                                    writeData8(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .ldxr64 => {
+                            const addr = getXOrSp(cpu, @truncate(d.rn));
                             const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
+                                const loaded = std.mem.readInt(u64, bus.ram[paddr..][0..8], .little);
+                                cpu.excl_valid = true;
+                                cpu.excl_paddr = paddr & ~@as(u32, 7);
+                                cpu.excl_val = loaded;
+                                setX(cpu, @truncate(d.rd), loaded);
+                            } else {
+                                executeLoadStoreExcl(cpu, bus, inst) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
+                            }
+                        },
+                        .stxr64 => {
+                            const addr = getXOrSp(cpu, @truncate(d.rn));
+                            const val = getX(cpu, @truncate(d.rd));
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
+                                if (cpu.excl_valid and (paddr & ~@as(u32, 7)) == cpu.excl_paddr) {
+                                    const stored = atomic_ram.compareAndSwap(u64, bus.ram, paddr, cpu.excl_val, val);
+                                    cpu.excl_valid = false;
+                                    if (stored) atomic_ram.signalEvent(bus);
+                                    setW(cpu, @truncate(d.rm), if (stored) 0 else 1);
+                                } else {
+                                    cpu.excl_valid = false;
+                                    setW(cpu, @truncate(d.rm), 1);
+                                }
+                            } else {
+                                executeLoadStoreExcl(cpu, bus, inst) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
+                            }
+                        },
+                        .ldxr32 => {
+                            const addr = getXOrSp(cpu, @truncate(d.rn));
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
+                                const loaded = std.mem.readInt(u32, bus.ram[paddr..][0..4], .little);
+                                cpu.excl_valid = true;
+                                cpu.excl_paddr = paddr & ~@as(u32, 7);
+                                cpu.excl_val = loaded;
+                                setW(cpu, @truncate(d.rd), loaded);
+                            } else {
+                                executeLoadStoreExcl(cpu, bus, inst) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
+                            }
+                        },
+                        .stxr32 => {
+                            const addr = getXOrSp(cpu, @truncate(d.rn));
+                            const val = getW(cpu, @truncate(d.rd));
+                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                const paddr = dslot.pbase | @as(u32, @truncate(addr & 0xfff));
+                                if (cpu.excl_valid and (paddr & ~@as(u32, 7)) == cpu.excl_paddr) {
+                                    const stored = atomic_ram.compareAndSwap(u32, bus.ram, paddr, @truncate(cpu.excl_val), val);
+                                    cpu.excl_valid = false;
+                                    if (stored) atomic_ram.signalEvent(bus);
+                                    setW(cpu, @truncate(d.rm), if (stored) 0 else 1);
+                                } else {
+                                    cpu.excl_valid = false;
+                                    setW(cpu, @truncate(d.rm), 1);
+                                }
+                            } else {
+                                executeLoadStoreExcl(cpu, bus, inst) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
+                            }
+                        },
+                        .ldp64_off, .ldp64_pre, .ldp64_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .ldp64_post) base else wb_addr;
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
                                 const off: usize = @truncate(addr & 0xfff);
                                 const v1 = std.mem.readInt(u64, data_r_page_ptr[bank][off..][0..8], .little);
                                 const v2 = std.mem.readInt(u64, data_r_page_ptr[bank][off + 8 ..][0..8], .little);
                                 setX(cpu, @truncate(d.rd), v1);
                                 setX(cpu, @truncate(d.rm), v2);
                             } else {
-                                const pair = readData128(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setX(cpu, @truncate(d.rd), @truncate(pair));
-                                setX(cpu, @truncate(d.rm), @truncate(pair >> 64));
-                            }
-                        }
-                        if (op != .ldp64_off) setXOrSp(cpu, rn, wb_addr);
-                    },
-                    .stp64_off, .stp64_pre, .stp64_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .stp64_post) base else wb_addr;
-                        const v1 = getX(cpu, @truncate(d.rd));
-                        const v2 = getX(cpu, @truncate(d.rm));
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
-                            const off: usize = @truncate(addr & 0xfff);
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][off..][0..8], v1, .little);
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][off + 8 ..][0..8], v2, .little);
-                            if (op != .stp64_off) setXOrSp(cpu, rn, wb_addr);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                const off: usize = @truncate(addr & 0xfff);
-                                std.mem.writeInt(u64, data_w_page_ptr[bank][off..][0..8], v1, .little);
-                                std.mem.writeInt(u64, data_w_page_ptr[bank][off + 8 ..][0..8], v2, .little);
-                                if (op != .stp64_off) setXOrSp(cpu, rn, wb_addr);
-                            } else {
-                                writeData128(cpu, bus, addr, @as(u128, v1) | (@as(u128, v2) << 64)) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if (op != .stp64_off) setXOrSp(cpu, rn, wb_addr);
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    const off: usize = @truncate(addr & 0xfff);
+                                    const v1 = std.mem.readInt(u64, data_r_page_ptr[bank][off..][0..8], .little);
+                                    const v2 = std.mem.readInt(u64, data_r_page_ptr[bank][off + 8 ..][0..8], .little);
+                                    setX(cpu, @truncate(d.rd), v1);
+                                    setX(cpu, @truncate(d.rm), v2);
+                                } else {
+                                    const pair = readData128(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    setX(cpu, @truncate(d.rd), @truncate(pair));
+                                    setX(cpu, @truncate(d.rm), @truncate(pair >> 64));
+                                }
+                            }
+                            if (op != .ldp64_off) setXOrSp(cpu, rn, wb_addr);
+                        },
+                        .stp64_off, .stp64_pre, .stp64_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .stp64_post) base else wb_addr;
+                            const v1 = getX(cpu, @truncate(d.rd));
+                            const v2 = getX(cpu, @truncate(d.rm));
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
+                                const off: usize = @truncate(addr & 0xfff);
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][off..][0..8], v1, .little);
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][off + 8 ..][0..8], v2, .little);
+                                if (op != .stp64_off) setXOrSp(cpu, rn, wb_addr);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    const off: usize = @truncate(addr & 0xfff);
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][off..][0..8], v1, .little);
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][off + 8 ..][0..8], v2, .little);
+                                    if (op != .stp64_off) setXOrSp(cpu, rn, wb_addr);
+                                } else {
+                                    writeData128(cpu, bus, addr, @as(u128, v1) | (@as(u128, v2) << 64)) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if (op != .stp64_off) setXOrSp(cpu, rn, wb_addr);
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                        if ((d.rn & 0x80) != 0 and executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
-                            cpu.x[29] = wb_addr;
-                            cpu.pc64 = cur_pc +% 8;
-                            executed += 1;
-                        }
-                    },
-                    .ldp32_off, .ldp32_pre, .ldp32_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .ldp32_post) base else wb_addr;
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            const off: usize = @truncate(addr & 0xfff);
-                            const v1 = std.mem.readInt(u32, data_r_page_ptr[bank][off..][0..4], .little);
-                            const v2 = std.mem.readInt(u32, data_r_page_ptr[bank][off + 4 ..][0..4], .little);
-                            setW(cpu, @truncate(d.rd), v1);
-                            setW(cpu, @truncate(d.rm), v2);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                            if ((d.rn & 0x80) != 0 and executed < batch_end and (cur_pc & ~@as(u64, 0xfff)) == code_vbase) {
+                                cpu.x[29] = wb_addr;
+                                cpu.pc64 = cur_pc +% 8;
+                                executed += 1;
+                            }
+                        },
+                        .ldp32_off, .ldp32_pre, .ldp32_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .ldp32_post) base else wb_addr;
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
                                 const off: usize = @truncate(addr & 0xfff);
                                 const v1 = std.mem.readInt(u32, data_r_page_ptr[bank][off..][0..4], .little);
                                 const v2 = std.mem.readInt(u32, data_r_page_ptr[bank][off + 4 ..][0..4], .little);
                                 setW(cpu, @truncate(d.rd), v1);
                                 setW(cpu, @truncate(d.rm), v2);
                             } else {
-                                const v1 = readData32(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                const v2 = readData32(cpu, bus, addr +% 4) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setW(cpu, @truncate(d.rd), v1);
-                                setW(cpu, @truncate(d.rm), v2);
-                            }
-                        }
-                        if (op != .ldp32_off) setXOrSp(cpu, rn, wb_addr);
-                    },
-                    .stp32_off, .stp32_pre, .stp32_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .stp32_post) base else wb_addr;
-                        const v1 = getW(cpu, @truncate(d.rd));
-                        const v2 = getW(cpu, @truncate(d.rm));
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
-                            const off: usize = @truncate(addr & 0xfff);
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][off..][0..4], v1, .little);
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][off + 4 ..][0..4], v2, .little);
-                            if (op != .stp32_off) setXOrSp(cpu, rn, wb_addr);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                const off: usize = @truncate(addr & 0xfff);
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][off..][0..4], v1, .little);
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][off + 4 ..][0..4], v2, .little);
-                                if (op != .stp32_off) setXOrSp(cpu, rn, wb_addr);
-                            } else {
-                                writeData32(cpu, bus, addr, v1) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                writeData32(cpu, bus, addr +% 4, v2) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if (op != .stp32_off) setXOrSp(cpu, rn, wb_addr);
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    const off: usize = @truncate(addr & 0xfff);
+                                    const v1 = std.mem.readInt(u32, data_r_page_ptr[bank][off..][0..4], .little);
+                                    const v2 = std.mem.readInt(u32, data_r_page_ptr[bank][off + 4 ..][0..4], .little);
+                                    setW(cpu, @truncate(d.rd), v1);
+                                    setW(cpu, @truncate(d.rm), v2);
+                                } else {
+                                    const v1 = readData32(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    const v2 = readData32(cpu, bus, addr +% 4) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    setW(cpu, @truncate(d.rd), v1);
+                                    setW(cpu, @truncate(d.rm), v2);
+                                }
+                            }
+                            if (op != .ldp32_off) setXOrSp(cpu, rn, wb_addr);
+                        },
+                        .stp32_off, .stp32_pre, .stp32_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .stp32_post) base else wb_addr;
+                            const v1 = getW(cpu, @truncate(d.rd));
+                            const v2 = getW(cpu, @truncate(d.rm));
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
+                                const off: usize = @truncate(addr & 0xfff);
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][off..][0..4], v1, .little);
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][off + 4 ..][0..4], v2, .little);
+                                if (op != .stp32_off) setXOrSp(cpu, rn, wb_addr);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    const off: usize = @truncate(addr & 0xfff);
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][off..][0..4], v1, .little);
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][off + 4 ..][0..4], v2, .little);
+                                    if (op != .stp32_off) setXOrSp(cpu, rn, wb_addr);
+                                } else {
+                                    writeData32(cpu, bus, addr, v1) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    writeData32(cpu, bus, addr +% 4, v2) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if (op != .stp32_off) setXOrSp(cpu, rn, wb_addr);
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldpsw_off, .ldpsw_pre, .ldpsw_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .ldpsw_post) base else wb_addr;
-                        if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            const off: usize = @truncate(addr & 0xfff);
-                            const v1: u64 = @bitCast(@as(i64, std.mem.readInt(i32, data_r_page_ptr[bank][off..][0..4], .little)));
-                            const v2: u64 = @bitCast(@as(i64, std.mem.readInt(i32, data_r_page_ptr[bank][off + 4 ..][0..4], .little)));
-                            setX(cpu, @truncate(d.rd), v1);
-                            setX(cpu, @truncate(d.rm), v2);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .ldpsw_off, .ldpsw_pre, .ldpsw_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .ldpsw_post) base else wb_addr;
+                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
                                 const off: usize = @truncate(addr & 0xfff);
                                 const v1: u64 = @bitCast(@as(i64, std.mem.readInt(i32, data_r_page_ptr[bank][off..][0..4], .little)));
                                 const v2: u64 = @bitCast(@as(i64, std.mem.readInt(i32, data_r_page_ptr[bank][off + 4 ..][0..4], .little)));
                                 setX(cpu, @truncate(d.rd), v1);
                                 setX(cpu, @truncate(d.rm), v2);
                             } else {
-                                const pair = readData64(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                const v1: u64 = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(pair))))));
-                                const v2: u64 = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(pair >> 32))))));
-                                setX(cpu, @truncate(d.rd), v1);
-                                setX(cpu, @truncate(d.rm), v2);
-                            }
-                        }
-                        if (op != .ldpsw_off) setXOrSp(cpu, rn, wb_addr);
-                    },
-                    .ldr_fp32_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank]) {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
-                            } else {
-                                const val = readData32(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
-                            }
-                        }
-                    },
-                    .str_fp32_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        const val: u32 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
-                        if ((addr & ~@as(u64, 0xffc)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
-                            } else {
-                                writeData32(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    const off: usize = @truncate(addr & 0xfff);
+                                    const v1: u64 = @bitCast(@as(i64, std.mem.readInt(i32, data_r_page_ptr[bank][off..][0..4], .little)));
+                                    const v2: u64 = @bitCast(@as(i64, std.mem.readInt(i32, data_r_page_ptr[bank][off + 4 ..][0..4], .little)));
+                                    setX(cpu, @truncate(d.rd), v1);
+                                    setX(cpu, @truncate(d.rm), v2);
+                                } else {
+                                    const pair = readData64(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
-                                    }
+                                    };
+                                    const v1: u64 = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(pair))))));
+                                    const v2: u64 = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(pair >> 32))))));
+                                    setX(cpu, @truncate(d.rd), v1);
+                                    setX(cpu, @truncate(d.rm), v2);
                                 }
                             }
-                        }
-                    },
-                    .ldr_fp64_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                            if (op != .ldpsw_off) setXOrSp(cpu, rn, wb_addr);
+                        },
+                        .ldr_fp32_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            if ((addr & ~@as(u64, 0xffc)) == data_r_vbase[bank]) {
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], .little);
                             } else {
-                                const val = readData64(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
-                            }
-                        }
-                    },
-                    .str_fp64_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        const val: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
-                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
-                            } else {
-                                writeData64(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u32, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], .little);
+                                } else {
+                                    const val = readData32(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
+                                }
+                            }
+                        },
+                        .str_fp32_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            const val: u32 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
+                            if ((addr & ~@as(u64, 0xffc)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xffc))..][0..4], val, .little);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xffc and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..4], val, .little);
+                                } else {
+                                    writeData32(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr_fp128_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .ldr_fp64_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                                } else {
+                                    const val = readData64(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
+                                }
+                            }
+                        },
+                        .str_fp64_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            const val: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
+                            if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                                } else {
+                                    writeData64(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .ldr_fp128_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
                                 cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
                             } else {
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
+                                } else {
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                }
                             }
-                        }
-                    },
-                    .str_fp128_uimm => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% d.imm;
-                        const val = cpu.vfp.v[@as(u5, @truncate(d.rd))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u128, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .str_fp128_uimm => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% d.imm;
+                            const val = cpu.vfp.v[@as(u5, @truncate(d.rd))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
                                 std.mem.writeInt(u128, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
                             } else {
-                                writeData128(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u128, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
+                                } else {
+                                    writeData128(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr_fp64_reg_lsl => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
-                        if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                        },
+                        .ldr_fp64_reg_lsl => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
+                            if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank]) {
+                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little);
                             } else {
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData64(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                            }
-                        }
-                    },
-                    .str_fp64_reg_lsl => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
-                        const val: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
-                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
-                            } else {
-                                writeData64(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                                } else {
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData64(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                }
+                            }
+                        },
+                        .str_fp64_reg_lsl => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
+                            const val: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
+                            if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                                } else {
+                                    writeData64(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr_fp128_reg_lsl => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .ldr_fp128_reg_lsl => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
                                 cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
                             } else {
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                            }
-                        }
-                    },
-                    .str_fp128_reg_lsl => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
-                        const val = cpu.vfp.v[@as(u5, @truncate(d.rd))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u128, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u128, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
-                            } else {
-                                writeData128(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
+                                } else {
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                }
+                            }
+                        },
+                        .str_fp128_reg_lsl => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const addr = getXOrSp(cpu, rn) +% (getX(cpu, @truncate(d.rm)) << @intCast(d.imm));
+                            const val = cpu.vfp.v[@as(u5, @truncate(d.rd))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u128, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u128, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
+                                } else {
+                                    writeData128(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr_fp64_pre, .ldr_fp64_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .ldr_fp64_post) base else wb_addr;
-                        const val: u64 = if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank])
-                            std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little)
-                        else blk: {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                break :blk std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
-                            }
-                            break :blk readData64(cpu, bus, addr) catch {
-                                handleAbort64(cpu, cur_pc);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                continue;
+                        },
+                        .ldr_fp64_pre, .ldr_fp64_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .ldr_fp64_post) base else wb_addr;
+                            const val: u64 = if ((addr & ~@as(u64, 0xff8)) == data_r_vbase[bank])
+                                std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], .little)
+                            else blk: {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    break :blk std.mem.readInt(u64, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], .little);
+                                }
+                                break :blk readData64(cpu, bus, addr) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
                             };
-                        };
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
-                        setXOrSp(cpu, rn, wb_addr);
-                    },
-                    .str_fp64_pre, .str_fp64_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .str_fp64_post) base else wb_addr;
-                        const val: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
-                        if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = val;
                             setXOrSp(cpu, rn, wb_addr);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                        },
+                        .str_fp64_pre, .str_fp64_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .str_fp64_post) base else wb_addr;
+                            const val: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
+                            if ((addr & ~@as(u64, 0xff8)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xff8))..][0..8], val, .little);
                                 setXOrSp(cpu, rn, wb_addr);
                             } else {
-                                writeData64(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setXOrSp(cpu, rn, wb_addr);
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff8 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..8], val, .little);
+                                    setXOrSp(cpu, rn, wb_addr);
+                                } else {
+                                    writeData64(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    setXOrSp(cpu, rn, wb_addr);
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr_fp128_pre, .ldr_fp128_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .ldr_fp128_post) base else wb_addr;
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .ldr_fp128_pre, .ldr_fp128_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .ldr_fp128_post) base else wb_addr;
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
                                 cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
                             } else {
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = std.mem.readInt(u128, data_r_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], .little);
+                                } else {
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = readData128(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                }
                             }
-                        }
-                        setXOrSp(cpu, rn, wb_addr);
-                    },
-                    .str_fp128_pre, .str_fp128_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .str_fp128_post) base else wb_addr;
-                        const val = cpu.vfp.v[@as(u5, @truncate(d.rd))];
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u128, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
                             setXOrSp(cpu, rn, wb_addr);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .str_fp128_pre, .str_fp128_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .str_fp128_post) base else wb_addr;
+                            const val = cpu.vfp.v[@as(u5, @truncate(d.rd))];
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
                                 std.mem.writeInt(u128, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
                                 setXOrSp(cpu, rn, wb_addr);
                             } else {
-                                writeData128(cpu, bus, addr, val) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                setXOrSp(cpu, rn, wb_addr);
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    std.mem.writeInt(u128, data_w_page_ptr[bank][@as(usize, @truncate(addr & 0xfff))..][0..16], val, .little);
+                                    setXOrSp(cpu, rn, wb_addr);
+                                } else {
+                                    writeData128(cpu, bus, addr, val) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    setXOrSp(cpu, rn, wb_addr);
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldp_fp64_off, .ldp_fp64_pre, .ldp_fp64_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .ldp_fp64_post) base else wb_addr;
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            const off: usize = @truncate(addr & 0xfff);
-                            const v1 = std.mem.readInt(u64, data_r_page_ptr[bank][off..][0..8], .little);
-                            const v2 = std.mem.readInt(u64, data_r_page_ptr[bank][off + 8 ..][0..8], .little);
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
-                            cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .ldp_fp64_off, .ldp_fp64_pre, .ldp_fp64_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .ldp_fp64_post) base else wb_addr;
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
                                 const off: usize = @truncate(addr & 0xfff);
                                 const v1 = std.mem.readInt(u64, data_r_page_ptr[bank][off..][0..8], .little);
                                 const v2 = std.mem.readInt(u64, data_r_page_ptr[bank][off + 8 ..][0..8], .little);
                                 cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
                                 cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
                             } else {
-                                const pair = readData128(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @truncate(pair));
-                                cpu.vfp.v[@as(u5, @truncate(d.rm))] = @as(u64, @truncate(pair >> 64));
-                            }
-                        }
-                        if (op != .ldp_fp64_off) setXOrSp(cpu, rn, wb_addr);
-                    },
-                    .stp_fp64_off, .stp_fp64_pre, .stp_fp64_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .stp_fp64_post) base else wb_addr;
-                        const v1: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
-                        const v2: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
-                            const off: usize = @truncate(addr & 0xfff);
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][off..][0..8], v1, .little);
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][off + 8 ..][0..8], v2, .little);
-                            if (op != .stp_fp64_off) setXOrSp(cpu, rn, wb_addr);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                const off: usize = @truncate(addr & 0xfff);
-                                std.mem.writeInt(u64, data_w_page_ptr[bank][off..][0..8], v1, .little);
-                                std.mem.writeInt(u64, data_w_page_ptr[bank][off + 8 ..][0..8], v2, .little);
-                                if (op != .stp_fp64_off) setXOrSp(cpu, rn, wb_addr);
-                            } else {
-                                writeData128(cpu, bus, addr, @as(u128, v1) | (@as(u128, v2) << 64)) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if (op != .stp_fp64_off) setXOrSp(cpu, rn, wb_addr);
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    const off: usize = @truncate(addr & 0xfff);
+                                    const v1 = std.mem.readInt(u64, data_r_page_ptr[bank][off..][0..8], .little);
+                                    const v2 = std.mem.readInt(u64, data_r_page_ptr[bank][off + 8 ..][0..8], .little);
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
+                                    cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
+                                } else {
+                                    const pair = readData128(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @truncate(pair));
+                                    cpu.vfp.v[@as(u5, @truncate(d.rm))] = @as(u64, @truncate(pair >> 64));
+                                }
+                            }
+                            if (op != .ldp_fp64_off) setXOrSp(cpu, rn, wb_addr);
+                        },
+                        .stp_fp64_off, .stp_fp64_pre, .stp_fp64_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .stp_fp64_post) base else wb_addr;
+                            const v1: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rd))]);
+                            const v2: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
+                                const off: usize = @truncate(addr & 0xfff);
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][off..][0..8], v1, .little);
+                                std.mem.writeInt(u64, data_w_page_ptr[bank][off + 8 ..][0..8], v2, .little);
+                                if (op != .stp_fp64_off) setXOrSp(cpu, rn, wb_addr);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xff0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    const off: usize = @truncate(addr & 0xfff);
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][off..][0..8], v1, .little);
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][off + 8 ..][0..8], v2, .little);
+                                    if (op != .stp_fp64_off) setXOrSp(cpu, rn, wb_addr);
+                                } else {
+                                    writeData128(cpu, bus, addr, @as(u128, v1) | (@as(u128, v2) << 64)) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if (op != .stp_fp64_off) setXOrSp(cpu, rn, wb_addr);
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldp_fp128_off, .ldp_fp128_pre, .ldp_fp128_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .ldp_fp128_post) base else wb_addr;
-                        if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            const off: usize = @truncate(addr & 0xfff);
-                            const v1 = std.mem.readInt(u128, data_r_page_ptr[bank][off..][0..16], .little);
-                            const v2 = std.mem.readInt(u128, data_r_page_ptr[bank][off + 16 ..][0..16], .little);
-                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
-                            cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .ldp_fp128_off, .ldp_fp128_pre, .ldp_fp128_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .ldp_fp128_post) base else wb_addr;
+                            if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
                                 const off: usize = @truncate(addr & 0xfff);
                                 const v1 = std.mem.readInt(u128, data_r_page_ptr[bank][off..][0..16], .little);
                                 const v2 = std.mem.readInt(u128, data_r_page_ptr[bank][off + 16 ..][0..16], .little);
                                 cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
                                 cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
                             } else {
-                                const v1 = readData128(cpu, bus, addr) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                const v2 = readData128(cpu, bus, addr +% 16) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
-                                cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
-                            }
-                        }
-                        if (op != .ldp_fp128_off) setXOrSp(cpu, rn, wb_addr);
-                    },
-                    .stp_fp128_off, .stp_fp128_pre, .stp_fp128_post => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const wb_addr = base +% d.imm;
-                        const addr = if (op == .stp_fp128_post) base else wb_addr;
-                        const v1 = cpu.vfp.v[@as(u5, @truncate(d.rd))];
-                        const v2 = cpu.vfp.v[@as(u5, @truncate(d.rm))];
-                        if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
-                            const off: usize = @truncate(addr & 0xfff);
-                            std.mem.writeInt(u128, data_w_page_ptr[bank][off..][0..16], v1, .little);
-                            std.mem.writeInt(u128, data_w_page_ptr[bank][off + 16 ..][0..16], v2, .little);
-                            if (op != .stp_fp128_off) setXOrSp(cpu, rn, wb_addr);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
-                                const off: usize = @truncate(addr & 0xfff);
-                                std.mem.writeInt(u128, data_w_page_ptr[bank][off..][0..16], v1, .little);
-                                std.mem.writeInt(u128, data_w_page_ptr[bank][off + 16 ..][0..16], v2, .little);
-                                if (op != .stp_fp128_off) setXOrSp(cpu, rn, wb_addr);
-                            } else {
-                                writeData128(cpu, bus, addr, v1) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                writeData128(cpu, bus, addr +% 16, v2) catch {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                };
-                                if (op != .stp_fp128_off) setXOrSp(cpu, rn, wb_addr);
-                                if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    const off: usize = @truncate(addr & 0xfff);
+                                    const v1 = std.mem.readInt(u128, data_r_page_ptr[bank][off..][0..16], .little);
+                                    const v2 = std.mem.readInt(u128, data_r_page_ptr[bank][off + 16 ..][0..16], .little);
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
+                                    cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
+                                } else {
+                                    const v1 = readData128(cpu, bus, addr) catch {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
+                                    };
+                                    const v2 = readData128(cpu, bus, addr +% 16) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    cpu.vfp.v[@as(u5, @truncate(d.rd))] = v1;
+                                    cpu.vfp.v[@as(u5, @truncate(d.rm))] = v2;
+                                }
+                            }
+                            if (op != .ldp_fp128_off) setXOrSp(cpu, rn, wb_addr);
+                        },
+                        .stp_fp128_off, .stp_fp128_pre, .stp_fp128_post => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const wb_addr = base +% d.imm;
+                            const addr = if (op == .stp_fp128_post) base else wb_addr;
+                            const v1 = cpu.vfp.v[@as(u5, @truncate(d.rd))];
+                            const v2 = cpu.vfp.v[@as(u5, @truncate(d.rm))];
+                            if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
+                                const off: usize = @truncate(addr & 0xfff);
+                                std.mem.writeInt(u128, data_w_page_ptr[bank][off..][0..16], v1, .little);
+                                std.mem.writeInt(u128, data_w_page_ptr[bank][off + 16 ..][0..16], v2, .little);
+                                if (op != .stp_fp128_off) setXOrSp(cpu, rn, wb_addr);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((addr >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((addr & 0xfff) <= 0xfe0 and (addr & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    const off: usize = @truncate(addr & 0xfff);
+                                    std.mem.writeInt(u128, data_w_page_ptr[bank][off..][0..16], v1, .little);
+                                    std.mem.writeInt(u128, data_w_page_ptr[bank][off + 16 ..][0..16], v2, .little);
+                                    if (op != .stp_fp128_off) setXOrSp(cpu, rn, wb_addr);
+                                } else {
+                                    writeData128(cpu, bus, addr, v1) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    writeData128(cpu, bus, addr +% 16, v2) catch {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    };
+                                    if (op != .stp_fp128_off) setXOrSp(cpu, rn, wb_addr);
+                                    if ((addr & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .simd_ld1_mult => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const q = (d.imm & 1) != 0;
-                        const rpt: u5 = @truncate(d.imm >> 1);
-                        const bytes_per_reg: u64 = if (q) 16 else 8;
-                        const total_bytes: u64 = @as(u64, rpt) * bytes_per_reg;
-                        const rt: u5 = @truncate(d.rd);
-                        if ((base & 0xfff) + total_bytes <= 0x1000 and (base & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
-                            var off: usize = @truncate(base & 0xfff);
-                            var r_idx: u5 = 0;
-                            while (r_idx < rpt) : (r_idx += 1) {
-                                cpu.vfp.v[rt +% r_idx] = if (q)
-                                    std.mem.readInt(u128, data_r_page_ptr[bank][off..][0..16], .little)
-                                else
-                                    std.mem.readInt(u64, data_r_page_ptr[bank][off..][0..8], .little);
-                                off += @intCast(bytes_per_reg);
-                            }
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((base >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((base & 0xfff) + total_bytes <= 0x1000 and (base & ~@as(u64, 0xfff)) == dslot.r_vbase) {
-                                data_r_vbase[bank] = dslot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .simd_ld1_mult => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const q = (d.imm & 1) != 0;
+                            const rpt: u5 = @truncate(d.imm >> 1);
+                            const bytes_per_reg: u64 = if (q) 16 else 8;
+                            const total_bytes: u64 = @as(u64, rpt) * bytes_per_reg;
+                            const rt: u5 = @truncate(d.rd);
+                            if ((base & 0xfff) + total_bytes <= 0x1000 and (base & ~@as(u64, 0xfff)) == data_r_vbase[bank]) {
                                 var off: usize = @truncate(base & 0xfff);
                                 var r_idx: u5 = 0;
                                 while (r_idx < rpt) : (r_idx += 1) {
@@ -4622,67 +4608,62 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     off += @intCast(bytes_per_reg);
                                 }
                             } else {
-                                var addr = base;
-                                var aborted = false;
-                                var r_idx: u5 = 0;
-                                while (r_idx < rpt) : (r_idx += 1) {
-                                    if (q) {
-                                        cpu.vfp.v[rt +% r_idx] = readData128(cpu, bus, addr) catch {
-                                            aborted = true;
-                                            break;
-                                        };
-                                    } else {
-                                        cpu.vfp.v[rt +% r_idx] = readData64(cpu, bus, addr) catch {
-                                            aborted = true;
-                                            break;
-                                        };
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((base >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((base & 0xfff) + total_bytes <= 0x1000 and (base & ~@as(u64, 0xfff)) == dslot.r_vbase) {
+                                    data_r_vbase[bank] = dslot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    var off: usize = @truncate(base & 0xfff);
+                                    var r_idx: u5 = 0;
+                                    while (r_idx < rpt) : (r_idx += 1) {
+                                        cpu.vfp.v[rt +% r_idx] = if (q)
+                                            std.mem.readInt(u128, data_r_page_ptr[bank][off..][0..16], .little)
+                                        else
+                                            std.mem.readInt(u64, data_r_page_ptr[bank][off..][0..8], .little);
+                                        off += @intCast(bytes_per_reg);
                                     }
-                                    addr +%= bytes_per_reg;
-                                }
-                                if (aborted) {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                }
-                            }
-                        }
-                        if (d.rm < 32) {
-                            const inc: u64 = if (d.rm == 31) total_bytes else getX(cpu, @truncate(d.rm));
-                            setXOrSp(cpu, rn, base +% inc);
-                        }
-                    },
-                    .simd_st1_mult => {
-                        const rn: u5 = @truncate(d.rn);
-                        const bank: usize = @intFromBool(rn >= 29);
-                        const base = getXOrSp(cpu, rn);
-                        const q = (d.imm & 1) != 0;
-                        const rpt: u5 = @truncate(d.imm >> 1);
-                        const bytes_per_reg: u64 = if (q) 16 else 8;
-                        const total_bytes: u64 = @as(u64, rpt) * bytes_per_reg;
-                        const rt: u5 = @truncate(d.rd);
-                        if ((base & 0xfff) + total_bytes <= 0x1000 and (base & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
-                            var off: usize = @truncate(base & 0xfff);
-                            var r_idx: u5 = 0;
-                            while (r_idx < rpt) : (r_idx += 1) {
-                                if (q) {
-                                    std.mem.writeInt(u128, data_w_page_ptr[bank][off..][0..16], cpu.vfp.v[rt +% r_idx], .little);
                                 } else {
-                                    std.mem.writeInt(u64, data_w_page_ptr[bank][off..][0..8], @truncate(cpu.vfp.v[rt +% r_idx]), .little);
+                                    var addr = base;
+                                    var aborted = false;
+                                    var r_idx: u5 = 0;
+                                    while (r_idx < rpt) : (r_idx += 1) {
+                                        if (q) {
+                                            cpu.vfp.v[rt +% r_idx] = readData128(cpu, bus, addr) catch {
+                                                aborted = true;
+                                                break;
+                                            };
+                                        } else {
+                                            cpu.vfp.v[rt +% r_idx] = readData64(cpu, bus, addr) catch {
+                                                aborted = true;
+                                                break;
+                                            };
+                                        }
+                                        addr +%= bytes_per_reg;
+                                    }
+                                    if (aborted) {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    }
                                 }
-                                off += @intCast(bytes_per_reg);
                             }
                             if (d.rm < 32) {
                                 const inc: u64 = if (d.rm == 31) total_bytes else getX(cpu, @truncate(d.rm));
                                 setXOrSp(cpu, rn, base +% inc);
                             }
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((base >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if ((base & 0xfff) + total_bytes <= 0x1000 and (base & ~@as(u64, 0xfff)) == dslot.w_vbase) {
-                                data_w_vbase[bank] = dslot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                        },
+                        .simd_st1_mult => {
+                            const rn: u5 = @truncate(d.rn);
+                            const bank: usize = @intFromBool(rn >= 29);
+                            const base = getXOrSp(cpu, rn);
+                            const q = (d.imm & 1) != 0;
+                            const rpt: u5 = @truncate(d.imm >> 1);
+                            const bytes_per_reg: u64 = if (q) 16 else 8;
+                            const total_bytes: u64 = @as(u64, rpt) * bytes_per_reg;
+                            const rt: u5 = @truncate(d.rd);
+                            if ((base & 0xfff) + total_bytes <= 0x1000 and (base & ~@as(u64, 0xfff)) == data_w_vbase[bank]) {
                                 var off: usize = @truncate(base & 0xfff);
                                 var r_idx: u5 = 0;
                                 while (r_idx < rpt) : (r_idx += 1) {
@@ -4698,805 +4679,152 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                     setXOrSp(cpu, rn, base +% inc);
                                 }
                             } else {
-                                var addr = base;
-                                var aborted = false;
-                                var r_idx: u5 = 0;
-                                while (r_idx < rpt) : (r_idx += 1) {
-                                    if (q) {
-                                        writeData128(cpu, bus, addr, cpu.vfp.v[rt +% r_idx]) catch {
-                                            aborted = true;
-                                            break;
-                                        };
-                                    } else {
-                                        writeData64(cpu, bus, addr, @truncate(cpu.vfp.v[rt +% r_idx])) catch {
-                                            aborted = true;
-                                            break;
-                                        };
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((base >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if ((base & 0xfff) + total_bytes <= 0x1000 and (base & ~@as(u64, 0xfff)) == dslot.w_vbase) {
+                                    data_w_vbase[bank] = dslot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + dslot.pbase;
+                                    var off: usize = @truncate(base & 0xfff);
+                                    var r_idx: u5 = 0;
+                                    while (r_idx < rpt) : (r_idx += 1) {
+                                        if (q) {
+                                            std.mem.writeInt(u128, data_w_page_ptr[bank][off..][0..16], cpu.vfp.v[rt +% r_idx], .little);
+                                        } else {
+                                            std.mem.writeInt(u64, data_w_page_ptr[bank][off..][0..8], @truncate(cpu.vfp.v[rt +% r_idx]), .little);
+                                        }
+                                        off += @intCast(bytes_per_reg);
                                     }
-                                    addr +%= bytes_per_reg;
-                                }
-                                if (aborted) {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                }
-                                if (d.rm < 32) {
-                                    const inc: u64 = if (d.rm == 31) total_bytes else getX(cpu, @truncate(d.rm));
-                                    setXOrSp(cpu, rn, base +% inc);
-                                }
-                                if ((base & ~@as(u64, 0xfff)) != dslot.w_vbase) {
-                                    if (checkInterrupts64(cpu, bus)) {
+                                    if (d.rm < 32) {
+                                        const inc: u64 = if (d.rm == 31) total_bytes else getX(cpu, @truncate(d.rm));
+                                        setXOrSp(cpu, rn, base +% inc);
+                                    }
+                                } else {
+                                    var addr = base;
+                                    var aborted = false;
+                                    var r_idx: u5 = 0;
+                                    while (r_idx < rpt) : (r_idx += 1) {
+                                        if (q) {
+                                            writeData128(cpu, bus, addr, cpu.vfp.v[rt +% r_idx]) catch {
+                                                aborted = true;
+                                                break;
+                                            };
+                                        } else {
+                                            writeData64(cpu, bus, addr, @truncate(cpu.vfp.v[rt +% r_idx])) catch {
+                                                aborted = true;
+                                                break;
+                                            };
+                                        }
+                                        addr +%= bytes_per_reg;
+                                    }
+                                    if (aborted) {
+                                        handleAbort64(cpu, cur_pc);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff_ffff_ffff;
                                         data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                         continue;
                                     }
-                                }
-                            }
-                        }
-                    },
-                    .b_imm => {
-                        const target_pc = cur_pc +% d.imm;
-                        cpu.pc64 = target_pc;
-                        noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
-                        if (cpu.yield_slice) break :step_loop;
-                    },
-                    .bl_imm => {
-                        const target_pc = cur_pc +% d.imm;
-                        cpu.x[30] = cur_pc +% 4;
-                        cpu.pc64 = target_pc;
-                        noteCallTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target_pc, cur_pc +% 4);
-                    },
-                    .b_cond => {
-                        if (evalCond(cpu.pstate, @truncate(d.rd))) {
-                            const target_pc = cur_pc +% d.imm;
-                            cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
-                            if (cpu.yield_slice) break :step_loop;
-                        }
-                    },
-                    .cbz64 => {
-                        if (getX(cpu, @truncate(d.rd)) == 0) {
-                            const target_pc = cur_pc +% d.imm;
-                            cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
-                            if (cpu.yield_slice) break :step_loop;
-                        }
-                    },
-                    .cbnz64 => {
-                        if (getX(cpu, @truncate(d.rd)) != 0) {
-                            const target_pc = cur_pc +% d.imm;
-                            cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
-                            if (cpu.yield_slice) break :step_loop;
-                        }
-                    },
-                    .cbz32 => {
-                        if (getW(cpu, @truncate(d.rd)) == 0) {
-                            const target_pc = cur_pc +% d.imm;
-                            cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
-                            if (cpu.yield_slice) break :step_loop;
-                        }
-                    },
-                    .cbnz32 => {
-                        if (getW(cpu, @truncate(d.rd)) != 0) {
-                            const target_pc = cur_pc +% d.imm;
-                            cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
-                            if (cpu.yield_slice) break :step_loop;
-                        }
-                    },
-                    .tbz => {
-                        if (((getX(cpu, @truncate(d.rd)) >> @intCast(d.rm)) & 1) == 0) {
-                            const target_pc = cur_pc +% d.imm;
-                            cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
-                            if (cpu.yield_slice) break :step_loop;
-                        }
-                    },
-                    .tbnz => {
-                        if (((getX(cpu, @truncate(d.rd)) >> @intCast(d.rm)) & 1) != 0) {
-                            const target_pc = cur_pc +% d.imm;
-                            cpu.pc64 = target_pc;
-                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
-                            if (cpu.yield_slice) break :step_loop;
-                        }
-                    },
-                    .br_reg => {
-                        cpu.pc64 = getX(cpu, @truncate(d.rn));
-                        noteJumpTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cpu.pc64);
-                    },
-                    .blr_reg => {
-                        const target = getX(cpu, @truncate(d.rn));
-                        cpu.x[30] = cur_pc +% 4;
-                        cpu.pc64 = target;
-                        noteCallTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target, cur_pc +% 4);
-                    },
-                    .ret => {
-                        cpu.pc64 = getX(cpu, @truncate(d.rn));
-                        noteJumpTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cpu.pc64);
-                    },
-                    .dp_imm_other => executeDpImm(cpu, inst, cur_pc),
-                    .dp_reg_other => executeDpReg(cpu, inst),
-                    .load_store_other => {
-                        executeLoadStore(cpu, bus, inst, cur_pc) catch {
-                            handleAbort64(cpu, cur_pc);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff_ffff_ffff;
-                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                            continue;
-                        };
-                        if (checkInterrupts64(cpu, bus)) {
-                            priv = 1;
-                            code_vbase = 0xffff_ffff_ffff_ffff;
-                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                            continue;
-                        }
-                        if (cpu.yield_slice) break :step_loop;
-                    },
-                    .mrs_tpidr_el0 => setX(cpu, @truncate(d.rd), cpu.mmu.tpidr_el0),
-                    .mrs_sys => {
-                        setX(
-                            cpu,
-                            @truncate(d.rd),
-                            readSysReg(cpu, @truncate(d.rn >> 3), @truncate(d.rn), @truncate(d.rm >> 4), @truncate(d.rm), @truncate(d.imm)),
-                        );
-                        if (cpu.yield_slice) break :step_loop;
-                    },
-                    .msr_safe => {
-                        switch (d.rn) {
-                            0 => cpu.excl_valid = false,
-                            1 => {
-                                if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
-                                    cpu.yield_slice = true;
-                                    break :step_loop;
-                                }
-                            },
-                            2 => {
-                                if (atomic_ram.busParallel(bus)) {
-                                    atomic_ram.fence(&cpu.fence_word);
-                                    if (d.imm == 4) bus.smp.broadcastTlb(cpu.mmu.core_id, &cpu.mmu);
-                                }
-                                const pc32: u32 = @truncate(cur_pc);
-                                if ((cpu.last_dmb_pc ^ pc32) < 256) {
-                                    cpu.last_dmb_pc = pc32;
-                                    if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
-                                        cpu.yield_slice = true;
-                                        break :step_loop;
+                                    if (d.rm < 32) {
+                                        const inc: u64 = if (d.rm == 31) total_bytes else getX(cpu, @truncate(d.rm));
+                                        setXOrSp(cpu, rn, base +% inc);
                                     }
-                                } else {
-                                    cpu.last_dmb_pc = pc32;
-                                    atomic_ram.signalEvent(bus);
-                                }
-                            },
-                            12 => atomic_ram.signalEvent(bus),
-                            3 => cpu.pstate |= @truncate(d.imm),
-                            4 => {
-                                cpu.pstate &= @truncate(d.imm);
-                                if (checkInterrupts64(cpu, bus)) {
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                }
-                            },
-                            5 => {
-                                cpu.pstate = (cpu.pstate & ~@as(u32, 0x3c0)) | (@as(u32, @truncate(getX(cpu, @truncate(d.rd)))) & 0x3c0);
-                                if (checkInterrupts64(cpu, bus)) {
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                }
-                            },
-                            6 => cpu.pstate = (cpu.pstate & 0x0fff_ffff) | (@as(u32, @truncate(getX(cpu, @truncate(d.rd)))) & 0xf000_0000),
-                            7 => cpu.mmu.tpidr_el0 = getX(cpu, @truncate(d.rd)),
-                            8 => cpu.mmu.tpidr_el1 = getX(cpu, @truncate(d.rd)),
-                            9 => cpu.sp_el[0] = getX(cpu, @truncate(d.rd)),
-                            11 => {
-                                cpu.invalidateIcache();
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                            },
-                            else => {
-                                if (d.imm == 0) cpu.vfp.fpcr64 = getX(cpu, @truncate(d.rd)) else cpu.vfp.fpsr64 = getX(cpu, @truncate(d.rd));
-                            },
-                        }
-                    },
-                    .dc_zva => {
-                        const base_va = getX(cpu, @truncate(d.rd)) & ~@as(u64, 63);
-                        const vbase = base_va & ~@as(u64, 0xfff);
-                        if (vbase == data_w_vbase[0]) {
-                            @memset(data_w_page_ptr[0][@as(usize, @truncate(base_va & 0xfff))..][0..64], 0);
-                        } else {
-                            const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((base_va >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
-                            if (vbase == dslot.w_vbase) {
-                                data_w_vbase[0] = dslot.w_vbase;
-                                data_w_page_ptr[0] = bus.ram.ptr + dslot.pbase;
-                                @memset(data_w_page_ptr[0][@as(usize, @truncate(base_va & 0xfff))..][0..64], 0);
-                            } else {
-                                var aborted = false;
-                                var off: u64 = 0;
-                                while (off < 64) : (off += 8) {
-                                    writeData64(cpu, bus, base_va +% off, 0) catch {
-                                        aborted = true;
-                                        break;
-                                    };
-                                }
-                                if (aborted) {
-                                    handleAbort64(cpu, cur_pc);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    continue;
-                                }
-                                if (vbase == dslot.w_vbase) {
-                                    data_w_vbase[0] = dslot.w_vbase;
-                                    data_w_page_ptr[0] = bus.ram.ptr + dslot.pbase;
-                                }
-                            }
-                        }
-                    },
-                    .branch_sys_other => {
-                        executeBranchSys(cpu, bus, inst, cur_pc) catch {
-                            handleAbort64(cpu, cur_pc);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff_ffff_ffff;
-                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                            continue;
-                        };
-                        if (checkInterrupts64(cpu, bus)) {
-                            priv = 1;
-                            code_vbase = 0xffff_ffff_ffff_ffff;
-                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                            continue;
-                        }
-                        priv = @intFromBool(currentEl(cpu) != 0);
-                        code_vbase = 0xffff_ffff_ffff_ffff;
-                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                        if (cpu.mmu.halted_wfi or cpu.yield_slice or !cpu.is_aarch64) break :step_loop;
-                    },
-                    .fmov_d_x => cpu.vfp.v[@as(u5, @truncate(d.rd))] = getX(cpu, @truncate(d.rn)),
-                    .fmov_x_d => setX(cpu, @truncate(d.rd), @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])),
-                    .fmov_s_w => cpu.vfp.v[@as(u5, @truncate(d.rd))] = getW(cpu, @truncate(d.rn)),
-                    .fmov_w_s => setW(cpu, @truncate(d.rd), @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])),
-                    .fmov_d_hi_x => {
-                        const rd_idx: u5 = @truncate(d.rd);
-                        cpu.vfp.v[rd_idx] = (cpu.vfp.v[rd_idx] & 0xffff_ffff_ffff_ffff) | (@as(u128, getX(cpu, @truncate(d.rn))) << 64);
-                    },
-                    .fmov_x_d_hi => setX(cpu, @truncate(d.rd), @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))] >> 64)),
-                    .fmov_f64 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])),
-                    .fmov_f32 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])),
-                    .fabs_f64 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])) & 0x7fff_ffff_ffff_ffff,
-                    .fneg_f64 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])) ^ 0x8000_0000_0000_0000,
-                    .fabs_f32 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])) & 0x7fff_ffff,
-                    .fneg_f32 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])) ^ 0x8000_0000,
-                    .fcvt_s_d => {
-                        const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(@as(f32, @floatCast(a))));
-                    },
-                    .fcvt_d_s => {
-                        const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(@as(f64, a)));
-                    },
-                    .fadd_f64 => {
-                        const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a + b));
-                    },
-                    .fsub_f64 => {
-                        const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a - b));
-                    },
-                    .fmul_f64 => {
-                        const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a * b));
-                    },
-                    .fdiv_f64 => {
-                        const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a / b));
-                    },
-                    .fadd_f32 => {
-                        const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a + b));
-                    },
-                    .fsub_f32 => {
-                        const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a - b));
-                    },
-                    .fmul_f32 => {
-                        const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a * b));
-                    },
-                    .fdiv_f32 => {
-                        const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a / b));
-                    },
-                    .fmadd_f64 => {
-                        const n: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const m: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.imm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a + (n * m)));
-                    },
-                    .fmsub_f64 => {
-                        const n: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const m: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.imm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a - (n * m)));
-                    },
-                    .fmadd_f32 => {
-                        const n: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const m: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.imm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a + (n * m)));
-                    },
-                    .fmsub_f32 => {
-                        const n: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const m: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.imm))])));
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a - (n * m)));
-                    },
-                    .fcmp_f64, .fcmpz_f64 => {
-                        const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const b: f64 = if (op == .fcmpz_f64) 0.0 else @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        if (std.math.isNan(a) or std.math.isNan(b)) {
-                            setNzcv(cpu, false, false, true, true);
-                        } else if (a == b) {
-                            setNzcv(cpu, false, true, true, false);
-                        } else if (a < b) {
-                            setNzcv(cpu, true, false, false, false);
-                        } else {
-                            setNzcv(cpu, false, false, true, false);
-                        }
-                    },
-                    .fcmp_f32, .fcmpz_f32 => {
-                        const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
-                        const b: f32 = if (op == .fcmpz_f32) 0.0 else @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
-                        if (std.math.isNan(a) or std.math.isNan(b)) {
-                            setNzcv(cpu, false, false, true, true);
-                        } else if (a == b) {
-                            setNzcv(cpu, false, true, true, false);
-                        } else if (a < b) {
-                            setNzcv(cpu, true, false, false, false);
-                        } else {
-                            setNzcv(cpu, false, false, true, false);
-                        }
-                    },
-                    .simd_movi => cpu.vfp.v[@as(u5, @truncate(d.rd))] = if (d.rn != 0) (@as(u128, d.imm) | (@as(u128, d.imm) << 64)) else d.imm,
-                    .simd_and => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] & cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
-                    },
-                    .simd_bic => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] & ~cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
-                    },
-                    .simd_orr => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] | cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
-                    },
-                    .simd_orn => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] | ~cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
-                    },
-                    .simd_eor => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] ^ cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
-                    },
-                    .simd_bsl => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const rd_idx: u5 = @truncate(d.rd);
-                        const vd = cpu.vfp.v[rd_idx];
-                        const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
-                        const vb = cpu.vfp.v[@as(u5, @truncate(d.rm))];
-                        cpu.vfp.v[rd_idx] = ((va & vd) | (vb & ~vd)) & mask;
-                    },
-                    .simd_not => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = (~cpu.vfp.v[@as(u5, @truncate(d.rn))]) & mask;
-                    },
-                    .simd_dup_gpr => {
-                        const gval = getX(cpu, @truncate(d.rn));
-                        const rep64: u64 = switch (d.rm) {
-                            1 => (@as(u64, @as(u8, @truncate(gval))) * 0x0101_0101_0101_0101),
-                            2 => (@as(u64, @as(u16, @truncate(gval))) * 0x0001_0001_0001_0001),
-                            4 => (@as(u64, @as(u32, @truncate(gval))) * 0x0000_0001_0000_0001),
-                            else => gval,
-                        };
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = if (d.imm != 0) (@as(u128, rep64) | (@as(u128, rep64) << 64)) else @as(u128, rep64);
-                    },
-                    .simd_dup_elem => {
-                        const elem: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))] >> @as(u7, @truncate(d.rm)));
-                        const esize_bytes: u8 = @truncate(d.imm >> 1);
-                        const rep64: u64 = switch (esize_bytes) {
-                            1 => (@as(u64, @as(u8, @truncate(elem))) * 0x0101_0101_0101_0101),
-                            2 => (@as(u64, @as(u16, @truncate(elem))) * 0x0001_0001_0001_0001),
-                            4 => (@as(u64, @as(u32, @truncate(elem))) * 0x0000_0001_0000_0001),
-                            else => elem,
-                        };
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = if ((d.imm & 1) != 0) (@as(u128, rep64) | (@as(u128, rep64) << 64)) else @as(u128, rep64);
-                    },
-                    .simd_umov32 => {
-                        const elem: u32 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))] >> @as(u7, @truncate(d.rm)));
-                        setW(cpu, @truncate(d.rd), elem);
-                    },
-                    .simd_umov64 => {
-                        const elem: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))] >> @as(u7, @truncate(d.rm)));
-                        setX(cpu, @truncate(d.rd), elem);
-                    },
-                    .simd_add_8 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const vb: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va +% vb)) & mask;
-                    },
-                    .simd_sub_8 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const vb: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va -% vb)) & mask;
-                    },
-                    .simd_add_16 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(8, u16) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const vb: @Vector(8, u16) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va +% vb)) & mask;
-                    },
-                    .simd_sub_16 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(8, u16) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const vb: @Vector(8, u16) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va -% vb)) & mask;
-                    },
-                    .simd_add_32 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(4, u32) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const vb: @Vector(4, u32) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va +% vb)) & mask;
-                    },
-                    .simd_sub_32 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(4, u32) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const vb: @Vector(4, u32) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va -% vb)) & mask;
-                    },
-                    .simd_add_64 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(2, u64) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const vb: @Vector(2, u64) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va +% vb)) & mask;
-                    },
-                    .simd_sub_64 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(2, u64) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const vb: @Vector(2, u64) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va -% vb)) & mask;
-                    },
-                    .simd_cmeq_8 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const vb: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        const zero: @Vector(16, u8) = @splat(0);
-                        const ones: @Vector(16, u8) = @splat(0xff);
-                        const res: @Vector(16, u8) = @select(u8, va == vb, ones, zero);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(res)) & mask;
-                    },
-                    .simd_cmeqz_8 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const zero: @Vector(16, u8) = @splat(0);
-                        const ones: @Vector(16, u8) = @splat(0xff);
-                        const res: @Vector(16, u8) = @select(u8, va == zero, ones, zero);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(res)) & mask;
-                    },
-                    .simd_cmtst_8 => {
-                        const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const va: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
-                        const vb: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
-                        const zero: @Vector(16, u8) = @splat(0);
-                        const ones: @Vector(16, u8) = @splat(0xff);
-                        const res: @Vector(16, u8) = @select(u8, (va & vb) != zero, ones, zero);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(res)) & mask;
-                    },
-                    .simd_ext_q => {
-                        const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
-                        const vb = cpu.vfp.v[@as(u5, @truncate(d.rm))];
-                        const sh: u7 = @truncate(d.imm);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = if (sh == 0) va else ((va >> sh) | (vb << @intCast(@as(u8, 128) - sh)));
-                    },
-                    .simd_ext_d => {
-                        const va: u128 = @as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))]));
-                        const vb: u128 = @as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))]));
-                        const sh: u7 = @truncate(d.imm);
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = ((va | (vb << 64)) >> sh) & 0xffff_ffff_ffff_ffff;
-                    },
-                    .simd_ushr => {
-                        const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
-                        const sh: u7 = @truncate(d.rm & 0x3f);
-                        const mask128: u128 = if ((d.rm & 0x40) != 0) (@as(u128, d.imm) | (@as(u128, d.imm) << 64)) else d.imm;
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = (va >> sh) & mask128;
-                    },
-                    .simd_shl => {
-                        const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
-                        const sh: u7 = @truncate(d.rm & 0x3f);
-                        const mask128: u128 = if ((d.rm & 0x40) != 0) (@as(u128, d.imm) | (@as(u128, d.imm) << 64)) else d.imm;
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = (va << sh) & mask128;
-                    },
-                    .fcvt_int => {
-                        const is_dbl = (d.imm & 1) != 0;
-                        const sf = ((d.imm >> 1) & 1) != 0;
-                        const opcode: u3 = @truncate(d.imm >> 2);
-                        const rd_idx: u5 = @truncate(d.rd);
-                        const rn_idx: u5 = @truncate(d.rn);
-                        if (opcode == 0b010) { // SCVTF
-                            const iv: f64 = if (sf) @floatFromInt(@as(i64, @bitCast(getX(cpu, rn_idx)))) else @floatFromInt(@as(i32, @bitCast(getW(cpu, rn_idx))));
-                            cpu.vfp.v[rd_idx] = if (is_dbl) @as(u64, @bitCast(iv)) else @as(u32, @bitCast(@as(f32, @floatCast(iv))));
-                        } else if (opcode == 0b011) { // UCVTF
-                            const uv: f64 = if (sf) @floatFromInt(getX(cpu, rn_idx)) else @floatFromInt(getW(cpu, rn_idx));
-                            cpu.vfp.v[rd_idx] = if (is_dbl) @as(u64, @bitCast(uv)) else @as(u32, @bitCast(@as(f32, @floatCast(uv))));
-                        } else { // FCVTZS (0b000) / FCVTZU (0b001)
-                            const raw_fv: f64 = if (is_dbl) @bitCast(@as(u64, @truncate(cpu.vfp.v[rn_idx]))) else @as(f64, @as(f32, @bitCast(@as(u32, @truncate(cpu.vfp.v[rn_idx])))));
-                            const fv = @trunc(raw_fv);
-                            if (std.math.isNan(fv)) {
-                                if (sf) setX(cpu, rd_idx, 0) else setW(cpu, rd_idx, 0);
-                            } else if (opcode == 0b000) {
-                                if (sf) {
-                                    const clamped = std.math.clamp(fv, -9223372036854775808.0, 9223372036854774784.0);
-                                    setX(cpu, rd_idx, @bitCast(@as(i64, @intFromFloat(clamped))));
-                                } else {
-                                    const clamped = std.math.clamp(fv, -2147483648.0, 2147483647.0);
-                                    setW(cpu, rd_idx, @bitCast(@as(i32, @intFromFloat(clamped))));
-                                }
-                            } else {
-                                if (sf) {
-                                    const clamped = std.math.clamp(fv, 0.0, 18446744073709549568.0);
-                                    setX(cpu, rd_idx, @intFromFloat(clamped));
-                                } else {
-                                    const clamped = std.math.clamp(fv, 0.0, 4294967295.0);
-                                    setW(cpu, rd_idx, @intFromFloat(clamped));
-                                }
-                            }
-                        }
-                    },
-                    .fop_misc => {
-                        const is_dbl = (d.imm & 1) != 0;
-                        const sub_op: u3 = @truncate((d.imm >> 1) & 7);
-                        const rd_idx: u5 = @truncate(d.rd);
-                        const rn_idx: u5 = @truncate(d.rn);
-                        const rm_idx: u5 = @truncate(d.rm);
-                        if (sub_op == 4) { // FCSEL
-                            const cond: u4 = @truncate(d.imm >> 4);
-                            const sel = if (evalCond(cpu.pstate, cond)) cpu.vfp.v[rn_idx] else cpu.vfp.v[rm_idx];
-                            cpu.vfp.v[rd_idx] = if (is_dbl) @as(u64, @truncate(sel)) else @as(u32, @truncate(sel));
-                        } else if (is_dbl) {
-                            const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[rn_idx])));
-                            if (sub_op == 0) {
-                                cpu.vfp.v[rd_idx] = @as(u64, @bitCast(@sqrt(a)));
-                            } else {
-                                const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[rm_idx])));
-                                const res: f64 = switch (sub_op) {
-                                    1 => @max(a, b),
-                                    2 => @min(a, b),
-                                    else => -(a * b),
-                                };
-                                cpu.vfp.v[rd_idx] = @as(u64, @bitCast(res));
-                            }
-                        } else {
-                            const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[rn_idx])));
-                            if (sub_op == 0) {
-                                cpu.vfp.v[rd_idx] = @as(u32, @bitCast(@sqrt(a)));
-                            } else {
-                                const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[rm_idx])));
-                                const res: f32 = switch (sub_op) {
-                                    1 => @max(a, b),
-                                    2 => @min(a, b),
-                                    else => -(a * b),
-                                };
-                                cpu.vfp.v[rd_idx] = @as(u32, @bitCast(res));
-                            }
-                        }
-                    },
-                    .simd_mul_mla => {
-                        const mask: u128 = if ((d.imm & 1) != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
-                        const kind: u2 = @truncate((d.imm >> 1) & 3);
-                        const size: u2 = @truncate(d.imm >> 3);
-                        const rd_idx: u5 = @truncate(d.rd);
-                        const raw_a = cpu.vfp.v[@as(u5, @truncate(d.rn))];
-                        const raw_b = cpu.vfp.v[@as(u5, @truncate(d.rm))];
-                        const raw_d = cpu.vfp.v[rd_idx];
-                        const res128: u128 = switch (size) {
-                            0 => blk: {
-                                const va: @Vector(16, u8) = @bitCast(raw_a);
-                                const vb: @Vector(16, u8) = @bitCast(raw_b);
-                                const prod = va *% vb;
-                                if (kind == 0) break :blk @bitCast(prod);
-                                const vd: @Vector(16, u8) = @bitCast(raw_d);
-                                break :blk @bitCast(if (kind == 1) (vd +% prod) else (vd -% prod));
-                            },
-                            1 => blk: {
-                                const va: @Vector(8, u16) = @bitCast(raw_a);
-                                const vb: @Vector(8, u16) = @bitCast(raw_b);
-                                const prod = va *% vb;
-                                if (kind == 0) break :blk @bitCast(prod);
-                                const vd: @Vector(8, u16) = @bitCast(raw_d);
-                                break :blk @bitCast(if (kind == 1) (vd +% prod) else (vd -% prod));
-                            },
-                            else => blk: {
-                                const va: @Vector(4, u32) = @bitCast(raw_a);
-                                const vb: @Vector(4, u32) = @bitCast(raw_b);
-                                const prod = va *% vb;
-                                if (kind == 0) break :blk @bitCast(prod);
-                                const vd: @Vector(4, u32) = @bitCast(raw_d);
-                                break :blk @bitCast(if (kind == 1) (vd +% prod) else (vd -% prod));
-                            },
-                        };
-                        cpu.vfp.v[rd_idx] = res128 & mask;
-                    },
-                    .simd_xtn_shrn => {
-                        const q = (d.imm & 1) != 0;
-                        const round: u64 = d.imm >> 1;
-                        const size: u2 = @truncate(d.rm & 3);
-                        const rshift: u6 = @truncate(d.rm >> 2);
-                        const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
-                        const rd_idx: u5 = @truncate(d.rd);
-                        const narrow64: u64 = switch (size) {
-                            0 => blk: {
-                                const v16: @Vector(8, u16) = @bitCast(va);
-                                const rvec: @Vector(8, u16) = @splat(@truncate(round));
-                                const shvec: @Vector(8, u4) = @splat(@truncate(rshift));
-                                const narrow: @Vector(8, u8) = @truncate((v16 +% rvec) >> shvec);
-                                break :blk @bitCast(narrow);
-                            },
-                            1 => blk: {
-                                const v32: @Vector(4, u32) = @bitCast(va);
-                                const rvec: @Vector(4, u32) = @splat(@truncate(round));
-                                const shvec: @Vector(4, u5) = @splat(@truncate(rshift));
-                                const narrow: @Vector(4, u16) = @truncate((v32 +% rvec) >> shvec);
-                                break :blk @bitCast(narrow);
-                            },
-                            else => blk: {
-                                const v64: @Vector(2, u64) = @bitCast(va);
-                                const rvec: @Vector(2, u64) = @splat(round);
-                                const shvec: @Vector(2, u6) = @splat(rshift);
-                                const narrow: @Vector(2, u32) = @truncate((v64 +% rvec) >> shvec);
-                                break :blk @bitCast(narrow);
-                            },
-                        };
-                        if (q) {
-                            cpu.vfp.v[rd_idx] = (cpu.vfp.v[rd_idx] & 0xffff_ffff_ffff_ffff) | (@as(u128, narrow64) << 64);
-                        } else {
-                            cpu.vfp.v[rd_idx] = narrow64;
-                        }
-                    },
-                    .simd_shll => {
-                        const q = (d.imm & 1) != 0;
-                        const is_unsigned = ((d.imm >> 1) & 1) != 0;
-                        const size: u2 = @truncate(d.imm >> 2);
-                        const lshift: u6 = @truncate(d.rm);
-                        const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
-                        const src64: u64 = if (q) @truncate(va >> 64) else @truncate(va);
-                        const out128: u128 = switch (size) {
-                            0 => if (is_unsigned) blk: {
-                                const v8: @Vector(8, u8) = @bitCast(src64);
-                                const wide: @Vector(8, u16) = v8;
-                                const sh: @Vector(8, u4) = @splat(@truncate(lshift));
-                                break :blk @bitCast(wide << sh);
-                            } else blk: {
-                                const v8: @Vector(8, i8) = @bitCast(src64);
-                                const wide: @Vector(8, u16) = @bitCast(@as(@Vector(8, i16), v8));
-                                const sh: @Vector(8, u4) = @splat(@truncate(lshift));
-                                break :blk @bitCast(wide << sh);
-                            },
-                            1 => if (is_unsigned) blk: {
-                                const v16: @Vector(4, u16) = @bitCast(src64);
-                                const wide: @Vector(4, u32) = v16;
-                                const sh: @Vector(4, u5) = @splat(@truncate(lshift));
-                                break :blk @bitCast(wide << sh);
-                            } else blk: {
-                                const v16: @Vector(4, i16) = @bitCast(src64);
-                                const wide: @Vector(4, u32) = @bitCast(@as(@Vector(4, i32), v16));
-                                const sh: @Vector(4, u5) = @splat(@truncate(lshift));
-                                break :blk @bitCast(wide << sh);
-                            },
-                            else => if (is_unsigned) blk: {
-                                const v32: @Vector(2, u32) = @bitCast(src64);
-                                const wide: @Vector(2, u64) = v32;
-                                const sh: @Vector(2, u6) = @splat(lshift);
-                                break :blk @bitCast(wide << sh);
-                            } else blk: {
-                                const v32: @Vector(2, i32) = @bitCast(src64);
-                                const wide: @Vector(2, u64) = @bitCast(@as(@Vector(2, i64), v32));
-                                const sh: @Vector(2, u6) = @splat(lshift);
-                                break :blk @bitCast(wide << sh);
-                            },
-                        };
-                        cpu.vfp.v[@as(u5, @truncate(d.rd))] = out128;
-                    },
-                    .fp_simd => executeFpSimd(cpu, inst),
-                    .nop => {},
-                    .jit_trace => {
-                        const max_jit_first: usize = (batch_end - executed) + 1;
-                        if (max_jit_first >= d.rd) {
-                            var cur_d = d;
-                            var cur_entry_pc = cur_pc;
-                            var chain_count: u8 = 0;
-                            while (true) {
-                                const max_jit: usize = (batch_end - executed) + 1;
-                                cpu.pc64 = code_vbase;
-                                const fn_ptr: jit_mod.JitFn = @ptrFromInt(@as(usize, @truncate(cur_d.imm)));
-                                const sp_ptr = &cpu.sp_el[spIndex(cpu)];
-                                const tlb_ptr = &cpu.mmu.soft_tlb64[priv][0];
-                                const ran = fn_ptr(cpu, bus, bus.ram.ptr, tlb_ptr, max_jit, sp_ptr);
-                                executed += ran - 1;
-                                const new_priv: u1 = @intFromBool(currentEl(cpu) != 0);
-                                if (new_priv != priv or cpu.mmu.halted_wfi or cpu.yield_slice) {
-                                    priv = new_priv;
-                                    code_vbase = 0xffff_ffff_ffff_ffff;
-                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                    break;
-                                }
-                                const next_pc = cpu.pc64;
-                                if ((next_pc & ~@as(u64, 0xfff)) != code_vbase) {
-                                    if ((next_pc & 3) != 0) {
-                                        code_vbase = 0xffff_ffff_ffff_ffff;
-                                        break;
-                                    }
-                                    const islot = cpu.mmu.soft_tlb64[priv][(next_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask];
-                                    if ((next_pc & ~@as(u64, 0xfff)) == islot.x_vbase) {
-                                        code_vbase = islot.x_vbase;
-                                        code_pbase = islot.pbase;
-                                        code_page_ptr = bus.ram.ptr + code_pbase;
-                                        code_page_idx = CpuType.icachePageIdx(code_pbase);
-                                        code_icache_ptr = cpu.prepareIcachePage(code_page_idx, code_pbase);
-                                    } else {
-                                        code_vbase = 0xffff_ffff_ffff_ffff;
-                                        break;
+                                    if ((base & ~@as(u64, 0xfff)) != dslot.w_vbase) {
+                                        if (checkInterrupts64(cpu, bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                            continue;
+                                        }
                                     }
                                 }
-                                if (chain_count >= 16 or next_pc == cur_entry_pc or executed >= batch_end) break;
-                                const next_d = code_icache_ptr[(next_pc >> 2) & 0x3ff];
-                                if (next_d.op == @intFromEnum(A64Op.jit_trace) and (batch_end - executed) >= next_d.rd) {
-                                    executed += 1;
-                                    cur_d = next_d;
-                                    cur_entry_pc = next_pc;
-                                    chain_count += 1;
-                                    continue;
-                                }
-                                noteBlockEntry64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, next_pc);
-                                break;
                             }
-                        } else if (batch_end < max_steps and (max_steps - executed) + 1 >= d.rd) {
-                            cpu.pc64 = cur_pc;
-                            executed -= 1;
-                            if (checkInterrupts64(cpu, bus)) {
-                                priv = 1;
-                                code_vbase = 0xffff_ffff_ffff_ffff;
-                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
-                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                        },
+                        .b_imm => {
+                            const target_pc = cur_pc +% d.imm;
+                            cpu.pc64 = target_pc;
+                            noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                            if (cpu.yield_slice) break :step_loop;
+                        },
+                        .bl_imm => {
+                            const target_pc = cur_pc +% d.imm;
+                            cpu.x[30] = cur_pc +% 4;
+                            cpu.pc64 = target_pc;
+                            noteCallTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target_pc, cur_pc +% 4);
+                        },
+                        .b_cond => {
+                            if (evalCond(cpu.pstate, @truncate(d.rd))) {
+                                const target_pc = cur_pc +% d.imm;
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                                if (cpu.yield_slice) break :step_loop;
                             }
-                            break;
-                        } else {
-                            executeSingleA64(cpu, bus, cur_pc, inst) catch {
+                        },
+                        .cbz64 => {
+                            if (getX(cpu, @truncate(d.rd)) == 0) {
+                                const target_pc = cur_pc +% d.imm;
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                                if (cpu.yield_slice) break :step_loop;
+                            }
+                        },
+                        .cbnz64 => {
+                            if (getX(cpu, @truncate(d.rd)) != 0) {
+                                const target_pc = cur_pc +% d.imm;
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                                if (cpu.yield_slice) break :step_loop;
+                            }
+                        },
+                        .cbz32 => {
+                            if (getW(cpu, @truncate(d.rd)) == 0) {
+                                const target_pc = cur_pc +% d.imm;
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                                if (cpu.yield_slice) break :step_loop;
+                            }
+                        },
+                        .cbnz32 => {
+                            if (getW(cpu, @truncate(d.rd)) != 0) {
+                                const target_pc = cur_pc +% d.imm;
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                                if (cpu.yield_slice) break :step_loop;
+                            }
+                        },
+                        .tbz => {
+                            if (((getX(cpu, @truncate(d.rd)) >> @intCast(d.rm)) & 1) == 0) {
+                                const target_pc = cur_pc +% d.imm;
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                                if (cpu.yield_slice) break :step_loop;
+                            }
+                        },
+                        .tbnz => {
+                            if (((getX(cpu, @truncate(d.rd)) >> @intCast(d.rm)) & 1) != 0) {
+                                const target_pc = cur_pc +% d.imm;
+                                cpu.pc64 = target_pc;
+                                noteBackwardBranch64(cpu, SlotType, bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cur_pc, target_pc, @intCast(page_word + 1));
+                                if (cpu.yield_slice) break :step_loop;
+                            }
+                        },
+                        .br_reg => {
+                            cpu.pc64 = getX(cpu, @truncate(d.rn));
+                            noteJumpTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cpu.pc64);
+                        },
+                        .blr_reg => {
+                            const target = getX(cpu, @truncate(d.rn));
+                            cpu.x[30] = cur_pc +% 4;
+                            cpu.pc64 = target;
+                            noteCallTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target, cur_pc +% 4);
+                        },
+                        .ret => {
+                            cpu.pc64 = getX(cpu, @truncate(d.rn));
+                            noteJumpTarget64(cpu, SlotType, bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, cpu.pc64);
+                        },
+                        .dp_imm_other => executeDpImm(cpu, inst, cur_pc),
+                        .dp_reg_other => executeDpReg(cpu, inst),
+                        .load_store_other => {
+                            executeLoadStore(cpu, bus, inst, cur_pc) catch {
                                 handleAbort64(cpu, cur_pc);
                                 priv = 1;
                                 code_vbase = 0xffff_ffff_ffff_ffff;
@@ -5511,9 +4839,681 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                 data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
                                 continue;
                             }
-                        }
-                    },
-                }
+                            if (cpu.yield_slice) break :step_loop;
+                        },
+                        .mrs_tpidr_el0 => setX(cpu, @truncate(d.rd), cpu.mmu.tpidr_el0),
+                        .mrs_sys => {
+                            setX(
+                                cpu,
+                                @truncate(d.rd),
+                                readSysReg(cpu, @truncate(d.rn >> 3), @truncate(d.rn), @truncate(d.rm >> 4), @truncate(d.rm), @truncate(d.imm)),
+                            );
+                            if (cpu.yield_slice) break :step_loop;
+                        },
+                        .msr_safe => {
+                            switch (d.rn) {
+                                0 => cpu.excl_valid = false,
+                                1 => {
+                                    if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
+                                        cpu.yield_slice = true;
+                                        break :step_loop;
+                                    }
+                                },
+                                2 => {
+                                    if (atomic_ram.busParallel(bus)) {
+                                        atomic_ram.fence(&cpu.fence_word);
+                                        if (d.imm == 4) bus.smp.broadcastTlb(cpu.mmu.core_id, &cpu.mmu);
+                                    }
+                                    const pc32: u32 = @truncate(cur_pc);
+                                    if ((cpu.last_dmb_pc ^ pc32) < 256) {
+                                        cpu.last_dmb_pc = pc32;
+                                        if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
+                                            cpu.yield_slice = true;
+                                            break :step_loop;
+                                        }
+                                    } else {
+                                        cpu.last_dmb_pc = pc32;
+                                        atomic_ram.signalEvent(bus);
+                                    }
+                                },
+                                12 => atomic_ram.signalEvent(bus),
+                                3 => cpu.pstate |= @truncate(d.imm),
+                                4 => {
+                                    cpu.pstate &= @truncate(d.imm);
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    }
+                                },
+                                5 => {
+                                    cpu.pstate = (cpu.pstate & ~@as(u32, 0x3c0)) | (@as(u32, @truncate(getX(cpu, @truncate(d.rd)))) & 0x3c0);
+                                    if (checkInterrupts64(cpu, bus)) {
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    }
+                                },
+                                6 => cpu.pstate = (cpu.pstate & 0x0fff_ffff) | (@as(u32, @truncate(getX(cpu, @truncate(d.rd)))) & 0xf000_0000),
+                                7 => cpu.mmu.tpidr_el0 = getX(cpu, @truncate(d.rd)),
+                                8 => cpu.mmu.tpidr_el1 = getX(cpu, @truncate(d.rd)),
+                                9 => cpu.sp_el[0] = getX(cpu, @truncate(d.rd)),
+                                11 => {
+                                    cpu.invalidateIcache();
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                },
+                                else => {
+                                    if (d.imm == 0) cpu.vfp.fpcr64 = getX(cpu, @truncate(d.rd)) else cpu.vfp.fpsr64 = getX(cpu, @truncate(d.rd));
+                                },
+                            }
+                        },
+                        .dc_zva => {
+                            const base_va = getX(cpu, @truncate(d.rd)) & ~@as(u64, 63);
+                            const vbase = base_va & ~@as(u64, 0xfff);
+                            if (vbase == data_w_vbase[0]) {
+                                @memset(data_w_page_ptr[0][@as(usize, @truncate(base_va & 0xfff))..][0..64], 0);
+                            } else {
+                                const dslot = &cpu.mmu.soft_tlb64[priv][@as(usize, @truncate((base_va >> 12) & mmu_mod.Mmu.soft_tlb_mask))];
+                                if (vbase == dslot.w_vbase) {
+                                    data_w_vbase[0] = dslot.w_vbase;
+                                    data_w_page_ptr[0] = bus.ram.ptr + dslot.pbase;
+                                    @memset(data_w_page_ptr[0][@as(usize, @truncate(base_va & 0xfff))..][0..64], 0);
+                                } else {
+                                    var aborted = false;
+                                    var off: u64 = 0;
+                                    while (off < 64) : (off += 8) {
+                                        writeData64(cpu, bus, base_va +% off, 0) catch {
+                                            aborted = true;
+                                            break;
+                                        };
+                                    }
+                                    if (aborted) {
+                                        handleAbort64(cpu, cur_pc);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        continue;
+                                    }
+                                    if (vbase == dslot.w_vbase) {
+                                        data_w_vbase[0] = dslot.w_vbase;
+                                        data_w_page_ptr[0] = bus.ram.ptr + dslot.pbase;
+                                    }
+                                }
+                            }
+                        },
+                        .branch_sys_other => {
+                            executeBranchSys(cpu, bus, inst, cur_pc) catch {
+                                handleAbort64(cpu, cur_pc);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                continue;
+                            };
+                            if (checkInterrupts64(cpu, bus)) {
+                                priv = 1;
+                                code_vbase = 0xffff_ffff_ffff_ffff;
+                                data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                continue;
+                            }
+                            priv = @intFromBool(currentEl(cpu) != 0);
+                            code_vbase = 0xffff_ffff_ffff_ffff;
+                            data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                            data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                            if (cpu.mmu.halted_wfi or cpu.yield_slice or !cpu.is_aarch64) break :step_loop;
+                        },
+                        .fmov_d_x => cpu.vfp.v[@as(u5, @truncate(d.rd))] = getX(cpu, @truncate(d.rn)),
+                        .fmov_x_d => setX(cpu, @truncate(d.rd), @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])),
+                        .fmov_s_w => cpu.vfp.v[@as(u5, @truncate(d.rd))] = getW(cpu, @truncate(d.rn)),
+                        .fmov_w_s => setW(cpu, @truncate(d.rd), @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])),
+                        .fmov_d_hi_x => {
+                            const rd_idx: u5 = @truncate(d.rd);
+                            cpu.vfp.v[rd_idx] = (cpu.vfp.v[rd_idx] & 0xffff_ffff_ffff_ffff) | (@as(u128, getX(cpu, @truncate(d.rn))) << 64);
+                        },
+                        .fmov_x_d_hi => setX(cpu, @truncate(d.rd), @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))] >> 64)),
+                        .fmov_f64 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])),
+                        .fmov_f32 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])),
+                        .fabs_f64 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])) & 0x7fff_ffff_ffff_ffff,
+                        .fneg_f64 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])) ^ 0x8000_0000_0000_0000,
+                        .fabs_f32 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])) & 0x7fff_ffff,
+                        .fneg_f32 => cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])) ^ 0x8000_0000,
+                        .fcvt_s_d => {
+                            const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(@as(f32, @floatCast(a))));
+                        },
+                        .fcvt_d_s => {
+                            const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(@as(f64, a)));
+                        },
+                        .fadd_f64 => {
+                            const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a + b));
+                        },
+                        .fsub_f64 => {
+                            const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a - b));
+                        },
+                        .fmul_f64 => {
+                            const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a * b));
+                        },
+                        .fdiv_f64 => {
+                            const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a / b));
+                        },
+                        .fadd_f32 => {
+                            const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a + b));
+                        },
+                        .fsub_f32 => {
+                            const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a - b));
+                        },
+                        .fmul_f32 => {
+                            const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a * b));
+                        },
+                        .fdiv_f32 => {
+                            const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a / b));
+                        },
+                        .fmadd_f64 => {
+                            const n: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const m: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.imm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a + (n * m)));
+                        },
+                        .fmsub_f64 => {
+                            const n: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const m: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.imm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u64, @bitCast(a - (n * m)));
+                        },
+                        .fmadd_f32 => {
+                            const n: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const m: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.imm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a + (n * m)));
+                        },
+                        .fmsub_f32 => {
+                            const n: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const m: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.imm))])));
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u32, @bitCast(a - (n * m)));
+                        },
+                        .fcmp_f64, .fcmpz_f64 => {
+                            const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const b: f64 = if (op == .fcmpz_f64) 0.0 else @bitCast(@as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            if (std.math.isNan(a) or std.math.isNan(b)) {
+                                setNzcv(cpu, false, false, true, true);
+                            } else if (a == b) {
+                                setNzcv(cpu, false, true, true, false);
+                            } else if (a < b) {
+                                setNzcv(cpu, true, false, false, false);
+                            } else {
+                                setNzcv(cpu, false, false, true, false);
+                            }
+                        },
+                        .fcmp_f32, .fcmpz_f32 => {
+                            const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))])));
+                            const b: f32 = if (op == .fcmpz_f32) 0.0 else @bitCast(@as(u32, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))])));
+                            if (std.math.isNan(a) or std.math.isNan(b)) {
+                                setNzcv(cpu, false, false, true, true);
+                            } else if (a == b) {
+                                setNzcv(cpu, false, true, true, false);
+                            } else if (a < b) {
+                                setNzcv(cpu, true, false, false, false);
+                            } else {
+                                setNzcv(cpu, false, false, true, false);
+                            }
+                        },
+                        .simd_movi => cpu.vfp.v[@as(u5, @truncate(d.rd))] = if (d.rn != 0) (@as(u128, d.imm) | (@as(u128, d.imm) << 64)) else d.imm,
+                        .simd_and => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] & cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
+                        },
+                        .simd_bic => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] & ~cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
+                        },
+                        .simd_orr => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] | cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
+                        },
+                        .simd_orn => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] | ~cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
+                        },
+                        .simd_eor => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = (cpu.vfp.v[@as(u5, @truncate(d.rn))] ^ cpu.vfp.v[@as(u5, @truncate(d.rm))]) & mask;
+                        },
+                        .simd_bsl => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const rd_idx: u5 = @truncate(d.rd);
+                            const vd = cpu.vfp.v[rd_idx];
+                            const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
+                            const vb = cpu.vfp.v[@as(u5, @truncate(d.rm))];
+                            cpu.vfp.v[rd_idx] = ((va & vd) | (vb & ~vd)) & mask;
+                        },
+                        .simd_not => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = (~cpu.vfp.v[@as(u5, @truncate(d.rn))]) & mask;
+                        },
+                        .simd_dup_gpr => {
+                            const gval = getX(cpu, @truncate(d.rn));
+                            const rep64: u64 = switch (d.rm) {
+                                1 => (@as(u64, @as(u8, @truncate(gval))) * 0x0101_0101_0101_0101),
+                                2 => (@as(u64, @as(u16, @truncate(gval))) * 0x0001_0001_0001_0001),
+                                4 => (@as(u64, @as(u32, @truncate(gval))) * 0x0000_0001_0000_0001),
+                                else => gval,
+                            };
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = if (d.imm != 0) (@as(u128, rep64) | (@as(u128, rep64) << 64)) else @as(u128, rep64);
+                        },
+                        .simd_dup_elem => {
+                            const elem: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))] >> @as(u7, @truncate(d.rm)));
+                            const esize_bytes: u8 = @truncate(d.imm >> 1);
+                            const rep64: u64 = switch (esize_bytes) {
+                                1 => (@as(u64, @as(u8, @truncate(elem))) * 0x0101_0101_0101_0101),
+                                2 => (@as(u64, @as(u16, @truncate(elem))) * 0x0001_0001_0001_0001),
+                                4 => (@as(u64, @as(u32, @truncate(elem))) * 0x0000_0001_0000_0001),
+                                else => elem,
+                            };
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = if ((d.imm & 1) != 0) (@as(u128, rep64) | (@as(u128, rep64) << 64)) else @as(u128, rep64);
+                        },
+                        .simd_umov32 => {
+                            const elem: u32 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))] >> @as(u7, @truncate(d.rm)));
+                            setW(cpu, @truncate(d.rd), elem);
+                        },
+                        .simd_umov64 => {
+                            const elem: u64 = @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))] >> @as(u7, @truncate(d.rm)));
+                            setX(cpu, @truncate(d.rd), elem);
+                        },
+                        .simd_add_8 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const vb: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va +% vb)) & mask;
+                        },
+                        .simd_sub_8 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const vb: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va -% vb)) & mask;
+                        },
+                        .simd_add_16 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(8, u16) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const vb: @Vector(8, u16) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va +% vb)) & mask;
+                        },
+                        .simd_sub_16 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(8, u16) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const vb: @Vector(8, u16) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va -% vb)) & mask;
+                        },
+                        .simd_add_32 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(4, u32) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const vb: @Vector(4, u32) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va +% vb)) & mask;
+                        },
+                        .simd_sub_32 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(4, u32) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const vb: @Vector(4, u32) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va -% vb)) & mask;
+                        },
+                        .simd_add_64 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(2, u64) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const vb: @Vector(2, u64) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va +% vb)) & mask;
+                        },
+                        .simd_sub_64 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(2, u64) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const vb: @Vector(2, u64) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(va -% vb)) & mask;
+                        },
+                        .simd_cmeq_8 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const vb: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            const zero: @Vector(16, u8) = @splat(0);
+                            const ones: @Vector(16, u8) = @splat(0xff);
+                            const res: @Vector(16, u8) = @select(u8, va == vb, ones, zero);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(res)) & mask;
+                        },
+                        .simd_cmeqz_8 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const zero: @Vector(16, u8) = @splat(0);
+                            const ones: @Vector(16, u8) = @splat(0xff);
+                            const res: @Vector(16, u8) = @select(u8, va == zero, ones, zero);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(res)) & mask;
+                        },
+                        .simd_cmtst_8 => {
+                            const mask: u128 = if (d.imm != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const va: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rn))]);
+                            const vb: @Vector(16, u8) = @bitCast(cpu.vfp.v[@as(u5, @truncate(d.rm))]);
+                            const zero: @Vector(16, u8) = @splat(0);
+                            const ones: @Vector(16, u8) = @splat(0xff);
+                            const res: @Vector(16, u8) = @select(u8, (va & vb) != zero, ones, zero);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = @as(u128, @bitCast(res)) & mask;
+                        },
+                        .simd_ext_q => {
+                            const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
+                            const vb = cpu.vfp.v[@as(u5, @truncate(d.rm))];
+                            const sh: u7 = @truncate(d.imm);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = if (sh == 0) va else ((va >> sh) | (vb << @intCast(@as(u8, 128) - sh)));
+                        },
+                        .simd_ext_d => {
+                            const va: u128 = @as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rn))]));
+                            const vb: u128 = @as(u64, @truncate(cpu.vfp.v[@as(u5, @truncate(d.rm))]));
+                            const sh: u7 = @truncate(d.imm);
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = ((va | (vb << 64)) >> sh) & 0xffff_ffff_ffff_ffff;
+                        },
+                        .simd_ushr => {
+                            const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
+                            const sh: u7 = @truncate(d.rm & 0x3f);
+                            const mask128: u128 = if ((d.rm & 0x40) != 0) (@as(u128, d.imm) | (@as(u128, d.imm) << 64)) else d.imm;
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = (va >> sh) & mask128;
+                        },
+                        .simd_shl => {
+                            const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
+                            const sh: u7 = @truncate(d.rm & 0x3f);
+                            const mask128: u128 = if ((d.rm & 0x40) != 0) (@as(u128, d.imm) | (@as(u128, d.imm) << 64)) else d.imm;
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = (va << sh) & mask128;
+                        },
+                        .fcvt_int => {
+                            const is_dbl = (d.imm & 1) != 0;
+                            const sf = ((d.imm >> 1) & 1) != 0;
+                            const opcode: u3 = @truncate(d.imm >> 2);
+                            const rd_idx: u5 = @truncate(d.rd);
+                            const rn_idx: u5 = @truncate(d.rn);
+                            if (opcode == 0b010) { // SCVTF
+                                const iv: f64 = if (sf) @floatFromInt(@as(i64, @bitCast(getX(cpu, rn_idx)))) else @floatFromInt(@as(i32, @bitCast(getW(cpu, rn_idx))));
+                                cpu.vfp.v[rd_idx] = if (is_dbl) @as(u64, @bitCast(iv)) else @as(u32, @bitCast(@as(f32, @floatCast(iv))));
+                            } else if (opcode == 0b011) { // UCVTF
+                                const uv: f64 = if (sf) @floatFromInt(getX(cpu, rn_idx)) else @floatFromInt(getW(cpu, rn_idx));
+                                cpu.vfp.v[rd_idx] = if (is_dbl) @as(u64, @bitCast(uv)) else @as(u32, @bitCast(@as(f32, @floatCast(uv))));
+                            } else { // FCVTZS (0b000) / FCVTZU (0b001)
+                                const raw_fv: f64 = if (is_dbl) @bitCast(@as(u64, @truncate(cpu.vfp.v[rn_idx]))) else @as(f64, @as(f32, @bitCast(@as(u32, @truncate(cpu.vfp.v[rn_idx])))));
+                                const fv = @trunc(raw_fv);
+                                if (std.math.isNan(fv)) {
+                                    if (sf) setX(cpu, rd_idx, 0) else setW(cpu, rd_idx, 0);
+                                } else if (opcode == 0b000) {
+                                    if (sf) {
+                                        const clamped = std.math.clamp(fv, -9223372036854775808.0, 9223372036854774784.0);
+                                        setX(cpu, rd_idx, @bitCast(@as(i64, @intFromFloat(clamped))));
+                                    } else {
+                                        const clamped = std.math.clamp(fv, -2147483648.0, 2147483647.0);
+                                        setW(cpu, rd_idx, @bitCast(@as(i32, @intFromFloat(clamped))));
+                                    }
+                                } else {
+                                    if (sf) {
+                                        const clamped = std.math.clamp(fv, 0.0, 18446744073709549568.0);
+                                        setX(cpu, rd_idx, @intFromFloat(clamped));
+                                    } else {
+                                        const clamped = std.math.clamp(fv, 0.0, 4294967295.0);
+                                        setW(cpu, rd_idx, @intFromFloat(clamped));
+                                    }
+                                }
+                            }
+                        },
+                        .fop_misc => {
+                            const is_dbl = (d.imm & 1) != 0;
+                            const sub_op: u3 = @truncate((d.imm >> 1) & 7);
+                            const rd_idx: u5 = @truncate(d.rd);
+                            const rn_idx: u5 = @truncate(d.rn);
+                            const rm_idx: u5 = @truncate(d.rm);
+                            if (sub_op == 4) { // FCSEL
+                                const cond: u4 = @truncate(d.imm >> 4);
+                                const sel = if (evalCond(cpu.pstate, cond)) cpu.vfp.v[rn_idx] else cpu.vfp.v[rm_idx];
+                                cpu.vfp.v[rd_idx] = if (is_dbl) @as(u64, @truncate(sel)) else @as(u32, @truncate(sel));
+                            } else if (is_dbl) {
+                                const a: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[rn_idx])));
+                                if (sub_op == 0) {
+                                    cpu.vfp.v[rd_idx] = @as(u64, @bitCast(@sqrt(a)));
+                                } else {
+                                    const b: f64 = @bitCast(@as(u64, @truncate(cpu.vfp.v[rm_idx])));
+                                    const res: f64 = switch (sub_op) {
+                                        1 => @max(a, b),
+                                        2 => @min(a, b),
+                                        else => -(a * b),
+                                    };
+                                    cpu.vfp.v[rd_idx] = @as(u64, @bitCast(res));
+                                }
+                            } else {
+                                const a: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[rn_idx])));
+                                if (sub_op == 0) {
+                                    cpu.vfp.v[rd_idx] = @as(u32, @bitCast(@sqrt(a)));
+                                } else {
+                                    const b: f32 = @bitCast(@as(u32, @truncate(cpu.vfp.v[rm_idx])));
+                                    const res: f32 = switch (sub_op) {
+                                        1 => @max(a, b),
+                                        2 => @min(a, b),
+                                        else => -(a * b),
+                                    };
+                                    cpu.vfp.v[rd_idx] = @as(u32, @bitCast(res));
+                                }
+                            }
+                        },
+                        .simd_mul_mla => {
+                            const mask: u128 = if ((d.imm & 1) != 0) ~@as(u128, 0) else 0xffff_ffff_ffff_ffff;
+                            const kind: u2 = @truncate((d.imm >> 1) & 3);
+                            const size: u2 = @truncate(d.imm >> 3);
+                            const rd_idx: u5 = @truncate(d.rd);
+                            const raw_a = cpu.vfp.v[@as(u5, @truncate(d.rn))];
+                            const raw_b = cpu.vfp.v[@as(u5, @truncate(d.rm))];
+                            const raw_d = cpu.vfp.v[rd_idx];
+                            const res128: u128 = switch (size) {
+                                0 => blk: {
+                                    const va: @Vector(16, u8) = @bitCast(raw_a);
+                                    const vb: @Vector(16, u8) = @bitCast(raw_b);
+                                    const prod = va *% vb;
+                                    if (kind == 0) break :blk @bitCast(prod);
+                                    const vd: @Vector(16, u8) = @bitCast(raw_d);
+                                    break :blk @bitCast(if (kind == 1) (vd +% prod) else (vd -% prod));
+                                },
+                                1 => blk: {
+                                    const va: @Vector(8, u16) = @bitCast(raw_a);
+                                    const vb: @Vector(8, u16) = @bitCast(raw_b);
+                                    const prod = va *% vb;
+                                    if (kind == 0) break :blk @bitCast(prod);
+                                    const vd: @Vector(8, u16) = @bitCast(raw_d);
+                                    break :blk @bitCast(if (kind == 1) (vd +% prod) else (vd -% prod));
+                                },
+                                else => blk: {
+                                    const va: @Vector(4, u32) = @bitCast(raw_a);
+                                    const vb: @Vector(4, u32) = @bitCast(raw_b);
+                                    const prod = va *% vb;
+                                    if (kind == 0) break :blk @bitCast(prod);
+                                    const vd: @Vector(4, u32) = @bitCast(raw_d);
+                                    break :blk @bitCast(if (kind == 1) (vd +% prod) else (vd -% prod));
+                                },
+                            };
+                            cpu.vfp.v[rd_idx] = res128 & mask;
+                        },
+                        .simd_xtn_shrn => {
+                            const q = (d.imm & 1) != 0;
+                            const round: u64 = d.imm >> 1;
+                            const size: u2 = @truncate(d.rm & 3);
+                            const rshift: u6 = @truncate(d.rm >> 2);
+                            const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
+                            const rd_idx: u5 = @truncate(d.rd);
+                            const narrow64: u64 = switch (size) {
+                                0 => blk: {
+                                    const v16: @Vector(8, u16) = @bitCast(va);
+                                    const rvec: @Vector(8, u16) = @splat(@truncate(round));
+                                    const shvec: @Vector(8, u4) = @splat(@truncate(rshift));
+                                    const narrow: @Vector(8, u8) = @truncate((v16 +% rvec) >> shvec);
+                                    break :blk @bitCast(narrow);
+                                },
+                                1 => blk: {
+                                    const v32: @Vector(4, u32) = @bitCast(va);
+                                    const rvec: @Vector(4, u32) = @splat(@truncate(round));
+                                    const shvec: @Vector(4, u5) = @splat(@truncate(rshift));
+                                    const narrow: @Vector(4, u16) = @truncate((v32 +% rvec) >> shvec);
+                                    break :blk @bitCast(narrow);
+                                },
+                                else => blk: {
+                                    const v64: @Vector(2, u64) = @bitCast(va);
+                                    const rvec: @Vector(2, u64) = @splat(round);
+                                    const shvec: @Vector(2, u6) = @splat(rshift);
+                                    const narrow: @Vector(2, u32) = @truncate((v64 +% rvec) >> shvec);
+                                    break :blk @bitCast(narrow);
+                                },
+                            };
+                            if (q) {
+                                cpu.vfp.v[rd_idx] = (cpu.vfp.v[rd_idx] & 0xffff_ffff_ffff_ffff) | (@as(u128, narrow64) << 64);
+                            } else {
+                                cpu.vfp.v[rd_idx] = narrow64;
+                            }
+                        },
+                        .simd_shll => {
+                            const q = (d.imm & 1) != 0;
+                            const is_unsigned = ((d.imm >> 1) & 1) != 0;
+                            const size: u2 = @truncate(d.imm >> 2);
+                            const lshift: u6 = @truncate(d.rm);
+                            const va = cpu.vfp.v[@as(u5, @truncate(d.rn))];
+                            const src64: u64 = if (q) @truncate(va >> 64) else @truncate(va);
+                            const out128: u128 = switch (size) {
+                                0 => if (is_unsigned) blk: {
+                                    const v8: @Vector(8, u8) = @bitCast(src64);
+                                    const wide: @Vector(8, u16) = v8;
+                                    const sh: @Vector(8, u4) = @splat(@truncate(lshift));
+                                    break :blk @bitCast(wide << sh);
+                                } else blk: {
+                                    const v8: @Vector(8, i8) = @bitCast(src64);
+                                    const wide: @Vector(8, u16) = @bitCast(@as(@Vector(8, i16), v8));
+                                    const sh: @Vector(8, u4) = @splat(@truncate(lshift));
+                                    break :blk @bitCast(wide << sh);
+                                },
+                                1 => if (is_unsigned) blk: {
+                                    const v16: @Vector(4, u16) = @bitCast(src64);
+                                    const wide: @Vector(4, u32) = v16;
+                                    const sh: @Vector(4, u5) = @splat(@truncate(lshift));
+                                    break :blk @bitCast(wide << sh);
+                                } else blk: {
+                                    const v16: @Vector(4, i16) = @bitCast(src64);
+                                    const wide: @Vector(4, u32) = @bitCast(@as(@Vector(4, i32), v16));
+                                    const sh: @Vector(4, u5) = @splat(@truncate(lshift));
+                                    break :blk @bitCast(wide << sh);
+                                },
+                                else => if (is_unsigned) blk: {
+                                    const v32: @Vector(2, u32) = @bitCast(src64);
+                                    const wide: @Vector(2, u64) = v32;
+                                    const sh: @Vector(2, u6) = @splat(lshift);
+                                    break :blk @bitCast(wide << sh);
+                                } else blk: {
+                                    const v32: @Vector(2, i32) = @bitCast(src64);
+                                    const wide: @Vector(2, u64) = @bitCast(@as(@Vector(2, i64), v32));
+                                    const sh: @Vector(2, u6) = @splat(lshift);
+                                    break :blk @bitCast(wide << sh);
+                                },
+                            };
+                            cpu.vfp.v[@as(u5, @truncate(d.rd))] = out128;
+                        },
+                        .fp_simd => executeFpSimd(cpu, inst),
+                        .nop => {},
+                        .jit_trace => {
+                            const max_jit_first: usize = (batch_end - executed) + 1;
+                            if (max_jit_first >= d.rd) {
+                                var cur_d = d;
+                                var cur_entry_pc = cur_pc;
+                                var chain_count: u8 = 0;
+                                while (true) {
+                                    const max_jit: usize = (batch_end - executed) + 1;
+                                    cpu.pc64 = code_vbase;
+                                    const fn_ptr: jit_mod.JitFn = @ptrFromInt(@as(usize, @truncate(cur_d.imm)));
+                                    const sp_ptr = &cpu.sp_el[spIndex(cpu)];
+                                    const tlb_ptr = &cpu.mmu.soft_tlb64[priv][0];
+                                    const ran = fn_ptr(cpu, bus, bus.ram.ptr, tlb_ptr, max_jit, sp_ptr);
+                                    executed += ran - 1;
+                                    const new_priv: u1 = @intFromBool(currentEl(cpu) != 0);
+                                    if (new_priv != priv or cpu.mmu.halted_wfi or cpu.yield_slice) {
+                                        priv = new_priv;
+                                        code_vbase = 0xffff_ffff_ffff_ffff;
+                                        data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                        break;
+                                    }
+                                    const next_pc = cpu.pc64;
+                                    if ((next_pc & ~@as(u64, 0xfff)) != code_vbase) {
+                                        if ((next_pc & 3) != 0) {
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            break;
+                                        }
+                                        const islot = cpu.mmu.soft_tlb64[priv][(next_pc >> 12) & mmu_mod.Mmu.soft_tlb_mask];
+                                        if ((next_pc & ~@as(u64, 0xfff)) == islot.x_vbase) {
+                                            code_vbase = islot.x_vbase;
+                                            code_pbase = islot.pbase;
+                                            code_page_ptr = bus.ram.ptr + code_pbase;
+                                            code_page_idx = CpuType.icachePageIdx(code_pbase);
+                                            code_icache_ptr = cpu.prepareIcachePage(code_page_idx, code_pbase);
+                                        } else {
+                                            code_vbase = 0xffff_ffff_ffff_ffff;
+                                            break;
+                                        }
+                                    }
+                                    if (chain_count >= 16 or next_pc == cur_entry_pc or executed >= batch_end) break;
+                                    const next_d = code_icache_ptr[(next_pc >> 2) & 0x3ff];
+                                    if (next_d.op == @backingInt(A64Op.jit_trace) and (batch_end - executed) >= next_d.rd) {
+                                        executed += 1;
+                                        cur_d = next_d;
+                                        cur_entry_pc = next_pc;
+                                        chain_count += 1;
+                                        continue;
+                                    }
+                                    noteBlockEntry64(cpu, SlotType, code_page_idx, code_icache_ptr, code_page_ptr, next_pc);
+                                    break;
+                                }
+                            } else if (batch_end < max_steps and (max_steps - executed) + 1 >= d.rd) {
+                                cpu.pc64 = cur_pc;
+                                executed -= 1;
+                                if (checkInterrupts64(cpu, bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                }
+                                break;
+                            } else {
+                                executeSingleA64(cpu, bus, cur_pc, inst) catch {
+                                    handleAbort64(cpu, cur_pc);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                };
+                                if (checkInterrupts64(cpu, bus)) {
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff_ffff_ffff;
+                                    data_r_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    data_w_vbase = @splat(0xffff_ffff_ffff_ffff);
+                                    continue;
+                                }
+                            }
+                        },
+                    }
                 }
             }
 
@@ -8529,13 +8529,13 @@ test "AArch64 pre-decoded atomics, SBFM/SXTW, variable shifts, extended add, ind
     }
 
     const SlotType = @TypeOf(cpu.icache[0]);
-    try std.testing.expectEqual(Exec.A64Op.ldxr64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[0]).op)));
-    try std.testing.expectEqual(Exec.A64Op.stxr64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[2]).op)));
-    try std.testing.expectEqual(Exec.A64Op.ldrsw_uimm, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[4]).op)));
-    try std.testing.expectEqual(Exec.A64Op.sbfm64_r, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[5]).op)));
-    try std.testing.expectEqual(Exec.A64Op.lslv64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[7]).op)));
-    try std.testing.expectEqual(Exec.A64Op.str64_reg_lsl, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[8]).op)));
-    try std.testing.expectEqual(Exec.A64Op.ldr64_reg_lsl, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[9]).op)));
+    try std.testing.expectEqual(Exec.A64Op.ldxr64, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[0]).op))));
+    try std.testing.expectEqual(Exec.A64Op.stxr64, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[2]).op))));
+    try std.testing.expectEqual(Exec.A64Op.ldrsw_uimm, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[4]).op))));
+    try std.testing.expectEqual(Exec.A64Op.sbfm64_r, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[5]).op))));
+    try std.testing.expectEqual(Exec.A64Op.lslv64, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[7]).op))));
+    try std.testing.expectEqual(Exec.A64Op.str64_reg_lsl, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[8]).op))));
+    try std.testing.expectEqual(Exec.A64Op.ldr64_reg_lsl, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[9]).op))));
 
     _ = cpu.runSteps(&bus, 16);
     try std.testing.expectEqual(@as(u64, 100), cpu.x[1]);
@@ -8617,12 +8617,12 @@ test "AArch64 pre-decoded NEON/FP load-store (LDR/STR/LDP/STP Q/D)" {
     }
 
     const SlotType = @TypeOf(cpu.icache[0]);
-    try std.testing.expectEqual(Exec.A64Op.ldp_fp128_post, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[0]).op)));
-    try std.testing.expectEqual(Exec.A64Op.stp_fp128_post, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[1]).op)));
-    try std.testing.expectEqual(Exec.A64Op.ldr_fp128_uimm, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[2]).op)));
-    try std.testing.expectEqual(Exec.A64Op.str_fp128_uimm, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[3]).op)));
-    try std.testing.expectEqual(Exec.A64Op.ldr_fp64_uimm, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[4]).op)));
-    try std.testing.expectEqual(Exec.A64Op.str_fp64_uimm, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[5]).op)));
+    try std.testing.expectEqual(Exec.A64Op.ldp_fp128_post, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[0]).op))));
+    try std.testing.expectEqual(Exec.A64Op.stp_fp128_post, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[1]).op))));
+    try std.testing.expectEqual(Exec.A64Op.ldr_fp128_uimm, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[2]).op))));
+    try std.testing.expectEqual(Exec.A64Op.str_fp128_uimm, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[3]).op))));
+    try std.testing.expectEqual(Exec.A64Op.ldr_fp64_uimm, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[4]).op))));
+    try std.testing.expectEqual(Exec.A64Op.str_fp64_uimm, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[5]).op))));
 
     _ = cpu.runSteps(&bus, 16);
     try std.testing.expectEqual(q0_val, cpu.vfp.v[0]);
@@ -8700,17 +8700,17 @@ test "AArch64 pre-decoded scalar FP and NEON vector fast-paths" {
     }
 
     const SlotType = @TypeOf(cpu.icache[0]);
-    try std.testing.expectEqual(Exec.A64Op.fmov_d_x, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[0]).op)));
-    try std.testing.expectEqual(Exec.A64Op.fadd_f64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[2]).op)));
-    try std.testing.expectEqual(Exec.A64Op.fmul_f64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[3]).op)));
-    try std.testing.expectEqual(Exec.A64Op.fcmp_f64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[4]).op)));
-    try std.testing.expectEqual(Exec.A64Op.fmov_x_d, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[5]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_movi, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[6]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_dup_gpr, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[7]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_add_8, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[8]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_cmeq_8, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[9]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_cmeqz_8, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[10]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_umov64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[11]).op)));
+    try std.testing.expectEqual(Exec.A64Op.fmov_d_x, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[0]).op))));
+    try std.testing.expectEqual(Exec.A64Op.fadd_f64, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[2]).op))));
+    try std.testing.expectEqual(Exec.A64Op.fmul_f64, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[3]).op))));
+    try std.testing.expectEqual(Exec.A64Op.fcmp_f64, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[4]).op))));
+    try std.testing.expectEqual(Exec.A64Op.fmov_x_d, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[5]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_movi, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[6]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_dup_gpr, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[7]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_add_8, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[8]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_cmeq_8, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[9]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_cmeqz_8, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[10]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_umov64, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[11]).op))));
 
     _ = cpu.runSteps(&bus, 32);
     try std.testing.expectEqual(@as(f64, 10.0), @as(f64, @bitCast(cpu.x[2])));
@@ -8872,14 +8872,14 @@ test "AArch64 pre-decoded LDPSW, FP64/128 reg-offset, and NEON LD1/ST1/EXT/USHR/
     }
 
     const SlotType = @TypeOf(cpu.icache[0]);
-    try std.testing.expectEqual(Exec.A64Op.ldpsw_post, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[0]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_ld1_mult, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[1]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_ext_q, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[2]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_ushr, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[3]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_shl, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[4]).op)));
-    try std.testing.expectEqual(Exec.A64Op.simd_st1_mult, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[5]).op)));
-    try std.testing.expectEqual(Exec.A64Op.str_fp128_reg_lsl, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[6]).op)));
-    try std.testing.expectEqual(Exec.A64Op.ldr_fp128_reg_lsl, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[7]).op)));
+    try std.testing.expectEqual(Exec.A64Op.ldpsw_post, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[0]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_ld1_mult, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[1]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_ext_q, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[2]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_ushr, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[3]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_shl, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[4]).op))));
+    try std.testing.expectEqual(Exec.A64Op.simd_st1_mult, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[5]).op))));
+    try std.testing.expectEqual(Exec.A64Op.str_fp128_reg_lsl, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[6]).op))));
+    try std.testing.expectEqual(Exec.A64Op.ldr_fp128_reg_lsl, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[7]).op))));
 
     _ = cpu.runSteps(&bus, 16);
     try std.testing.expectEqual(@as(i64, -10), @as(i64, @bitCast(cpu.x[3])));
@@ -9046,17 +9046,17 @@ test "AArch64 pre-decoded signed loads, literal loads, shifted/ext ALU, CCMP, UD
     }
 
     const SlotType = @TypeOf(cpu.icache[0]);
-    try std.testing.expectEqual(Exec.A64Op.ldrsb64_uimm, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[0]).op)));
-    try std.testing.expectEqual(Exec.A64Op.ldrsh32_uimm, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[1]).op)));
-    try std.testing.expectEqual(Exec.A64Op.ldr_lit64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[2]).op)));
-    try std.testing.expectEqual(Exec.A64Op.ldrsw_lit, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[3]).op)));
-    try std.testing.expectEqual(Exec.A64Op.ldr_fp128_lit, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[4]).op)));
-    try std.testing.expectEqual(Exec.A64Op.udiv64, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[7]).op)));
-    try std.testing.expectEqual(Exec.A64Op.sdiv32, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[8]).op)));
-    try std.testing.expectEqual(Exec.A64Op.dp_shift_reg, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[9]).op)));
-    try std.testing.expectEqual(Exec.A64Op.add_sub_ext, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[10]).op)));
-    try std.testing.expectEqual(Exec.A64Op.ccmp, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[11]).op)));
-    try std.testing.expectEqual(Exec.A64Op.maddl_mulh, @as(Exec.A64Op, @enumFromInt(Exec.decodeA64(SlotType, prog[12]).op)));
+    try std.testing.expectEqual(Exec.A64Op.ldrsb64_uimm, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[0]).op))));
+    try std.testing.expectEqual(Exec.A64Op.ldrsh32_uimm, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[1]).op))));
+    try std.testing.expectEqual(Exec.A64Op.ldr_lit64, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[2]).op))));
+    try std.testing.expectEqual(Exec.A64Op.ldrsw_lit, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[3]).op))));
+    try std.testing.expectEqual(Exec.A64Op.ldr_fp128_lit, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[4]).op))));
+    try std.testing.expectEqual(Exec.A64Op.udiv64, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[7]).op))));
+    try std.testing.expectEqual(Exec.A64Op.sdiv32, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[8]).op))));
+    try std.testing.expectEqual(Exec.A64Op.dp_shift_reg, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[9]).op))));
+    try std.testing.expectEqual(Exec.A64Op.add_sub_ext, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[10]).op))));
+    try std.testing.expectEqual(Exec.A64Op.ccmp, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[11]).op))));
+    try std.testing.expectEqual(Exec.A64Op.maddl_mulh, @as(Exec.A64Op, @fromBackingInt(@intCast(Exec.decodeA64(SlotType, prog[12]).op))));
 
     _ = cpu.runSteps(&bus, 32);
     try std.testing.expectEqual(@as(i64, -5), @as(i64, @bitCast(cpu.x[1])));
@@ -9207,7 +9207,7 @@ test "AArch64 superinstruction fusion (ADRP+ADD, ADRP+LDR, STP+MOV FP, CMP+B.con
     try std.testing.expectEqual(@as(u64, 0), cpu.x[11]);
     if (jit_mod.is_x86_64_linux) {
         const Exec = Aarch64Exec(Cpu, TestBus);
-        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1100 & 0xfff) >> 2)].op)));
+        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024 + ((0x1100 & 0xfff) >> 2)].op))));
     }
 
     // Verify hot function (BL/RET) compilation and direct trace chaining
@@ -9255,8 +9255,8 @@ test "AArch64 superinstruction fusion (ADRP+ADD, ADRP+LDR, STP+MOV FP, CMP+B.con
     if (jit_mod.is_x86_64_linux) {
         const Exec = Aarch64Exec(Cpu, TestBus);
         // Both callee (0x1200) and caller return continuation (0x1144) should be compiled into .jit_trace
-        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1200 & 0xfff) >> 2)].op)));
-        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1144 & 0xfff) >> 2)].op)));
+        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024 + ((0x1200 & 0xfff) >> 2)].op))));
+        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024 + ((0x1144 & 0xfff) >> 2)].op))));
     }
 
     // Verify AArch64 NEON SIMD / DC ZVA hot loop compiles to .jit_trace and executes accurately
@@ -9295,8 +9295,6 @@ test "AArch64 superinstruction fusion (ADRP+ADD, ADRP+LDR, STP+MOV FP, CMP+B.con
     try std.testing.expectEqual(@as(u128, 0x5a5a5a5a_5a5a5a5a_5a5a5a5a_5a5a5a5a), std.mem.readInt(u128, ram[0x2090..][0..16], .little));
     if (jit_mod.is_x86_64_linux) {
         const Exec = Aarch64Exec(Cpu, TestBus);
-        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1300 & 0xfff) >> 2)].op)));
+        try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024 + ((0x1300 & 0xfff) >> 2)].op))));
     }
 }
-
-

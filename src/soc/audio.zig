@@ -1947,4 +1947,3 @@ test "Vchiq MMAL service opens and handles component creation, port info, and pa
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, ram[slot1 + 24 + 32 ..][0..4], .little)); // input_num
     try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, ram[slot1 + 24 + 36 ..][0..4], .little)); // output_num
 }
-

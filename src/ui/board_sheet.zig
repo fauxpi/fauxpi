@@ -5454,12 +5454,13 @@ pub fn drawGpioRibbonCable(
 ) void {
     const conn_r: Rect = if (connected)
         gpio_r.outset(0.35 * s)
-    else .{
-        .x = gpio_r.x - 0.35 * s,
-        .y = gpio_r.y - 7.8 * s,
-        .w = gpio_r.w + 0.7 * s,
-        .h = gpio_r.h,
-    };
+    else
+        .{
+            .x = gpio_r.x - 0.35 * s,
+            .y = gpio_r.y - 7.8 * s,
+            .w = gpio_r.w + 0.7 * s,
+            .h = gpio_r.h,
+        };
 
     const ribbon_x = gpio_r.x + 0.8 * s;
     const ribbon_w = gpio_r.w - 1.6 * s;
@@ -7180,6 +7181,3 @@ test "BoardUi renders thermometer and temperature on CPU and opens temperature s
     }
     try testing.expect(diff_count > 10);
 }
-
-
-

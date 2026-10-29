@@ -130,7 +130,7 @@ pub const Gpio = struct {
         if (pin >= 54) return .input;
         const reg_idx = pin / 10;
         const shift: u5 = @intCast((pin % 10) * 3);
-        return @enumFromInt(@as(u3, @truncate(self.gpfsel[reg_idx] >> shift)));
+        return @fromBackingInt(@intCast(@as(u3, @truncate(self.gpfsel[reg_idx] >> shift))));
     }
 
     pub fn setPinFunction(self: *Gpio, pin: u6, func: Function) void {
@@ -138,7 +138,7 @@ pub const Gpio = struct {
         const reg_idx = pin / 10;
         const shift: u5 = @intCast((pin % 10) * 3);
         const old = self.getPinFunction(pin);
-        self.gpfsel[reg_idx] = (self.gpfsel[reg_idx] & ~(@as(u32, 7) << shift)) | (@as(u32, @intFromEnum(func)) << shift);
+        self.gpfsel[reg_idx] = (self.gpfsel[reg_idx] & ~(@as(u32, 7) << shift)) | (@as(u32, @backingInt(func)) << shift);
         if (old != func) {
             if (pin < 28) {
                 self.ext_mask &= ~(@as(u64, 1) << pin);

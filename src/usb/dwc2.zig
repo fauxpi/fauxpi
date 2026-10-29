@@ -469,7 +469,7 @@ pub const Dwc2Controller = struct {
                 // Complete-Split (CSPLIT): for SETUP stage, return the status of the SSPLIT setup
                 if (epnum == 0 and pid == 3 and !epdir_in) {
                     ch.hcchar &= ~HCCHAR_CHEN;
-                    if (self.hid.ctrl[@intFromEnum(target)].last_setup_ok) {
+                    if (self.hid.ctrl[@backingInt(target)].last_setup_ok) {
                         ch.hctsiz = (@as(u32, pid) << 29);
                         ch.hcint |= HCINT_XFERCOMP | HCINT_CHHLTD | HCINT_ACK;
                     } else {
@@ -888,4 +888,3 @@ test "DWC2 asserts GINTSTS_SOF on dwc2_hcd_urb_enqueue GINTMSK read and tickSof 
     try std.testing.expect(dwc2.irqPending());
     try std.testing.expect((dwc2.read32(0x014) & Dwc2Controller.GINTSTS_SOF) != 0);
 }
-

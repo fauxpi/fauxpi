@@ -48,5 +48,3 @@ test "40-pin GPIO header covers all 28 BCM GPIO lines" {
     };
     for (seen) |s| try testing.expect(s);
 }
-
-

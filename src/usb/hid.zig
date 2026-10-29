@@ -222,7 +222,7 @@ pub const UsbHidComposite = struct {
         self.port_status = @splat(0);
         self.port_change = @splat(0);
         self.latched_port_conn = @splat(false);
-        self.ctrl[@intFromEnum(TargetDevice.hub)] = .{};
+        self.ctrl[@backingInt(TargetDevice.hub)] = .{};
     }
 
     pub fn resetEthDevice(self: *UsbHidComposite) void {
@@ -237,7 +237,7 @@ pub const UsbHidComposite = struct {
         self.cdc_notif_count = 0;
         self.lan7800.reset();
         self.lan9514.reset();
-        self.ctrl[@intFromEnum(TargetDevice.eth)] = .{};
+        self.ctrl[@backingInt(TargetDevice.eth)] = .{};
     }
 
     pub fn resetKbdDevice(self: *UsbHidComposite) void {
@@ -245,7 +245,7 @@ pub const UsbHidComposite = struct {
         self.kbd_configured = false;
         self.kbd_idle_rate = 0;
         self.kbd_protocol = 1;
-        self.ctrl[@intFromEnum(TargetDevice.kbd)] = .{};
+        self.ctrl[@backingInt(TargetDevice.kbd)] = .{};
     }
 
     pub fn resetMouseDevice(self: *UsbHidComposite) void {
@@ -254,7 +254,7 @@ pub const UsbHidComposite = struct {
         self.has_target = false;
         self.mouse_idle_rate = 0;
         self.mouse_protocol = 1;
-        self.ctrl[@intFromEnum(TargetDevice.mouse)] = .{};
+        self.ctrl[@backingInt(TargetDevice.mouse)] = .{};
     }
 
     /// Resets the entire USB bus (triggered on DWC2 root port `HPRT0` reset).
@@ -677,7 +677,7 @@ pub const UsbHidComposite = struct {
     }
 
     pub fn readTargetControlData(self: *UsbHidComposite, target: TargetDevice, dest: []u8) usize {
-        var cs = &self.ctrl[@intFromEnum(target)];
+        var cs = &self.ctrl[@backingInt(target)];
         if (cs.pos >= cs.len) return 0;
         const avail = cs.len - cs.pos;
         const n = @min(avail, dest.len);
@@ -688,7 +688,7 @@ pub const UsbHidComposite = struct {
 
     /// Delivers the DATA OUT stage of a host-to-device control request to `target`.
     pub fn writeTargetControlData(self: *UsbHidComposite, target: TargetDevice, data: []const u8) void {
-        var cs = &self.ctrl[@intFromEnum(target)];
+        var cs = &self.ctrl[@backingInt(target)];
         const setup = cs.out_setup orelse return;
         const wLength: usize = std.mem.readInt(u16, setup[6..8], .little);
         const n = @min(data.len, @min(wLength, cs.buf.len) - cs.len);
@@ -705,7 +705,7 @@ pub const UsbHidComposite = struct {
 
     /// Processes an 8-byte USB SETUP packet for a specific `target` device. Returns true if ACKed, false if STALLed.
     pub fn handleTargetSetup(self: *UsbHidComposite, target: TargetDevice, setup: [8]u8) bool {
-        var cs = &self.ctrl[@intFromEnum(target)];
+        var cs = &self.ctrl[@backingInt(target)];
         cs.len = 0;
         cs.pos = 0;
         cs.out_setup = null;
@@ -1310,74 +1310,87 @@ pub const UsbHidComposite = struct {
 
     pub const HUB_CONFIG_DESC = [25]u8{
         // Configuration Descriptor (9 bytes, wTotalLength = 25, bNumInterfaces = 1, self-powered + remote wakeup)
-        9, 0x02, 25, 0, 1, 1, 0, 0xe0, 1,
+        9, 0x02, 25,   0,    1, 1,    0,    0xe0, 1,
         // Interface 0 Descriptor: USB Hub (9 bytes)
-        9, 0x04, 0, 0, 1, 0x09, 0x00, 0x00, 0,
+        9, 0x04, 0,    0,    1, 0x09, 0x00, 0x00, 0,
         // Endpoint 1 IN Interrupt Descriptor: Status Change Bitmap (7 bytes, bInterval = 12 -> 256ms)
-        7, 0x05, 0x81, 0x03, 1, 0, 12,
+        7, 0x05, 0x81, 0x03, 1, 0,    12,
     };
 
     pub const ETH_CONFIG_DESC = [80]u8{
         // Configuration Descriptor (9 bytes, wTotalLength = 80, bNumInterfaces = 2)
-        9, 0x02, 80, 0, 2, 1, 0, 0xa0, 50,
+        9,    0x02, 80,   0,    2,    1,    0,    0xa0, 50,
         // Interface 0 Descriptor: CDC Communications Control (9 bytes)
-        9, 0x04, 0, 0, 1, 0x02, 0x06, 0x00, 0,
+        9,    0x04, 0,    0,    1,    0x02, 0x06, 0x00, 0,
         // CDC Header Functional Descriptor (5 bytes)
-        5, 0x24, 0x00, 0x10, 0x01,
+        5,    0x24, 0x00, 0x10, 0x01,
         // CDC Union Functional Descriptor: Master=0, Slave=1 (5 bytes)
-        5, 0x24, 0x06, 0, 1,
+        5,    0x24, 0x06, 0,
+        1,
         // CDC Ethernet Networking Functional Descriptor: iMACAddress=4, wMaxSegmentSize=1514 (13 bytes)
-        13, 0x24, 0x0f, 4, 0, 0, 0, 0, 0xea, 0x05, 0, 0, 0,
+           13,   0x24, 0x0f, 4,    0,    0,    0,    0,
+        0xea, 0x05, 0,    0,    0,
         // Endpoint 1 IN Interrupt Descriptor (7 bytes, bInterval = 11 -> 128ms)
-        7, 0x05, 0x81, 0x03, 16, 0, 11,
+           7,    0x05, 0x81, 0x03,
+        16,   0,    11,
         // Interface 1 Alternate 0: CDC Data Idle (9 bytes)
-        9, 0x04, 1, 0, 0, 0x0a, 0x00, 0x00, 0,
+          9,    0x04, 1,    0,    0,    0x0a,
+        0x00, 0x00, 0,
         // Interface 1 Alternate 1: CDC Data Active (9 bytes)
-        9, 0x04, 1, 1, 2, 0x0a, 0x00, 0x00, 0,
+           9,    0x04, 1,    1,    2,    0x0a,
+        0x00, 0x00, 0,
         // Endpoint 2 IN Bulk Descriptor (7 bytes, wMaxPacketSize = 512)
-        7, 0x05, 0x82, 0x02, 0x00, 0x02, 0,
+           7,    0x05, 0x82, 0x02, 0x00, 0x02,
+        0,
         // Endpoint 2 OUT Bulk Descriptor (7 bytes, wMaxPacketSize = 512)
-        7, 0x05, 0x02, 0x02, 0x00, 0x02, 0,
+           7,    0x05, 0x02, 0x02, 0x00, 0x02, 0,
     };
 
     /// Microchip LAN7800: one vendor-specific interface with Bulk IN (EP1), Bulk OUT (EP2) and
     /// Interrupt IN (EP3) endpoints.
     pub const LAN7800_CONFIG_DESC = [39]u8{
         // Configuration Descriptor (9 bytes, wTotalLength = 39, bNumInterfaces = 1, remote wakeup)
-        9, 0x02, 39, 0, 1, 1, 0, 0xa0, 50,
+        9,    0x02, 39,   0,    1,    1,    0,    0xa0, 50,
         // Interface 0 Descriptor: vendor-specific class and protocol (9 bytes)
-        9, 0x04, 0, 0, 3, 0xff, 0x00, 0xff, 0,
+        9,    0x04, 0,    0,    3,    0xff, 0x00, 0xff, 0,
         // Endpoint 1 IN Bulk Descriptor (7 bytes, wMaxPacketSize = 512)
-        7, 0x05, 0x81, 0x02, 0x00, 0x02, 0,
+        7,    0x05, 0x81, 0x02, 0x00, 0x02, 0,
         // Endpoint 2 OUT Bulk Descriptor (7 bytes, wMaxPacketSize = 512)
-        7, 0x05, 0x02, 0x02, 0x00, 0x02, 0,
+           7,    0x05,
+        0x02, 0x02, 0x00, 0x02, 0,
         // Endpoint 3 IN Interrupt Descriptor (7 bytes, wMaxPacketSize = 16, bInterval = 4 -> 1ms)
-        7, 0x05, 0x83, 0x03, 16, 0, 4,
+           7,    0x05, 0x83, 0x03,
+        16,   0,    4,
     };
 
     /// SMSC LAN9514: one vendor-specific interface with Bulk IN (EP1), Bulk OUT (EP2) and
     /// Interrupt IN (EP3) endpoints.
     pub const LAN9514_CONFIG_DESC = [39]u8{
         // Configuration Descriptor (9 bytes, wTotalLength = 39, bNumInterfaces = 1, self-powered, remote wakeup, 2mA)
-        9, 0x02, 39, 0, 1, 1, 0, 0xe0, 1,
+        9,    0x02, 39,   0,    1,    1,    0,    0xe0, 1,
         // Interface 0 Descriptor: vendor-specific class and protocol (9 bytes)
-        9, 0x04, 0, 0, 3, 0xff, 0x00, 0xff, 0,
+        9,    0x04, 0,    0,    3,    0xff, 0x00, 0xff, 0,
         // Endpoint 1 IN Bulk Descriptor (7 bytes, wMaxPacketSize = 512)
-        7, 0x05, 0x81, 0x02, 0x00, 0x02, 0,
+        7,    0x05, 0x81, 0x02, 0x00, 0x02, 0,
         // Endpoint 2 OUT Bulk Descriptor (7 bytes, wMaxPacketSize = 512)
-        7, 0x05, 0x02, 0x02, 0x00, 0x02, 0,
+           7,    0x05,
+        0x02, 0x02, 0x00, 0x02, 0,
         // Endpoint 3 IN Interrupt Descriptor (7 bytes, wMaxPacketSize = 16, bInterval = 4 -> 1ms)
-        7, 0x05, 0x83, 0x03, 16, 0, 4,
+           7,    0x05, 0x83, 0x03,
+        16,   0,    4,
     };
 
     /// LAN7800 Binary Object Store: USB 2.0 Extension (LPM) and SuperSpeed USB device capabilities.
     pub const LAN7800_BOS_DESC = [22]u8{
         // BOS Descriptor (5 bytes, wTotalLength = 22, bNumDeviceCaps = 2)
-        5, 0x0f, 22, 0, 2,
+        5,    0x0f, 22,   0,    2,
         // USB 2.0 Extension: Link Power Management supported (7 bytes)
-        7, 0x10, 0x02, 0x02, 0x00, 0x00, 0x00,
+        7,    0x10, 0x02, 0x02, 0x00,
+        0x00, 0x00,
         // SuperSpeed USB: Full/High/SuperSpeed, functional from Full-Speed, U1 10us, U2 2047us (10 bytes)
-        10, 0x10, 0x03, 0x00, 0x0e, 0x00, 0x01, 0x0a, 0xff, 0x07,
+        10,   0x10, 0x03,
+        0x00, 0x0e, 0x00, 0x01, 0x0a,
+        0xff, 0x07,
     };
 
     pub const KBD_DEVICE_DESC = [18]u8{
@@ -1481,24 +1494,24 @@ pub const UsbHidComposite = struct {
 
     pub const KBD_CONFIG_DESC = [34]u8{
         // Configuration Descriptor (9 bytes, wTotalLength = 34, bNumInterfaces = 1)
-        9, 0x02, 34, 0, 1, 1, 0, 0xa0, 50,
+        9, 0x02, 34,   0,    1, 1,    0,    0xa0,                50,
         // Interface 0 Descriptor: HID Boot Keyboard (9 bytes, offset 9)
-        9, 0x04, 0, 0, 1, 0x03, 0x01, 0x01, 0,
+        9, 0x04, 0,    0,    1, 0x03, 0x01, 0x01,                0,
         // HID Descriptor (9 bytes, offset 18)
-        9, 0x21, 0x11, 0x01, 0, 1, 0x22, KBD_REPORT_DESC.len, 0,
+        9, 0x21, 0x11, 0x01, 0, 1,    0x22, KBD_REPORT_DESC.len, 0,
         // Endpoint 1 IN Descriptor (7 bytes, offset 27, bInterval = 10 -> 10ms)
-        7, 0x05, 0x81, 0x03, 8, 0, 10,
+        7, 0x05, 0x81, 0x03, 8, 0,    10,
     };
 
     pub const MOUSE_CONFIG_DESC = [34]u8{
         // Configuration Descriptor (9 bytes, wTotalLength = 34, bNumInterfaces = 1)
-        9, 0x02, 34, 0, 1, 1, 0, 0xa0, 50,
+        9, 0x02, 34,   0,    1, 1,    0,    0xa0,                  50,
         // Interface 0 Descriptor: HID Boot Mouse (9 bytes, offset 9)
-        9, 0x04, 0, 0, 1, 0x03, 0x01, 0x02, 0,
+        9, 0x04, 0,    0,    1, 0x03, 0x01, 0x02,                  0,
         // HID Descriptor (9 bytes, offset 18)
-        9, 0x21, 0x11, 0x01, 0, 1, 0x22, MOUSE_REPORT_DESC.len, 0,
+        9, 0x21, 0x11, 0x01, 0, 1,    0x22, MOUSE_REPORT_DESC.len, 0,
         // Endpoint 1 IN Descriptor (7 bytes, offset 27, bInterval = 10 -> 10ms)
-        7, 0x05, 0x81, 0x03, 4, 0, 10,
+        7, 0x05, 0x81, 0x03, 4, 0,    10,
     };
 
     fn evdevToModifierBit(evdev_key: u32) ?u8 {
@@ -1672,8 +1685,6 @@ test "USB HubKind mapping for RPi boards and separate Hub/Ethernet/Keyboard/Mous
     try std.testing.expect((hub_desc[3] & 0x04) != 0); // HUB_CHAR_COMPOUND
     try std.testing.expectEqual(@as(u8, 0x02), hub_desc[7]); // DeviceRemovable: Port 1 fixed, Ports 2..5 removable
 }
-
-
 
 test "USB LAN7515 Ethernet presents a LAN7800 with vendor register access" {
     var hid = UsbHidComposite{};

@@ -350,22 +350,22 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
     if (cond == 0xf) {
         if ((inst & 0x0f00_0000) == 0x0500_0000 or (inst & 0x0f00_0000) == 0x0700_0000) {
             if ((inst & 0x0fff_fff0) == 0x057f_f010) {
-                return .{ .raw = inst, .op = @intFromEnum(ArmOp.clrex_al) };
+                return .{ .raw = inst, .op = @backingInt(ArmOp.clrex_al) };
             } else if ((inst & 0x0fff_ffe0) == 0x057f_f040) {
-                return .{ .raw = inst, .op = @intFromEnum(ArmOp.dmb_dsb_v7_al), .rd = @intFromBool((inst & 0x10) == 0) };
+                return .{ .raw = inst, .op = @backingInt(ArmOp.dmb_dsb_v7_al), .rd = @intFromBool((inst & 0x10) == 0) };
             }
-            return .{ .raw = inst, .op = @intFromEnum(ArmOp.nop_al) }; // PLD / PLI / ISB
+            return .{ .raw = inst, .op = @backingInt(ArmOp.nop_al) }; // PLD / PLI / ISB
         }
         if ((inst & 0x0ff3_0020) == 0x0100_0000) {
             const imod: u2 = @truncate((inst >> 18) & 3);
             const mask_bits: u32 = inst & 0x1c0;
             if (imod == 0b11) {
-                return .{ .raw = inst, .op = @intFromEnum(ArmOp.cpsid_al), .imm = mask_bits };
+                return .{ .raw = inst, .op = @backingInt(ArmOp.cpsid_al), .imm = mask_bits };
             } else if (imod == 0b10) {
-                return .{ .raw = inst, .op = @intFromEnum(ArmOp.cpsie_al), .imm = ~mask_bits };
+                return .{ .raw = inst, .op = @backingInt(ArmOp.cpsie_al), .imm = ~mask_bits };
             }
         }
-        return .{ .raw = inst, .op = @intFromEnum(ArmOp.unconditional) };
+        return .{ .raw = inst, .op = @backingInt(ArmOp.unconditional) };
     }
     const top3: u3 = @truncate((inst >> 25) & 7);
     switch (top3) {
@@ -386,7 +386,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             if (mul_op == 0b000) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(ArmOp.mul_al),
+                                    .op = @backingInt(ArmOp.mul_al),
                                     .rd = rd_hi,
                                     .rn = rs,
                                     .rm = rm,
@@ -404,7 +404,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 if (m_op) |mop| {
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(mop),
+                                        .op = @backingInt(mop),
                                         .rd = rd_hi,
                                         .rn = rs,
                                         .rm = rm,
@@ -420,14 +420,14 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                         const rm: u4 = @truncate(inst & 0xf);
                         if (rd != 15 and rn != 15) {
                             switch (sync_op) {
-                                0b1001 => return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldrex_al), .rd = rd, .rn = rn },
-                                0b1000 => if (rm != 15) return .{ .raw = inst, .op = @intFromEnum(ArmOp.strex_al), .rd = rd, .rn = rn, .rm = rm },
-                                0b1011 => if ((rd & 1) == 0 and rd != 14) return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldrexd_al), .rd = rd, .rn = rn },
-                                0b1010 => if ((rm & 1) == 0 and rm != 14) return .{ .raw = inst, .op = @intFromEnum(ArmOp.strexd_al), .rd = rd, .rn = rn, .rm = rm },
-                                0b1101 => return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldrexb_al), .rd = rd, .rn = rn },
-                                0b1100 => if (rm != 15) return .{ .raw = inst, .op = @intFromEnum(ArmOp.strexb_al), .rd = rd, .rn = rn, .rm = rm },
-                                0b1111 => return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldrexh_al), .rd = rd, .rn = rn },
-                                0b1110 => if (rm != 15) return .{ .raw = inst, .op = @intFromEnum(ArmOp.strexh_al), .rd = rd, .rn = rn, .rm = rm },
+                                0b1001 => return .{ .raw = inst, .op = @backingInt(ArmOp.ldrex_al), .rd = rd, .rn = rn },
+                                0b1000 => if (rm != 15) return .{ .raw = inst, .op = @backingInt(ArmOp.strex_al), .rd = rd, .rn = rn, .rm = rm },
+                                0b1011 => if ((rd & 1) == 0 and rd != 14) return .{ .raw = inst, .op = @backingInt(ArmOp.ldrexd_al), .rd = rd, .rn = rn },
+                                0b1010 => if ((rm & 1) == 0 and rm != 14) return .{ .raw = inst, .op = @backingInt(ArmOp.strexd_al), .rd = rd, .rn = rn, .rm = rm },
+                                0b1101 => return .{ .raw = inst, .op = @backingInt(ArmOp.ldrexb_al), .rd = rd, .rn = rn },
+                                0b1100 => if (rm != 15) return .{ .raw = inst, .op = @backingInt(ArmOp.strexb_al), .rd = rd, .rn = rn, .rm = rm },
+                                0b1111 => return .{ .raw = inst, .op = @backingInt(ArmOp.ldrexh_al), .rd = rd, .rn = rn },
+                                0b1110 => if (rm != 15) return .{ .raw = inst, .op = @backingInt(ArmOp.strexh_al), .rd = rd, .rn = rn, .rm = rm },
                                 else => {},
                             }
                         }
@@ -444,7 +444,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             if (sh == 0b01) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (l) ArmOp.ldrh_imm_al else ArmOp.strh_imm_al),
+                                    .op = @backingInt(if (l) ArmOp.ldrh_imm_al else ArmOp.strh_imm_al),
                                     .rd = rd,
                                     .rn = rn,
                                     .imm = signed_off,
@@ -452,7 +452,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             } else if (l) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (sh == 0b10) ArmOp.ldrsb_imm_al else ArmOp.ldrsh_imm_al),
+                                    .op = @backingInt(if (sh == 0b10) ArmOp.ldrsb_imm_al else ArmOp.ldrsh_imm_al),
                                     .rd = rd,
                                     .rn = rn,
                                     .imm = signed_off,
@@ -460,7 +460,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             } else if ((rd & 1) == 0 and rd != 14) {
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (sh == 0b10) ArmOp.ldrd_imm_al else ArmOp.strd_imm_al),
+                                    .op = @backingInt(if (sh == 0b10) ArmOp.ldrd_imm_al else ArmOp.strd_imm_al),
                                     .rd = rd,
                                     .rn = rn,
                                     .imm = signed_off,
@@ -472,7 +472,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 if (sh == 0b01) {
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(if (l) ArmOp.ldrh_reg_al else ArmOp.strh_reg_al),
+                                        .op = @backingInt(if (l) ArmOp.ldrh_reg_al else ArmOp.strh_reg_al),
                                         .rd = rd,
                                         .rn = rn,
                                         .rm = rm,
@@ -480,7 +480,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 } else if (l) {
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(if (sh == 0b10) ArmOp.ldrsb_reg_al else ArmOp.ldrsh_reg_al),
+                                        .op = @backingInt(if (sh == 0b10) ArmOp.ldrsb_reg_al else ArmOp.ldrsh_reg_al),
                                         .rd = rd,
                                         .rn = rn,
                                         .rm = rm,
@@ -490,40 +490,40 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                         }
                     }
                 }
-                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mul_extra_ls) };
+                return .{ .raw = inst, .op = @backingInt(ArmOp.mul_extra_ls) };
             }
 
             const op: u4 = @truncate((inst >> 21) & 0xf);
             const s = (inst & (1 << 20)) != 0;
             if ((op & 0b1100) == 0b1000 and !s) {
                 if ((inst & 0x0fff_ffff) == 0x012f_ff1e) {
-                    return .{ .raw = inst, .op = @intFromEnum(ArmOp.bx_lr_al) };
+                    return .{ .raw = inst, .op = @backingInt(ArmOp.bx_lr_al) };
                 }
                 if ((inst & 0x0fff_0fff) == 0x010f_0000) {
                     const rd: u4 = @truncate((inst >> 12) & 0xf);
                     if (rd != 15) {
-                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.mrs_cpsr_al), .rd = rd };
+                        return .{ .raw = inst, .op = @backingInt(ArmOp.mrs_cpsr_al), .rd = rd };
                     }
                 }
                 const rm: u4 = @truncate(inst & 0xf);
                 if (rm != 15) {
                     if ((inst & 0x0fff_fff0) == 0x012f_ff10) {
-                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.bx_reg_al), .rm = rm };
+                        return .{ .raw = inst, .op = @backingInt(ArmOp.bx_reg_al), .rm = rm };
                     }
                     if ((inst & 0x0fff_fff0) == 0x012f_ff30) {
-                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.blx_reg_al), .rm = rm };
+                        return .{ .raw = inst, .op = @backingInt(ArmOp.blx_reg_al), .rm = rm };
                     }
                     if ((inst & 0x0fff_0ff0) == 0x016f_0f10) {
                         const rd: u4 = @truncate((inst >> 12) & 0xf);
                         if (rd != 15) {
-                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.clz_al), .rd = rd, .rm = rm };
+                            return .{ .raw = inst, .op = @backingInt(ArmOp.clz_al), .rd = rd, .rm = rm };
                         }
                     }
                     if ((inst & 0x0fff_fff0) == 0x0121_f000) {
-                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.msr_cpsr_c_al), .rm = rm };
+                        return .{ .raw = inst, .op = @backingInt(ArmOp.msr_cpsr_c_al), .rm = rm };
                     }
                 }
-                return .{ .raw = inst, .op = @intFromEnum(ArmOp.misc_000) };
+                return .{ .raw = inst, .op = @backingInt(ArmOp.misc_000) };
             }
 
             if (!bit4) {
@@ -551,7 +551,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             else => null,
                         };
                         if (fast_op) |fop| {
-                            return .{ .raw = inst, .op = @intFromEnum(fop), .rd = rd, .rn = rn, .rm = rm };
+                            return .{ .raw = inst, .op = @backingInt(fop), .rd = rd, .rn = rn, .rm = rm };
                         }
                     } else if (s and rn != 15) {
                         const fast_s: ?ArmOp = switch (op) {
@@ -566,7 +566,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             else => null,
                         };
                         if (fast_s) |fs| {
-                            return .{ .raw = inst, .op = @intFromEnum(fs), .rd = rd, .rn = rn, .rm = rm };
+                            return .{ .raw = inst, .op = @backingInt(fs), .rd = rd, .rn = rn, .rm = rm };
                         }
                     }
                 } else if (!s and shift_imm != 0 and rd != 15 and rm != 15) {
@@ -578,12 +578,12 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             else => null,
                         };
                         if (sh_op) |sop| {
-                            return .{ .raw = inst, .op = @intFromEnum(sop), .rd = rd, .rm = rm, .imm = shift_imm };
+                            return .{ .raw = inst, .op = @backingInt(sop), .rd = rd, .rm = rm, .imm = shift_imm };
                         }
                     } else if (op == 0xf and (shift_type == 0b00 or shift_type == 0b01)) {
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(if (shift_type == 0b00) ArmOp.mvn_lsl_imm_al else ArmOp.mvn_lsr_imm_al),
+                            .op = @backingInt(if (shift_type == 0b00) ArmOp.mvn_lsl_imm_al else ArmOp.mvn_lsr_imm_al),
                             .rd = rd,
                             .rm = rm,
                             .imm = shift_imm,
@@ -601,7 +601,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 else => null,
                             };
                             if (lsl_op) |lop| {
-                                return .{ .raw = inst, .op = @intFromEnum(lop), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
+                                return .{ .raw = inst, .op = @backingInt(lop), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
                             }
                         } else if (shift_type == 0b01) {
                             const lsr_op: ?ArmOp = switch (op) {
@@ -615,7 +615,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 else => null,
                             };
                             if (lsr_op) |lop| {
-                                return .{ .raw = inst, .op = @intFromEnum(lop), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
+                                return .{ .raw = inst, .op = @backingInt(lop), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
                             }
                         } else if (shift_type == 0b10) {
                             const asr_op: ?ArmOp = switch (op) {
@@ -627,7 +627,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 else => null,
                             };
                             if (asr_op) |aop| {
-                                return .{ .raw = inst, .op = @intFromEnum(aop), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
+                                return .{ .raw = inst, .op = @backingInt(aop), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
                             }
                         }
                     }
@@ -635,7 +635,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                     if (op == 0xa) {
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(if (shift_type == 0b00) ArmOp.cmp_lsl_reg_al else ArmOp.cmp_lsr_reg_al),
+                            .op = @backingInt(if (shift_type == 0b00) ArmOp.cmp_lsl_reg_al else ArmOp.cmp_lsr_reg_al),
                             .rn = rn,
                             .rm = rm,
                             .imm = shift_imm,
@@ -643,7 +643,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                     } else if (op == 0x8) {
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(if (shift_type == 0b00) ArmOp.tst_lsl_reg_al else ArmOp.tst_lsr_reg_al),
+                            .op = @backingInt(if (shift_type == 0b00) ArmOp.tst_lsl_reg_al else ArmOp.tst_lsr_reg_al),
                             .rn = rn,
                             .rm = rm,
                             .imm = shift_imm,
@@ -651,7 +651,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                     }
                 }
             }
-            return .{ .raw = inst, .op = @intFromEnum(ArmOp.dp_reg_general) };
+            return .{ .raw = inst, .op = @backingInt(ArmOp.dp_reg_general) };
         },
         0b001 => {
             const op: u4 = @truncate((inst >> 21) & 0xf);
@@ -663,7 +663,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                     const imm16: u32 = (((inst >> 16) & 0xf) << 12) | (inst & 0xfff);
                     return .{
                         .raw = inst,
-                        .op = @intFromEnum(if (op == 0b1000) ArmOp.movw_al else ArmOp.movt_al),
+                        .op = @backingInt(if (op == 0b1000) ArmOp.movw_al else ArmOp.movt_al),
                         .rd = rd,
                         .imm = imm16,
                     };
@@ -671,12 +671,12 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                 if (op == 0b1001 and rn == 0) {
                     const hint = inst & 0xff;
                     if (hint == 0 or hint > 3) {
-                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.nop_al), .rd = if (hint == 4) 4 else 0 };
+                        return .{ .raw = inst, .op = @backingInt(ArmOp.nop_al), .rd = if (hint == 4) 4 else 0 };
                     } else if (hint == 1 or hint == 2) {
-                        return .{ .raw = inst, .op = @intFromEnum(ArmOp.yield_wfe_al) };
+                        return .{ .raw = inst, .op = @backingInt(ArmOp.yield_wfe_al) };
                     }
                 }
-                return .{ .raw = inst, .op = @intFromEnum(ArmOp.dp_imm_general) };
+                return .{ .raw = inst, .op = @backingInt(ArmOp.dp_imm_general) };
             }
 
             const imm8: u32 = inst & 0xff;
@@ -700,7 +700,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                     else => null,
                 };
                 if (fast_op) |fop| {
-                    return .{ .raw = inst, .op = @intFromEnum(fop), .rd = rd, .rn = rn, .imm = imm32 };
+                    return .{ .raw = inst, .op = @backingInt(fop), .rd = rd, .rn = rn, .imm = imm32 };
                 }
             } else if (s and rn != 15) {
                 const fast_s: ?ArmOp = switch (op) {
@@ -715,10 +715,10 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                     else => null,
                 };
                 if (fast_s) |fs| {
-                    return .{ .raw = inst, .op = @intFromEnum(fs), .rd = rd, .rn = rn, .imm = imm32 };
+                    return .{ .raw = inst, .op = @backingInt(fs), .rd = rd, .rn = rn, .imm = imm32 };
                 }
             }
-            return .{ .raw = inst, .op = @intFromEnum(ArmOp.dp_imm_general) };
+            return .{ .raw = inst, .op = @backingInt(ArmOp.dp_imm_general) };
         },
         0b010 => {
             const p = (inst & (1 << 24)) != 0;
@@ -736,9 +736,9 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                         (if (b) .ldrb_imm_al else .ldr_imm_al)
                     else
                         (if (b) .strb_imm_al else .str_imm_al);
-                    return .{ .raw = inst, .op = @intFromEnum(ls_op), .rd = rd, .rn = rn, .imm = signed_off };
+                    return .{ .raw = inst, .op = @backingInt(ls_op), .rd = rd, .rn = rn, .imm = signed_off };
                 } else if (l and !b) {
-                    return .{ .raw = inst, .op = @intFromEnum(ArmOp.ldr_lit_al), .rd = rd, .imm = signed_off };
+                    return .{ .raw = inst, .op = @backingInt(ArmOp.ldr_lit_al), .rd = rd, .imm = signed_off };
                 }
             } else if ((p and w) or (!p and !w)) {
                 // Pre-index with writeback (`p and w`) or post-index (`!p and !w`, not LDRT/STRT)
@@ -749,10 +749,10 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                         (if (b) .ldrb_wb_al else .ldr_wb_al)
                     else
                         (if (b) .strb_wb_al else .str_wb_al);
-                    return .{ .raw = inst, .op = @intFromEnum(wb_op), .rd = rd, .rn = rn, .imm = packed_imm };
+                    return .{ .raw = inst, .op = @backingInt(wb_op), .rd = rd, .rn = rn, .imm = packed_imm };
                 }
             }
-            return .{ .raw = inst, .op = @intFromEnum(ArmOp.ls_wb_imm) };
+            return .{ .raw = inst, .op = @backingInt(ArmOp.ls_wb_imm) };
         },
         0b011 => {
             if ((inst & (1 << 4)) != 0) {
@@ -768,7 +768,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                     if (div_rd != 15 and div_rn != 15 and div_rm != 15) {
                         return .{
                             .raw = inst,
-                            .op = @intFromEnum(if (op1 == 0b10011) ArmOp.udiv_al else ArmOp.sdiv_al),
+                            .op = @backingInt(if (op1 == 0b10011) ArmOp.udiv_al else ArmOp.sdiv_al),
                             .rd = div_rd,
                             .rn = div_rn,
                             .rm = div_rm,
@@ -782,7 +782,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             switch (op1) {
                                 0b01110 => return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (rn == 15) ArmOp.uxtb_al else ArmOp.uxtab_al),
+                                    .op = @backingInt(if (rn == 15) ArmOp.uxtb_al else ArmOp.uxtab_al),
                                     .rd = rd,
                                     .rn = rn,
                                     .rm = rm,
@@ -790,7 +790,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 },
                                 0b01111 => return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (rn == 15) ArmOp.uxth_al else ArmOp.uxtah_al),
+                                    .op = @backingInt(if (rn == 15) ArmOp.uxth_al else ArmOp.uxtah_al),
                                     .rd = rd,
                                     .rn = rn,
                                     .rm = rm,
@@ -798,7 +798,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 },
                                 0b01010 => return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (rn == 15) ArmOp.sxtb_al else ArmOp.sxtab_al),
+                                    .op = @backingInt(if (rn == 15) ArmOp.sxtb_al else ArmOp.sxtab_al),
                                     .rd = rd,
                                     .rn = rn,
                                     .rm = rm,
@@ -806,7 +806,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 },
                                 0b01011 => return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (rn == 15) ArmOp.sxth_al else ArmOp.sxtah_al),
+                                    .op = @backingInt(if (rn == 15) ArmOp.sxth_al else ArmOp.sxtah_al),
                                     .rd = rd,
                                     .rn = rn,
                                     .rm = rm,
@@ -816,18 +816,18 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             }
                         } else if (op1 == 0b01011) {
                             if (op2 == 0b001 and rn == 15) {
-                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.rev_al), .rd = rd, .rm = rm };
+                                return .{ .raw = inst, .op = @backingInt(ArmOp.rev_al), .rd = rd, .rm = rm };
                             } else if (op2 == 0b101) {
-                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.rev16_al), .rd = rd, .rm = rm };
+                                return .{ .raw = inst, .op = @backingInt(ArmOp.rev16_al), .rd = rd, .rm = rm };
                             }
                         } else if (op1 == 0b01111 and op2 == 0b001) {
-                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.rbit_al), .rd = rd, .rm = rm };
+                            return .{ .raw = inst, .op = @backingInt(ArmOp.rbit_al), .rd = rd, .rm = rm };
                         } else if ((op1 == 0b11110 or op1 == 0b11111) and (op2 & 0b011) == 0b010) {
                             const lsb: u5 = @truncate((inst >> 7) & 0x1f);
                             const widthm1: u5 = @truncate((inst >> 16) & 0x1f);
                             const width: u6 = @as(u6, widthm1) + 1;
                             const mask: u32 = if (width >= 32) 0xffff_ffff else (@as(u32, 1) << @truncate(width)) -% 1;
-                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.ubfx_al), .rd = rd, .rn = lsb, .rm = rm, .imm = mask };
+                            return .{ .raw = inst, .op = @backingInt(ArmOp.ubfx_al), .rd = rd, .rn = lsb, .rm = rm, .imm = mask };
                         } else if ((op1 == 0b11010 or op1 == 0b11011) and (op2 & 0b011) == 0b010) {
                             const lsb: u5 = @truncate((inst >> 7) & 0x1f);
                             const widthm1: u5 = @truncate((inst >> 16) & 0x1f);
@@ -835,7 +835,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             if (width <= 32 - @as(u6, lsb)) {
                                 const sh_left: u5 = @truncate(32 - (width + @as(u6, lsb)));
                                 const sh_right: u5 = @truncate(32 - width);
-                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.sbfx_al), .rd = rd, .rn = sh_left, .rm = rm, .imm = sh_right };
+                                return .{ .raw = inst, .op = @backingInt(ArmOp.sbfx_al), .rd = rd, .rn = sh_left, .rm = rm, .imm = sh_right };
                             }
                         }
                     }
@@ -847,7 +847,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                             const mask: u32 = if (width >= 32) 0xffff_ffff else ((@as(u32, 1) << @truncate(width)) -% 1) << lsb;
                             return .{
                                 .raw = inst,
-                                .op = @intFromEnum(if (rm == 15) ArmOp.bfc_al else ArmOp.bfi_al),
+                                .op = @backingInt(if (rm == 15) ArmOp.bfc_al else ArmOp.bfi_al),
                                 .rd = rd,
                                 .rn = lsb,
                                 .rm = rm,
@@ -856,7 +856,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                         }
                     }
                 }
-                return .{ .raw = inst, .op = @intFromEnum(ArmOp.media) };
+                return .{ .raw = inst, .op = @backingInt(ArmOp.media) };
             }
             // Scaled register offset LDR/STR/LDRB/STRB (P == 1, W == 0)
             const p = (inst & (1 << 24)) != 0;
@@ -875,11 +875,11 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                         (if (l) (if (b) .ldrb_reg_lsl_al else .ldr_reg_lsl_al) else (if (b) .strb_reg_lsl_al else .str_reg_lsl_al))
                     else
                         (if (l) (if (b) .ldrb_reg_sub_lsl_al else .ldr_reg_sub_lsl_al) else (if (b) .strb_reg_sub_lsl_al else .str_reg_sub_lsl_al));
-                    return .{ .raw = inst, .op = @intFromEnum(reg_op), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
+                    return .{ .raw = inst, .op = @backingInt(reg_op), .rd = rd, .rn = rn, .rm = rm, .imm = shift_imm };
                 } else if (shift_type == 0b01 and u and shift_imm != 0 and !b) {
                     return .{
                         .raw = inst,
-                        .op = @intFromEnum(if (l) ArmOp.ldr_reg_lsr_al else ArmOp.str_reg_lsr_al),
+                        .op = @backingInt(if (l) ArmOp.ldr_reg_lsr_al else ArmOp.str_reg_lsr_al),
                         .rd = rd,
                         .rn = rn,
                         .rm = rm,
@@ -887,7 +887,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                     };
                 }
             }
-            return .{ .raw = inst, .op = @intFromEnum(ArmOp.ls_wb_reg) };
+            return .{ .raw = inst, .op = @backingInt(ArmOp.ls_wb_reg) };
         },
         0b100 => {
             const p = (inst & (1 << 24)) != 0;
@@ -930,14 +930,14 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                 }
                 return .{
                     .raw = inst,
-                    .op = @intFromEnum(op),
+                    .op = @backingInt(op),
                     .rd = first_byte,
                     .rn = rn,
                     .rm = contig_meta,
                     .imm = packed_imm,
                 };
             }
-            return .{ .raw = inst, .op = @intFromEnum(ArmOp.ls_multiple) };
+            return .{ .raw = inst, .op = @backingInt(ArmOp.ls_multiple) };
         },
         0b101 => {
             const link = (inst & (1 << 24)) != 0;
@@ -946,7 +946,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
             const offset: u32 = @bitCast(shift_imm);
             return .{
                 .raw = inst,
-                .op = @intFromEnum(if (link) ArmOp.bl_al else ArmOp.b_al),
+                .op = @backingInt(if (link) ArmOp.bl_al else ArmOp.b_al),
                 .imm = offset,
             };
         },
@@ -965,7 +965,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 if (rt != 15 and rt2 != 15 and (!l or rt != rt2)) {
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(if (l) ArmOp.vmov_r_f64_al else ArmOp.vmov_f64_r_al),
+                                        .op = @backingInt(if (l) ArmOp.vmov_r_f64_al else ArmOp.vmov_f64_r_al),
                                         .rd = rt,
                                         .rn = rt2,
                                         .rm = dm * 2,
@@ -988,7 +988,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                     const dd: u8 = (d_bit << 4) | vd;
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(if (l) ArmOp.vldr_f64_al else ArmOp.vstr_f64_al),
+                                        .op = @backingInt(if (l) ArmOp.vldr_f64_al else ArmOp.vstr_f64_al),
                                         .rd = dd * 2,
                                         .rn = rn,
                                         .imm = signed_off,
@@ -997,7 +997,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                     const sd: u8 = (vd << 1) | d_bit;
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(if (l) ArmOp.vldr_f32_al else ArmOp.vstr_f32_al),
+                                        .op = @backingInt(if (l) ArmOp.vldr_f32_al else ArmOp.vstr_f32_al),
                                         .rd = sd,
                                         .rn = rn,
                                         .imm = signed_off,
@@ -1018,19 +1018,19 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                     (@as(u64, @as(u16, @bitCast(wb_off))) << 48);
                                 return .{
                                     .raw = inst,
-                                    .op = @intFromEnum(if (l) ArmOp.vldm_al else ArmOp.vstm_al),
+                                    .op = @backingInt(if (l) ArmOp.vldm_al else ArmOp.vstm_al),
                                     .rd = @intCast(first_s),
                                     .rn = rn,
                                     .rm = @intFromBool(is_double),
                                     .imm = packed_imm,
                                 };
                             }
-                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.vfp_ls_multi_al), .rm = @intFromBool(is_double) };
+                            return .{ .raw = inst, .op = @backingInt(ArmOp.vfp_ls_multi_al), .rm = @intFromBool(is_double) };
                         }
                     } else {
                         if ((inst & 0x0f00_0010) == 0x0e00_0010) {
                             if ((inst & 0x0fff_ffff) == 0x0ef1_fa10) {
-                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.vmrs_apsr_al) };
+                                return .{ .raw = inst, .op = @backingInt(ArmOp.vmrs_apsr_al) };
                             }
                             if (!is_double and ((inst >> 21) & 7) == 0) {
                                 const l = (inst & (1 << 20)) != 0;
@@ -1039,7 +1039,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                 if (rt != 15) {
                                     return .{
                                         .raw = inst,
-                                        .op = @intFromEnum(if (l) ArmOp.vmov_r_f32_al else ArmOp.vmov_f32_r_al),
+                                        .op = @backingInt(if (l) ArmOp.vmov_r_f32_al else ArmOp.vmov_f32_r_al),
                                         .rd = rt,
                                         .rn = sn,
                                     };
@@ -1072,7 +1072,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                     else => null,
                                 };
                                 if (f64_op) |fop| {
-                                    return .{ .raw = inst, .op = @intFromEnum(fop), .rd = dd, .rn = dn, .rm = dm };
+                                    return .{ .raw = inst, .op = @backingInt(fop), .rd = dd, .rn = dn, .rm = dm };
                                 }
                             } else {
                                 const sd: u8 = @truncate((((inst >> 12) & 0xf) << 1) | ((inst >> 22) & 1));
@@ -1089,10 +1089,10 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                                     else => null,
                                 };
                                 if (f32_op) |fop| {
-                                    return .{ .raw = inst, .op = @intFromEnum(fop), .rd = sd, .rn = sn, .rm = sm };
+                                    return .{ .raw = inst, .op = @backingInt(fop), .rd = sd, .rn = sn, .rm = sm };
                                 }
                             }
-                            return .{ .raw = inst, .op = @intFromEnum(ArmOp.vfp_dp_al) };
+                            return .{ .raw = inst, .op = @backingInt(ArmOp.vfp_dp_al) };
                         }
                     }
                 } else if (cp_num == 15 and top3 == 0b111 and (inst & 0x0f00_0010) == 0x0e00_0010) {
@@ -1105,23 +1105,23 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
                     if (opc1 == 0 and rt != 15) {
                         if (l and crn == 13 and crm == 0) {
                             if (opc2 == 3) {
-                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mrc_tpidruro_al), .rd = rt };
+                                return .{ .raw = inst, .op = @backingInt(ArmOp.mrc_tpidruro_al), .rd = rt };
                             } else if (opc2 == 2) {
-                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mrc_tpidrurw_al), .rd = rt };
+                                return .{ .raw = inst, .op = @backingInt(ArmOp.mrc_tpidrurw_al), .rd = rt };
                             } else if (opc2 == 4) {
-                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mrc_tpidrprw_al), .rd = rt };
+                                return .{ .raw = inst, .op = @backingInt(ArmOp.mrc_tpidrprw_al), .rd = rt };
                             }
                         } else if (!l and crn == 7) {
                             if (crm == 10 and (opc2 == 4 or opc2 == 5)) {
-                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mcr_barrier_al), .rd = @intFromBool(opc2 == 4) };
+                                return .{ .raw = inst, .op = @backingInt(ArmOp.mcr_barrier_al), .rd = @intFromBool(opc2 == 4) };
                             } else if (crm == 5 and (opc2 == 4 or opc2 == 6)) {
-                                return .{ .raw = inst, .op = @intFromEnum(ArmOp.mcr_barrier_al), .rd = 2 };
+                                return .{ .raw = inst, .op = @backingInt(ArmOp.mcr_barrier_al), .rd = 2 };
                             }
                         }
                     }
                 }
             }
-            return .{ .raw = inst, .op = @intFromEnum(ArmOp.coproc_svc) };
+            return .{ .raw = inst, .op = @backingInt(ArmOp.coproc_svc) };
         },
     }
 }
@@ -1129,7 +1129,7 @@ pub noinline fn decodeArm32(inst: u32) DecodedSlot {
 pub noinline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_word: usize) DecodedSlot {
     const d = decodeArm32(inst);
     if (inst < 0xe000_0000 or page_word >= 1022) return d;
-    const op: ArmOp = @enumFromInt(d.op);
+    const op: ArmOp = @fromBackingInt(@intCast(d.op));
     switch (op) {
         .cmp_imm_al, .cmp_reg_al, .tst_imm_al, .tst_reg_al, .subs_imm_al, .adds_imm_al => {
             const next_inst = std.mem.readInt(u32, code_page_ptr[(page_word + 1) * 4 ..][0..4], .little);
@@ -1151,7 +1151,7 @@ pub noinline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_w
                     };
                     return .{
                         .raw = inst,
-                        .op = @intFromEnum(fused_op),
+                        .op = @backingInt(fused_op),
                         .rd = if (op == .subs_imm_al or op == .adds_imm_al) d.rd else b_cond,
                         .rn = d.rn,
                         .rm = if (op == .subs_imm_al or op == .adds_imm_al) b_cond else d.rm,
@@ -1168,7 +1168,7 @@ pub noinline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_w
                     const imm16_hi: u32 = (((next_inst >> 16) & 0xf) << 12) | (next_inst & 0xfff);
                     return .{
                         .raw = inst,
-                        .op = @intFromEnum(ArmOp.movw_movt_al),
+                        .op = @backingInt(ArmOp.movw_movt_al),
                         .rd = d.rd,
                         .imm = (@as(u32, @truncate(d.imm)) & 0xffff) | (imm16_hi << 16),
                     };
@@ -1183,7 +1183,7 @@ pub noinline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_w
                 if (rd2 != 15 and rm2 != 15 and rm2 != d.rd) {
                     return .{
                         .raw = inst,
-                        .op = @intFromEnum(ArmOp.mov_pair_reg_al),
+                        .op = @backingInt(ArmOp.mov_pair_reg_al),
                         .rd = d.rd,
                         .rm = d.rm,
                         .rn = rd2,
@@ -1203,7 +1203,7 @@ pub noinline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_w
                     const off2: u32 = if (u2_bit) imm12_2 else (0 -% imm12_2);
                     return .{
                         .raw = inst,
-                        .op = @intFromEnum(ArmOp.ldr_pair_imm_al),
+                        .op = @backingInt(ArmOp.ldr_pair_imm_al),
                         .rd = d.rd,
                         .rn = d.rn,
                         .rm = rd2,
@@ -1213,7 +1213,7 @@ pub noinline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_w
             } else if (next_inst == (0xe350_0000 | (@as(u32, d.rd) << 16))) {
                 return .{
                     .raw = inst,
-                    .op = @intFromEnum(ArmOp.ldr_imm_cmp0_al),
+                    .op = @backingInt(ArmOp.ldr_imm_cmp0_al),
                     .rd = d.rd,
                     .rn = d.rn,
                     .imm = d.imm,
@@ -1231,7 +1231,7 @@ pub noinline fn decodeAndFuseArm32(inst: u32, code_page_ptr: [*]const u8, page_w
                     const off2: u32 = if (u2_bit) imm12_2 else (0 -% imm12_2);
                     return .{
                         .raw = inst,
-                        .op = @intFromEnum(ArmOp.str_pair_imm_al),
+                        .op = @backingInt(ArmOp.str_pair_imm_al),
                         .rd = d.rd,
                         .rn = d.rn,
                         .rm = rd2,
@@ -1301,7 +1301,7 @@ pub noinline fn decodeThumb16(inst: u16, next_hw: ?u16) ThumbSlot {
                 const alu_op: u4 = @truncate((inst >> 6) & 0xf);
                 const rm: u8 = @truncate((inst >> 3) & 7);
                 const rd: u8 = @truncate(inst & 7);
-                const top: ThumbOp = @enumFromInt(@intFromEnum(ThumbOp.alu_and) + alu_op);
+                const top: ThumbOp = @fromBackingInt(@intCast(@backingInt(ThumbOp.alu_and) + alu_op));
                 return .{ .raw = inst, .op = top, .rd = rd, .rm = rm };
             } else if ((inst & 0xfc00) == 0x4400) {
                 const op: u2 = @truncate((inst >> 8) & 3);
@@ -1323,7 +1323,7 @@ pub noinline fn decodeThumb16(inst: u16, next_hw: ?u16) ThumbSlot {
                 const rm: u8 = @truncate((inst >> 6) & 7);
                 const rn: u8 = @truncate((inst >> 3) & 7);
                 const rd: u8 = @truncate(inst & 7);
-                const top: ThumbOp = @enumFromInt(@intFromEnum(ThumbOp.str_reg) + op);
+                const top: ThumbOp = @fromBackingInt(@intCast(@backingInt(ThumbOp.str_reg) + op));
                 return .{ .raw = inst, .op = top, .rd = rd, .rn = rn, .rm = rm };
             }
         },
@@ -1517,7 +1517,7 @@ pub fn Arm1176(comptime Bus: type) type {
         /// Active general-purpose registers r0..r15 (r13=SP, r14=LR, r15=PC)
         r: [16]u32 = @splat(0),
         /// Current Program Status Register
-        cpsr: u32 = PsrFlags.I | PsrFlags.F | @intFromEnum(Mode.svc),
+        cpsr: u32 = PsrFlags.I | PsrFlags.F | @backingInt(Mode.svc),
 
         /// True when executing in 64-bit ARMv8 AArch64 (A64) state (`EL3` / `EL2` / `EL1` / `EL0`)
         is_aarch64: bool = false,
@@ -1697,7 +1697,7 @@ pub fn Arm1176(comptime Bus: type) type {
 
         pub fn resetInPlace(self: *Self) void {
             self.r = @splat(0);
-            self.cpsr = PsrFlags.I | PsrFlags.F | @intFromEnum(Mode.svc);
+            self.cpsr = PsrFlags.I | PsrFlags.F | @backingInt(Mode.svc);
             self.is_aarch64 = false;
             self.x = @splat(0);
             self.sp_el = @splat(0);
@@ -1738,7 +1738,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.r[1] = r1;
             self.r[2] = r2;
             self.r[15] = entry_pc;
-            self.cpsr = PsrFlags.I | PsrFlags.F | @intFromEnum(Mode.svc);
+            self.cpsr = PsrFlags.I | PsrFlags.F | @backingInt(Mode.svc);
         }
 
         pub fn initReset64(self: *Self, entry_pc: u64, x0_dtb: u64) void {
@@ -1759,7 +1759,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.mmu.is_cortex_a53 = true;
             self.vfp.is_vfpv4 = true;
             self.halted_spin = true;
-            self.cpsr = PsrFlags.I | PsrFlags.F | @intFromEnum(Mode.svc);
+            self.cpsr = PsrFlags.I | PsrFlags.F | @backingInt(Mode.svc);
         }
 
         pub fn initSecondaryCore64(self: *Self, core_id: u2) void {
@@ -1890,7 +1890,7 @@ pub fn Arm1176(comptime Bus: type) type {
         /// Enters an ARM exception vector (`UND`, `SVC`, `PABT`, `DABT`, `IRQ`, `FIQ`).
         pub noinline fn enterException(self: *Self, target_mode: Mode, vector_offset: u32, lr_val: u32, disable_fiq: bool) void {
             const saved_cpsr = self.cpsr;
-            self.switchMode(@intFromEnum(target_mode));
+            self.switchMode(@backingInt(target_mode));
             self.setSpsr(saved_cpsr);
             self.r[14] = lr_val;
 
@@ -2285,7 +2285,7 @@ pub fn Arm1176(comptime Bus: type) type {
             h: u8,
             count: u8,
         ) bool {
-            if (code_icache_ptr[start_word].op == @intFromEnum(ArmOp.jit_trace)) return false;
+            if (code_icache_ptr[start_word].op == @backingInt(ArmOp.jit_trace)) return false;
             const tc_idx = jit_mod.JitCodeBuffer.traceCacheIdx(code_page_idx, start_word, end_word_req);
             const code_hash = jit_mod.JitCodeBuffer.hashLoopWords(code_page_ptr, start_word, end_word_req);
             const entry = &self.jit_buf.trace_cache[tc_idx];
@@ -2299,7 +2299,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     const inst = std.mem.readInt(u32, code_page_ptr[@as(usize, start_word) * 4 ..][0..4], .little);
                     code_icache_ptr[start_word] = .{
                         .raw = inst,
-                        .op = @intFromEnum(ArmOp.jit_trace),
+                        .op = @backingInt(ArmOp.jit_trace),
                         .rd = entry.trace_len,
                         .imm = @intFromPtr(fn_ptr),
                     };
@@ -2339,7 +2339,7 @@ pub fn Arm1176(comptime Bus: type) type {
                 };
                 code_icache_ptr[start_word] = .{
                     .raw = inst,
-                    .op = @intFromEnum(ArmOp.jit_trace),
+                    .op = @backingInt(ArmOp.jit_trace),
                     .rd = trace_len,
                     .imm = @intFromPtr(fn_ptr),
                 };
@@ -2373,7 +2373,7 @@ pub fn Arm1176(comptime Bus: type) type {
             if (target_pc <= cur_pc and (target_pc & ~@as(u32, 0xffc)) == code_vbase) {
                 const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
                 if (end_word_req > @as(u16, start_word) + 1 and end_word_req - @as(u16, start_word) <= 64) {
-                    if (code_icache_ptr[start_word].op == @intFromEnum(ArmOp.jit_trace) and
+                    if (code_icache_ptr[start_word].op == @backingInt(ArmOp.jit_trace) and
                         code_icache_ptr[start_word].rd >= end_word_req - @as(u16, start_word)) return;
                     const h: u8 = @truncate((target_pc >> 2) ^ (target_pc >> 10));
                     const c = self.jit_buf.loop_counts[h] +% 1;
@@ -2424,14 +2424,14 @@ pub fn Arm1176(comptime Bus: type) type {
         ) void {
             if ((return_pc & ~@as(u32, 0xffc)) == code_vbase) {
                 const ret_word: u10 = @truncate((return_pc >> 2) & 0x3ff);
-                if (code_icache_ptr[ret_word].op != @intFromEnum(ArmOp.jit_trace)) {
+                if (code_icache_ptr[ret_word].op != @backingInt(ArmOp.jit_trace)) {
                     const rh: u8 = @truncate((return_pc >> 2) ^ (return_pc >> 10));
                     _ = self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, ret_word, 0, rh, 0x20);
                 }
             }
             const start_word: u10 = @truncate((target_pc >> 2) & 0x3ff);
             if ((target_pc & ~@as(u32, 0xffc)) == code_vbase) {
-                if (code_icache_ptr[start_word].op != @intFromEnum(ArmOp.jit_trace)) {
+                if (code_icache_ptr[start_word].op != @backingInt(ArmOp.jit_trace)) {
                     _ = self.compileHotLoop32(code_page_idx, code_icache_ptr, code_page_ptr, start_word, 0, h, 0x20);
                 }
             } else {
@@ -2441,7 +2441,7 @@ pub fn Arm1176(comptime Bus: type) type {
                     const t_page_idx = icachePageIdx(t_pbase);
                     if (t_page_idx != code_page_idx) {
                         const t_icache_ptr = self.prepareIcachePage(t_page_idx, t_pbase);
-                        if (t_icache_ptr[start_word].op != @intFromEnum(ArmOp.jit_trace)) {
+                        if (t_icache_ptr[start_word].op != @backingInt(ArmOp.jit_trace)) {
                             _ = self.compileHotLoop32(t_page_idx, t_icache_ptr, bus.ram.ptr + t_pbase, start_word, 0, h, 0x20);
                         }
                     }
@@ -2689,417 +2689,216 @@ pub fn Arm1176(comptime Bus: type) type {
                     executed += 1;
 
                     if (inst < 0xe000_0000) {
-                        if (d.op != @intFromEnum(ArmOp.jit_trace) and !dec.checkCond(@truncate(inst >> 28), self.cpsr)) continue;
+                        if (d.op != @backingInt(ArmOp.jit_trace) and !dec.checkCond(@truncate(inst >> 28), self.cpsr)) continue;
                     }
 
-                const imm32: u32 = @truncate(d.imm);
-                const bank: usize = @intFromBool(d.rn >= 11);
-                const op: ArmOp = @enumFromInt(d.op);
-                switch (op) {
-                    .add_imm_al => self.r[d.rd] = self.r[d.rn] +% imm32,
-                    .sub_imm_al => self.r[d.rd] = self.r[d.rn] -% imm32,
-                    .rsb_imm_al => self.r[d.rd] = imm32 -% self.r[d.rn],
-                    .adc_imm_al => self.r[d.rd] = self.r[d.rn] +% imm32 +% ((self.cpsr >> 29) & 1),
-                    .sbc_imm_al => self.r[d.rd] = self.r[d.rn] +% ~imm32 +% ((self.cpsr >> 29) & 1),
-                    .rsc_imm_al => self.r[d.rd] = imm32 +% ~self.r[d.rn] +% ((self.cpsr >> 29) & 1),
-                    .and_imm_al => self.r[d.rd] = self.r[d.rn] & imm32,
-                    .orr_imm_al => self.r[d.rd] = self.r[d.rn] | imm32,
-                    .eor_imm_al => self.r[d.rd] = self.r[d.rn] ^ imm32,
-                    .bic_imm_al => self.r[d.rd] = self.r[d.rn] & ~imm32,
-                    .mov_imm_al => self.r[d.rd] = imm32,
-                    .mvn_imm_al => self.r[d.rd] = ~imm32,
-                    .cmp_imm_al => _ = self.setSubNZCV(self.r[d.rn], imm32),
-                    .cmn_imm_al => _ = self.setAddNZCV(self.r[d.rn], imm32),
-                    .tst_imm_al => self.setNZ(self.r[d.rn] & imm32),
-                    .teq_imm_al => self.setNZ(self.r[d.rn] ^ imm32),
-                    .adds_imm_al => self.r[d.rd] = self.setAddNZCV(self.r[d.rn], imm32),
-                    .subs_imm_al => self.r[d.rd] = self.setSubNZCV(self.r[d.rn], imm32),
-                    .adcs_imm_al => {
-                        const res = dec.addWithCarry(self.r[d.rn], imm32, @truncate((self.cpsr >> 29) & 1));
-                        self.r[d.rd] = res.val;
-                        self.setNZCV(res);
-                    },
-                    .sbcs_imm_al => {
-                        const res = dec.addWithCarry(self.r[d.rn], ~imm32, @truncate((self.cpsr >> 29) & 1));
-                        self.r[d.rd] = res.val;
-                        self.setNZCV(res);
-                    },
-                    .movw_al => self.r[d.rd] = imm32,
-                    .movt_al => self.r[d.rd] = (self.r[d.rd] & 0x0000_ffff) | (imm32 << 16),
-                    .cmp_imm_bcond_al => {
-                        _ = self.setSubNZCV(self.r[d.rn], imm32);
-                        executed += 1;
-                        if (dec.checkCond(@truncate(d.rd), self.cpsr)) {
-                            const target_off: u32 = @truncate(d.imm >> 32);
-                            const target_pc = pc +% target_off;
-                            self.r[15] = target_pc;
-                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
-                            if (self.yield_slice) break :step_loop;
-                        } else {
-                            self.r[15] = pc +% 8;
-                        }
-                    },
-                    .cmp_reg_bcond_al => {
-                        _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm]);
-                        executed += 1;
-                        if (dec.checkCond(@truncate(d.rd), self.cpsr)) {
-                            const target_off: u32 = @truncate(d.imm >> 32);
-                            const target_pc = pc +% target_off;
-                            self.r[15] = target_pc;
-                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
-                            if (self.yield_slice) break :step_loop;
-                        } else {
-                            self.r[15] = pc +% 8;
-                        }
-                    },
-                    .tst_imm_bcond_al => {
-                        self.setNZ(self.r[d.rn] & imm32);
-                        executed += 1;
-                        if (dec.checkCond(@truncate(d.rd), self.cpsr)) {
-                            const target_off: u32 = @truncate(d.imm >> 32);
-                            const target_pc = pc +% target_off;
-                            self.r[15] = target_pc;
-                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
-                            if (self.yield_slice) break :step_loop;
-                        } else {
-                            self.r[15] = pc +% 8;
-                        }
-                    },
-                    .tst_reg_bcond_al => {
-                        self.setNZ(self.r[d.rn] & self.r[d.rm]);
-                        executed += 1;
-                        if (dec.checkCond(@truncate(d.rd), self.cpsr)) {
-                            const target_off: u32 = @truncate(d.imm >> 32);
-                            const target_pc = pc +% target_off;
-                            self.r[15] = target_pc;
-                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
-                            if (self.yield_slice) break :step_loop;
-                        } else {
-                            self.r[15] = pc +% 8;
-                        }
-                    },
-                    .subs_imm_bcond_al => {
-                        self.r[d.rd] = self.setSubNZCV(self.r[d.rn], imm32);
-                        executed += 1;
-                        if (dec.checkCond(@truncate(d.rm), self.cpsr)) {
-                            const target_off: u32 = @truncate(d.imm >> 32);
-                            const target_pc = pc +% target_off;
-                            self.r[15] = target_pc;
-                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
-                            if (self.yield_slice) break :step_loop;
-                        } else {
-                            self.r[15] = pc +% 8;
-                        }
-                    },
-                    .adds_imm_bcond_al => {
-                        self.r[d.rd] = self.setAddNZCV(self.r[d.rn], imm32);
-                        executed += 1;
-                        if (dec.checkCond(@truncate(d.rm), self.cpsr)) {
-                            const target_off: u32 = @truncate(d.imm >> 32);
-                            const target_pc = pc +% target_off;
-                            self.r[15] = target_pc;
-                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
-                            if (self.yield_slice) break :step_loop;
-                        } else {
-                            self.r[15] = pc +% 8;
-                        }
-                    },
-                    .movw_movt_al => {
-                        self.r[d.rd] = imm32;
-                        self.r[15] = pc +% 8;
-                        executed += 1;
-                    },
-                    .mov_pair_reg_al => {
-                        self.r[d.rd] = self.r[d.rm];
-                        self.r[d.rn] = self.r[@as(u4, @truncate(imm32))];
-                        self.r[15] = pc +% 8;
-                        executed += 1;
-                    },
-                    .ldr_pair_imm_al => {
-                        const base_val = self.r[d.rn];
-                        const vaddr1 = base_val +% imm32;
-                        const vaddr2 = base_val +% @as(u32, @truncate(d.imm >> 32));
-                        if ((vaddr1 & ~@as(u32, 0xffc)) == data_r_vbase[bank] and (vaddr2 & ~@as(u32, 0xffc)) == data_r_vbase[bank]) {
-                            self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr1 & 0xffc ..][0..4], .little);
-                            self.r[d.rm] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr2 & 0xffc ..][0..4], .little);
-                            self.r[15] = pc +% 8;
+                    const imm32: u32 = @truncate(d.imm);
+                    const bank: usize = @intFromBool(d.rn >= 11);
+                    const op: ArmOp = @fromBackingInt(@intCast(d.op));
+                    switch (op) {
+                        .add_imm_al => self.r[d.rd] = self.r[d.rn] +% imm32,
+                        .sub_imm_al => self.r[d.rd] = self.r[d.rn] -% imm32,
+                        .rsb_imm_al => self.r[d.rd] = imm32 -% self.r[d.rn],
+                        .adc_imm_al => self.r[d.rd] = self.r[d.rn] +% imm32 +% ((self.cpsr >> 29) & 1),
+                        .sbc_imm_al => self.r[d.rd] = self.r[d.rn] +% ~imm32 +% ((self.cpsr >> 29) & 1),
+                        .rsc_imm_al => self.r[d.rd] = imm32 +% ~self.r[d.rn] +% ((self.cpsr >> 29) & 1),
+                        .and_imm_al => self.r[d.rd] = self.r[d.rn] & imm32,
+                        .orr_imm_al => self.r[d.rd] = self.r[d.rn] | imm32,
+                        .eor_imm_al => self.r[d.rd] = self.r[d.rn] ^ imm32,
+                        .bic_imm_al => self.r[d.rd] = self.r[d.rn] & ~imm32,
+                        .mov_imm_al => self.r[d.rd] = imm32,
+                        .mvn_imm_al => self.r[d.rd] = ~imm32,
+                        .cmp_imm_al => _ = self.setSubNZCV(self.r[d.rn], imm32),
+                        .cmn_imm_al => _ = self.setAddNZCV(self.r[d.rn], imm32),
+                        .tst_imm_al => self.setNZ(self.r[d.rn] & imm32),
+                        .teq_imm_al => self.setNZ(self.r[d.rn] ^ imm32),
+                        .adds_imm_al => self.r[d.rd] = self.setAddNZCV(self.r[d.rn], imm32),
+                        .subs_imm_al => self.r[d.rd] = self.setSubNZCV(self.r[d.rn], imm32),
+                        .adcs_imm_al => {
+                            const res = dec.addWithCarry(self.r[d.rn], imm32, @truncate((self.cpsr >> 29) & 1));
+                            self.r[d.rd] = res.val;
+                            self.setNZCV(res);
+                        },
+                        .sbcs_imm_al => {
+                            const res = dec.addWithCarry(self.r[d.rn], ~imm32, @truncate((self.cpsr >> 29) & 1));
+                            self.r[d.rd] = res.val;
+                            self.setNZCV(res);
+                        },
+                        .movw_al => self.r[d.rd] = imm32,
+                        .movt_al => self.r[d.rd] = (self.r[d.rd] & 0x0000_ffff) | (imm32 << 16),
+                        .cmp_imm_bcond_al => {
+                            _ = self.setSubNZCV(self.r[d.rn], imm32);
                             executed += 1;
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr1 >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr1 & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr1 & 0xffc ..][0..4], .little);
-                                if ((vaddr2 & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                    self.r[d.rm] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr2 & 0xffc ..][0..4], .little);
-                                    self.r[15] = pc +% 8;
-                                    executed += 1;
-                                }
+                            if (dec.checkCond(@truncate(d.rd), self.cpsr)) {
+                                const target_off: u32 = @truncate(d.imm >> 32);
+                                const target_pc = pc +% target_off;
+                                self.r[15] = target_pc;
+                                self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                                if (self.yield_slice) break :step_loop;
                             } else {
-                                self.r[d.rd] = self.read32(bus, vaddr1) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
+                                self.r[15] = pc +% 8;
                             }
-                        }
-                    },
-                    .str_pair_imm_al => {
-                        const base_val = self.r[d.rn];
-                        const vaddr1 = base_val +% imm32;
-                        const vaddr2 = base_val +% @as(u32, @truncate(d.imm >> 32));
-                        if ((vaddr1 & ~@as(u32, 0xffc)) == data_w_vbase[bank] and (vaddr2 & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr1 & 0xffc ..][0..4], self.r[d.rd], .little);
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr2 & 0xffc ..][0..4], self.r[d.rm], .little);
+                        },
+                        .cmp_reg_bcond_al => {
+                            _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm]);
+                            executed += 1;
+                            if (dec.checkCond(@truncate(d.rd), self.cpsr)) {
+                                const target_off: u32 = @truncate(d.imm >> 32);
+                                const target_pc = pc +% target_off;
+                                self.r[15] = target_pc;
+                                self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                                if (self.yield_slice) break :step_loop;
+                            } else {
+                                self.r[15] = pc +% 8;
+                            }
+                        },
+                        .tst_imm_bcond_al => {
+                            self.setNZ(self.r[d.rn] & imm32);
+                            executed += 1;
+                            if (dec.checkCond(@truncate(d.rd), self.cpsr)) {
+                                const target_off: u32 = @truncate(d.imm >> 32);
+                                const target_pc = pc +% target_off;
+                                self.r[15] = target_pc;
+                                self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                                if (self.yield_slice) break :step_loop;
+                            } else {
+                                self.r[15] = pc +% 8;
+                            }
+                        },
+                        .tst_reg_bcond_al => {
+                            self.setNZ(self.r[d.rn] & self.r[d.rm]);
+                            executed += 1;
+                            if (dec.checkCond(@truncate(d.rd), self.cpsr)) {
+                                const target_off: u32 = @truncate(d.imm >> 32);
+                                const target_pc = pc +% target_off;
+                                self.r[15] = target_pc;
+                                self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                                if (self.yield_slice) break :step_loop;
+                            } else {
+                                self.r[15] = pc +% 8;
+                            }
+                        },
+                        .subs_imm_bcond_al => {
+                            self.r[d.rd] = self.setSubNZCV(self.r[d.rn], imm32);
+                            executed += 1;
+                            if (dec.checkCond(@truncate(d.rm), self.cpsr)) {
+                                const target_off: u32 = @truncate(d.imm >> 32);
+                                const target_pc = pc +% target_off;
+                                self.r[15] = target_pc;
+                                self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                                if (self.yield_slice) break :step_loop;
+                            } else {
+                                self.r[15] = pc +% 8;
+                            }
+                        },
+                        .adds_imm_bcond_al => {
+                            self.r[d.rd] = self.setAddNZCV(self.r[d.rn], imm32);
+                            executed += 1;
+                            if (dec.checkCond(@truncate(d.rm), self.cpsr)) {
+                                const target_off: u32 = @truncate(d.imm >> 32);
+                                const target_pc = pc +% target_off;
+                                self.r[15] = target_pc;
+                                self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 2));
+                                if (self.yield_slice) break :step_loop;
+                            } else {
+                                self.r[15] = pc +% 8;
+                            }
+                        },
+                        .movw_movt_al => {
+                            self.r[d.rd] = imm32;
                             self.r[15] = pc +% 8;
                             executed += 1;
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr1 >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr1 & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                data_w_vbase[bank] = slot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr1 & 0xffc ..][0..4], self.r[d.rd], .little);
-                                if ((vaddr2 & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                    std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr2 & 0xffc ..][0..4], self.r[d.rm], .little);
-                                    self.r[15] = pc +% 8;
-                                    executed += 1;
-                                }
+                        },
+                        .mov_pair_reg_al => {
+                            self.r[d.rd] = self.r[d.rm];
+                            self.r[d.rn] = self.r[@as(u4, @truncate(imm32))];
+                            self.r[15] = pc +% 8;
+                            executed += 1;
+                        },
+                        .ldr_pair_imm_al => {
+                            const base_val = self.r[d.rn];
+                            const vaddr1 = base_val +% imm32;
+                            const vaddr2 = base_val +% @as(u32, @truncate(d.imm >> 32));
+                            if ((vaddr1 & ~@as(u32, 0xffc)) == data_r_vbase[bank] and (vaddr2 & ~@as(u32, 0xffc)) == data_r_vbase[bank]) {
+                                self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr1 & 0xffc ..][0..4], .little);
+                                self.r[d.rm] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr2 & 0xffc ..][0..4], .little);
+                                self.r[15] = pc +% 8;
+                                executed += 1;
                             } else {
-                                self.write32(bus, vaddr1, self.r[d.rd]) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                                if ((vaddr1 & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr1 >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                    if (self.checkInterrupts(bus)) {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr1 >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr1 & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr1 & 0xffc ..][0..4], .little);
+                                    if ((vaddr2 & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                        self.r[d.rm] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr2 & 0xffc ..][0..4], .little);
+                                        self.r[15] = pc +% 8;
+                                        executed += 1;
+                                    }
+                                } else {
+                                    self.r[d.rd] = self.read32(bus, vaddr1) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
                                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                }
+                            }
+                        },
+                        .str_pair_imm_al => {
+                            const base_val = self.r[d.rn];
+                            const vaddr1 = base_val +% imm32;
+                            const vaddr2 = base_val +% @as(u32, @truncate(d.imm >> 32));
+                            if ((vaddr1 & ~@as(u32, 0xffc)) == data_w_vbase[bank] and (vaddr2 & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr1 & 0xffc ..][0..4], self.r[d.rd], .little);
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr2 & 0xffc ..][0..4], self.r[d.rm], .little);
+                                self.r[15] = pc +% 8;
+                                executed += 1;
+                            } else {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr1 >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr1 & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr1 & 0xffc ..][0..4], self.r[d.rd], .little);
+                                    if ((vaddr2 & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                                        std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr2 & 0xffc ..][0..4], self.r[d.rm], .little);
+                                        self.r[15] = pc +% 8;
+                                        executed += 1;
+                                    }
+                                } else {
+                                    self.write32(bus, vaddr1, self.r[d.rd]) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                    if ((vaddr1 & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr1 >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                        if (self.checkInterrupts(bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff;
+                                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr_imm_cmp0_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        const val: u32 = if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
-                            std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little)
-                        else blk: {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                break :blk std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
-                            }
-                            break :blk self.read32(bus, vaddr) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                continue;
-                            };
-                        };
-                        self.r[d.rd] = val;
-                        self.cpsr = (self.cpsr & 0x0fff_ffff) | (val & 0x8000_0000) | (@as(u32, @intFromBool(val == 0)) << 30) | (1 << 29);
-                        self.r[15] = pc +% 8;
-                        executed += 1;
-                    },
-                    .add_reg_al => self.r[d.rd] = self.r[d.rn] +% self.r[d.rm],
-                    .sub_reg_al => self.r[d.rd] = self.r[d.rn] -% self.r[d.rm],
-                    .rsb_reg_al => self.r[d.rd] = self.r[d.rm] -% self.r[d.rn],
-                    .adc_reg_al => self.r[d.rd] = self.r[d.rn] +% self.r[d.rm] +% ((self.cpsr >> 29) & 1),
-                    .sbc_reg_al => self.r[d.rd] = self.r[d.rn] +% ~self.r[d.rm] +% ((self.cpsr >> 29) & 1),
-                    .rsc_reg_al => self.r[d.rd] = self.r[d.rm] +% ~self.r[d.rn] +% ((self.cpsr >> 29) & 1),
-                    .and_reg_al => self.r[d.rd] = self.r[d.rn] & self.r[d.rm],
-                    .orr_reg_al => self.r[d.rd] = self.r[d.rn] | self.r[d.rm],
-                    .eor_reg_al => self.r[d.rd] = self.r[d.rn] ^ self.r[d.rm],
-                    .bic_reg_al => self.r[d.rd] = self.r[d.rn] & ~self.r[d.rm],
-                    .mov_reg_al => self.r[d.rd] = self.r[d.rm],
-                    .mvn_reg_al => self.r[d.rd] = ~self.r[d.rm],
-                    .adds_reg_al => self.r[d.rd] = self.setAddNZCV(self.r[d.rn], self.r[d.rm]),
-                    .subs_reg_al => self.r[d.rd] = self.setSubNZCV(self.r[d.rn], self.r[d.rm]),
-                    .adcs_reg_al => {
-                        const res = dec.addWithCarry(self.r[d.rn], self.r[d.rm], @truncate((self.cpsr >> 29) & 1));
-                        self.r[d.rd] = res.val;
-                        self.setNZCV(res);
-                    },
-                    .sbcs_reg_al => {
-                        const res = dec.addWithCarry(self.r[d.rn], ~self.r[d.rm], @truncate((self.cpsr >> 29) & 1));
-                        self.r[d.rd] = res.val;
-                        self.setNZCV(res);
-                    },
-                    .cmp_reg_al => _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm]),
-                    .cmn_reg_al => _ = self.setAddNZCV(self.r[d.rn], self.r[d.rm]),
-                    .tst_reg_al => self.setNZ(self.r[d.rn] & self.r[d.rm]),
-                    .teq_reg_al => self.setNZ(self.r[d.rn] ^ self.r[d.rm]),
-                    .lsl_imm_al => self.r[d.rd] = self.r[d.rm] << @as(u5, @truncate(imm32)),
-                    .lsr_imm_al => self.r[d.rd] = self.r[d.rm] >> @as(u5, @truncate(imm32)),
-                    .asr_imm_al => self.r[d.rd] = @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32))),
-                    .mvn_lsl_imm_al => self.r[d.rd] = ~(self.r[d.rm] << @as(u5, @truncate(imm32))),
-                    .mvn_lsr_imm_al => self.r[d.rd] = ~(self.r[d.rm] >> @as(u5, @truncate(imm32))),
-                    .add_lsl_reg_al => self.r[d.rd] = self.r[d.rn] +% (self.r[d.rm] << @as(u5, @truncate(imm32))),
-                    .sub_lsl_reg_al => self.r[d.rd] = self.r[d.rn] -% (self.r[d.rm] << @as(u5, @truncate(imm32))),
-                    .rsb_lsl_reg_al => self.r[d.rd] = (self.r[d.rm] << @as(u5, @truncate(imm32))) -% self.r[d.rn],
-                    .orr_lsl_reg_al => self.r[d.rd] = self.r[d.rn] | (self.r[d.rm] << @as(u5, @truncate(imm32))),
-                    .eor_lsl_reg_al => self.r[d.rd] = self.r[d.rn] ^ (self.r[d.rm] << @as(u5, @truncate(imm32))),
-                    .and_lsl_reg_al => self.r[d.rd] = self.r[d.rn] & (self.r[d.rm] << @as(u5, @truncate(imm32))),
-                    .bic_lsl_reg_al => self.r[d.rd] = self.r[d.rn] & ~(self.r[d.rm] << @as(u5, @truncate(imm32))),
-                    .add_lsr_reg_al => self.r[d.rd] = self.r[d.rn] +% (self.r[d.rm] >> @as(u5, @truncate(imm32))),
-                    .sub_lsr_reg_al => self.r[d.rd] = self.r[d.rn] -% (self.r[d.rm] >> @as(u5, @truncate(imm32))),
-                    .rsb_lsr_reg_al => self.r[d.rd] = (self.r[d.rm] >> @as(u5, @truncate(imm32))) -% self.r[d.rn],
-                    .orr_lsr_reg_al => self.r[d.rd] = self.r[d.rn] | (self.r[d.rm] >> @as(u5, @truncate(imm32))),
-                    .eor_lsr_reg_al => self.r[d.rd] = self.r[d.rn] ^ (self.r[d.rm] >> @as(u5, @truncate(imm32))),
-                    .and_lsr_reg_al => self.r[d.rd] = self.r[d.rn] & (self.r[d.rm] >> @as(u5, @truncate(imm32))),
-                    .bic_lsr_reg_al => self.r[d.rd] = self.r[d.rn] & ~(self.r[d.rm] >> @as(u5, @truncate(imm32))),
-                    .add_asr_reg_al => self.r[d.rd] = self.r[d.rn] +% @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
-                    .sub_asr_reg_al => self.r[d.rd] = self.r[d.rn] -% @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
-                    .orr_asr_reg_al => self.r[d.rd] = self.r[d.rn] | @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
-                    .and_asr_reg_al => self.r[d.rd] = self.r[d.rn] & @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
-                    .bic_asr_reg_al => self.r[d.rd] = self.r[d.rn] & ~@as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
-                    .cmp_lsl_reg_al => _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm] << @as(u5, @truncate(imm32))),
-                    .cmp_lsr_reg_al => _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm] >> @as(u5, @truncate(imm32))),
-                    .tst_lsl_reg_al => {
-                        const sh: u5 = @truncate(imm32);
-                        const inv: u5 = @truncate(@as(u6, 32) -% sh);
-                        const rm_val = self.r[d.rm];
-                        self.setNZC(self.r[d.rn] & (rm_val << sh), @truncate(rm_val >> inv));
-                    },
-                    .tst_lsr_reg_al => {
-                        const sh: u5 = @truncate(imm32);
-                        const m1: u5 = sh -% 1;
-                        const rm_val = self.r[d.rm];
-                        self.setNZC(self.r[d.rn] & (rm_val >> sh), @truncate(rm_val >> m1));
-                    },
-                    .mul_al => self.r[d.rd] = self.r[d.rm] *% self.r[d.rn],
-                    .mla_al => self.r[d.rd] = self.r[d.rm] *% self.r[d.rn] +% self.r[@as(u4, @truncate(imm32))],
-                    .mls_al => self.r[d.rd] = self.r[@as(u4, @truncate(imm32))] -% (self.r[d.rm] *% self.r[d.rn]),
-                    .umull_al => {
-                        const prod: u64 = @as(u64, self.r[d.rm]) * @as(u64, self.r[d.rn]);
-                        self.r[@as(u4, @truncate(imm32))] = @truncate(prod);
-                        self.r[d.rd] = @truncate(prod >> 32);
-                    },
-                    .umlal_al => {
-                        const rd_lo: u4 = @truncate(imm32);
-                        const acc: u64 = (@as(u64, self.r[d.rd]) << 32) | self.r[rd_lo];
-                        const prod: u64 = (@as(u64, self.r[d.rm]) * @as(u64, self.r[d.rn])) +% acc;
-                        self.r[rd_lo] = @truncate(prod);
-                        self.r[d.rd] = @truncate(prod >> 32);
-                    },
-                    .smull_al => {
-                        const a: i64 = @as(i32, @bitCast(self.r[d.rm]));
-                        const b: i64 = @as(i32, @bitCast(self.r[d.rn]));
-                        const prod: u64 = @bitCast(a * b);
-                        self.r[@as(u4, @truncate(imm32))] = @truncate(prod);
-                        self.r[d.rd] = @truncate(prod >> 32);
-                    },
-                    .smlal_al => {
-                        const rd_lo: u4 = @truncate(imm32);
-                        const a: i64 = @as(i32, @bitCast(self.r[d.rm]));
-                        const b: i64 = @as(i32, @bitCast(self.r[d.rn]));
-                        const acc: i64 = @bitCast((@as(u64, self.r[d.rd]) << 32) | self.r[rd_lo]);
-                        const prod: u64 = @bitCast((a * b) +% acc);
-                        self.r[rd_lo] = @truncate(prod);
-                        self.r[d.rd] = @truncate(prod >> 32);
-                    },
-                    .ldrex_al => {
-                        const vaddr = self.r[d.rn];
-                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                        if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                            data_r_vbase[bank] = slot.r_vbase;
-                            data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                            const paddr = slot.pbase | (vaddr & 0xfff);
-                            self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
-                            self.excl_valid = true;
-                            self.excl_paddr = paddr;
-                            self.excl_val = self.r[d.rd];
-                        } else {
-                            self.r[d.rd] = self.read32(bus, vaddr) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                continue;
-                            };
-                            self.excl_valid = true;
-                            self.excl_val = self.r[d.rd];
-                            const slot2 = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            self.excl_paddr = if ((vaddr & 0xffff_f000) == slot2.r_vbase) (slot2.pbase | (vaddr & 0xfff)) else 0;
-                        }
-                    },
-                    .strex_al => {
-                        const vaddr = self.r[d.rn];
-                        const val = self.r[d.rm];
-                        const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                        if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                            data_w_vbase[bank] = slot.w_vbase;
-                            data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                            if (self.excl_valid) {
-                                const stored = atomic_ram.compareAndSwap(u32, bus.ram, slot.pbase | (vaddr & 0xfff), @truncate(self.excl_val), val);
-                                if (stored) atomic_ram.signalEvent(bus);
-                                self.r[d.rd] = if (stored) 0 else 1;
-                                self.excl_valid = false;
-                            } else {
-                                self.r[d.rd] = 1;
-                            }
-                        } else {
-                            self.r[d.rd] = self.storeExclusive(bus, u32, vaddr, val, priv != 0) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                continue;
-                            };
-                        }
-                    },
-                    .ldrexd_al => {
-                        const vaddr = self.r[d.rn];
-                        const pair = self.read64(bus, vaddr) catch {
-                            self.enterException(.abt, 0x10, pc +% 8, false);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            continue;
-                        };
-                        self.r[d.rd] = @truncate(pair);
-                        self.r[d.rd + 1] = @truncate(pair >> 32);
-                        self.excl_valid = true;
-                        self.excl_val = pair;
-                    },
-                    .strexd_al => {
-                        const vaddr = self.r[d.rn];
-                        const val: u64 = @as(u64, self.r[d.rm]) | (@as(u64, self.r[d.rm + 1]) << 32);
-                        self.r[d.rd] = self.storeExclusive(bus, u64, vaddr, val, priv != 0) catch {
-                            self.enterException(.abt, 0x10, pc +% 8, false);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            continue;
-                        };
-                    },
-                    .ldrexb_al => {
-                        const vaddr = self.r[d.rn];
-                        if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
-                            self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
-                            } else {
-                                self.r[d.rd] = self.read8(bus, vaddr) catch {
+                        },
+                        .ldr_imm_cmp0_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            const val: u32 = if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
+                                std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little)
+                            else blk: {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    break :blk std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
+                                }
+                                break :blk self.read32(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
@@ -3107,129 +2906,120 @@ pub fn Arm1176(comptime Bus: type) type {
                                     data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
-                            }
-                        }
-                        self.excl_valid = true;
-                        self.excl_val = self.r[d.rd];
-                    },
-                    .strexb_al => {
-                        const vaddr = self.r[d.rn];
-                        const val: u8 = @truncate(self.r[d.rm]);
-                        self.r[d.rd] = self.storeExclusive(bus, u8, vaddr, val, priv != 0) catch {
-                            self.enterException(.abt, 0x10, pc +% 8, false);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            continue;
-                        };
-                    },
-                    .ldrexh_al => {
-                        const vaddr = self.r[d.rn];
-                        if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank]) {
-                            self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
-                            } else {
-                                self.r[d.rd] = self.read16(bus, vaddr) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                            }
-                        }
-                        self.excl_valid = true;
-                        self.excl_val = self.r[d.rd];
-                    },
-                    .strexh_al => {
-                        const vaddr = self.r[d.rn];
-                        const val: u16 = @truncate(self.r[d.rm]);
-                        self.r[d.rd] = self.storeExclusive(bus, u16, vaddr, val, priv != 0) catch {
-                            self.enterException(.abt, 0x10, pc +% 8, false);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            continue;
-                        };
-                    },
-                    .clz_al => self.r[d.rd] = @clz(self.r[d.rm]),
-                    .uxtb_al => self.r[d.rd] = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xff,
-                    .uxth_al => self.r[d.rd] = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xffff,
-                    .sxtb_al => {
-                        const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
-                        self.r[d.rd] = @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(rot_rm))))));
-                    },
-                    .sxth_al => {
-                        const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
-                        self.r[d.rd] = @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(rot_rm))))));
-                    },
-                    .uxtab_al => self.r[d.rd] = self.r[d.rn] +% (std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xff),
-                    .uxtah_al => self.r[d.rd] = self.r[d.rn] +% (std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xffff),
-                    .sxtab_al => {
-                        const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
-                        const sext: u32 = @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(rot_rm))))));
-                        self.r[d.rd] = self.r[d.rn] +% sext;
-                    },
-                    .sxtah_al => {
-                        const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
-                        const sext: u32 = @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(rot_rm))))));
-                        self.r[d.rd] = self.r[d.rn] +% sext;
-                    },
-                    .rev_al => self.r[d.rd] = @byteSwap(self.r[d.rm]),
-                    .rev16_al => {
-                        const v = self.r[d.rm];
-                        const lo: u16 = @byteSwap(@as(u16, @truncate(v)));
-                        const hi: u16 = @byteSwap(@as(u16, @truncate(v >> 16)));
-                        self.r[d.rd] = (@as(u32, hi) << 16) | lo;
-                    },
-                    .rbit_al => self.r[d.rd] = @bitReverse(self.r[d.rm]),
-                    .ubfx_al => self.r[d.rd] = (self.r[d.rm] >> @as(u5, @truncate(d.rn))) & imm32,
-                    .sbfx_al => {
-                        const sh_left: u5 = @truncate(d.rn);
-                        const sh_right: u5 = @truncate(imm32);
-                        const shifted: i32 = @as(i32, @bitCast(self.r[d.rm] << sh_left)) >> sh_right;
-                        self.r[d.rd] = @bitCast(shifted);
-                    },
-                    .bfi_al => {
-                        const lsb: u5 = @truncate(d.rn);
-                        self.r[d.rd] = (self.r[d.rd] & ~imm32) | ((self.r[d.rm] << lsb) & imm32);
-                    },
-                    .bfc_al => self.r[d.rd] &= ~imm32,
-                    .udiv_al => {
-                        const den = self.r[d.rm];
-                        self.r[d.rd] = if (den == 0) 0 else self.r[d.rn] / den;
-                    },
-                    .sdiv_al => {
-                        const den_u = self.r[d.rm];
-                        if (den_u == 0) {
-                            self.r[d.rd] = 0;
-                        } else {
-                            const num: i32 = @bitCast(self.r[d.rn]);
-                            const den: i32 = @bitCast(den_u);
-                            self.r[d.rd] = if (num == std.math.minInt(i32) and den == -1)
-                                @bitCast(num)
-                            else
-                                @bitCast(@divTrunc(num, den));
-                        }
-                    },
-                    .ldr_imm_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank]) {
-                            self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
-                        } else {
+                            };
+                            self.r[d.rd] = val;
+                            self.cpsr = (self.cpsr & 0x0fff_ffff) | (val & 0x8000_0000) | (@as(u32, @intFromBool(val == 0)) << 30) | (1 << 29);
+                            self.r[15] = pc +% 8;
+                            executed += 1;
+                        },
+                        .add_reg_al => self.r[d.rd] = self.r[d.rn] +% self.r[d.rm],
+                        .sub_reg_al => self.r[d.rd] = self.r[d.rn] -% self.r[d.rm],
+                        .rsb_reg_al => self.r[d.rd] = self.r[d.rm] -% self.r[d.rn],
+                        .adc_reg_al => self.r[d.rd] = self.r[d.rn] +% self.r[d.rm] +% ((self.cpsr >> 29) & 1),
+                        .sbc_reg_al => self.r[d.rd] = self.r[d.rn] +% ~self.r[d.rm] +% ((self.cpsr >> 29) & 1),
+                        .rsc_reg_al => self.r[d.rd] = self.r[d.rm] +% ~self.r[d.rn] +% ((self.cpsr >> 29) & 1),
+                        .and_reg_al => self.r[d.rd] = self.r[d.rn] & self.r[d.rm],
+                        .orr_reg_al => self.r[d.rd] = self.r[d.rn] | self.r[d.rm],
+                        .eor_reg_al => self.r[d.rd] = self.r[d.rn] ^ self.r[d.rm],
+                        .bic_reg_al => self.r[d.rd] = self.r[d.rn] & ~self.r[d.rm],
+                        .mov_reg_al => self.r[d.rd] = self.r[d.rm],
+                        .mvn_reg_al => self.r[d.rd] = ~self.r[d.rm],
+                        .adds_reg_al => self.r[d.rd] = self.setAddNZCV(self.r[d.rn], self.r[d.rm]),
+                        .subs_reg_al => self.r[d.rd] = self.setSubNZCV(self.r[d.rn], self.r[d.rm]),
+                        .adcs_reg_al => {
+                            const res = dec.addWithCarry(self.r[d.rn], self.r[d.rm], @truncate((self.cpsr >> 29) & 1));
+                            self.r[d.rd] = res.val;
+                            self.setNZCV(res);
+                        },
+                        .sbcs_reg_al => {
+                            const res = dec.addWithCarry(self.r[d.rn], ~self.r[d.rm], @truncate((self.cpsr >> 29) & 1));
+                            self.r[d.rd] = res.val;
+                            self.setNZCV(res);
+                        },
+                        .cmp_reg_al => _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm]),
+                        .cmn_reg_al => _ = self.setAddNZCV(self.r[d.rn], self.r[d.rm]),
+                        .tst_reg_al => self.setNZ(self.r[d.rn] & self.r[d.rm]),
+                        .teq_reg_al => self.setNZ(self.r[d.rn] ^ self.r[d.rm]),
+                        .lsl_imm_al => self.r[d.rd] = self.r[d.rm] << @as(u5, @truncate(imm32)),
+                        .lsr_imm_al => self.r[d.rd] = self.r[d.rm] >> @as(u5, @truncate(imm32)),
+                        .asr_imm_al => self.r[d.rd] = @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32))),
+                        .mvn_lsl_imm_al => self.r[d.rd] = ~(self.r[d.rm] << @as(u5, @truncate(imm32))),
+                        .mvn_lsr_imm_al => self.r[d.rd] = ~(self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                        .add_lsl_reg_al => self.r[d.rd] = self.r[d.rn] +% (self.r[d.rm] << @as(u5, @truncate(imm32))),
+                        .sub_lsl_reg_al => self.r[d.rd] = self.r[d.rn] -% (self.r[d.rm] << @as(u5, @truncate(imm32))),
+                        .rsb_lsl_reg_al => self.r[d.rd] = (self.r[d.rm] << @as(u5, @truncate(imm32))) -% self.r[d.rn],
+                        .orr_lsl_reg_al => self.r[d.rd] = self.r[d.rn] | (self.r[d.rm] << @as(u5, @truncate(imm32))),
+                        .eor_lsl_reg_al => self.r[d.rd] = self.r[d.rn] ^ (self.r[d.rm] << @as(u5, @truncate(imm32))),
+                        .and_lsl_reg_al => self.r[d.rd] = self.r[d.rn] & (self.r[d.rm] << @as(u5, @truncate(imm32))),
+                        .bic_lsl_reg_al => self.r[d.rd] = self.r[d.rn] & ~(self.r[d.rm] << @as(u5, @truncate(imm32))),
+                        .add_lsr_reg_al => self.r[d.rd] = self.r[d.rn] +% (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                        .sub_lsr_reg_al => self.r[d.rd] = self.r[d.rn] -% (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                        .rsb_lsr_reg_al => self.r[d.rd] = (self.r[d.rm] >> @as(u5, @truncate(imm32))) -% self.r[d.rn],
+                        .orr_lsr_reg_al => self.r[d.rd] = self.r[d.rn] | (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                        .eor_lsr_reg_al => self.r[d.rd] = self.r[d.rn] ^ (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                        .and_lsr_reg_al => self.r[d.rd] = self.r[d.rn] & (self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                        .bic_lsr_reg_al => self.r[d.rd] = self.r[d.rn] & ~(self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                        .add_asr_reg_al => self.r[d.rd] = self.r[d.rn] +% @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
+                        .sub_asr_reg_al => self.r[d.rd] = self.r[d.rn] -% @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
+                        .orr_asr_reg_al => self.r[d.rd] = self.r[d.rn] | @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
+                        .and_asr_reg_al => self.r[d.rd] = self.r[d.rn] & @as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
+                        .bic_asr_reg_al => self.r[d.rd] = self.r[d.rn] & ~@as(u32, @bitCast(@as(i32, @bitCast(self.r[d.rm])) >> @as(u5, @truncate(imm32)))),
+                        .cmp_lsl_reg_al => _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm] << @as(u5, @truncate(imm32))),
+                        .cmp_lsr_reg_al => _ = self.setSubNZCV(self.r[d.rn], self.r[d.rm] >> @as(u5, @truncate(imm32))),
+                        .tst_lsl_reg_al => {
+                            const sh: u5 = @truncate(imm32);
+                            const inv: u5 = @truncate(@as(u6, 32) -% sh);
+                            const rm_val = self.r[d.rm];
+                            self.setNZC(self.r[d.rn] & (rm_val << sh), @truncate(rm_val >> inv));
+                        },
+                        .tst_lsr_reg_al => {
+                            const sh: u5 = @truncate(imm32);
+                            const m1: u5 = sh -% 1;
+                            const rm_val = self.r[d.rm];
+                            self.setNZC(self.r[d.rn] & (rm_val >> sh), @truncate(rm_val >> m1));
+                        },
+                        .mul_al => self.r[d.rd] = self.r[d.rm] *% self.r[d.rn],
+                        .mla_al => self.r[d.rd] = self.r[d.rm] *% self.r[d.rn] +% self.r[@as(u4, @truncate(imm32))],
+                        .mls_al => self.r[d.rd] = self.r[@as(u4, @truncate(imm32))] -% (self.r[d.rm] *% self.r[d.rn]),
+                        .umull_al => {
+                            const prod: u64 = @as(u64, self.r[d.rm]) * @as(u64, self.r[d.rn]);
+                            self.r[@as(u4, @truncate(imm32))] = @truncate(prod);
+                            self.r[d.rd] = @truncate(prod >> 32);
+                        },
+                        .umlal_al => {
+                            const rd_lo: u4 = @truncate(imm32);
+                            const acc: u64 = (@as(u64, self.r[d.rd]) << 32) | self.r[rd_lo];
+                            const prod: u64 = (@as(u64, self.r[d.rm]) * @as(u64, self.r[d.rn])) +% acc;
+                            self.r[rd_lo] = @truncate(prod);
+                            self.r[d.rd] = @truncate(prod >> 32);
+                        },
+                        .smull_al => {
+                            const a: i64 = @as(i32, @bitCast(self.r[d.rm]));
+                            const b: i64 = @as(i32, @bitCast(self.r[d.rn]));
+                            const prod: u64 = @bitCast(a * b);
+                            self.r[@as(u4, @truncate(imm32))] = @truncate(prod);
+                            self.r[d.rd] = @truncate(prod >> 32);
+                        },
+                        .smlal_al => {
+                            const rd_lo: u4 = @truncate(imm32);
+                            const a: i64 = @as(i32, @bitCast(self.r[d.rm]));
+                            const b: i64 = @as(i32, @bitCast(self.r[d.rn]));
+                            const acc: i64 = @bitCast((@as(u64, self.r[d.rd]) << 32) | self.r[rd_lo]);
+                            const prod: u64 = @bitCast((a * b) +% acc);
+                            self.r[rd_lo] = @truncate(prod);
+                            self.r[d.rd] = @truncate(prod >> 32);
+                        },
+                        .ldrex_al => {
+                            const vaddr = self.r[d.rn];
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
                                 data_r_vbase[bank] = slot.r_vbase;
                                 data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                const paddr = slot.pbase | (vaddr & 0xfff);
                                 self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
+                                self.excl_valid = true;
+                                self.excl_paddr = paddr;
+                                self.excl_val = self.r[d.rd];
                             } else {
                                 self.r[d.rd] = self.read32(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
@@ -3239,21 +3029,29 @@ pub fn Arm1176(comptime Bus: type) type {
                                     data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
+                                self.excl_valid = true;
+                                self.excl_val = self.r[d.rd];
+                                const slot2 = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                self.excl_paddr = if ((vaddr & 0xffff_f000) == slot2.r_vbase) (slot2.pbase | (vaddr & 0xfff)) else 0;
                             }
-                        }
-                    },
-                    .str_imm_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
-                        } else {
+                        },
+                        .strex_al => {
+                            const vaddr = self.r[d.rn];
+                            const val = self.r[d.rm];
                             const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
                             if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
                                 data_w_vbase[bank] = slot.w_vbase;
                                 data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                                if (self.excl_valid) {
+                                    const stored = atomic_ram.compareAndSwap(u32, bus.ram, slot.pbase | (vaddr & 0xfff), @truncate(self.excl_val), val);
+                                    if (stored) atomic_ram.signalEvent(bus);
+                                    self.r[d.rd] = if (stored) 0 else 1;
+                                    self.excl_valid = false;
+                                } else {
+                                    self.r[d.rd] = 1;
+                                }
                             } else {
-                                self.write32(bus, vaddr, self.r[d.rd]) catch {
+                                self.r[d.rd] = self.storeExclusive(bus, u32, vaddr, val, priv != 0) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
@@ -3261,321 +3059,555 @@ pub fn Arm1176(comptime Bus: type) type {
                                     data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
-                                if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                    if (self.checkInterrupts(bus)) {
-                                        priv = 1;
-                                        code_vbase = 0xffff_ffff;
-                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    }
-                                }
                             }
-                        }
-                    },
-                    .ldrb_imm_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
-                            self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                        },
+                        .ldrexd_al => {
+                            const vaddr = self.r[d.rn];
+                            const pair = self.read64(bus, vaddr) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                continue;
+                            };
+                            self.r[d.rd] = @truncate(pair);
+                            self.r[d.rd + 1] = @truncate(pair >> 32);
+                            self.excl_valid = true;
+                            self.excl_val = pair;
+                        },
+                        .strexd_al => {
+                            const vaddr = self.r[d.rn];
+                            const val: u64 = @as(u64, self.r[d.rm]) | (@as(u64, self.r[d.rm + 1]) << 32);
+                            self.r[d.rd] = self.storeExclusive(bus, u64, vaddr, val, priv != 0) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                continue;
+                            };
+                        },
+                        .ldrexb_al => {
+                            const vaddr = self.r[d.rn];
+                            if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
                                 self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                             } else {
-                                self.r[d.rd] = self.read8(bus, vaddr) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                            }
-                        }
-                    },
-                    .strb_imm_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & 0xffff_f000) == data_w_vbase[bank]) {
-                            data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xffff_f000) == slot.w_vbase) {
-                                data_w_vbase[bank] = slot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
-                            } else {
-                                self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                                if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                    if (self.checkInterrupts(bus)) {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & 0xffff_f000) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
+                                } else {
+                                    self.r[d.rd] = self.read8(bus, vaddr) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
                                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                }
+                            }
+                            self.excl_valid = true;
+                            self.excl_val = self.r[d.rd];
+                        },
+                        .strexb_al => {
+                            const vaddr = self.r[d.rn];
+                            const val: u8 = @truncate(self.r[d.rm]);
+                            self.r[d.rd] = self.storeExclusive(bus, u8, vaddr, val, priv != 0) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                continue;
+                            };
+                        },
+                        .ldrexh_al => {
+                            const vaddr = self.r[d.rn];
+                            if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank]) {
+                                self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
+                            } else {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
+                                } else {
+                                    self.r[d.rd] = self.read16(bus, vaddr) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                }
+                            }
+                            self.excl_valid = true;
+                            self.excl_val = self.r[d.rd];
+                        },
+                        .strexh_al => {
+                            const vaddr = self.r[d.rn];
+                            const val: u16 = @truncate(self.r[d.rm]);
+                            self.r[d.rd] = self.storeExclusive(bus, u16, vaddr, val, priv != 0) catch {
+                                self.enterException(.abt, 0x10, pc +% 8, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                continue;
+                            };
+                        },
+                        .clz_al => self.r[d.rd] = @clz(self.r[d.rm]),
+                        .uxtb_al => self.r[d.rd] = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xff,
+                        .uxth_al => self.r[d.rd] = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xffff,
+                        .sxtb_al => {
+                            const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
+                            self.r[d.rd] = @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(rot_rm))))));
+                        },
+                        .sxth_al => {
+                            const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
+                            self.r[d.rd] = @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(rot_rm))))));
+                        },
+                        .uxtab_al => self.r[d.rd] = self.r[d.rn] +% (std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xff),
+                        .uxtah_al => self.r[d.rd] = self.r[d.rn] +% (std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32))) & 0xffff),
+                        .sxtab_al => {
+                            const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
+                            const sext: u32 = @bitCast(@as(i32, @as(i8, @bitCast(@as(u8, @truncate(rot_rm))))));
+                            self.r[d.rd] = self.r[d.rn] +% sext;
+                        },
+                        .sxtah_al => {
+                            const rot_rm = std.math.rotr(u32, self.r[d.rm], @as(u5, @truncate(imm32)));
+                            const sext: u32 = @bitCast(@as(i32, @as(i16, @bitCast(@as(u16, @truncate(rot_rm))))));
+                            self.r[d.rd] = self.r[d.rn] +% sext;
+                        },
+                        .rev_al => self.r[d.rd] = @byteSwap(self.r[d.rm]),
+                        .rev16_al => {
+                            const v = self.r[d.rm];
+                            const lo: u16 = @byteSwap(@as(u16, @truncate(v)));
+                            const hi: u16 = @byteSwap(@as(u16, @truncate(v >> 16)));
+                            self.r[d.rd] = (@as(u32, hi) << 16) | lo;
+                        },
+                        .rbit_al => self.r[d.rd] = @bitReverse(self.r[d.rm]),
+                        .ubfx_al => self.r[d.rd] = (self.r[d.rm] >> @as(u5, @truncate(d.rn))) & imm32,
+                        .sbfx_al => {
+                            const sh_left: u5 = @truncate(d.rn);
+                            const sh_right: u5 = @truncate(imm32);
+                            const shifted: i32 = @as(i32, @bitCast(self.r[d.rm] << sh_left)) >> sh_right;
+                            self.r[d.rd] = @bitCast(shifted);
+                        },
+                        .bfi_al => {
+                            const lsb: u5 = @truncate(d.rn);
+                            self.r[d.rd] = (self.r[d.rd] & ~imm32) | ((self.r[d.rm] << lsb) & imm32);
+                        },
+                        .bfc_al => self.r[d.rd] &= ~imm32,
+                        .udiv_al => {
+                            const den = self.r[d.rm];
+                            self.r[d.rd] = if (den == 0) 0 else self.r[d.rn] / den;
+                        },
+                        .sdiv_al => {
+                            const den_u = self.r[d.rm];
+                            if (den_u == 0) {
+                                self.r[d.rd] = 0;
+                            } else {
+                                const num: i32 = @bitCast(self.r[d.rn]);
+                                const den: i32 = @bitCast(den_u);
+                                self.r[d.rd] = if (num == std.math.minInt(i32) and den == -1)
+                                    @bitCast(num)
+                                else
+                                    @bitCast(@divTrunc(num, den));
+                            }
+                        },
+                        .ldr_imm_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank]) {
+                                self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
+                            } else {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
+                                } else {
+                                    self.r[d.rd] = self.read32(bus, vaddr) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                }
+                            }
+                        },
+                        .str_imm_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                            } else {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                                } else {
+                                    self.write32(bus, vaddr, self.r[d.rd]) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                    if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                        if (self.checkInterrupts(bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff;
+                                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr_lit_al => {
-                        const vaddr = (pc +% 8) +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffc)) == code_vbase) {
-                            self.r[d.rd] = std.mem.readInt(u32, code_page_ptr[vaddr & 0xffc ..][0..4], .little);
-                        } else if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[0]) {
-                            self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[0][vaddr & 0xffc ..][0..4], .little);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase[0] = slot.r_vbase;
-                                data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                        },
+                        .ldrb_imm_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
+                                self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
+                            } else {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & 0xffff_f000) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
+                                } else {
+                                    self.r[d.rd] = self.read8(bus, vaddr) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                }
+                            }
+                        },
+                        .strb_imm_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            if ((vaddr & 0xffff_f000) == data_w_vbase[bank]) {
+                                data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
+                            } else {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & 0xffff_f000) == slot.w_vbase) {
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
+                                } else {
+                                    self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                    if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                        if (self.checkInterrupts(bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff;
+                                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .ldr_lit_al => {
+                            const vaddr = (pc +% 8) +% imm32;
+                            if ((vaddr & ~@as(u32, 0xffc)) == code_vbase) {
+                                self.r[d.rd] = std.mem.readInt(u32, code_page_ptr[vaddr & 0xffc ..][0..4], .little);
+                            } else if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[0]) {
                                 self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[0][vaddr & 0xffc ..][0..4], .little);
                             } else {
-                                self.r[d.rd] = self.read32(bus, vaddr) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                            }
-                        }
-                    },
-                    .ldrh_imm_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank]) {
-                            self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
-                            } else {
-                                self.r[d.rd] = self.read16(bus, vaddr) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                            }
-                        }
-                    },
-                    .strh_imm_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        if ((vaddr & ~@as(u32, 0xffe)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
-                                data_w_vbase[bank] = slot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
-                            } else {
-                                self.write16(bus, vaddr, @truncate(self.r[d.rd])) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                                if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                    if (self.checkInterrupts(bus)) {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                    data_r_vbase[0] = slot.r_vbase;
+                                    data_r_page_ptr[0] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[0][vaddr & 0xffc ..][0..4], .little);
+                                } else {
+                                    self.r[d.rd] = self.read32(bus, vaddr) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
                                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    }
+                                        continue;
+                                    };
                                 }
                             }
-                        }
-                    },
-                    .ldrsb_imm_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        const byte_val: u8 = if ((vaddr & 0xffff_f000) == data_r_vbase[bank])
-                            data_r_page_ptr[bank][vaddr & 0xfff]
-                        else blk: {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                break :blk data_r_page_ptr[bank][vaddr & 0xfff];
-                            }
-                            break :blk self.read8(bus, vaddr) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                continue;
-                            };
-                        };
-                        self.r[d.rd] = @bitCast(@as(i32, @as(i8, @bitCast(byte_val))));
-                    },
-                    .ldrsh_imm_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        const half_val: u16 = if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank])
-                            std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little)
-                        else blk: {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                break :blk std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
-                            }
-                            break :blk self.read16(bus, vaddr) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                continue;
-                            };
-                        };
-                        self.r[d.rd] = @bitCast(@as(i32, @as(i16, @bitCast(half_val))));
-                    },
-                    .ldrh_reg_al => {
-                        const vaddr = self.r[d.rn] +% self.r[d.rm];
-                        if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank]) {
-                            self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                        },
+                        .ldrh_imm_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank]) {
                                 self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
                             } else {
-                                self.r[d.rd] = self.read16(bus, vaddr) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                            }
-                        }
-                    },
-                    .strh_reg_al => {
-                        const vaddr = self.r[d.rn] +% self.r[d.rm];
-                        if ((vaddr & ~@as(u32, 0xffe)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
-                                data_w_vbase[bank] = slot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
-                            } else {
-                                self.write16(bus, vaddr, @truncate(self.r[d.rd])) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                                if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                    if (self.checkInterrupts(bus)) {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
+                                } else {
+                                    self.r[d.rd] = self.read16(bus, vaddr) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
                                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                }
+                            }
+                        },
+                        .strh_imm_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            if ((vaddr & ~@as(u32, 0xffe)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
+                            } else {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
+                                } else {
+                                    self.write16(bus, vaddr, @truncate(self.r[d.rd])) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                    if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                        if (self.checkInterrupts(bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff;
+                                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldrsb_reg_al => {
-                        const vaddr = self.r[d.rn] +% self.r[d.rm];
-                        const byte_val: u8 = if ((vaddr & 0xffff_f000) == data_r_vbase[bank])
-                            data_r_page_ptr[bank][vaddr & 0xfff]
-                        else blk: {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                break :blk data_r_page_ptr[bank][vaddr & 0xfff];
-                            }
-                            break :blk self.read8(bus, vaddr) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                continue;
+                        },
+                        .ldrsb_imm_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            const byte_val: u8 = if ((vaddr & 0xffff_f000) == data_r_vbase[bank])
+                                data_r_page_ptr[bank][vaddr & 0xfff]
+                            else blk: {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & 0xffff_f000) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    break :blk data_r_page_ptr[bank][vaddr & 0xfff];
+                                }
+                                break :blk self.read8(bus, vaddr) catch {
+                                    self.enterException(.abt, 0x10, pc +% 8, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    continue;
+                                };
                             };
-                        };
-                        self.r[d.rd] = @bitCast(@as(i32, @as(i8, @bitCast(byte_val))));
-                    },
-                    .ldrsh_reg_al => {
-                        const vaddr = self.r[d.rn] +% self.r[d.rm];
-                        const half_val: u16 = if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank])
-                            std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little)
-                        else blk: {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                break :blk std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
-                            }
-                            break :blk self.read16(bus, vaddr) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                continue;
+                            self.r[d.rd] = @bitCast(@as(i32, @as(i8, @bitCast(byte_val))));
+                        },
+                        .ldrsh_imm_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            const half_val: u16 = if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank])
+                                std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little)
+                            else blk: {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    break :blk std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
+                                }
+                                break :blk self.read16(bus, vaddr) catch {
+                                    self.enterException(.abt, 0x10, pc +% 8, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    continue;
+                                };
                             };
-                        };
-                        self.r[d.rd] = @bitCast(@as(i32, @as(i16, @bitCast(half_val))));
-                    },
-                    .ldrd_imm_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        const pair: u64 = if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
-                            std.mem.readInt(u64, data_r_page_ptr[bank][vaddr & 0xffc ..][0..8], .little)
-                        else blk: {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                break :blk std.mem.readInt(u64, data_r_page_ptr[bank][vaddr & 0xffc ..][0..8], .little);
+                            self.r[d.rd] = @bitCast(@as(i32, @as(i16, @bitCast(half_val))));
+                        },
+                        .ldrh_reg_al => {
+                            const vaddr = self.r[d.rn] +% self.r[d.rm];
+                            if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank]) {
+                                self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
+                            } else {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
+                                } else {
+                                    self.r[d.rd] = self.read16(bus, vaddr) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                }
                             }
-                            break :blk self.read64(bus, vaddr) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                continue;
+                        },
+                        .strh_reg_al => {
+                            const vaddr = self.r[d.rn] +% self.r[d.rm];
+                            if ((vaddr & ~@as(u32, 0xffe)) == data_w_vbase[bank]) {
+                                std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
+                            } else {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffe)) == slot.w_vbase) {
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    std.mem.writeInt(u16, data_w_page_ptr[bank][vaddr & 0xffe ..][0..2], @truncate(self.r[d.rd]), .little);
+                                } else {
+                                    self.write16(bus, vaddr, @truncate(self.r[d.rd])) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                    if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                        if (self.checkInterrupts(bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff;
+                                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .ldrsb_reg_al => {
+                            const vaddr = self.r[d.rn] +% self.r[d.rm];
+                            const byte_val: u8 = if ((vaddr & 0xffff_f000) == data_r_vbase[bank])
+                                data_r_page_ptr[bank][vaddr & 0xfff]
+                            else blk: {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & 0xffff_f000) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    break :blk data_r_page_ptr[bank][vaddr & 0xfff];
+                                }
+                                break :blk self.read8(bus, vaddr) catch {
+                                    self.enterException(.abt, 0x10, pc +% 8, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    continue;
+                                };
                             };
-                        };
-                        self.r[d.rd] = @truncate(pair);
-                        self.r[d.rd + 1] = @truncate(pair >> 32);
-                    },
-                    .strd_imm_al => {
-                        const vaddr = self.r[d.rn] +% imm32;
-                        const val: u64 = @as(u64, self.r[d.rd]) | (@as(u64, self.r[d.rd + 1]) << 32);
-                        if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u64, data_w_page_ptr[bank][vaddr & 0xffc ..][0..8], val, .little);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                data_w_vbase[bank] = slot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                            self.r[d.rd] = @bitCast(@as(i32, @as(i8, @bitCast(byte_val))));
+                        },
+                        .ldrsh_reg_al => {
+                            const vaddr = self.r[d.rn] +% self.r[d.rm];
+                            const half_val: u16 = if ((vaddr & ~@as(u32, 0xffe)) == data_r_vbase[bank])
+                                std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little)
+                            else blk: {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffe)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    break :blk std.mem.readInt(u16, data_r_page_ptr[bank][vaddr & 0xffe ..][0..2], .little);
+                                }
+                                break :blk self.read16(bus, vaddr) catch {
+                                    self.enterException(.abt, 0x10, pc +% 8, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    continue;
+                                };
+                            };
+                            self.r[d.rd] = @bitCast(@as(i32, @as(i16, @bitCast(half_val))));
+                        },
+                        .ldrd_imm_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            const pair: u64 = if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
+                                std.mem.readInt(u64, data_r_page_ptr[bank][vaddr & 0xffc ..][0..8], .little)
+                            else blk: {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    break :blk std.mem.readInt(u64, data_r_page_ptr[bank][vaddr & 0xffc ..][0..8], .little);
+                                }
+                                break :blk self.read64(bus, vaddr) catch {
+                                    self.enterException(.abt, 0x10, pc +% 8, false);
+                                    priv = 1;
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    continue;
+                                };
+                            };
+                            self.r[d.rd] = @truncate(pair);
+                            self.r[d.rd + 1] = @truncate(pair >> 32);
+                        },
+                        .strd_imm_al => {
+                            const vaddr = self.r[d.rn] +% imm32;
+                            const val: u64 = @as(u64, self.r[d.rd]) | (@as(u64, self.r[d.rd + 1]) << 32);
+                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
                                 std.mem.writeInt(u64, data_w_page_ptr[bank][vaddr & 0xffc ..][0..8], val, .little);
                             } else {
-                                self.write64(bus, vaddr, val) catch {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & 0xfff) <= 0xff8 and (vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    std.mem.writeInt(u64, data_w_page_ptr[bank][vaddr & 0xffc ..][0..8], val, .little);
+                                } else {
+                                    self.write64(bus, vaddr, val) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                    if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                        if (self.checkInterrupts(bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff;
+                                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        .ldr_wb_al => {
+                            const base_val = self.r[d.rn];
+                            const vaddr = base_val +% imm32;
+                            const wb_off: u32 = @truncate(d.imm >> 32);
+                            const val: u32 = if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
+                                std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little)
+                            else blk: {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    break :blk std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
+                                }
+                                break :blk self.read32(bus, vaddr) catch {
                                     self.enterException(.abt, 0x10, pc +% 8, false);
                                     priv = 1;
                                     code_vbase = 0xffff_ffff;
@@ -3583,968 +3615,225 @@ pub fn Arm1176(comptime Bus: type) type {
                                     data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                     continue;
                                 };
-                                if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                    if (self.checkInterrupts(bus)) {
-                                        priv = 1;
-                                        code_vbase = 0xffff_ffff;
-                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    .ldr_wb_al => {
-                        const base_val = self.r[d.rn];
-                        const vaddr = base_val +% imm32;
-                        const wb_off: u32 = @truncate(d.imm >> 32);
-                        const val: u32 = if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
-                            std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little)
-                        else blk: {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                break :blk std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
-                            }
-                            break :blk self.read32(bus, vaddr) catch {
-                                self.enterException(.abt, 0x10, pc +% 8, false);
-                                priv = 1;
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                continue;
                             };
-                        };
-                        self.r[d.rn] = base_val +% wb_off;
-                        if (d.rd == 15) {
-                            self.setPcWithInterworking(val);
-                            if ((val & 1) != 0) code_vbase = 0xffff_ffff;
-                        } else {
-                            self.r[d.rd] = val;
-                        }
-                    },
-                    .str_wb_al => {
-                        const base_val = self.r[d.rn];
-                        const vaddr = base_val +% imm32;
-                        const wb_off: u32 = @truncate(d.imm >> 32);
-                        if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
                             self.r[d.rn] = base_val +% wb_off;
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                data_w_vbase[bank] = slot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                            if (d.rd == 15) {
+                                self.setPcWithInterworking(val);
+                                if ((val & 1) != 0) code_vbase = 0xffff_ffff;
+                            } else {
+                                self.r[d.rd] = val;
+                            }
+                        },
+                        .str_wb_al => {
+                            const base_val = self.r[d.rn];
+                            const vaddr = base_val +% imm32;
+                            const wb_off: u32 = @truncate(d.imm >> 32);
+                            if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
                                 std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
                                 self.r[d.rn] = base_val +% wb_off;
                             } else {
-                                self.write32(bus, vaddr, self.r[d.rd]) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                                self.r[d.rn] = base_val +% wb_off;
-                                if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                    if (self.checkInterrupts(bus)) {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                                    self.r[d.rn] = base_val +% wb_off;
+                                } else {
+                                    self.write32(bus, vaddr, self.r[d.rd]) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
                                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                    self.r[d.rn] = base_val +% wb_off;
+                                    if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                        if (self.checkInterrupts(bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff;
+                                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldrb_wb_al => {
-                        const base_val = self.r[d.rn];
-                        const vaddr = base_val +% imm32;
-                        const wb_off: u32 = @truncate(d.imm >> 32);
-                        if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
-                            self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                        },
+                        .ldrb_wb_al => {
+                            const base_val = self.r[d.rn];
+                            const vaddr = base_val +% imm32;
+                            const wb_off: u32 = @truncate(d.imm >> 32);
+                            if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
                                 self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                             } else {
-                                self.r[d.rd] = self.read8(bus, vaddr) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & 0xffff_f000) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
+                                } else {
+                                    self.r[d.rd] = self.read8(bus, vaddr) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                }
                             }
-                        }
-                        self.r[d.rn] = base_val +% wb_off;
-                    },
-                    .strb_wb_al => {
-                        const base_val = self.r[d.rn];
-                        const vaddr = base_val +% imm32;
-                        const wb_off: u32 = @truncate(d.imm >> 32);
-                        if ((vaddr & 0xffff_f000) == data_w_vbase[bank]) {
-                            data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
                             self.r[d.rn] = base_val +% wb_off;
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xffff_f000) == slot.w_vbase) {
-                                data_w_vbase[bank] = slot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                        },
+                        .strb_wb_al => {
+                            const base_val = self.r[d.rn];
+                            const vaddr = base_val +% imm32;
+                            const wb_off: u32 = @truncate(d.imm >> 32);
+                            if ((vaddr & 0xffff_f000) == data_w_vbase[bank]) {
                                 data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
                                 self.r[d.rn] = base_val +% wb_off;
                             } else {
-                                self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                                self.r[d.rn] = base_val +% wb_off;
-                                if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                    if (self.checkInterrupts(bus)) {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & 0xffff_f000) == slot.w_vbase) {
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
+                                    self.r[d.rn] = base_val +% wb_off;
+                                } else {
+                                    self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
                                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                    self.r[d.rn] = base_val +% wb_off;
+                                    if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                        if (self.checkInterrupts(bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff;
+                                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldr_reg_lsl_al, .ldr_reg_sub_lsl_al, .ldr_reg_lsr_al => {
-                        const scaled = if (op == .ldr_reg_lsr_al)
-                            (self.r[d.rm] >> @as(u5, @truncate(imm32)))
-                        else
-                            (self.r[d.rm] << @as(u5, @truncate(imm32)));
-                        const vaddr = if (op == .ldr_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
-                        if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank]) {
-                            self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                        },
+                        .ldr_reg_lsl_al, .ldr_reg_sub_lsl_al, .ldr_reg_lsr_al => {
+                            const scaled = if (op == .ldr_reg_lsr_al)
+                                (self.r[d.rm] >> @as(u5, @truncate(imm32)))
+                            else
+                                (self.r[d.rm] << @as(u5, @truncate(imm32)));
+                            const vaddr = if (op == .ldr_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
+                            if ((vaddr & ~@as(u32, 0xffc)) == data_r_vbase[bank]) {
                                 self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
                             } else {
-                                self.r[d.rd] = self.read32(bus, vaddr) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffc)) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xffc ..][0..4], .little);
+                                } else {
+                                    self.r[d.rd] = self.read32(bus, vaddr) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                }
                             }
-                        }
-                    },
-                    .str_reg_lsl_al, .str_reg_sub_lsl_al, .str_reg_lsr_al => {
-                        const scaled = if (op == .str_reg_lsr_al)
-                            (self.r[d.rm] >> @as(u5, @truncate(imm32)))
-                        else
-                            (self.r[d.rm] << @as(u5, @truncate(imm32)));
-                        const vaddr = if (op == .str_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
-                        if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
-                            std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
-                                data_w_vbase[bank] = slot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                        },
+                        .str_reg_lsl_al, .str_reg_sub_lsl_al, .str_reg_lsr_al => {
+                            const scaled = if (op == .str_reg_lsr_al)
+                                (self.r[d.rm] >> @as(u5, @truncate(imm32)))
+                            else
+                                (self.r[d.rm] << @as(u5, @truncate(imm32)));
+                            const vaddr = if (op == .str_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
+                            if ((vaddr & ~@as(u32, 0xffc)) == data_w_vbase[bank]) {
                                 std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
                             } else {
-                                self.write32(bus, vaddr, self.r[d.rd]) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                                if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                    if (self.checkInterrupts(bus)) {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & ~@as(u32, 0xffc)) == slot.w_vbase) {
+                                    data_w_vbase[bank] = slot.w_vbase;
+                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xffc ..][0..4], self.r[d.rd], .little);
+                                } else {
+                                    self.write32(bus, vaddr, self.r[d.rd]) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
                                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                    if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                        if (self.checkInterrupts(bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff;
+                                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        }
                                     }
                                 }
                             }
-                        }
-                    },
-                    .ldrb_reg_lsl_al, .ldrb_reg_sub_lsl_al => {
-                        const scaled = self.r[d.rm] << @as(u5, @truncate(imm32));
-                        const vaddr = if (op == .ldrb_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
-                        if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
-                            self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xffff_f000) == slot.r_vbase) {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                        },
+                        .ldrb_reg_lsl_al, .ldrb_reg_sub_lsl_al => {
+                            const scaled = self.r[d.rm] << @as(u5, @truncate(imm32));
+                            const vaddr = if (op == .ldrb_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
+                            if ((vaddr & 0xffff_f000) == data_r_vbase[bank]) {
                                 self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
                             } else {
-                                self.r[d.rd] = self.read8(bus, vaddr) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                            }
-                        }
-                    },
-                    .strb_reg_lsl_al, .strb_reg_sub_lsl_al => {
-                        const scaled = self.r[d.rm] << @as(u5, @truncate(imm32));
-                        const vaddr = if (op == .strb_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
-                        if ((vaddr & 0xffff_f000) == data_w_vbase[bank]) {
-                            data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
-                        } else {
-                            const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                            if ((vaddr & 0xffff_f000) == slot.w_vbase) {
-                                data_w_vbase[bank] = slot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
-                            } else {
-                                self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
-                                    self.enterException(.abt, 0x10, pc +% 8, false);
-                                    priv = 1;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    continue;
-                                };
-                                if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                    if (self.checkInterrupts(bus)) {
+                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                if ((vaddr & 0xffff_f000) == slot.r_vbase) {
+                                    data_r_vbase[bank] = slot.r_vbase;
+                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                    self.r[d.rd] = data_r_page_ptr[bank][vaddr & 0xfff];
+                                } else {
+                                    self.r[d.rd] = self.read8(bus, vaddr) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
                                         priv = 1;
                                         code_vbase = 0xffff_ffff;
                                         data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                         data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    }
+                                        continue;
+                                    };
                                 }
                             }
-                        }
-                    },
-                    .ldm_al, .ldm_pc_al => {
-                        const base_val = self.r[d.rn];
-                        const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
-                        const start_addr = base_val +% @as(u32, @bitCast(start_off));
-                        const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
-                        const last_addr = start_addr +% last_off;
-                        const hit_page: ?[*]const u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_r_vbase[bank] and
-                            (last_addr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
-                            data_r_page_ptr[bank]
-                        else blk: {
-                            const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
-                            if ((start_addr & ~@as(u32, 0xffc)) == slot.r_vbase and
-                                (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
-                            {
-                                data_r_vbase[bank] = slot.r_vbase;
-                                data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                break :blk data_r_page_ptr[bank];
-                            }
-                            break :blk null;
-                        };
-                        if (hit_page) |page_ptr| {
-                            var off: usize = start_addr & 0xfff;
-                            if (comptime @import("builtin").cpu.arch.endian() == .little) {
-                                if ((d.rm & 0x80) != 0) {
-                                    const nbytes: usize = d.rm & 0x3f;
-                                    if (nbytes != 0) {
-                                        const r_bytes: *[64]u8 = @ptrCast(&self.r);
-                                        @memcpy(r_bytes[d.rd..][0..nbytes], page_ptr[off..][0..nbytes]);
-                                        off += nbytes;
-                                    }
-                                    if ((d.rm & 0x40) != 0) {
-                                        self.r[14] = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
-                                        off += 4;
-                                    }
-                                } else {
-                                    var rem: u16 = @truncate(d.imm & 0x7fff);
-                                    while (rem != 0) : (rem &= rem - 1) {
-                                        const i: u4 = @intCast(@ctz(rem));
-                                        self.r[i] = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
-                                        off += 4;
-                                    }
-                                }
-                            } else {
-                                var rem: u16 = @truncate(d.imm & 0x7fff);
-                                while (rem != 0) : (rem &= rem - 1) {
-                                    const i: u4 = @intCast(@ctz(rem));
-                                    self.r[i] = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
-                                    off += 4;
-                                }
-                            }
-                            const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
-                            if (wb_off != 0) self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
-                            if (op == .ldm_pc_al) {
-                                const pc_val = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
-                                self.setPcWithInterworking(pc_val);
-                                if ((pc_val & 1) != 0) code_vbase = 0xffff_ffff;
-                            }
-                        } else {
-                            self.executeLoadStoreMultiple(bus, pc, inst);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .stm_al => {
-                        const base_val = self.r[d.rn];
-                        const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
-                        const start_addr = base_val +% @as(u32, @bitCast(start_off));
-                        const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
-                        const last_addr = start_addr +% last_off;
-                        const hit_page: ?[*]u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_w_vbase[bank] and
-                            (last_addr & ~@as(u32, 0xffc)) == data_w_vbase[bank])
-                            data_w_page_ptr[bank]
-                        else blk: {
-                            const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
-                            if ((start_addr & ~@as(u32, 0xffc)) == slot.w_vbase and
-                                (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
-                            {
-                                data_w_vbase[bank] = slot.w_vbase;
-                                data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                break :blk data_w_page_ptr[bank];
-                            }
-                            break :blk null;
-                        };
-                        if (hit_page) |page_ptr| {
-                            var off: usize = start_addr & 0xfff;
-                            if (comptime @import("builtin").cpu.arch.endian() == .little) {
-                                if ((d.rm & 0x80) != 0) {
-                                    const nbytes: usize = d.rm & 0x3f;
-                                    if (nbytes != 0) {
-                                        const r_bytes: *const [64]u8 = @ptrCast(&self.r);
-                                        @memcpy(page_ptr[off..][0..nbytes], r_bytes[d.rd..][0..nbytes]);
-                                        off += nbytes;
-                                    }
-                                    if ((d.rm & 0x40) != 0) {
-                                        std.mem.writeInt(u32, page_ptr[off..][0..4], self.r[14], .little);
-                                    }
-                                } else {
-                                    var rem: u16 = @truncate(d.imm);
-                                    while (rem != 0) : (rem &= rem - 1) {
-                                        const i: u4 = @intCast(@ctz(rem));
-                                        const val = if (i == 15) (pc +% 8) else self.r[i];
-                                        std.mem.writeInt(u32, page_ptr[off..][0..4], val, .little);
-                                        off += 4;
-                                    }
-                                }
-                            } else {
-                                var rem: u16 = @truncate(d.imm);
-                                while (rem != 0) : (rem &= rem - 1) {
-                                    const i: u4 = @intCast(@ctz(rem));
-                                    const val = if (i == 15) (pc +% 8) else self.r[i];
-                                    std.mem.writeInt(u32, page_ptr[off..][0..4], val, .little);
-                                    off += 4;
-                                }
-                            }
-                            const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
-                            if (wb_off != 0) self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
-                        } else {
-                            self.executeLoadStoreMultiple(bus, pc, inst);
-                            if ((last_addr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(last_addr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
-                                _ = self.checkInterrupts(bus);
-                            }
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .b_al => {
-                        const shift_imm: i32 = @bitCast(imm32);
-                        if (shift_imm >= -28 and shift_imm < 0) {
-                            if (self.last_dmb_pc == pc) {
-                                if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
-                                    self.yield_slice = true;
-                                }
-                            } else if ((pc & 0xfff) < 0xffc and (pc & 0xffff_f000) == code_vbase) {
-                                const next_paddr = code_pbase | ((pc +% 4) & 0xfff);
-                                const next_inst = std.mem.readInt(u32, bus.ram[next_paddr..][0..4], .little);
-                                if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) {
-                                    self.last_dmb_pc = pc;
-                                }
-                            }
-                        }
-                        const target_pc = (pc +% 8) +% imm32;
-                        self.r[15] = target_pc;
-                        if (self.yield_slice) break :step_loop;
-                        self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 1));
-                    },
-                    .bl_al => {
-                        const target_pc = (pc +% 8) +% imm32;
-                        self.r[14] = pc +% 4;
-                        if (inst >= 0xe000_0000) {
-                            if (self.last_dmb_pc == pc) {
-                                if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
-                                    self.yield_slice = true;
-                                }
-                            } else {
-                                const tslot = self.mmu.soft_tlb32[priv][(target_pc >> 12) & Mmu.soft_tlb_mask];
-                                if ((target_pc & 0xffff_f000) == tslot.x_vbase) {
-                                    const target_paddr = tslot.pbase | (target_pc & 0xfff);
-                                    const target_inst = std.mem.readInt(u32, bus.ram[target_paddr..][0..4], .little);
-                                    if (target_inst == 0xe12fff1e) {
-                                        self.last_dmb_pc = pc;
-                                    }
-                                }
-                            }
-                        }
-                        self.r[15] = target_pc;
-                        if (self.yield_slice) break :step_loop;
-                        self.noteCallTarget32(bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target_pc, pc +% 4);
-                    },
-                    .bx_lr_al => {
-                        const target = self.r[14];
-                        self.setPcWithInterworking(target);
-                        if ((target & 1) != 0) code_vbase = 0xffff_ffff;
-                    },
-                    .bx_reg_al => {
-                        const target = self.r[d.rm];
-                        self.setPcWithInterworking(target);
-                        if ((target & 1) != 0) code_vbase = 0xffff_ffff;
-                    },
-                    .blx_reg_al => {
-                        const target = self.r[d.rm];
-                        self.r[14] = pc +% 4;
-                        self.setPcWithInterworking(target);
-                        if ((target & 1) != 0) {
-                            code_vbase = 0xffff_ffff;
-                        } else {
-                            self.noteCallTarget32(bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target, pc +% 4);
-                        }
-                    },
-                    .dp_imm_general => {
-                        self.executeGroup001(pc, inst);
-                        if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
-                        _ = self.checkInterrupts(bus);
-                        priv = @intFromBool(self.isPrivileged());
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                    },
-                    .dp_reg_general => {
-                        self.executeGroup000(bus, pc, inst);
-                        if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
-                        _ = self.checkInterrupts(bus);
-                        priv = @intFromBool(self.isPrivileged());
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                    },
-                    .mrs_cpsr_al => self.r[d.rd] = self.cpsr,
-                    .msr_cpsr_c_al => {
-                        if (priv != 0) {
-                            const val = self.r[d.rm];
-                            if ((val & 0x1f) == (self.cpsr & 0x1f) and (val & PsrFlags.T) == 0) {
-                                self.cpsr = (self.cpsr & 0xffff_ff00) | (val & 0xff);
-                                if (self.checkInterrupts(bus)) {
-                                    priv = @intFromBool(self.isPrivileged());
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                }
-                            } else {
-                                self.setCpsr((self.cpsr & 0xffff_ff00) | (val & 0xff));
-                                _ = self.checkInterrupts(bus);
-                                priv = @intFromBool(self.isPrivileged());
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            }
-                        }
-                    },
-                    .mrc_tpidruro_al => self.r[d.rd] = self.mmu.tpidruro,
-                    .mrc_tpidrurw_al => self.r[d.rd] = self.mmu.tpidrurw,
-                    .mrc_tpidrprw_al => {
-                        if (priv != 0) {
-                            self.r[d.rd] = self.mmu.tpidrprw;
-                        } else {
-                            self.enterException(.und, 0x04, pc +% 4, false);
-                            priv = 1;
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .mcr_barrier_al => {
-                        if (d.rd == 2) {
-                            self.invalidateIcache();
-                            code_vbase = 0xffff_ffff;
-                        } else {
-                            self.memoryBarrier(bus, d.rd != 0);
-                            atomic_ram.signalEvent(bus);
-                        }
-                    },
-                    .nop_al => {
-                        if (d.rd == 4) atomic_ram.signalEvent(bus);
-                    },
-                    .yield_wfe_al => {
-                        if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
-                            self.yield_slice = true;
-                            break :step_loop;
-                        }
-                    },
-                    .clrex_al => self.excl_valid = false,
-                    .dmb_dsb_v7_al => {
-                        self.memoryBarrier(bus, d.rd != 0);
-                        if (self.last_dmb_pc == pc) {
-                            if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
-                                self.yield_slice = true;
-                                break :step_loop;
-                            }
-                        } else {
-                            self.last_dmb_pc = pc;
-                            atomic_ram.signalEvent(bus);
-                        }
-                    },
-                    .cpsid_al => {
-                        if (priv != 0) self.cpsr |= imm32;
-                    },
-                    .cpsie_al => {
-                        if (priv != 0) {
-                            self.cpsr &= imm32;
-                            if (self.checkInterrupts(bus)) {
-                                priv = @intFromBool(self.isPrivileged());
-                                code_vbase = 0xffff_ffff;
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            }
-                        }
-                    },
-                    .misc_000 => {
-                        self.executeMisc000(pc, inst);
-                        _ = self.checkInterrupts(bus);
-                        priv = @intFromBool(self.isPrivileged());
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                    },
-                    .mul_extra_ls => {
-                        self.executeMultipliesAndExtraLoadStore(bus, pc, inst);
-                        _ = self.checkInterrupts(bus);
-                        priv = @intFromBool(self.isPrivileged());
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                    },
-                    .ls_wb_imm => {
-                        self.executeLoadStoreWordByte(bus, pc, inst, false);
-                        _ = self.checkInterrupts(bus);
-                        priv = @intFromBool(self.isPrivileged());
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                    },
-                    .ls_wb_reg => {
-                        self.executeLoadStoreWordByte(bus, pc, inst, true);
-                        _ = self.checkInterrupts(bus);
-                        priv = @intFromBool(self.isPrivileged());
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                    },
-                    .ls_multiple => {
-                        self.executeLoadStoreMultiple(bus, pc, inst);
-                        _ = self.checkInterrupts(bus);
-                        priv = @intFromBool(self.isPrivileged());
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                    },
-                    .media => {
-                        self.executeMediaGroup(pc, inst);
-                    },
-                    .coproc_svc => {
-                        self.executeCoprocOrSvc(bus, pc, inst);
-                        if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
-                        _ = self.checkInterrupts(bus);
-                        priv = @intFromBool(self.isPrivileged());
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                    },
-                    .vldr_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
-                            const vaddr = base +% imm32;
-                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == data_r_vbase[bank]) {
-                                const off: usize = vaddr & 0xfff;
-                                self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][off..][0..4], .little);
-                                self.vfp.s[d.rd + 1] = std.mem.readInt(u32, data_r_page_ptr[bank][off + 4 ..][0..4], .little);
-                            } else if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == code_vbase) {
-                                const off: usize = vaddr & 0xfff;
-                                self.vfp.s[d.rd] = std.mem.readInt(u32, code_page_ptr[off..][0..4], .little);
-                                self.vfp.s[d.rd + 1] = std.mem.readInt(u32, code_page_ptr[off + 4 ..][0..4], .little);
+                        },
+                        .strb_reg_lsl_al, .strb_reg_sub_lsl_al => {
+                            const scaled = self.r[d.rm] << @as(u5, @truncate(imm32));
+                            const vaddr = if (op == .strb_reg_sub_lsl_al) (self.r[d.rn] -% scaled) else (self.r[d.rn] +% scaled);
+                            if ((vaddr & 0xffff_f000) == data_w_vbase[bank]) {
+                                data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
                             } else {
                                 const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                                if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == slot.r_vbase) {
-                                    data_r_vbase[bank] = slot.r_vbase;
-                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                    const off: usize = vaddr & 0xfff;
-                                    self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][off..][0..4], .little);
-                                    self.vfp.s[d.rd + 1] = std.mem.readInt(u32, data_r_page_ptr[bank][off + 4 ..][0..4], .little);
-                                } else {
-                                    self.executeVfp(bus, pc, inst, true);
-                                    priv = @intFromBool(self.isPrivileged());
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                }
-                            }
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vstr_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
-                            const vaddr = base +% imm32;
-                            if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == data_w_vbase[bank]) {
-                                const off: usize = vaddr & 0xfff;
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][off..][0..4], self.vfp.s[d.rd], .little);
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][off + 4 ..][0..4], self.vfp.s[d.rd + 1], .little);
-                            } else {
-                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                                if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == slot.w_vbase) {
+                                if ((vaddr & 0xffff_f000) == slot.w_vbase) {
                                     data_w_vbase[bank] = slot.w_vbase;
                                     data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                    const off: usize = vaddr & 0xfff;
-                                    std.mem.writeInt(u32, data_w_page_ptr[bank][off..][0..4], self.vfp.s[d.rd], .little);
-                                    std.mem.writeInt(u32, data_w_page_ptr[bank][off + 4 ..][0..4], self.vfp.s[d.rd + 1], .little);
+                                    data_w_page_ptr[bank][vaddr & 0xfff] = @truncate(self.r[d.rd]);
                                 } else {
-                                    self.executeVfp(bus, pc, inst, true);
-                                    _ = self.checkInterrupts(bus);
-                                    priv = @intFromBool(self.isPrivileged());
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    self.write8(bus, vaddr, @truncate(self.r[d.rd])) catch {
+                                        self.enterException(.abt, 0x10, pc +% 8, false);
+                                        priv = 1;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        continue;
+                                    };
+                                    if ((vaddr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                        if (self.checkInterrupts(bus)) {
+                                            priv = 1;
+                                            code_vbase = 0xffff_ffff;
+                                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        }
+                                    }
                                 }
                             }
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vldr_f32_al => {
-                        if (self.vfpReady(priv)) {
-                            const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
-                            const vaddr = base +% imm32;
-                            if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == data_r_vbase[bank]) {
-                                self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xfff ..][0..4], .little);
-                            } else if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == code_vbase) {
-                                self.vfp.s[d.rd] = std.mem.readInt(u32, code_page_ptr[vaddr & 0xfff ..][0..4], .little);
-                            } else {
-                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                                if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == slot.r_vbase) {
-                                    data_r_vbase[bank] = slot.r_vbase;
-                                    data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                    self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xfff ..][0..4], .little);
-                                } else {
-                                    self.executeVfp(bus, pc, inst, false);
-                                    priv = @intFromBool(self.isPrivileged());
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                }
-                            }
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vstr_f32_al => {
-                        if (self.vfpReady(priv)) {
-                            const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
-                            const vaddr = base +% imm32;
-                            if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == data_w_vbase[bank]) {
-                                std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xfff ..][0..4], self.vfp.s[d.rd], .little);
-                            } else {
-                                const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
-                                if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == slot.w_vbase) {
-                                    data_w_vbase[bank] = slot.w_vbase;
-                                    data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
-                                    std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xfff ..][0..4], self.vfp.s[d.rd], .little);
-                                } else {
-                                    self.executeVfp(bus, pc, inst, false);
-                                    _ = self.checkInterrupts(bus);
-                                    priv = @intFromBool(self.isPrivileged());
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                }
-                            }
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmov_r_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            self.r[d.rd] = self.vfp.s[d.rm];
-                            self.r[d.rn] = self.vfp.s[d.rm + 1];
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmov_f64_r_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.s[d.rm] = self.r[d.rd];
-                            self.vfp.s[d.rm + 1] = self.r[d.rn];
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmov_r_f32_al => {
-                        if (self.vfpReady(priv)) {
-                            self.r[d.rd] = self.vfp.s[d.rn];
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmov_f32_r_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.s[d.rn] = self.r[d.rd];
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmrs_apsr_al => {
-                        if (self.vfpReady(priv)) {
-                            self.cpsr = (self.cpsr & 0x0fff_ffff) | (self.vfp.fpscr & 0xf000_0000);
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vadd_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) + self.vfp.getD(@truncate(d.rm)));
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vsub_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) - self.vfp.getD(@truncate(d.rm)));
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmul_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) * self.vfp.getD(@truncate(d.rm)));
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vdiv_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) / self.vfp.getD(@truncate(d.rm)));
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmla_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rd)) + (self.vfp.getD(@truncate(d.rn)) * self.vfp.getD(@truncate(d.rm))));
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmls_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rd)) - (self.vfp.getD(@truncate(d.rn)) * self.vfp.getD(@truncate(d.rm))));
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmov_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setDU64(@truncate(d.rd), self.vfp.getDU64(@truncate(d.rm)));
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vcmp_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.updateCmpFlags(f64, self.vfp.getD(@truncate(d.rd)), self.vfp.getD(@truncate(d.rm)));
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vcmpz_f64_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.updateCmpFlags(f64, self.vfp.getD(@truncate(d.rd)), 0.0);
-                        } else {
-                            self.executeVfp(bus, pc, inst, true);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vadd_f32_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) + self.vfp.getS(@truncate(d.rm)));
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vsub_f32_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) - self.vfp.getS(@truncate(d.rm)));
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmul_f32_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) * self.vfp.getS(@truncate(d.rm)));
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vdiv_f32_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) / self.vfp.getS(@truncate(d.rm)));
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmla_f32_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rd)) + (self.vfp.getS(@truncate(d.rn)) * self.vfp.getS(@truncate(d.rm))));
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmls_f32_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rd)) - (self.vfp.getS(@truncate(d.rn)) * self.vfp.getS(@truncate(d.rm))));
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vmov_f32_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.s[d.rd] = self.vfp.s[d.rm];
-                        } else {
-                            self.executeVfp(bus, pc, inst, false);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vfp_dp_al => {
-                        if (self.vfpReady(priv)) {
-                            self.vfp.executeDataProc(inst);
-                        } else {
-                            self.executeVfp(bus, pc, inst, ((inst >> 8) & 0xf) == 11);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vldm_al => {
-                        if (self.vfpReady(priv)) {
+                        },
+                        .ldm_al, .ldm_pc_al => {
                             const base_val = self.r[d.rn];
                             const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
                             const start_addr = base_val +% @as(u32, @bitCast(start_off));
@@ -4565,36 +3854,51 @@ pub fn Arm1176(comptime Bus: type) type {
                                 break :blk null;
                             };
                             if (hit_page) |page_ptr| {
-                                const off: usize = start_addr & 0xfff;
-                                const nbytes: usize = @as(u16, @truncate(d.imm));
+                                var off: usize = start_addr & 0xfff;
                                 if (comptime @import("builtin").cpu.arch.endian() == .little) {
-                                    const s_bytes: *[256]u8 = @ptrCast(&self.vfp.s);
-                                    @memcpy(s_bytes[@as(usize, d.rd) * 4 ..][0..nbytes], page_ptr[off..][0..nbytes]);
+                                    if ((d.rm & 0x80) != 0) {
+                                        const nbytes: usize = d.rm & 0x3f;
+                                        if (nbytes != 0) {
+                                            const r_bytes: *[64]u8 = @ptrCast(&self.r);
+                                            @memcpy(r_bytes[d.rd..][0..nbytes], page_ptr[off..][0..nbytes]);
+                                            off += nbytes;
+                                        }
+                                        if ((d.rm & 0x40) != 0) {
+                                            self.r[14] = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
+                                            off += 4;
+                                        }
+                                    } else {
+                                        var rem: u16 = @truncate(d.imm & 0x7fff);
+                                        while (rem != 0) : (rem &= rem - 1) {
+                                            const i: u4 = @intCast(@ctz(rem));
+                                            self.r[i] = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
+                                            off += 4;
+                                        }
+                                    }
                                 } else {
-                                    var p = off;
-                                    for (self.vfp.s[d.rd..][0 .. nbytes / 4]) |*s_reg| {
-                                        s_reg.* = std.mem.readInt(u32, page_ptr[p..][0..4], .little);
-                                        p += 4;
+                                    var rem: u16 = @truncate(d.imm & 0x7fff);
+                                    while (rem != 0) : (rem &= rem - 1) {
+                                        const i: u4 = @intCast(@ctz(rem));
+                                        self.r[i] = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
+                                        off += 4;
                                     }
                                 }
                                 const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
                                 if (wb_off != 0) self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
+                                if (op == .ldm_pc_al) {
+                                    const pc_val = std.mem.readInt(u32, page_ptr[off..][0..4], .little);
+                                    self.setPcWithInterworking(pc_val);
+                                    if ((pc_val & 1) != 0) code_vbase = 0xffff_ffff;
+                                }
                             } else {
-                                self.executeVfp(bus, pc, inst, d.rm != 0);
+                                self.executeLoadStoreMultiple(bus, pc, inst);
                                 priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
                                 data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             }
-                        } else {
-                            self.executeVfp(bus, pc, inst, d.rm != 0);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vstm_al => {
-                        if (self.vfpReady(priv)) {
+                        },
+                        .stm_al => {
                             const base_val = self.r[d.rn];
                             const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
                             const start_addr = base_val +% @as(u32, @bitCast(start_off));
@@ -4615,120 +3919,816 @@ pub fn Arm1176(comptime Bus: type) type {
                                 break :blk null;
                             };
                             if (hit_page) |page_ptr| {
-                                const off: usize = start_addr & 0xfff;
-                                const nbytes: usize = @as(u16, @truncate(d.imm));
+                                var off: usize = start_addr & 0xfff;
                                 if (comptime @import("builtin").cpu.arch.endian() == .little) {
-                                    const s_bytes: *const [256]u8 = @ptrCast(&self.vfp.s);
-                                    @memcpy(page_ptr[off..][0..nbytes], s_bytes[@as(usize, d.rd) * 4 ..][0..nbytes]);
+                                    if ((d.rm & 0x80) != 0) {
+                                        const nbytes: usize = d.rm & 0x3f;
+                                        if (nbytes != 0) {
+                                            const r_bytes: *const [64]u8 = @ptrCast(&self.r);
+                                            @memcpy(page_ptr[off..][0..nbytes], r_bytes[d.rd..][0..nbytes]);
+                                            off += nbytes;
+                                        }
+                                        if ((d.rm & 0x40) != 0) {
+                                            std.mem.writeInt(u32, page_ptr[off..][0..4], self.r[14], .little);
+                                        }
+                                    } else {
+                                        var rem: u16 = @truncate(d.imm);
+                                        while (rem != 0) : (rem &= rem - 1) {
+                                            const i: u4 = @intCast(@ctz(rem));
+                                            const val = if (i == 15) (pc +% 8) else self.r[i];
+                                            std.mem.writeInt(u32, page_ptr[off..][0..4], val, .little);
+                                            off += 4;
+                                        }
+                                    }
                                 } else {
-                                    var p = off;
-                                    for (self.vfp.s[d.rd..][0 .. nbytes / 4]) |s_reg| {
-                                        std.mem.writeInt(u32, page_ptr[p..][0..4], s_reg, .little);
-                                        p += 4;
+                                    var rem: u16 = @truncate(d.imm);
+                                    while (rem != 0) : (rem &= rem - 1) {
+                                        const i: u4 = @intCast(@ctz(rem));
+                                        const val = if (i == 15) (pc +% 8) else self.r[i];
+                                        std.mem.writeInt(u32, page_ptr[off..][0..4], val, .little);
+                                        off += 4;
                                     }
                                 }
                                 const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
                                 if (wb_off != 0) self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
                             } else {
-                                self.executeVfp(bus, pc, inst, d.rm != 0);
-                                priv = @intFromBool(self.isPrivileged());
-                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            }
-                        } else {
-                            self.executeVfp(bus, pc, inst, d.rm != 0);
-                            priv = @intFromBool(self.isPrivileged());
-                            code_vbase = 0xffff_ffff;
-                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                    .vfp_ls_multi_al => {
-                        self.executeVfp(bus, pc, inst, d.rm != 0);
-                        priv = @intFromBool(self.isPrivileged());
-                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                    },
-                    .unconditional => {
-                        self.executeUnconditional(bus, pc, inst);
-                        if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
-                        _ = self.checkInterrupts(bus);
-                        priv = @intFromBool(self.isPrivileged());
-                        code_vbase = 0xffff_ffff;
-                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                    },
-                    .jit_trace => {
-                        const max_jit_first: usize = (batch_end - executed) + 1;
-                        if (max_jit_first >= d.rd) {
-                            var cur_d = d;
-                            var cur_entry_pc = pc;
-                            var chain_count: u8 = 0;
-                            while (true) {
-                                const max_jit: usize = (batch_end - executed) + 1;
-                                self.r[15] = code_vbase;
-                                const fn_ptr: jit_mod.JitFn = @ptrFromInt(@as(usize, @truncate(cur_d.imm)));
-                                const tlb_ptr = &self.mmu.soft_tlb32[priv][0];
-                                const ran = fn_ptr(self, bus, bus.ram.ptr, tlb_ptr, max_jit, bus.ram.ptr);
-                                executed += ran - 1;
-                                const new_priv: u1 = @intFromBool(self.isPrivileged());
-                                if (new_priv != priv or self.isThumb() or self.mmu.halted_wfi or self.yield_slice) {
-                                    priv = new_priv;
-                                    code_vbase = 0xffff_ffff;
-                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                                    break;
+                                self.executeLoadStoreMultiple(bus, pc, inst);
+                                if ((last_addr & 0xffff_f000) != self.mmu.soft_tlb32[priv][(last_addr >> 12) & Mmu.soft_tlb_mask].w_vbase) {
+                                    _ = self.checkInterrupts(bus);
                                 }
-                                const next_pc = self.r[15];
-                                if ((next_pc & ~@as(u32, 0xffc)) != code_vbase) {
-                                    if ((next_pc & 3) != 0) {
-                                        code_vbase = 0xffff_ffff;
-                                        break;
-                                    }
-                                    const islot = self.mmu.soft_tlb32[priv][(next_pc >> 12) & Mmu.soft_tlb_mask];
-                                    if ((next_pc & 0xffff_f000) == islot.x_vbase) {
-                                        code_vbase = islot.x_vbase;
-                                        code_pbase = islot.pbase;
-                                        code_page_ptr = bus.ram.ptr + code_pbase;
-                                        code_page_idx = icachePageIdx(code_pbase);
-                                        code_icache_ptr = self.prepareIcachePage(code_page_idx, code_pbase);
-                                    } else {
-                                        code_vbase = 0xffff_ffff;
-                                        break;
-                                    }
-                                }
-                                if (chain_count >= 16 or next_pc == cur_entry_pc or executed >= batch_end) break;
-                                const next_d = code_icache_ptr[(next_pc >> 2) & 0x3ff];
-                                if (next_d.op == @intFromEnum(ArmOp.jit_trace) and (batch_end - executed) >= next_d.rd) {
-                                    executed += 1;
-                                    cur_d = next_d;
-                                    cur_entry_pc = next_pc;
-                                    chain_count += 1;
-                                    continue;
-                                }
-                                break;
-                            }
-                        } else if (batch_end < max_steps and (max_steps - executed) + 1 >= d.rd) {
-                            self.r[15] = pc;
-                            executed -= 1;
-                            if (self.checkInterrupts(bus)) {
                                 priv = @intFromBool(self.isPrivileged());
                                 code_vbase = 0xffff_ffff;
                                 data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                                 data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             }
-                            break;
-                        } else {
-                            self.executeArm(bus, pc, inst);
+                        },
+                        .b_al => {
+                            const shift_imm: i32 = @bitCast(imm32);
+                            if (shift_imm >= -28 and shift_imm < 0) {
+                                if (self.last_dmb_pc == pc) {
+                                    if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                                        self.yield_slice = true;
+                                    }
+                                } else if ((pc & 0xfff) < 0xffc and (pc & 0xffff_f000) == code_vbase) {
+                                    const next_paddr = code_pbase | ((pc +% 4) & 0xfff);
+                                    const next_inst = std.mem.readInt(u32, bus.ram[next_paddr..][0..4], .little);
+                                    if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) {
+                                        self.last_dmb_pc = pc;
+                                    }
+                                }
+                            }
+                            const target_pc = (pc +% 8) +% imm32;
+                            self.r[15] = target_pc;
+                            if (self.yield_slice) break :step_loop;
+                            self.noteBackwardBranch32(bus, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, pc, target_pc, @intCast(page_word + 1));
+                        },
+                        .bl_al => {
+                            const target_pc = (pc +% 8) +% imm32;
+                            self.r[14] = pc +% 4;
+                            if (inst >= 0xe000_0000) {
+                                if (self.last_dmb_pc == pc) {
+                                    if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                                        self.yield_slice = true;
+                                    }
+                                } else {
+                                    const tslot = self.mmu.soft_tlb32[priv][(target_pc >> 12) & Mmu.soft_tlb_mask];
+                                    if ((target_pc & 0xffff_f000) == tslot.x_vbase) {
+                                        const target_paddr = tslot.pbase | (target_pc & 0xfff);
+                                        const target_inst = std.mem.readInt(u32, bus.ram[target_paddr..][0..4], .little);
+                                        if (target_inst == 0xe12fff1e) {
+                                            self.last_dmb_pc = pc;
+                                        }
+                                    }
+                                }
+                            }
+                            self.r[15] = target_pc;
+                            if (self.yield_slice) break :step_loop;
+                            self.noteCallTarget32(bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target_pc, pc +% 4);
+                        },
+                        .bx_lr_al => {
+                            const target = self.r[14];
+                            self.setPcWithInterworking(target);
+                            if ((target & 1) != 0) code_vbase = 0xffff_ffff;
+                        },
+                        .bx_reg_al => {
+                            const target = self.r[d.rm];
+                            self.setPcWithInterworking(target);
+                            if ((target & 1) != 0) code_vbase = 0xffff_ffff;
+                        },
+                        .blx_reg_al => {
+                            const target = self.r[d.rm];
+                            self.r[14] = pc +% 4;
+                            self.setPcWithInterworking(target);
+                            if ((target & 1) != 0) {
+                                code_vbase = 0xffff_ffff;
+                            } else {
+                                self.noteCallTarget32(bus, priv, code_vbase, code_page_idx, code_icache_ptr, code_page_ptr, target, pc +% 4);
+                            }
+                        },
+                        .dp_imm_general => {
+                            self.executeGroup001(pc, inst);
                             if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
                             _ = self.checkInterrupts(bus);
                             priv = @intFromBool(self.isPrivileged());
                             code_vbase = 0xffff_ffff;
                             data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
                             data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
-                        }
-                    },
-                }
+                        },
+                        .dp_reg_general => {
+                            self.executeGroup000(bus, pc, inst);
+                            if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        },
+                        .mrs_cpsr_al => self.r[d.rd] = self.cpsr,
+                        .msr_cpsr_c_al => {
+                            if (priv != 0) {
+                                const val = self.r[d.rm];
+                                if ((val & 0x1f) == (self.cpsr & 0x1f) and (val & PsrFlags.T) == 0) {
+                                    self.cpsr = (self.cpsr & 0xffff_ff00) | (val & 0xff);
+                                    if (self.checkInterrupts(bus)) {
+                                        priv = @intFromBool(self.isPrivileged());
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    }
+                                } else {
+                                    self.setCpsr((self.cpsr & 0xffff_ff00) | (val & 0xff));
+                                    _ = self.checkInterrupts(bus);
+                                    priv = @intFromBool(self.isPrivileged());
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                }
+                            }
+                        },
+                        .mrc_tpidruro_al => self.r[d.rd] = self.mmu.tpidruro,
+                        .mrc_tpidrurw_al => self.r[d.rd] = self.mmu.tpidrurw,
+                        .mrc_tpidrprw_al => {
+                            if (priv != 0) {
+                                self.r[d.rd] = self.mmu.tpidrprw;
+                            } else {
+                                self.enterException(.und, 0x04, pc +% 4, false);
+                                priv = 1;
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .mcr_barrier_al => {
+                            if (d.rd == 2) {
+                                self.invalidateIcache();
+                                code_vbase = 0xffff_ffff;
+                            } else {
+                                self.memoryBarrier(bus, d.rd != 0);
+                                atomic_ram.signalEvent(bus);
+                            }
+                        },
+                        .nop_al => {
+                            if (d.rd == 4) atomic_ram.signalEvent(bus);
+                        },
+                        .yield_wfe_al => {
+                            if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                                self.yield_slice = true;
+                                break :step_loop;
+                            }
+                        },
+                        .clrex_al => self.excl_valid = false,
+                        .dmb_dsb_v7_al => {
+                            self.memoryBarrier(bus, d.rd != 0);
+                            if (self.last_dmb_pc == pc) {
+                                if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                                    self.yield_slice = true;
+                                    break :step_loop;
+                                }
+                            } else {
+                                self.last_dmb_pc = pc;
+                                atomic_ram.signalEvent(bus);
+                            }
+                        },
+                        .cpsid_al => {
+                            if (priv != 0) self.cpsr |= imm32;
+                        },
+                        .cpsie_al => {
+                            if (priv != 0) {
+                                self.cpsr &= imm32;
+                                if (self.checkInterrupts(bus)) {
+                                    priv = @intFromBool(self.isPrivileged());
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                }
+                            }
+                        },
+                        .misc_000 => {
+                            self.executeMisc000(pc, inst);
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        },
+                        .mul_extra_ls => {
+                            self.executeMultipliesAndExtraLoadStore(bus, pc, inst);
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        },
+                        .ls_wb_imm => {
+                            self.executeLoadStoreWordByte(bus, pc, inst, false);
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        },
+                        .ls_wb_reg => {
+                            self.executeLoadStoreWordByte(bus, pc, inst, true);
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        },
+                        .ls_multiple => {
+                            self.executeLoadStoreMultiple(bus, pc, inst);
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        },
+                        .media => {
+                            self.executeMediaGroup(pc, inst);
+                        },
+                        .coproc_svc => {
+                            self.executeCoprocOrSvc(bus, pc, inst);
+                            if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        },
+                        .vldr_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
+                                const vaddr = base +% imm32;
+                                if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == data_r_vbase[bank]) {
+                                    const off: usize = vaddr & 0xfff;
+                                    self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][off..][0..4], .little);
+                                    self.vfp.s[d.rd + 1] = std.mem.readInt(u32, data_r_page_ptr[bank][off + 4 ..][0..4], .little);
+                                } else if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == code_vbase) {
+                                    const off: usize = vaddr & 0xfff;
+                                    self.vfp.s[d.rd] = std.mem.readInt(u32, code_page_ptr[off..][0..4], .little);
+                                    self.vfp.s[d.rd + 1] = std.mem.readInt(u32, code_page_ptr[off + 4 ..][0..4], .little);
+                                } else {
+                                    const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                    if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == slot.r_vbase) {
+                                        data_r_vbase[bank] = slot.r_vbase;
+                                        data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                        const off: usize = vaddr & 0xfff;
+                                        self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][off..][0..4], .little);
+                                        self.vfp.s[d.rd + 1] = std.mem.readInt(u32, data_r_page_ptr[bank][off + 4 ..][0..4], .little);
+                                    } else {
+                                        self.executeVfp(bus, pc, inst, true);
+                                        priv = @intFromBool(self.isPrivileged());
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    }
+                                }
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vstr_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
+                                const vaddr = base +% imm32;
+                                if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == data_w_vbase[bank]) {
+                                    const off: usize = vaddr & 0xfff;
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][off..][0..4], self.vfp.s[d.rd], .little);
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][off + 4 ..][0..4], self.vfp.s[d.rd + 1], .little);
+                                } else {
+                                    const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                    if ((vaddr & 0xfff) <= 0xff8 and (vaddr & 0xffff_f000) == slot.w_vbase) {
+                                        data_w_vbase[bank] = slot.w_vbase;
+                                        data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                        const off: usize = vaddr & 0xfff;
+                                        std.mem.writeInt(u32, data_w_page_ptr[bank][off..][0..4], self.vfp.s[d.rd], .little);
+                                        std.mem.writeInt(u32, data_w_page_ptr[bank][off + 4 ..][0..4], self.vfp.s[d.rd + 1], .little);
+                                    } else {
+                                        self.executeVfp(bus, pc, inst, true);
+                                        _ = self.checkInterrupts(bus);
+                                        priv = @intFromBool(self.isPrivileged());
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    }
+                                }
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vldr_f32_al => {
+                            if (self.vfpReady(priv)) {
+                                const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
+                                const vaddr = base +% imm32;
+                                if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == data_r_vbase[bank]) {
+                                    self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xfff ..][0..4], .little);
+                                } else if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == code_vbase) {
+                                    self.vfp.s[d.rd] = std.mem.readInt(u32, code_page_ptr[vaddr & 0xfff ..][0..4], .little);
+                                } else {
+                                    const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                    if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == slot.r_vbase) {
+                                        data_r_vbase[bank] = slot.r_vbase;
+                                        data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                        self.vfp.s[d.rd] = std.mem.readInt(u32, data_r_page_ptr[bank][vaddr & 0xfff ..][0..4], .little);
+                                    } else {
+                                        self.executeVfp(bus, pc, inst, false);
+                                        priv = @intFromBool(self.isPrivileged());
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    }
+                                }
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vstr_f32_al => {
+                            if (self.vfpReady(priv)) {
+                                const base = if (d.rn == 15) (pc +% 8) else self.r[d.rn];
+                                const vaddr = base +% imm32;
+                                if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == data_w_vbase[bank]) {
+                                    std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xfff ..][0..4], self.vfp.s[d.rd], .little);
+                                } else {
+                                    const slot = self.mmu.soft_tlb32[priv][(vaddr >> 12) & Mmu.soft_tlb_mask];
+                                    if ((vaddr & 0xfff) <= 0xffc and (vaddr & 0xffff_f000) == slot.w_vbase) {
+                                        data_w_vbase[bank] = slot.w_vbase;
+                                        data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                        std.mem.writeInt(u32, data_w_page_ptr[bank][vaddr & 0xfff ..][0..4], self.vfp.s[d.rd], .little);
+                                    } else {
+                                        self.executeVfp(bus, pc, inst, false);
+                                        _ = self.checkInterrupts(bus);
+                                        priv = @intFromBool(self.isPrivileged());
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    }
+                                }
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmov_r_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                self.r[d.rd] = self.vfp.s[d.rm];
+                                self.r[d.rn] = self.vfp.s[d.rm + 1];
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmov_f64_r_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.s[d.rm] = self.r[d.rd];
+                                self.vfp.s[d.rm + 1] = self.r[d.rn];
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmov_r_f32_al => {
+                            if (self.vfpReady(priv)) {
+                                self.r[d.rd] = self.vfp.s[d.rn];
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmov_f32_r_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.s[d.rn] = self.r[d.rd];
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmrs_apsr_al => {
+                            if (self.vfpReady(priv)) {
+                                self.cpsr = (self.cpsr & 0x0fff_ffff) | (self.vfp.fpscr & 0xf000_0000);
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vadd_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) + self.vfp.getD(@truncate(d.rm)));
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vsub_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) - self.vfp.getD(@truncate(d.rm)));
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmul_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) * self.vfp.getD(@truncate(d.rm)));
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vdiv_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rn)) / self.vfp.getD(@truncate(d.rm)));
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmla_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rd)) + (self.vfp.getD(@truncate(d.rn)) * self.vfp.getD(@truncate(d.rm))));
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmls_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setD(@truncate(d.rd), self.vfp.getD(@truncate(d.rd)) - (self.vfp.getD(@truncate(d.rn)) * self.vfp.getD(@truncate(d.rm))));
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmov_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setDU64(@truncate(d.rd), self.vfp.getDU64(@truncate(d.rm)));
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vcmp_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.updateCmpFlags(f64, self.vfp.getD(@truncate(d.rd)), self.vfp.getD(@truncate(d.rm)));
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vcmpz_f64_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.updateCmpFlags(f64, self.vfp.getD(@truncate(d.rd)), 0.0);
+                            } else {
+                                self.executeVfp(bus, pc, inst, true);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vadd_f32_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) + self.vfp.getS(@truncate(d.rm)));
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vsub_f32_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) - self.vfp.getS(@truncate(d.rm)));
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmul_f32_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) * self.vfp.getS(@truncate(d.rm)));
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vdiv_f32_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rn)) / self.vfp.getS(@truncate(d.rm)));
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmla_f32_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rd)) + (self.vfp.getS(@truncate(d.rn)) * self.vfp.getS(@truncate(d.rm))));
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmls_f32_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.setS(@truncate(d.rd), self.vfp.getS(@truncate(d.rd)) - (self.vfp.getS(@truncate(d.rn)) * self.vfp.getS(@truncate(d.rm))));
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vmov_f32_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.s[d.rd] = self.vfp.s[d.rm];
+                            } else {
+                                self.executeVfp(bus, pc, inst, false);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vfp_dp_al => {
+                            if (self.vfpReady(priv)) {
+                                self.vfp.executeDataProc(inst);
+                            } else {
+                                self.executeVfp(bus, pc, inst, ((inst >> 8) & 0xf) == 11);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vldm_al => {
+                            if (self.vfpReady(priv)) {
+                                const base_val = self.r[d.rn];
+                                const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
+                                const start_addr = base_val +% @as(u32, @bitCast(start_off));
+                                const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
+                                const last_addr = start_addr +% last_off;
+                                const hit_page: ?[*]const u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_r_vbase[bank] and
+                                    (last_addr & ~@as(u32, 0xffc)) == data_r_vbase[bank])
+                                    data_r_page_ptr[bank]
+                                else blk: {
+                                    const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
+                                    if ((start_addr & ~@as(u32, 0xffc)) == slot.r_vbase and
+                                        (last_addr & ~@as(u32, 0xffc)) == slot.r_vbase)
+                                    {
+                                        data_r_vbase[bank] = slot.r_vbase;
+                                        data_r_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                        break :blk data_r_page_ptr[bank];
+                                    }
+                                    break :blk null;
+                                };
+                                if (hit_page) |page_ptr| {
+                                    const off: usize = start_addr & 0xfff;
+                                    const nbytes: usize = @as(u16, @truncate(d.imm));
+                                    if (comptime @import("builtin").cpu.arch.endian() == .little) {
+                                        const s_bytes: *[256]u8 = @ptrCast(&self.vfp.s);
+                                        @memcpy(s_bytes[@as(usize, d.rd) * 4 ..][0..nbytes], page_ptr[off..][0..nbytes]);
+                                    } else {
+                                        var p = off;
+                                        for (self.vfp.s[d.rd..][0 .. nbytes / 4]) |*s_reg| {
+                                            s_reg.* = std.mem.readInt(u32, page_ptr[p..][0..4], .little);
+                                            p += 4;
+                                        }
+                                    }
+                                    const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
+                                    if (wb_off != 0) self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
+                                } else {
+                                    self.executeVfp(bus, pc, inst, d.rm != 0);
+                                    priv = @intFromBool(self.isPrivileged());
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                }
+                            } else {
+                                self.executeVfp(bus, pc, inst, d.rm != 0);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vstm_al => {
+                            if (self.vfpReady(priv)) {
+                                const base_val = self.r[d.rn];
+                                const start_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 32))));
+                                const start_addr = base_val +% @as(u32, @bitCast(start_off));
+                                const last_off: u32 = @as(u16, @truncate(d.imm >> 16));
+                                const last_addr = start_addr +% last_off;
+                                const hit_page: ?[*]u8 = if ((start_addr & ~@as(u32, 0xffc)) == data_w_vbase[bank] and
+                                    (last_addr & ~@as(u32, 0xffc)) == data_w_vbase[bank])
+                                    data_w_page_ptr[bank]
+                                else blk: {
+                                    const slot = self.mmu.soft_tlb32[priv][(start_addr >> 12) & Mmu.soft_tlb_mask];
+                                    if ((start_addr & ~@as(u32, 0xffc)) == slot.w_vbase and
+                                        (last_addr & ~@as(u32, 0xffc)) == slot.w_vbase)
+                                    {
+                                        data_w_vbase[bank] = slot.w_vbase;
+                                        data_w_page_ptr[bank] = bus.ram.ptr + slot.pbase;
+                                        break :blk data_w_page_ptr[bank];
+                                    }
+                                    break :blk null;
+                                };
+                                if (hit_page) |page_ptr| {
+                                    const off: usize = start_addr & 0xfff;
+                                    const nbytes: usize = @as(u16, @truncate(d.imm));
+                                    if (comptime @import("builtin").cpu.arch.endian() == .little) {
+                                        const s_bytes: *const [256]u8 = @ptrCast(&self.vfp.s);
+                                        @memcpy(page_ptr[off..][0..nbytes], s_bytes[@as(usize, d.rd) * 4 ..][0..nbytes]);
+                                    } else {
+                                        var p = off;
+                                        for (self.vfp.s[d.rd..][0 .. nbytes / 4]) |s_reg| {
+                                            std.mem.writeInt(u32, page_ptr[p..][0..4], s_reg, .little);
+                                            p += 4;
+                                        }
+                                    }
+                                    const wb_off: i32 = @as(i16, @bitCast(@as(u16, @truncate(d.imm >> 48))));
+                                    if (wb_off != 0) self.r[d.rn] = base_val +% @as(u32, @bitCast(wb_off));
+                                } else {
+                                    self.executeVfp(bus, pc, inst, d.rm != 0);
+                                    priv = @intFromBool(self.isPrivileged());
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                }
+                            } else {
+                                self.executeVfp(bus, pc, inst, d.rm != 0);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                        .vfp_ls_multi_al => {
+                            self.executeVfp(bus, pc, inst, d.rm != 0);
+                            priv = @intFromBool(self.isPrivileged());
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        },
+                        .unconditional => {
+                            self.executeUnconditional(bus, pc, inst);
+                            if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
+                            _ = self.checkInterrupts(bus);
+                            priv = @intFromBool(self.isPrivileged());
+                            code_vbase = 0xffff_ffff;
+                            data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                        },
+                        .jit_trace => {
+                            const max_jit_first: usize = (batch_end - executed) + 1;
+                            if (max_jit_first >= d.rd) {
+                                var cur_d = d;
+                                var cur_entry_pc = pc;
+                                var chain_count: u8 = 0;
+                                while (true) {
+                                    const max_jit: usize = (batch_end - executed) + 1;
+                                    self.r[15] = code_vbase;
+                                    const fn_ptr: jit_mod.JitFn = @ptrFromInt(@as(usize, @truncate(cur_d.imm)));
+                                    const tlb_ptr = &self.mmu.soft_tlb32[priv][0];
+                                    const ran = fn_ptr(self, bus, bus.ram.ptr, tlb_ptr, max_jit, bus.ram.ptr);
+                                    executed += ran - 1;
+                                    const new_priv: u1 = @intFromBool(self.isPrivileged());
+                                    if (new_priv != priv or self.isThumb() or self.mmu.halted_wfi or self.yield_slice) {
+                                        priv = new_priv;
+                                        code_vbase = 0xffff_ffff;
+                                        data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                        break;
+                                    }
+                                    const next_pc = self.r[15];
+                                    if ((next_pc & ~@as(u32, 0xffc)) != code_vbase) {
+                                        if ((next_pc & 3) != 0) {
+                                            code_vbase = 0xffff_ffff;
+                                            break;
+                                        }
+                                        const islot = self.mmu.soft_tlb32[priv][(next_pc >> 12) & Mmu.soft_tlb_mask];
+                                        if ((next_pc & 0xffff_f000) == islot.x_vbase) {
+                                            code_vbase = islot.x_vbase;
+                                            code_pbase = islot.pbase;
+                                            code_page_ptr = bus.ram.ptr + code_pbase;
+                                            code_page_idx = icachePageIdx(code_pbase);
+                                            code_icache_ptr = self.prepareIcachePage(code_page_idx, code_pbase);
+                                        } else {
+                                            code_vbase = 0xffff_ffff;
+                                            break;
+                                        }
+                                    }
+                                    if (chain_count >= 16 or next_pc == cur_entry_pc or executed >= batch_end) break;
+                                    const next_d = code_icache_ptr[(next_pc >> 2) & 0x3ff];
+                                    if (next_d.op == @backingInt(ArmOp.jit_trace) and (batch_end - executed) >= next_d.rd) {
+                                        executed += 1;
+                                        cur_d = next_d;
+                                        cur_entry_pc = next_pc;
+                                        chain_count += 1;
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            } else if (batch_end < max_steps and (max_steps - executed) + 1 >= d.rd) {
+                                self.r[15] = pc;
+                                executed -= 1;
+                                if (self.checkInterrupts(bus)) {
+                                    priv = @intFromBool(self.isPrivileged());
+                                    code_vbase = 0xffff_ffff;
+                                    data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                    data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                }
+                                break;
+                            } else {
+                                self.executeArm(bus, pc, inst);
+                                if (self.mmu.halted_wfi or self.yield_slice) break :step_loop;
+                                _ = self.checkInterrupts(bus);
+                                priv = @intFromBool(self.isPrivileged());
+                                code_vbase = 0xffff_ffff;
+                                data_r_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                                data_w_vbase = .{ 0xffff_ffff, 0xffff_ffff };
+                            }
+                        },
+                    }
                 }
             }
             return executed;
@@ -5664,7 +5664,7 @@ pub fn Arm1176(comptime Bus: type) type {
             const unpriv_access = (!p and w);
             const saved_cpsr = self.cpsr;
             if (unpriv_access) {
-                self.cpsr = (self.cpsr & ~@as(u32, 0x1f)) | @intFromEnum(Mode.usr);
+                self.cpsr = (self.cpsr & ~@as(u32, 0x1f)) | @backingInt(Mode.usr);
             }
             defer if (unpriv_access) {
                 self.cpsr = saved_cpsr;
@@ -8013,12 +8013,12 @@ test "ARM1176 pre-decoded atomics, 64-bit multiplies, CLZ, and media fast-path" 
         std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
     }
 
-    try std.testing.expectEqual(ArmOp.ldrex_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[0]).op)));
-    try std.testing.expectEqual(ArmOp.strex_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[2]).op)));
-    try std.testing.expectEqual(ArmOp.clz_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[6]).op)));
-    try std.testing.expectEqual(ArmOp.umull_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[7]).op)));
-    try std.testing.expectEqual(ArmOp.ubfx_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[8]).op)));
-    try std.testing.expectEqual(ArmOp.sxtb_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[9]).op)));
+    try std.testing.expectEqual(ArmOp.ldrex_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[0]).op))));
+    try std.testing.expectEqual(ArmOp.strex_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[2]).op))));
+    try std.testing.expectEqual(ArmOp.clz_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[6]).op))));
+    try std.testing.expectEqual(ArmOp.umull_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[7]).op))));
+    try std.testing.expectEqual(ArmOp.ubfx_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[8]).op))));
+    try std.testing.expectEqual(ArmOp.sxtb_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[9]).op))));
 
     _ = cpu.runSteps(&bus, prog.len);
     try std.testing.expectEqual(@as(u32, 10), cpu.r[0]);
@@ -8097,12 +8097,12 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
         std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
     }
 
-    try std.testing.expectEqual(ArmOp.vldr_f64_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[0]).op)));
-    try std.testing.expectEqual(ArmOp.vadd_f64_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[2]).op)));
-    try std.testing.expectEqual(ArmOp.vmul_f64_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[3]).op)));
-    try std.testing.expectEqual(ArmOp.vstr_f64_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[4]).op)));
-    try std.testing.expectEqual(ArmOp.vcmp_f64_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[5]).op)));
-    try std.testing.expectEqual(ArmOp.vmrs_apsr_al, @as(ArmOp, @enumFromInt(decodeArm32(prog[6]).op)));
+    try std.testing.expectEqual(ArmOp.vldr_f64_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[0]).op))));
+    try std.testing.expectEqual(ArmOp.vadd_f64_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[2]).op))));
+    try std.testing.expectEqual(ArmOp.vmul_f64_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[3]).op))));
+    try std.testing.expectEqual(ArmOp.vstr_f64_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[4]).op))));
+    try std.testing.expectEqual(ArmOp.vcmp_f64_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[5]).op))));
+    try std.testing.expectEqual(ArmOp.vmrs_apsr_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(prog[6]).op))));
 
     _ = cpu.runSteps(&bus, prog.len);
     try std.testing.expectEqual(@as(f64, 16.0), cpu.vfp.getD(2));
@@ -8144,13 +8144,13 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     }
 
     const push_dec = decodeArm32(block_prog[0]);
-    try std.testing.expectEqual(ArmOp.stm_al, @as(ArmOp, @enumFromInt(push_dec.op)));
+    try std.testing.expectEqual(ArmOp.stm_al, @as(ArmOp, @fromBackingInt(@intCast(push_dec.op))));
     try std.testing.expect((push_dec.rm & 0x80) != 0); // contiguous fast-path active
-    try std.testing.expectEqual(ArmOp.vstm_al, @as(ArmOp, @enumFromInt(decodeArm32(block_prog[1]).op)));
-    try std.testing.expectEqual(ArmOp.vldm_al, @as(ArmOp, @enumFromInt(decodeArm32(block_prog[5]).op)));
-    try std.testing.expectEqual(ArmOp.strd_imm_al, @as(ArmOp, @enumFromInt(decodeArm32(block_prog[6]).op)));
-    try std.testing.expectEqual(ArmOp.ldm_pc_al, @as(ArmOp, @enumFromInt(decodeArm32(block_prog[7]).op)));
-    try std.testing.expectEqual(ArmOp.ldrd_imm_al, @as(ArmOp, @enumFromInt(decodeArm32(block_prog[9]).op)));
+    try std.testing.expectEqual(ArmOp.vstm_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(block_prog[1]).op))));
+    try std.testing.expectEqual(ArmOp.vldm_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(block_prog[5]).op))));
+    try std.testing.expectEqual(ArmOp.strd_imm_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(block_prog[6]).op))));
+    try std.testing.expectEqual(ArmOp.ldm_pc_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(block_prog[7]).op))));
+    try std.testing.expectEqual(ArmOp.ldrd_imm_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(block_prog[9]).op))));
 
     _ = cpu.runSteps(&bus, 9);
     try std.testing.expectEqual(@as(u32, 0x3000), cpu.r[13]);
@@ -8234,13 +8234,13 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     for (sync_reg_prog, 0..) |inst, i| {
         std.mem.writeInt(u32, ram[0x1900 + i * 4 ..][0..4], inst, .little);
     }
-    try std.testing.expectEqual(ArmOp.ldrexd_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[0]).op)));
-    try std.testing.expectEqual(ArmOp.strexd_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[2]).op)));
-    try std.testing.expectEqual(ArmOp.strh_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[3]).op)));
-    try std.testing.expectEqual(ArmOp.ldrh_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[4]).op)));
-    try std.testing.expectEqual(ArmOp.ldrsh_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[5]).op)));
-    try std.testing.expectEqual(ArmOp.ldrsb_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[6]).op)));
-    try std.testing.expectEqual(ArmOp.ldr_lit_al, @as(ArmOp, @enumFromInt(decodeArm32(sync_reg_prog[7]).op)));
+    try std.testing.expectEqual(ArmOp.ldrexd_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(sync_reg_prog[0]).op))));
+    try std.testing.expectEqual(ArmOp.strexd_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(sync_reg_prog[2]).op))));
+    try std.testing.expectEqual(ArmOp.strh_reg_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(sync_reg_prog[3]).op))));
+    try std.testing.expectEqual(ArmOp.ldrh_reg_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(sync_reg_prog[4]).op))));
+    try std.testing.expectEqual(ArmOp.ldrsh_reg_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(sync_reg_prog[5]).op))));
+    try std.testing.expectEqual(ArmOp.ldrsb_reg_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(sync_reg_prog[6]).op))));
+    try std.testing.expectEqual(ArmOp.ldr_lit_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(sync_reg_prog[7]).op))));
 
     _ = cpu.runSteps(&bus, sync_reg_prog.len);
     try std.testing.expectEqual(@as(u32, 0x4433_2212), cpu.r[2]);
@@ -8287,17 +8287,17 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     for (ext_prog, 0..) |inst, i| {
         std.mem.writeInt(u32, ram[0x1a00 + i * 4 ..][0..4], inst, .little);
     }
-    try std.testing.expectEqual(ArmOp.adc_imm_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[0]).op)));
-    try std.testing.expectEqual(ArmOp.sbc_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[1]).op)));
-    try std.testing.expectEqual(ArmOp.add_lsr_reg_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[2]).op)));
-    try std.testing.expectEqual(ArmOp.sbfx_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[3]).op)));
-    try std.testing.expectEqual(ArmOp.bfi_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[4]).op)));
-    try std.testing.expectEqual(ArmOp.bfc_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[5]).op)));
-    try std.testing.expectEqual(ArmOp.rbit_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[6]).op)));
-    try std.testing.expectEqual(ArmOp.sxtab_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[7]).op)));
-    try std.testing.expectEqual(ArmOp.udiv_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[8]).op)));
-    try std.testing.expectEqual(ArmOp.str_reg_sub_lsl_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[9]).op)));
-    try std.testing.expectEqual(ArmOp.ldr_reg_sub_lsl_al, @as(ArmOp, @enumFromInt(decodeArm32(ext_prog[10]).op)));
+    try std.testing.expectEqual(ArmOp.adc_imm_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[0]).op))));
+    try std.testing.expectEqual(ArmOp.sbc_reg_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[1]).op))));
+    try std.testing.expectEqual(ArmOp.add_lsr_reg_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[2]).op))));
+    try std.testing.expectEqual(ArmOp.sbfx_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[3]).op))));
+    try std.testing.expectEqual(ArmOp.bfi_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[4]).op))));
+    try std.testing.expectEqual(ArmOp.bfc_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[5]).op))));
+    try std.testing.expectEqual(ArmOp.rbit_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[6]).op))));
+    try std.testing.expectEqual(ArmOp.sxtab_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[7]).op))));
+    try std.testing.expectEqual(ArmOp.udiv_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[8]).op))));
+    try std.testing.expectEqual(ArmOp.str_reg_sub_lsl_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[9]).op))));
+    try std.testing.expectEqual(ArmOp.ldr_reg_sub_lsl_al, @as(ArmOp, @fromBackingInt(@intCast(decodeArm32(ext_prog[10]).op))));
 
     _ = cpu.runSteps(&bus, ext_prog.len);
     try std.testing.expectEqual(@as(u32, 111), cpu.r[4]);
@@ -8344,10 +8344,10 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     for (fuse_prog, 0..) |inst, i| {
         std.mem.writeInt(u32, ram[0x1b00 + i * 4 ..][0..4], inst, .little);
     }
-    try std.testing.expectEqual(ArmOp.movw_movt_al, @as(ArmOp, @enumFromInt(decodeAndFuseArm32(fuse_prog[0], ram[0x1000..].ptr, (0x1b00 & 0xfff) >> 2).op)));
-    try std.testing.expectEqual(ArmOp.subs_imm_bcond_al, @as(ArmOp, @enumFromInt(decodeAndFuseArm32(fuse_prog[3], ram[0x1000..].ptr, (0x1b0c & 0xfff) >> 2).op)));
-    try std.testing.expectEqual(ArmOp.cmp_imm_bcond_al, @as(ArmOp, @enumFromInt(decodeAndFuseArm32(fuse_prog[5], ram[0x1000..].ptr, (0x1b14 & 0xfff) >> 2).op)));
-    try std.testing.expectEqual(ArmOp.tst_imm_bcond_al, @as(ArmOp, @enumFromInt(decodeAndFuseArm32(fuse_prog[9], ram[0x1000..].ptr, (0x1b24 & 0xfff) >> 2).op)));
+    try std.testing.expectEqual(ArmOp.movw_movt_al, @as(ArmOp, @fromBackingInt(@intCast(decodeAndFuseArm32(fuse_prog[0], ram[0x1000..].ptr, (0x1b00 & 0xfff) >> 2).op))));
+    try std.testing.expectEqual(ArmOp.subs_imm_bcond_al, @as(ArmOp, @fromBackingInt(@intCast(decodeAndFuseArm32(fuse_prog[3], ram[0x1000..].ptr, (0x1b0c & 0xfff) >> 2).op))));
+    try std.testing.expectEqual(ArmOp.cmp_imm_bcond_al, @as(ArmOp, @fromBackingInt(@intCast(decodeAndFuseArm32(fuse_prog[5], ram[0x1000..].ptr, (0x1b14 & 0xfff) >> 2).op))));
+    try std.testing.expectEqual(ArmOp.tst_imm_bcond_al, @as(ArmOp, @fromBackingInt(@intCast(decodeAndFuseArm32(fuse_prog[9], ram[0x1000..].ptr, (0x1b24 & 0xfff) >> 2).op))));
 
     // Total dynamic instructions executed: 2 (movw+movt) + 5*3 (loop) + 2 (cmp+beq) + 2 (tst+bne) + 1 (add) = 22
     const fuse_ran = cpu.runSteps(&bus, 22);
@@ -8400,7 +8400,7 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     try std.testing.expectEqual(@as(u32, 0x14f), std.mem.readInt(u32, ram[0x233c..][0..4], .little));
     if (jit_mod.is_x86_64_linux) {
         const page_idx: usize = ((0x1000 >> 12) ^ (0x1000 >> 16) ^ (0x1000 >> 20)) & (icache_pages - 1);
-        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1c00 & 0xfff) >> 2)].op)));
+        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024 + ((0x1c00 & 0xfff) >> 2)].op))));
     }
 
     // Verify ARM32 hot function (BL/BX LR) compilation and return continuation compilation
@@ -8444,8 +8444,8 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     try std.testing.expectEqual(@as(u32, 281), cpu.r[2]);
     if (jit_mod.is_x86_64_linux) {
         const page_idx: usize = ((0x1000 >> 12) ^ (0x1000 >> 16) ^ (0x1000 >> 20)) & (icache_pages - 1);
-        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1d00 & 0xfff) >> 2)].op)));
-        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1c44 & 0xfff) >> 2)].op)));
+        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024 + ((0x1d00 & 0xfff) >> 2)].op))));
+        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024 + ((0x1c44 & 0xfff) >> 2)].op))));
     }
 
     // Verify ARM32 VFPv2/VFPv4 hot loop (VLDR.64 / VADD.F64 / VSTR.64) compiles to .jit_trace
@@ -8482,7 +8482,7 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
     try std.testing.expectEqual(@as(f64, 100.0), @as(f64, @bitCast(std.mem.readInt(u64, ram[0x2408..][0..8], .little))));
     if (jit_mod.is_x86_64_linux) {
         const page_idx: usize = ((0x1000 >> 12) ^ (0x1000 >> 16) ^ (0x1000 >> 20)) & (icache_pages - 1);
-        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @enumFromInt(cpu.icache[page_idx * 1024 + ((0x1c80 & 0xfff) >> 2)].op)));
+        try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024 + ((0x1c80 & 0xfff) >> 2)].op))));
     }
 
     // Verify 16-bit Thumb hot backward-branch loop compiles to .jit_trace
@@ -8519,9 +8519,6 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
         try std.testing.expectEqual(ThumbOp.jit_trace, cpu.thumb_icache[tpage_idx * 2048 + ((0x1e00 & 0xfff) >> 1)].op);
     }
 }
-
-
-
 
 test "ARM1176 runs glibc's ARMv6 strlen (LDRD post-index, UQSUB8, REV, CLZ)" {
     const TestBus = struct {
@@ -8879,7 +8876,7 @@ test "ARM1176 Thumb CPSIE/CPSID mask and unmask exceptions" {
     // With an IRQ pending, unmasking takes it before the next instruction
     bus.irq = true;
     _ = cpu.runSteps(&bus, 1);
-    try std.testing.expectEqual(@as(u32, @intFromEnum(Mode.irq)), cpu.cpsr & PsrFlags.MODE_MASK);
+    try std.testing.expectEqual(@as(u32, @backingInt(Mode.irq)), cpu.cpsr & PsrFlags.MODE_MASK);
     try std.testing.expectEqual(@as(u32, 0x18), cpu.r[15]);
     try std.testing.expectEqual(@as(u32, 0), cpu.cpsr & PsrFlags.T);
     try std.testing.expectEqual(PsrFlags.A | PsrFlags.F, cpu.getSpsr() & (PsrFlags.A | PsrFlags.I | PsrFlags.F));
@@ -8888,7 +8885,7 @@ test "ARM1176 Thumb CPSIE/CPSID mask and unmask exceptions" {
     var user: Arm1176(TestBus) = .{};
     bus.irq = false;
     user.initReset(0x1100, 0, 0xffffffff, 0x2000);
-    user.setCpsr(@intFromEnum(Mode.usr) | PsrFlags.T);
+    user.setCpsr(@backingInt(Mode.usr) | PsrFlags.T);
     _ = user.runSteps(&bus, 1);
     try std.testing.expectEqual(@as(u32, 0), user.cpsr & (PsrFlags.A | PsrFlags.I | PsrFlags.F));
     try std.testing.expectEqual(@as(u32, 0x1102), user.r[15]);

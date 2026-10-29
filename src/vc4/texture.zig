@@ -44,7 +44,7 @@ pub const Config = struct {
 
 pub fn p0(c: Config) u32 {
     std.debug.assert(c.offset & 0xfff == 0);
-    return c.offset | (@as(u32, @intFromEnum(c.type)) & 0xf) << 4 | c.mip_levels;
+    return c.offset | (@as(u32, @backingInt(c.type)) & 0xf) << 4 | c.mip_levels;
 }
 
 pub fn p1(c: Config) u32 {
@@ -60,13 +60,13 @@ pub fn p1(c: Config) u32 {
         .linear => 0,
         .nearest => 1,
     };
-    return (@as(u32, @intFromEnum(c.type)) >> 4) << 31 |
+    return (@as(u32, @backingInt(c.type)) >> 4) << 31 |
         (c.height & 2047) << 20 |
         (c.width & 2047) << 8 |
         mag << 7 |
         min << 4 |
-        @as(u32, @intFromEnum(c.wrap_t)) << 2 |
-        @as(u32, @intFromEnum(c.wrap_s));
+        @as(u32, @backingInt(c.wrap_t)) << 2 |
+        @as(u32, @backingInt(c.wrap_s));
 }
 
 pub fn decodeConfig(param0: u32, param1: u32) Config {
@@ -74,7 +74,7 @@ pub fn decodeConfig(param0: u32, param1: u32) Config {
     const h = (param1 >> 20) & 2047;
     return .{
         .offset = param0 & 0xfffff000,
-        .type = @enumFromInt(((param0 >> 4) & 0xf) | ((param1 >> 31) << 4)),
+        .type = @fromBackingInt(@intCast(((param0 >> 4) & 0xf) | ((param1 >> 31) << 4))),
         .width = if (w == 0) 2048 else w,
         .height = if (h == 0) 2048 else h,
         .mag_filter = if ((param1 >> 7) & 1 != 0) .nearest else .linear,
@@ -82,8 +82,8 @@ pub fn decodeConfig(param0: u32, param1: u32) Config {
             1, 2, 3 => .nearest,
             else => .linear,
         },
-        .wrap_t = @enumFromInt(@as(u2, @truncate(param1 >> 2))),
-        .wrap_s = @enumFromInt(@as(u2, @truncate(param1))),
+        .wrap_t = @fromBackingInt(@intCast(@as(u2, @truncate(param1 >> 2)))),
+        .wrap_s = @fromBackingInt(@intCast(@as(u2, @truncate(param1)))),
         .mip_levels = @truncate(param0),
         .mip_filter = switch ((param1 >> 4) & 7) {
             2, 4 => .nearest,
@@ -551,4 +551,3 @@ test "detileTextureToBgra matches per-texel reference across T-tiled, LT-tiled, 
         }
     }
 }
-

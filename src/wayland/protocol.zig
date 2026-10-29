@@ -274,4 +274,3 @@ pub const input = struct {
     pub const btn_right = 0x111;
     pub const btn_middle = 0x112;
 };
-

@@ -730,8 +730,6 @@ pub fn applyBoardConfigToRamDtb(
     return updated_dtb.len;
 }
 
-
-
 test "parse config.txt" {
     const sample =
         \\# Raspberry Pi config.txt

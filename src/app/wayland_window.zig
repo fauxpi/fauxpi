@@ -987,4 +987,3 @@ test "WaylandWindow keyboard repeat_info, serviceRepeat, keymap fd mmap, and lea
 test {
     _ = portal;
 }
-

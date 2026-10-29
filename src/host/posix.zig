@@ -392,7 +392,7 @@ pub fn readNonBlock(fd: fd_t, buf: []u8) union(enum) { bytes: usize, again, err 
         const rc = std.c.read(fd, buf.ptr, buf.len);
         if (rc < 0) {
             const e = std.c._errno().*;
-            if (e == @intFromEnum(std.c.E.AGAIN)) return .again;
+            if (e == @backingInt(std.c.E.AGAIN)) return .again;
             return .err;
         }
         return .{ .bytes = @intCast(rc) };
@@ -1053,7 +1053,7 @@ pub fn connectIpv4NonBlock(fd: fd_t, ip: [4]u8, port: u16) ConnectStatus {
         const rc = std.c.connect(fd, @ptrCast(&addr), @sizeOf(sockaddr.in));
         if (rc == 0) return .connected_or_in_progress;
         const e = std.c._errno().*;
-        if (e == @intFromEnum(std.c.E.INPROGRESS) or e == @intFromEnum(std.c.E.AGAIN)) {
+        if (e == @backingInt(std.c.E.INPROGRESS) or e == @backingInt(std.c.E.AGAIN)) {
             return .connected_or_in_progress;
         }
         return .failed;
@@ -1118,7 +1118,7 @@ pub fn recvNonBlock(fd: fd_t, buf: []u8) RecvResult {
         if (rc > 0) return .{ .data = @intCast(rc) };
         if (rc == 0) return .eof;
         const e = std.c._errno().*;
-        if (e == @intFromEnum(std.c.E.AGAIN) or e == @intFromEnum(std.c.E.INPROGRESS)) return .again;
+        if (e == @backingInt(std.c.E.AGAIN) or e == @backingInt(std.c.E.INPROGRESS)) return .again;
         return .err;
     }
 }

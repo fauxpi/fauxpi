@@ -102,8 +102,8 @@ pub fn translate(code: []const qpu.Inst, stage: qpu.Stage) TranslatedShader {
         if (sig == .branch) continue;
 
         const ws = qpu.getWs(inst);
-        const cond_add: qpu.Cond = @enumFromInt(@as(u3, @truncate(inst >> 49)));
-        const cond_mul: qpu.Cond = @enumFromInt(@as(u3, @truncate(inst >> 46)));
+        const cond_add: qpu.Cond = @fromBackingInt(@intCast(@as(u3, @truncate(inst >> 49))));
+        const cond_mul: qpu.Cond = @fromBackingInt(@intCast(@as(u3, @truncate(inst >> 46))));
         const pm = (inst >> 56) & 1 != 0;
         const pack: u4 = @truncate(inst >> 52);
         const unpack_mode: u3 = @truncate(inst >> 57);

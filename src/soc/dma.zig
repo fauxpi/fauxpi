@@ -577,4 +577,3 @@ test "DMA zero-fill and constant-word fill fast paths" {
     }
     try std.testing.expectEqual(@as(u8, 0xAA), ram[0x280 + 76]);
 }
-

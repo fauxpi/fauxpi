@@ -1094,7 +1094,6 @@ test "parseHdmiSize parses WxH strings and rejects malformed dimensions" {
     try testing.expect(parseHdmiSize("abcxdef") == null);
 }
 
-
 test "RealtimeClock follows the host clock and absorbs long host stalls" {
     const testing = std.testing;
     var clock = RealtimeClock.start(1_000_000_000);

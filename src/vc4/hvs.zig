@@ -1151,5 +1151,3 @@ test "HVS scaled T-tiled plane compositing matches exact integer division" {
         }
     }
 }
-
-
