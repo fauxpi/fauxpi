@@ -1,17 +1,13 @@
 //! Flattened Device Tree (FDT / `.dtb`) parser, patcher, and serializer.
 //!
 //! Emulates the device-tree setup performed by the Raspberry Pi VideoCore
-//! firmware (`start.elf`):
-//! - Patches `/chosen` (`bootargs`, `linux,initrd-start`, `linux,initrd-end`)
+//! firmware (`start.elf`), and nothing beyond it:
+//! - Patches `/chosen` (`bootargs`, `linux,initrd-start`, `linux,initrd-end`, `rng-seed`)
 //! - Patches `/memory@0` (`reg = <0x00000000 ram_size>`)
-//! - Applies the `vc4-kms-v3d` overlay configuration (`i2c2`, `pixelvalve0..2`,
-//!   `hvs`, `hdmi`, `v3d`, `vc4`, `txp` enabled; legacy `fb` disabled; `cma` sized)
-//! - Sets `/soc/usb@7e980000` `compatible = "brcm,bcm2835-usb"` so mainline `dwc2` binds.
+//! - Sets the board revision, serial number, Ethernet MAC and Bluetooth address
 //! - Applies `.dtbo` overlays and `__overrides__` parameters (`dtoverlay=` / `dtparam=`).
 
 const std = @import("std");
-const BoardModel = @import("../ui/board.zig").BoardModel;
-const HubKind = @import("../usb/hid.zig").HubKind;
 
 pub const fdt_magic: u32 = 0xd00dfeed;
 pub const fdt_version: u32 = 17;
@@ -272,133 +268,30 @@ pub const Tree = struct {
         try self.root.setStringProp(self.allocator, "serial-number", sstr);
     }
 
-    pub fn setBoardModel(self: *Tree, board_model: BoardModel) !void {
-        try self.root.setStringProp(self.allocator, "model", board_model.dtModel());
+    pub fn setBoardRevision(self: *Tree, revision: u32) !void {
         const sys_node = try self.findOrCreateNode("/system");
-        try sys_node.setU32Prop(self.allocator, "linux,revision", board_model.boardRevision());
-        try self.setBuiltInUsbHub(board_model.hubKind());
-        try self.setHeadphoneAudioEnabled(board_model.hasHeadphoneJack());
+        try sys_node.setU32Prop(self.allocator, "linux,revision", revision);
     }
 
-    pub fn setHeadphoneAudioEnabled(self: *Tree, enabled: bool) !void {
-        // Configure audio_pins under /soc/gpio@7e200000 so pinctrl-bcm2835 succeeds when vchiq probes
-        if (self.findNode("audio_pins") orelse self.findNode("/soc/gpio@7e200000/audio_pins")) |ap| {
-            const existing_pins = ap.getProp("brcm,pins") orelse &.{};
-            if (existing_pins.len == 0) {
-                try ap.setCellsProp(self.allocator, "brcm,pins", &.{ 40, 45 });
-                try ap.setU32Prop(self.allocator, "brcm,function", 4); // ALT0 (PWM0/PWM1)
-                try ap.setU32Prop(self.allocator, "brcm,pull", 0);
-            }
-        }
-        if (self.findNode("vchiq") orelse self.findNode("/soc/mailbox@7e00b840")) |vchiq_node| {
-            try vchiq_node.setStringProp(self.allocator, "status", "okay");
-            if (vchiq_node.findChild("audio")) |audio_child| {
-                try audio_child.setStringProp(self.allocator, "status", if (enabled) "okay" else "disabled");
-                try audio_child.setU32Prop(self.allocator, "brcm,enable-headphones", if (enabled) 1 else 0);
-            }
-        }
-        if (self.findNode("audio")) |audio_node| {
-            try audio_node.setStringProp(self.allocator, "status", if (enabled) "okay" else "disabled");
-            try audio_node.setU32Prop(self.allocator, "brcm,enable-headphones", if (enabled) 1 else 0);
-        }
-
-        // Update snd_bcm2835.enable_headphones in /chosen/bootargs
-        const chosen = try self.findOrCreateNode("/chosen");
-        const cur_bootargs = chosen.getStringProp("bootargs") orelse "";
-        var clean_buf: std.ArrayList(u8) = .empty;
-        var tok = std.mem.tokenizeScalar(u8, cur_bootargs, ' ');
-        while (tok.next()) |part| {
-            if (std.mem.startsWith(u8, part, "snd_bcm2835.enable_headphones=")) continue;
-            if (clean_buf.items.len > 0) try clean_buf.append(self.allocator, ' ');
-            try clean_buf.appendSlice(self.allocator, part);
-        }
-        if (clean_buf.items.len > 0) try clean_buf.append(self.allocator, ' ');
-        try clean_buf.appendSlice(
-            self.allocator,
-            if (enabled) "snd_bcm2835.enable_headphones=1" else "snd_bcm2835.enable_headphones=0",
-        );
-        try chosen.setStringProp(self.allocator, "bootargs", clean_buf.items);
-    }
-
-    pub fn setBuiltInUsbHub(self: *Tree, hub_kind: HubKind) !void {
-        const usb = self.findNode("usb") orelse self.findNode("/soc/usb@7e980000") orelse return;
-        usb.children.clearRetainingCapacity();
-        if (hub_kind.dtHubCompatible()) |compat| {
-            try usb.setU32Prop(self.allocator, "#address-cells", 1);
-            try usb.setU32Prop(self.allocator, "#size-cells", 0);
-            const hub_node = try usb.findOrCreateChild(self.allocator, "usb1@1");
-            try hub_node.setStringProp(self.allocator, "compatible", compat);
-            try hub_node.setU32Prop(self.allocator, "reg", 1);
-        }
-    }
-
-    pub fn setWirelessMac(self: *Tree, wifi_mac: [6]u8) !void {
-        const mmcnr = self.findNode("/soc/mmcnr@7e300000") orelse self.findNode("mmcnr");
-        const mmc = self.findNode("/soc/mmc@7e300000") orelse self.findNode("sdhci") orelse self.findNode("mmc");
-        const target = mmcnr orelse mmc;
-
-        if (target) |sdhci_node| {
-            // If both mmcnr@7e300000 and mmc@7e300000 exist, keep the non-selected clone disabled
-            if (mmcnr != null and mmc != null and mmc.? != sdhci_node) {
-                try mmc.?.setStringProp(self.allocator, "status", "disabled");
-            }
-            try sdhci_node.setStringProp(self.allocator, "status", "okay");
-            try sdhci_node.setProp(self.allocator, "non-removable", &.{});
-            try sdhci_node.setU32Prop(self.allocator, "bus-width", 4);
-            try sdhci_node.setU32Prop(self.allocator, "#address-cells", 1);
-            try sdhci_node.setU32Prop(self.allocator, "#size-cells", 0);
-
-            const wifi = try sdhci_node.findOrCreateChild(self.allocator, "wifi@1");
-            try wifi.setU32Prop(self.allocator, "reg", 1);
-            try wifi.setStringProp(self.allocator, "compatible", "brcm,bcm4329-fmac");
-            try wifi.setProp(self.allocator, "local-mac-address", &wifi_mac);
-
-            if (self.findNode("/aliases")) |aliases| {
-                const alias_path = if (std.mem.eql(u8, sdhci_node.name, "mmcnr@7e300000"))
-                    "/soc/mmcnr@7e300000"
-                else
-                    "/soc/mmc@7e300000";
-                try aliases.setStringProp(self.allocator, "mmc1", alias_path);
-            }
-        }
-    }
-
-    pub fn disableWireless(self: *Tree) !void {
-        if (self.findNode("/soc/mmcnr@7e300000") orelse self.findNode("mmcnr")) |mmcnr| {
-            try mmcnr.setStringProp(self.allocator, "status", "disabled");
-        }
-        // Only disable /soc/mmc@7e300000 if it has a wifi@1 child or if sdhost (/soc/mmc@7e202000) is enabled,
-        // so upstream DTBs or dtoverlay=sdio that route the primary SD card to Arasan SDHCI continue to work.
-        const sdhost_node = self.findNode("sdhost") orelse self.findNode("/soc/mmc@7e202000") orelse self.findNode("/soc/sdhost@7e202000");
-        const sdhost_enabled = if (sdhost_node) |sh|
-            std.mem.eql(u8, sh.getStringProp("status") orelse "okay", "okay")
-        else
-            false;
-
-        for ([_][]const u8{ "/soc/mmc@7e300000", "sdhci" }) |path| {
-            if (self.findNode(path)) |n| {
-                if (n.findChild("wifi@1") != null or sdhost_enabled) {
-                    try n.setStringProp(self.allocator, "status", "disabled");
-                }
-            }
-        }
+    /// Sets `local-mac-address` on the Ethernet device the tree names as `ethernet0`, as the firmware
+    /// does for the boards with built-in Ethernet.
+    pub fn setEthernetMac(self: *Tree, mac: [6]u8) !void {
+        const aliases = self.findNode("/aliases") orelse return;
+        const path = aliases.getStringProp("ethernet0") orelse return;
+        const node = self.findNode(path) orelse return;
+        try node.setProp(self.allocator, "local-mac-address", &mac);
     }
 
     /// Fills in `local-bd-address` (LSB first, as the firmware does) on the Bluetooth serdev
-    /// nodes (`bt` on the PL011, `minibt` on the mini UART), or disables them when the board
-    /// has no Bluetooth (`bd_addr` null).
-    pub fn setBluetooth(self: *Tree, bd_addr: ?[6]u8) !void {
+    /// nodes (`bt` on the PL011, `minibt` on the mini UART).
+    pub fn setBluetoothAddress(self: *Tree, bd_addr: [6]u8) !void {
         const candidates = [_]?*Node{
             self.findNode("bt") orelse self.findNode("/soc/serial@7e201000/bluetooth"),
             self.findNode("minibt") orelse self.findNode("/soc/serial@7e215040/bluetooth"),
         };
         for (candidates) |candidate| {
             const node = candidate orelse continue;
-            if (bd_addr) |addr| {
-                try node.setProp(self.allocator, "local-bd-address", &addr);
-            } else {
-                try node.setStringProp(self.allocator, "status", "disabled");
-            }
+            try node.setProp(self.allocator, "local-bd-address", &bd_addr);
         }
     }
 
@@ -443,16 +336,22 @@ pub const Tree = struct {
         try fb_node.setStringProp(self.allocator, "status", "okay");
     }
 
+    /// Makes the device-tree changes the firmware (`start.elf`) makes before starting the kernel:
+    /// - `/memory@0` covers the ARM's RAM, below the VideoCore's share at the top (`0x1c000000..`)
+    /// - `/chosen/bootargs` is the tree's own bootargs, then the firmware's `8250.nr_uarts` setting
+    ///   when the mini UART is the primary UART, then `cmdline` with `serial0`/`serial1` resolved
+    /// - `/chosen` initrd range and `rng-seed`
+    /// - `/chosen/framebuffer@1c100000` for the framebuffer the firmware sets up, with `dtoverlay=vc4-kms-v3d`
     pub fn patchForPiZero(
         self: *Tree,
         ram_size: u32,
         cmdline: []const u8,
         initrd: ?InitrdRange,
-        enable_vc4_kms: bool,
-        linux_kernel: bool,
+        enable_uart: ?bool,
+        kms_framebuffer: bool,
     ) !void {
-        // 1. Memory size (reserve top 64 MiB at 0x1c000000..0x20000000 for VideoCore framebuffer & allocations)
-        const arm_ram_size: u32 = if (enable_vc4_kms and ram_size > 0x1c00_0000) 0x1c00_0000 else ram_size;
+        // 1. Memory size (the top 64 MiB at 0x1c000000..0x20000000 is the VideoCore's)
+        const arm_ram_size: u32 = @min(ram_size, 0x1c00_0000);
         const mem_node = self.findNode("/memory@0") orelse self.findNode("/memory") orelse try self.findOrCreateNode("/memory@0");
         try mem_node.setCellsProp(self.allocator, "reg", &.{ 0, arm_ram_size });
 
@@ -466,31 +365,37 @@ pub const Tree = struct {
             std.mem.indexOf(u8, st, "7e215040") != null
         else
             false;
-        if (cmdline.len > 0) {
-            const serial0_tty = if (serial0_is_aux) "ttyS0" else "ttyAMA0";
-            const serial1_tty = if (serial0_is_aux) "ttyAMA0" else "ttyS0";
+        const serial0_tty = if (serial0_is_aux) "ttyS0" else "ttyAMA0";
+        const serial1_tty = if (serial0_is_aux) "ttyAMA0" else "ttyS0";
 
-            var bootargs_buf: std.ArrayList(u8) = .empty;
-            if (serial0_is_aux and std.mem.indexOf(u8, cmdline, "8250.nr_uarts=") == null) {
-                try bootargs_buf.appendSlice(self.allocator, "8250.nr_uarts=1 ");
-            }
-            var i: usize = 0;
-            while (i < cmdline.len) {
-                if (std.mem.startsWith(u8, cmdline[i..], "console=serial0")) {
-                    try bootargs_buf.appendSlice(self.allocator, "console=");
-                    try bootargs_buf.appendSlice(self.allocator, serial0_tty);
-                    i += "console=serial0".len;
-                } else if (std.mem.startsWith(u8, cmdline[i..], "console=serial1")) {
-                    try bootargs_buf.appendSlice(self.allocator, "console=");
-                    try bootargs_buf.appendSlice(self.allocator, serial1_tty);
-                    i += "console=serial1".len;
-                } else {
-                    try bootargs_buf.append(self.allocator, cmdline[i]);
-                    i += 1;
-                }
-            }
-            try chosen.setStringProp(self.allocator, "bootargs", bootargs_buf.items);
+        var bootargs_buf: std.ArrayList(u8) = .empty;
+        var dt_args = std.mem.tokenizeScalar(u8, chosen.getStringProp("bootargs") orelse "", ' ');
+        while (dt_args.next()) |arg| {
+            if (serial0_is_aux and std.mem.startsWith(u8, arg, "8250.nr_uarts=")) continue;
+            try bootargs_buf.appendSlice(self.allocator, arg);
+            try bootargs_buf.append(self.allocator, ' ');
         }
+        // `enable_uart` defaults to on where the PL011 is the primary UART, and off where the mini UART
+        // is (its clock follows the VPU's), which the 8250 driver then leaves alone.
+        if (serial0_is_aux) {
+            try bootargs_buf.appendSlice(self.allocator, if (enable_uart orelse false) "8250.nr_uarts=1 " else "8250.nr_uarts=0 ");
+        }
+        var i: usize = 0;
+        while (i < cmdline.len) {
+            if (std.mem.startsWith(u8, cmdline[i..], "console=serial0")) {
+                try bootargs_buf.appendSlice(self.allocator, "console=");
+                try bootargs_buf.appendSlice(self.allocator, serial0_tty);
+                i += "console=serial0".len;
+            } else if (std.mem.startsWith(u8, cmdline[i..], "console=serial1")) {
+                try bootargs_buf.appendSlice(self.allocator, "console=");
+                try bootargs_buf.appendSlice(self.allocator, serial1_tty);
+                i += "console=serial1".len;
+            } else {
+                try bootargs_buf.append(self.allocator, cmdline[i]);
+                i += 1;
+            }
+        }
+        try chosen.setStringProp(self.allocator, "bootargs", std.mem.trim(u8, bootargs_buf.items, " "));
         if (initrd) |rd| {
             try chosen.setU32Prop(self.allocator, "linux,initrd-start", rd.start);
             try chosen.setU32Prop(self.allocator, "linux,initrd-end", rd.end);
@@ -504,96 +409,9 @@ pub const Tree = struct {
         try sys_node.setU32Prop(self.allocator, "linux,revision", 0x00900093);
         try self.setBoardSerial(0x00000000fa000001);
 
-        // 2c. Ensure PL011 UART0 (/soc/serial@7e201000) is enabled (its Bluetooth serdev child is set up by `setBluetooth`)
-        if (self.findNode("/soc/serial@7e201000") orelse self.findNode("uart0")) |uart0| {
-            try uart0.setStringProp(self.allocator, "status", "okay");
-            if (!serial0_is_aux) {
-                if (self.findNode("/aliases")) |aliases| {
-                    try aliases.setStringProp(self.allocator, "serial0", "/soc/serial@7e201000");
-                }
-            }
-        }
-
-        // 3. Ensure the USB controller is enabled. Linux gets the mainline dwc2 compatible string
-        // instead of the Raspberry Pi `dwc_otg` one; other kernels see the firmware's tree as is.
-        if (self.findNode("usb") orelse self.findNode("/soc/usb@7e980000")) |usb| {
-            if (linux_kernel) try usb.setStringProp(self.allocator, "compatible", "brcm,bcm2835-usb");
-            try usb.setStringProp(self.allocator, "status", "okay");
-        }
-
-        // Configure audio_pins so /soc/mailbox@7e00b840 (vchiq) probes without pinctrl errors
-        if (self.findNode("audio_pins") orelse self.findNode("/soc/gpio@7e200000/audio_pins")) |ap| {
-            const existing_pins = ap.getProp("brcm,pins") orelse &.{};
-            if (existing_pins.len == 0) {
-                try ap.setCellsProp(self.allocator, "brcm,pins", &.{ 40, 45 });
-                try ap.setU32Prop(self.allocator, "brcm,function", 4);
-                try ap.setU32Prop(self.allocator, "brcm,pull", 0);
-            }
-        }
-
-        // 4. Enable vc4-kms-v3d nodes (equivalent to dtoverlay=vc4-kms-v3d), for Linux only: other kernels
-        // keep the firmware's tree, with its framebuffer node (`brcm,bcm2708-fb`) enabled.
-        if (enable_vc4_kms and linux_kernel) {
-            // With firmware KMS (dtoverlay=vc4-fkms-v3d) the firmware drives the display pipeline, so its
-            // nodes stay disabled as on hardware; enabling them too gives vc4 a second set of CRTCs whose
-            // vblanks never arrive, and the first modeset never completes.
-            const firmware_kms = if (self.findNode("firmwarekms") orelse self.findNode("/soc/firmwarekms@7e600000")) |n|
-                std.mem.eql(u8, n.getStringProp("status") orelse "", "okay")
-            else
-                false;
-            const pipeline_targets = [_][]const u8{
-                "i2c2",
-                "/soc/i2c@7e805000",
-                "pixelvalve0",
-                "/soc/pixelvalve@7e206000",
-                "pixelvalve1",
-                "/soc/pixelvalve@7e207000",
-                "pixelvalve2",
-                "/soc/pixelvalve@7e807000",
-                "hvs",
-                "/soc/hvs@7e400000",
-                "hdmi",
-                "/soc/hdmi@7e902000",
-                "txp",
-                "/soc/txp@7e004000",
-            };
-            const gpu_targets = [_][]const u8{
-                "v3d",
-                "/soc/v3d@7ec00000",
-                "vc4",
-                "/soc/gpu",
-                "/gpu",
-            };
-            for (gpu_targets) |t| {
-                if (self.findNode(t)) |n| {
-                    try n.setStringProp(self.allocator, "status", "okay");
-                }
-            }
-            if (!firmware_kms) {
-                for (pipeline_targets) |t| {
-                    if (self.findNode(t)) |n| {
-                        try n.setStringProp(self.allocator, "status", "okay");
-                    }
-                }
-            }
-            // Disable legacy bcm2708_fb
-            for ([_][]const u8{ "fb", "/soc/fb" }) |t| {
-                if (self.findNode(t)) |n| {
-                    try n.setStringProp(self.allocator, "status", "disabled");
-                }
-            }
-            // Claim PLL clocks on cprman
-            if (self.findNode("clocks") orelse self.findNode("/soc/cprman@7e101000")) |clocks| {
-                // BCM2835_PLLD_DSI0 (13), BCM2835_PLLD_DSI1 (14), BCM2835_PLLH_AUX (16), BCM2835_PLLH_PIX (17)
-                try clocks.setCellsProp(self.allocator, "claim-clocks", &.{ 13, 14, 16, 17 });
-            }
-            // Set CMA size to 128 MiB (plenty for 512 MiB Pi Zero while leaving 384 MiB for kernel + userland)
-            if (self.findNode("cma") orelse self.findNode("/reserved-memory/linux,cma")) |cma| {
-                try cma.setU32Prop(self.allocator, "size", 128 * 1024 * 1024);
-            }
-            // Populate /chosen/framebuffer@1c100000 for early boot simpledrm / simplefb console output
-            try self.setSimpleFramebuffer(1280, 720);
-        }
+        // 3. With the KMS display driver (`dtoverlay=vc4-kms-v3d`), the framebuffer the firmware set up,
+        // for an early console (simplefb / simpledrm) until the driver takes the display over
+        if (kms_framebuffer) try self.setSimpleFramebuffer(1280, 720);
     }
 
     // Device-tree overlays (`dtoverlay=` / `dtparam=`), following the Raspberry Pi `dtoverlay`
@@ -1235,7 +1053,7 @@ pub const Tree = struct {
     }
 };
 
-test "FDT roundtrip and Pi Zero patching" {
+test "FDT roundtrip and firmware patching" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
@@ -1244,19 +1062,27 @@ test "FDT roundtrip and Pi Zero patching" {
     const soc = try tree.findOrCreateNode("/soc");
     const usb = try soc.findOrCreateChild(alloc, "usb@7e980000");
     try usb.setStringProp(alloc, "compatible", "brcm,bcm2708-usb");
+    const eth = try tree.findOrCreateNode("/soc/usb@7e980000/usb1@1/usb1_1@1");
+    try eth.setStringProp(alloc, "compatible", "usb424,ec00");
     const hvs = try soc.findOrCreateChild(alloc, "hvs@7e400000");
     try hvs.setStringProp(alloc, "status", "disabled");
-    const mmcnr = try soc.findOrCreateChild(alloc, "mmcnr@7e300000");
-    try mmcnr.setStringProp(alloc, "status", "disabled");
+    const bt = try tree.findOrCreateNode("/soc/serial@7e201000/bluetooth");
+    try bt.setStringProp(alloc, "compatible", "brcm,bcm43438-bt");
+    const aliases = try tree.findOrCreateNode("/aliases");
+    try aliases.setStringProp(alloc, "serial0", "/soc/serial@7e215040");
+    try aliases.setStringProp(alloc, "ethernet0", "/soc/usb@7e980000/usb1@1/usb1_1@1");
+    try (try tree.findOrCreateNode("/chosen")).setStringProp(alloc, "bootargs", "coherent_pool=1M 8250.nr_uarts=0");
 
-    try tree.patchForPiZero(512 * 1024 * 1024, "console=ttyAMA0,115200", .{ .start = 0x02000000, .end = 0x02500000 }, true, true);
-    try tree.setWirelessMac(.{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 });
+    try tree.patchForPiZero(512 * 1024 * 1024, "console=serial0,115200 root=/dev/mmcblk0p2", .{ .start = 0x02000000, .end = 0x02500000 }, true, true);
+    try tree.setEthernetMac(.{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 });
+    try tree.setBluetoothAddress(.{ 0x04, 0x61, 0x47, 0xeb, 0x27, 0xb8 });
 
     const blob = try tree.serialize(alloc);
     var parsed = try Tree.parse(alloc, blob);
 
+    // The tree's own bootargs, the UART setting (the mini UART is primary here), then cmdline.txt
     const chosen = parsed.findNode("/chosen").?;
-    try std.testing.expectEqualStrings("console=ttyAMA0,115200", chosen.getStringProp("bootargs").?);
+    try std.testing.expectEqualStrings("coherent_pool=1M 8250.nr_uarts=1 console=ttyS0,115200 root=/dev/mmcblk0p2", chosen.getStringProp("bootargs").?);
     try std.testing.expectEqual(@as(u32, 0x02000000), std.mem.readInt(u32, chosen.getProp("linux,initrd-start").?[0..4], .big));
 
     const mem_parsed = parsed.findNode("/memory@0").?;
@@ -1264,31 +1090,22 @@ test "FDT roundtrip and Pi Zero patching" {
 
     const fb_parsed = parsed.findNode("/chosen/framebuffer@1c100000").?;
     try std.testing.expectEqualStrings("simple-framebuffer", fb_parsed.getStringProp("compatible").?);
-    try std.testing.expectEqualStrings("x8r8g8b8", fb_parsed.getStringProp("format").?);
-    try std.testing.expectEqualStrings("okay", fb_parsed.getStringProp("status").?);
     try std.testing.expectEqual(@as(u32, 1280), std.mem.readInt(u32, fb_parsed.getProp("width").?[0..4], .big));
-    try std.testing.expectEqual(@as(u32, 720), std.mem.readInt(u32, fb_parsed.getProp("height").?[0..4], .big));
 
-    const usb_parsed = parsed.findNode("/soc/usb@7e980000").?;
-    try std.testing.expectEqualStrings("brcm,bcm2835-usb", usb_parsed.getStringProp("compatible").?);
+    // Nodes the firmware leaves alone stay as the board's tree has them
+    try std.testing.expectEqualStrings("brcm,bcm2708-usb", parsed.findNode("/soc/usb@7e980000").?.getStringProp("compatible").?);
+    try std.testing.expectEqualStrings("disabled", parsed.findNode("/soc/hvs@7e400000").?.getStringProp("status").?);
 
-    const hvs_parsed = parsed.findNode("/soc/hvs@7e400000").?;
-    try std.testing.expectEqualStrings("okay", hvs_parsed.getStringProp("status").?);
+    try std.testing.expectEqualSlices(u8, &.{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 }, parsed.findNode("/soc/usb@7e980000/usb1@1/usb1_1@1").?.getProp("local-mac-address").?);
+    try std.testing.expectEqualSlices(u8, &.{ 0x04, 0x61, 0x47, 0xeb, 0x27, 0xb8 }, parsed.findNode("/soc/serial@7e201000/bluetooth").?.getProp("local-bd-address").?);
 
-    // Built-in USB hub node usb1@1 is populated for boards with built-in hubs (e.g. Pi 1 Model B+ -> usb424,9514)
-    try parsed.setBoardModel(.pi_1_b_plus);
-    const hub_node = parsed.findNode("/soc/usb@7e980000/usb1@1").?;
-    try std.testing.expectEqualStrings("usb424,9514", hub_node.getStringProp("compatible").?);
-
-    // And removed for boards with an external hub (e.g. Pi Zero)
-    try parsed.setBoardModel(.pi_zero);
-    try std.testing.expect(parsed.findNode("/soc/usb@7e980000/usb1@1") == null);
-
-    const mmcnr_parsed = parsed.findNode("/soc/mmcnr@7e300000").?;
-    try std.testing.expectEqualStrings("okay", mmcnr_parsed.getStringProp("status").?);
-    const wifi_parsed = parsed.findNode("/soc/mmcnr@7e300000/wifi@1").?;
-    try std.testing.expectEqualStrings("brcm,bcm4329-fmac", wifi_parsed.getStringProp("compatible").?);
-    try std.testing.expectEqualSlices(u8, &.{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 }, wifi_parsed.getProp("local-mac-address").?);
+    // With enable_uart off (the default where the mini UART is primary) the 8250 driver leaves it alone
+    var tree2 = try Tree.initEmpty(alloc);
+    try (try tree2.findOrCreateNode("/aliases")).setStringProp(alloc, "serial0", "/soc/serial@7e215040");
+    try tree2.patchForPiZero(512 * 1024 * 1024, "console=serial0,115200", null, null, false);
+    try std.testing.expectEqualStrings("8250.nr_uarts=0 console=ttyS0,115200", tree2.findNode("/chosen").?.getStringProp("bootargs").?);
+    // and without the KMS driver there is no simple-framebuffer node
+    try std.testing.expect(tree2.findNode("/chosen/framebuffer@1c100000") == null);
 }
 
 test "overlay fixups, parameters and merge" {

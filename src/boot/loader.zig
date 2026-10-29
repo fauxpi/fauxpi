@@ -25,12 +25,6 @@ pub fn isArm64KernelImage(kernel_bytes: []const u8) bool {
     return std.mem.readInt(u32, kernel_bytes[0x38..0x3c], .little) == arm64_image_magic;
 }
 
-/// True for a 32-bit ARM Linux `zImage` (magic `0x016f2818` at byte offset 0x24).
-pub fn isArmZImage(kernel_bytes: []const u8) bool {
-    if (kernel_bytes.len < 0x28) return false;
-    return std.mem.readInt(u32, kernel_bytes[0x24..0x28], .little) == 0x016f2818;
-}
-
 pub fn arm64KernelLoadOffset(kernel_bytes: []const u8) u32 {
     if (!isArm64KernelImage(kernel_bytes)) return kernel64_load_addr;
     const text_offset = std.mem.readInt(u64, kernel_bytes[0x08..0x10], .little);
@@ -69,10 +63,10 @@ pub const BootConfig = struct {
     kernel_explicit: bool = false,
     arm_64bit: ?bool = null,
     kernel_address: ?u32 = null,
+    enable_uart: ?bool = null,
     device_tree: ?[]const u8 = null,
     initramfs: ?[]const u8 = null,
     auto_initramfs: bool = false,
-    vc4_kms_v3d: bool = false,
     dt_directives: [max_dt_directives]DtDirective = undefined,
     dt_directive_count: usize = 0,
 
@@ -140,6 +134,8 @@ pub const BootConfig = struct {
                 }
             } else if (std.mem.eql(u8, key, "kernel_address")) {
                 cfg.kernel_address = std.fmt.parseInt(u32, val, 0) catch null;
+            } else if (std.mem.eql(u8, key, "enable_uart")) {
+                cfg.enable_uart = !std.mem.eql(u8, val, "0");
             } else if (std.mem.eql(u8, key, "auto_initramfs")) {
                 cfg.auto_initramfs = std.mem.eql(u8, val, "1") or std.ascii.eqlIgnoreCase(val, "true");
             } else if (std.mem.eql(u8, key, "device_tree")) {
@@ -150,9 +146,6 @@ pub const BootConfig = struct {
                 std.mem.eql(u8, key, "dtparam") or std.mem.eql(u8, key, "device_tree_param"))
             {
                 const is_overlay = std.mem.eql(u8, key, "dtoverlay") or std.mem.eql(u8, key, "device_tree_overlay");
-                if (is_overlay and std.mem.startsWith(u8, val, "vc4-kms-v3d")) {
-                    cfg.vc4_kms_v3d = true;
-                }
                 if (cfg.dt_directive_count < max_dt_directives) {
                     cfg.dt_directives[cfg.dt_directive_count] = .{ .kind = if (is_overlay) .overlay else .param, .text = val };
                     cfg.dt_directive_count += 1;
@@ -240,48 +233,16 @@ pub const BootResult = struct {
     initrd_size: usize,
 };
 
+/// The device tree the firmware loads for each board (unless config.txt names one with `device_tree=`).
 pub fn dtbCandidatesForModel(board_model: BoardModel) []const []const u8 {
     return switch (board_model) {
-        .pi_zero => &.{
-            "bcm2708-rpi-zero.dtb",
-            "bcm2835-rpi-zero.dtb",
-            "bcm2708-rpi-zero-w.dtb",
-            "bcm2835-rpi-zero-w.dtb",
-        },
-        .pi_zero_w => &.{
-            "bcm2708-rpi-zero-w.dtb",
-            "bcm2835-rpi-zero-w.dtb",
-            "bcm2708-rpi-zero.dtb",
-            "bcm2835-rpi-zero.dtb",
-        },
-        .pi_1_a_plus, .pi_1_b_plus => &.{
-            "bcm2708-rpi-b-plus.dtb",
-            "bcm2835-rpi-b-plus.dtb",
-            "bcm2708-rpi-zero.dtb",
-            "bcm2835-rpi-zero.dtb",
-        },
-        .pi_3_a_plus => &.{
-            "bcm2710-rpi-3-a-plus.dtb",
-            "bcm2837-rpi-3-a-plus.dtb",
-            "bcm2710-rpi-3-b-plus.dtb",
-            "bcm2837-rpi-3-b-plus.dtb",
-            "bcm2710-rpi-3-b.dtb",
-            "bcm2708-rpi-zero.dtb",
-        },
-        .pi_3_b_plus => &.{
-            "bcm2710-rpi-3-b-plus.dtb",
-            "bcm2837-rpi-3-b-plus.dtb",
-            "bcm2710-rpi-3-b.dtb",
-            "bcm2837-rpi-3-a-plus.dtb",
-            "bcm2708-rpi-zero.dtb",
-        },
-        .pi_zero_2_w => &.{
-            "bcm2710-rpi-zero-2-w.dtb",
-            "bcm2837-rpi-zero-2-w.dtb",
-            "bcm2710-rpi-zero-2.dtb",
-            "bcm2710-rpi-3-b-plus.dtb",
-            "bcm2708-rpi-zero-w.dtb",
-        },
+        .pi_zero => &.{"bcm2708-rpi-zero.dtb"},
+        .pi_zero_w => &.{"bcm2708-rpi-zero-w.dtb"},
+        .pi_1_a_plus => &.{"bcm2708-rpi-a-plus.dtb"},
+        .pi_1_b_plus => &.{"bcm2708-rpi-b-plus.dtb"},
+        .pi_3_a_plus => &.{"bcm2710-rpi-3-a-plus.dtb"},
+        .pi_3_b_plus => &.{"bcm2710-rpi-3-b-plus.dtb"},
+        .pi_zero_2_w => &.{"bcm2710-rpi-zero-2-w.dtb"},
     };
 }
 
@@ -369,12 +330,7 @@ pub fn loadFromSdImageForModel(
     const cmdline_path = try std.fmt.allocPrint(alloc, "{s}cmdline.txt", .{cfg.os_prefix});
     const raw_cmdline = fs.readFileAlloc(alloc, cmdline_path) catch
         (fs.readFileAlloc(alloc, "cmdline.txt") catch "");
-    const trimmed_cmdline = std.mem.trim(u8, raw_cmdline, " \t\r\n");
-
-    const full_cmdline = if (std.mem.indexOf(u8, trimmed_cmdline, "console=") == null)
-        try std.fmt.allocPrint(alloc, "console=ttyAMA0,115200 {s}", .{trimmed_cmdline})
-    else
-        trimmed_cmdline;
+    const full_cmdline = std.mem.trim(u8, raw_cmdline, " \t\r\n");
 
     const overlays = try cfg.dtOverlays(alloc);
     for (overlays) |*o| {
@@ -387,18 +343,27 @@ pub fn loadFromSdImageForModel(
     }
 
     const boot64 = board_model.isBcm2837() and (cfg.arm_64bit orelse std.mem.eql(u8, kernel_name, "kernel8.img"));
-    return loadDirectWithOverlays(allocator, ram, kernel_bytes, dtb_bytes, initrd_bytes, full_cmdline, cfg.vc4_kms_v3d or true, overlays, .{
+    return loadDirectWithOverlays(allocator, ram, kernel_bytes, dtb_bytes, initrd_bytes, full_cmdline, overlays, .{
         .aarch64 = boot64,
         .kernel_address = cfg.kernel_address,
+        .enable_uart = cfg.enable_uart,
+        .kms_framebuffer = for (overlays) |o| {
+            if (o.dtbo != null and std.mem.startsWith(u8, o.name, "vc4-kms-v3d")) break true;
+        } else false,
     });
 }
 
-/// How the firmware starts a kernel without a Linux `Image` header, which would say for itself.
+/// config.txt settings that change how the firmware starts the kernel.
 pub const KernelStart = struct {
-    /// Start in AArch64 (`arm_64bit=1`, or `kernel8.img` on a 64-bit board).
+    /// Start a kernel without a Linux `Image` header (which says for itself) in AArch64
+    /// (`arm_64bit=1`, or `kernel8.img` on a 64-bit board).
     aarch64: bool = false,
-    /// `kernel_address` from config.txt.
+    /// `kernel_address`: where to load it.
     kernel_address: ?u32 = null,
+    /// `enable_uart`: whether the primary UART is usable (see `fdt.Tree.patchForPiZero`).
+    enable_uart: ?bool = null,
+    /// `dtoverlay=vc4-kms-v3d`: the KMS display driver takes over the firmware's framebuffer.
+    kms_framebuffer: bool = false,
 };
 
 const SliceLzma2Buffer = struct {
@@ -637,9 +602,8 @@ pub fn loadDirect(
     dtb_bytes: []const u8,
     initrd_bytes: ?[]const u8,
     cmdline: []const u8,
-    enable_vc4_kms: bool,
 ) !BootResult {
-    return loadDirectWithOverlays(allocator, ram, raw_kernel_bytes, dtb_bytes, initrd_bytes, cmdline, enable_vc4_kms, &.{}, .{});
+    return loadDirectWithOverlays(allocator, ram, raw_kernel_bytes, dtb_bytes, initrd_bytes, cmdline, &.{}, .{});
 }
 
 /// Like `loadDirect`, also applying `dtoverlay=` / `dtparam=` settings to the device tree.
@@ -650,7 +614,6 @@ pub fn loadDirectWithOverlays(
     dtb_bytes: []const u8,
     initrd_bytes: ?[]const u8,
     cmdline: []const u8,
-    enable_vc4_kms: bool,
     overlays: []const DtOverlay,
     start: KernelStart,
 ) !BootResult {
@@ -709,18 +672,8 @@ pub fn loadDirectWithOverlays(
 
     var tree = try fdt.Tree.parse(alloc, dtb_bytes);
 
-    // Overlays may append to /chosen/bootargs; keep those additions after the command line,
-    // which otherwise replaces the device tree's bootargs.
-    const base_bootargs = if (tree.findNode("/chosen")) |c| c.getStringProp("bootargs") orelse "" else "";
     applyDtOverlays(alloc, &tree, overlays);
-    const overlay_bootargs = if (tree.findNode("/chosen")) |c| c.getStringProp("bootargs") orelse "" else "";
-    const full_cmdline = if (overlay_bootargs.len > base_bootargs.len and std.mem.startsWith(u8, overlay_bootargs, base_bootargs))
-        std.mem.trim(u8, try std.fmt.allocPrint(alloc, "{s} {s}", .{ cmdline, overlay_bootargs[base_bootargs.len..] }), " ")
-    else
-        cmdline;
-
-    const linux_kernel = isArm64KernelImage(kernel_bytes) or isArmZImage(kernel_bytes);
-    try tree.patchForPiZero(@intCast(ram.len), full_cmdline, initrd_range, enable_vc4_kms, linux_kernel);
+    try tree.patchForPiZero(@intCast(ram.len), cmdline, initrd_range, start.enable_uart, start.kms_framebuffer);
     if (is_aarch64) {
         try tree.configureSpinTable64();
     }
@@ -741,13 +694,14 @@ pub fn loadDirectWithOverlays(
     };
 }
 
-/// Updates `/model`, `/system/linux,revision`, `/system/linux,serial`, `/serial-number`, and optional wireless MAC and Bluetooth address in the in-RAM DTB at `dtb_load_addr`.
+/// Sets the board details the firmware fills in - `/system/linux,revision`, `/system/linux,serial`, `/serial-number`, the Ethernet MAC address and the Bluetooth address - in the in-RAM DTB at `dtb_load_addr`.
 pub fn applyBoardConfigToRamDtb(
     allocator: std.mem.Allocator,
     ram: []u8,
     dtb_size: usize,
     board_model: BoardModel,
     serial: u64,
+    ethernet_mac: [6]u8,
     wifi_mac: ?[6]u8,
 ) !usize {
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -756,15 +710,10 @@ pub fn applyBoardConfigToRamDtb(
 
     if (dtb_load_addr + dtb_size > ram.len) return error.DtbTooLarge;
     var tree = try fdt.Tree.parse(alloc, ram[dtb_load_addr .. dtb_load_addr + dtb_size]);
-    try tree.setBoardModel(board_model);
+    try tree.setBoardRevision(board_model.boardRevision());
     try tree.setBoardSerial(serial);
-    if (wifi_mac) |wmac| {
-        try tree.setWirelessMac(wmac);
-        try tree.setBluetooth(bluetooth.hciOrder(bluetooth.addressFromWifiMac(wmac)));
-    } else {
-        try tree.disableWireless();
-        try tree.setBluetooth(null);
-    }
+    try tree.setEthernetMac(ethernet_mac);
+    if (wifi_mac) |wmac| try tree.setBluetoothAddress(bluetooth.hciOrder(bluetooth.addressFromWifiMac(wmac)));
     const updated_dtb = try tree.serialize(alloc);
     if (dtb_load_addr + updated_dtb.len > ram.len) return error.DtbTooLarge;
     @memcpy(ram[dtb_load_addr .. dtb_load_addr + updated_dtb.len], updated_dtb);
@@ -785,7 +734,6 @@ test "parse config.txt" {
     try std.testing.expectEqualStrings("slot-a/", cfg.os_prefix);
     try std.testing.expectEqualStrings("kernel.img", cfg.kernel);
     try std.testing.expectEqualStrings("initramfs.cpio", cfg.initramfs.?);
-    try std.testing.expect(cfg.vc4_kms_v3d);
 
     const cfg64 = BootConfig.parseForModel("arm_64bit=1\n", .pi_3_b_plus);
     try std.testing.expectEqualStrings("kernel8.img", cfg64.kernel);
@@ -852,12 +800,12 @@ test "raw AArch64 kernels load at kernel_address or 0x80000" {
     @memset(ram, 0);
     const kernel: [128]u8 = @splat(0xaa); // No `Image` header
 
-    const res = try loadDirectWithOverlays(alloc, ram, &kernel, dtb, null, "", false, &.{}, .{ .aarch64 = true });
+    const res = try loadDirectWithOverlays(alloc, ram, &kernel, dtb, null, "", &.{}, .{ .aarch64 = true });
     try std.testing.expect(res.is_aarch64);
     try std.testing.expectEqual(raw_kernel64_load_addr, res.entry_pc);
     try std.testing.expectEqual(dtb_load_addr, res.r0);
     try std.testing.expectEqualSlices(u8, &kernel, ram[raw_kernel64_load_addr..][0..kernel.len]);
 
-    const res2 = try loadDirectWithOverlays(alloc, ram, &kernel, dtb, null, "", false, &.{}, .{ .aarch64 = true, .kernel_address = 0x100000 });
+    const res2 = try loadDirectWithOverlays(alloc, ram, &kernel, dtb, null, "", &.{}, .{ .aarch64 = true, .kernel_address = 0x100000 });
     try std.testing.expectEqual(@as(u32, 0x100000), res2.entry_pc);
 }

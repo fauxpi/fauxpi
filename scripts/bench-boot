@@ -39,7 +39,7 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Bump when the probe changes, so cached images are rebuilt.
-PROBE_VERSION = 2
+PROBE_VERSION = 3
 
 PROBE_SCRIPT = """#!/bin/sh
 # Added by scripts/bench-boot: reports boot milestones on the console, then powers off.
@@ -112,6 +112,60 @@ def debugfs(fs_path, command):
     r = subprocess.run(["debugfs", "-w", fs_path, "-R", command], capture_output=True, text=True)
     if r.returncode != 0:
         fail("debugfs '%s' failed: %s" % (command, r.stderr.strip()))
+
+
+def enable_serial_console(raw_image):
+    """Appends `enable_uart=1` to config.txt in the FAT boot partition, as on a board whose serial
+    console is used: without it the firmware leaves the mini UART (the primary UART on boards with
+    Bluetooth) unusable. Writes into the file's last cluster, which must have room."""
+    with open(raw_image, "r+b") as f:
+        mbr = f.read(512)
+        entry = mbr[446:462]
+        if entry[4] not in (0x0B, 0x0C):
+            fail("the first partition is not FAT32")
+        part = int.from_bytes(entry[8:12], "little") * 512
+        f.seek(part)
+        bpb = f.read(512)
+        bps = int.from_bytes(bpb[11:13], "little")
+        spc = bpb[13]
+        reserved = int.from_bytes(bpb[14:16], "little")
+        nfats = bpb[16]
+        fatsz = int.from_bytes(bpb[36:40], "little")
+        root_cluster = int.from_bytes(bpb[44:48], "little")
+        csize = bps * spc
+        fat = part + reserved * bps
+        data = fat + nfats * fatsz * bps
+
+        def next_cluster(c):
+            f.seek(fat + c * 4)
+            return int.from_bytes(f.read(4), "little") & 0x0FFFFFFF
+
+        cluster = root_cluster
+        while cluster < 0x0FFFFFF8:
+            base = data + (cluster - 2) * csize
+            f.seek(base)
+            block = f.read(csize)
+            for off in range(0, csize, 32):
+                e = block[off:off + 32]
+                if e[0] == 0:
+                    break
+                if e[:11] == b"CONFIG  TXT":
+                    size = int.from_bytes(e[28:32], "little")
+                    first = int.from_bytes(e[20:22], "little") << 16 | int.from_bytes(e[26:28], "little")
+                    extra = b"\n[all]\nenable_uart=1\n"
+                    last, n = first, 1
+                    while next_cluster(last) < 0x0FFFFFF8:
+                        last, n = next_cluster(last), n + 1
+                    used = size - (n - 1) * csize
+                    if used + len(extra) > csize:
+                        fail("no room to append to config.txt")
+                    f.seek(data + (last - 2) * csize + used)
+                    f.write(extra)
+                    f.seek(base + off + 28)
+                    f.write((size + len(extra)).to_bytes(4, "little"))
+                    return
+            cluster = next_cluster(cluster)
+    fail("config.txt not found in the boot partition")
 
 
 def install_probe(raw_image, work_dir):
@@ -250,6 +304,7 @@ def prepare(args, cache_dir):
             subprocess.run(["xz", "-dc", "-T0", args.image], stdout=out, check=True)
     else:
         shutil.copyfile(args.image, raw)
+    enable_serial_console(raw)
     install_probe(raw, cache_dir)
     staging = os.path.join(cache_dir, "staging.qcow2")
     subprocess.run(["qemu-img", "convert", "-O", "qcow2", "-f", "raw", raw, staging], check=True)
