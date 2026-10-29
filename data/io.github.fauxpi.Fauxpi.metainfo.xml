@@ -22,9 +22,9 @@
     </ul>
   </description>
   <launchable type="desktop-id">io.github.fauxpi.Fauxpi.desktop</launchable>
-  <url type="homepage">https://github.com/robert-ancell/fauxpi</url>
-  <url type="bugtracker">https://github.com/robert-ancell/fauxpi/issues</url>
-  <url type="vcs-browser">https://github.com/robert-ancell/fauxpi</url>
+  <url type="homepage">https://github.com/fauxpi/fauxpi</url>
+  <url type="bugtracker">https://github.com/fauxpi/fauxpi/issues</url>
+  <url type="vcs-browser">https://github.com/fauxpi/fauxpi</url>
   <content_rating type="oars-1.1" />
   <releases>
     <release version="26.10" date="2026-10-29" />

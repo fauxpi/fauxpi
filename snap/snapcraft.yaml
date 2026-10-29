@@ -16,10 +16,10 @@ description: |
   - Copy-on-write QCOW2 SD card image management
   - USB HID keyboard/mouse, user-mode NAT Ethernet & Wi-Fi, and audio playback
 license: MIT
-website: https://github.com/robert-ancell/fauxpi
-source-code: https://github.com/robert-ancell/fauxpi
-issues: https://github.com/robert-ancell/fauxpi/issues
-contact: https://github.com/robert-ancell/fauxpi/issues
+website: https://github.com/fauxpi/fauxpi
+source-code: https://github.com/fauxpi/fauxpi
+issues: https://github.com/fauxpi/fauxpi/issues
+contact: https://github.com/fauxpi/fauxpi/issues
 grade: stable
 confinement: strict
 icon: data/io.github.fauxpi.Fauxpi.svg
