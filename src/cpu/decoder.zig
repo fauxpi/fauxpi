@@ -467,101 +467,83 @@ fn clampSat(val: i32, min_v: i32, max_v: i32, q_set: *bool) i32 {
     return val;
 }
 
-fn executeParallelAddSub(op1: u5, op2: u3, r_rn: u32, r_rm: u32, cpsr: *u32) u32 {
+/// One lane of a parallel add/subtract: the result, and whether it sets the lane's GE flags.
+fn parallelLane(comptime bits: u5, a_raw: u32, b_raw: u32, sub: bool, is_unsigned: bool, prefix: u2) struct { u32, bool } {
+    const mask: u32 = (@as(u32, 1) << bits) - 1;
+    const a: i64 = if (is_unsigned) a_raw & mask else signExtend(a_raw & mask, bits);
+    const b: i64 = if (is_unsigned) b_raw & mask else signExtend(b_raw & mask, bits);
+    const r: i64 = if (sub) a - b else a + b;
+    const value: i64 = switch (prefix) {
+        0b10 => if (is_unsigned)
+            std.math.clamp(r, 0, @as(i64, mask))
+        else
+            std.math.clamp(r, -(@as(i64, 1) << (bits - 1)), (@as(i64, 1) << (bits - 1)) - 1),
+        0b11 => r >> 1,
+        else => r,
+    };
+    // GE: unsigned add carries out, unsigned subtract does not borrow, signed result is non-negative
+    const ge = if (is_unsigned) (if (sub) r >= 0 else r > mask) else r >= 0;
+    return .{ @as(u32, @truncate(@as(u64, @bitCast(value)))) & mask, ge };
+}
+
+fn signExtend(v: u32, comptime bits: u5) i64 {
+    const shift: u6 = @intCast(64 - @as(u7, bits));
+    return @as(i64, @bitCast(@as(u64, v) << shift)) >> shift;
+}
+
+/// ARMv6 parallel add/subtract: `op1[1:0]` selects modulo (01, which sets GE), saturating (10)
+/// or halving (11), `op1[2]` unsigned, and `op2` the operation: ADD16 (000), ASX (001), SAX (010),
+/// SUB16 (011), ADD8 (100) or SUB8 (111). Other encodings are undefined.
+fn executeParallelAddSub(op1: u5, op2: u3, r_rn: u32, r_rm: u32, cpsr: *u32) ?u32 {
     const prefix: u2 = @truncate(op1 & 3);
     const is_unsigned = (op1 & 0b00100) != 0;
+    if (prefix == 0b00 or op2 == 0b101 or op2 == 0b110) return null;
 
-    // UADD8 / SADD8 / USUB8 / SSUB8 / UQADD8 / UQSUB8 (op2 == 0b010)
-    if (op2 == 0b010) {
-        const is_sub = (op2 & 0b100) != 0; // wait: for 8-bit, op2 is 0b010 for ADD8 and 0b110 for SUB8
-        _ = is_sub;
-    }
-    const is_8bit = (op2 & 0b011) == 0b010;
-    const is_sub8 = op2 == 0b110;
-
-    if (is_8bit) {
-        var out: u32 = 0;
-        var ge: u32 = 0;
+    var out: u32 = 0;
+    var ge: u32 = 0;
+    if (op2 == 0b100 or op2 == 0b111) {
         inline for (0..4) |i| {
             const sh: u5 = @intCast(i * 8);
-            const u_a: u8 = @truncate(r_rn >> sh);
-            const u_b: u8 = @truncate(r_rm >> sh);
-            const s_a: i32 = @as(i8, @bitCast(u_a));
-            const s_b: i32 = @as(i8, @bitCast(u_b));
-            var res_byte: u8 = 0;
-            if (is_unsigned) {
-                const a: i32 = u_a;
-                const b: i32 = u_b;
-                const sum: i32 = if (is_sub8) (a - b) else (a + b);
-                if (prefix == 0b01) { // Modulo (UADD8 / USUB8)
-                    if (!is_sub8 and sum >= 0x100) ge |= (@as(u32, 1) << @intCast(i));
-                    if (is_sub8 and sum >= 0) ge |= (@as(u32, 1) << @intCast(i));
-                    res_byte = @truncate(@as(u32, @bitCast(sum)));
-                } else if (prefix == 0b10) { // Saturating (UQADD8 / UQSUB8)
-                    res_byte = @intCast(std.math.clamp(sum, 0, 255));
-                } else if (prefix == 0b11) { // Halving (UHADD8 / UHSUB8)
-                    res_byte = @truncate(@as(u32, @bitCast(sum >> 1)));
-                }
-            } else {
-                const sum: i32 = if (is_sub8) (s_a - s_b) else (s_a + s_b);
-                if (prefix == 0b01) { // Modulo (SADD8 / SSUB8)
-                    if (sum >= 0) ge |= (@as(u32, 1) << @intCast(i));
-                    res_byte = @truncate(@as(u32, @bitCast(sum)));
-                } else if (prefix == 0b10) { // Saturating (QADD8 / QSUB8)
-                    const clamped: i8 = @intCast(std.math.clamp(sum, -128, 127));
-                    res_byte = @bitCast(clamped);
-                } else if (prefix == 0b11) { // Halving (SHADD8 / SHSUB8)
-                    res_byte = @truncate(@as(u32, @bitCast(sum >> 1)));
-                }
-            }
-            out |= (@as(u32, res_byte) << sh);
+            const lane = parallelLane(8, r_rn >> sh, r_rm >> sh, op2 == 0b111, is_unsigned, prefix);
+            out |= lane[0] << sh;
+            if (lane[1]) ge |= @as(u32, 1) << @intCast(i);
         }
-        if (prefix == 0b01) {
-            cpsr.* = (cpsr.* & ~PsrFlags.GE_MASK) | (ge << 16);
-        }
-        return out;
-    }
-
-    // 16-bit parallel operations (SADD16 / UADD16 / SSUB16 / USUB16 / etc.)
-    const is_sub16 = op2 == 0b011;
-    var out16: u32 = 0;
-    var ge16: u32 = 0;
-    inline for (0..2) |i| {
-        const sh: u5 = @intCast(i * 16);
-        const u_a: u16 = @truncate(r_rn >> sh);
-        const u_b: u16 = @truncate(r_rm >> sh);
-        const s_a: i32 = @as(i16, @bitCast(u_a));
-        const s_b: i32 = @as(i16, @bitCast(u_b));
-        var res_half: u16 = 0;
-        if (is_unsigned) {
-            const a: i32 = u_a;
-            const b: i32 = u_b;
-            const sum: i32 = if (is_sub16) (a - b) else (a + b);
-            if (prefix == 0b01) {
-                if (!is_sub16 and sum >= 0x10000) ge16 |= (@as(u32, 0b11) << @intCast(i * 2));
-                if (is_sub16 and sum >= 0) ge16 |= (@as(u32, 0b11) << @intCast(i * 2));
-                res_half = @truncate(@as(u32, @bitCast(sum)));
-            } else if (prefix == 0b10) {
-                res_half = @intCast(std.math.clamp(sum, 0, 65535));
-            } else {
-                res_half = @truncate(@as(u32, @bitCast(sum >> 1)));
-            }
-        } else {
-            const sum: i32 = if (is_sub16) (s_a - s_b) else (s_a + s_b);
-            if (prefix == 0b01) {
-                if (sum >= 0) ge16 |= (@as(u32, 0b11) << @intCast(i * 2));
-                res_half = @truncate(@as(u32, @bitCast(sum)));
-            } else if (prefix == 0b10) {
-                const clamped: i16 = @intCast(std.math.clamp(sum, -32768, 32767));
-                res_half = @bitCast(clamped);
-            } else {
-                res_half = @truncate(@as(u32, @bitCast(sum >> 1)));
-            }
-        }
-        out16 |= (@as(u32, res_half) << sh);
+    } else {
+        // 16-bit lanes; ASX/SAX exchange Rm's halves and add in one lane while subtracting in the other
+        const rm_lo = if (op2 == 0b001 or op2 == 0b010) r_rm >> 16 else r_rm;
+        const rm_hi = if (op2 == 0b001 or op2 == 0b010) r_rm else r_rm >> 16;
+        const lo = parallelLane(16, r_rn, rm_lo, op2 == 0b011 or op2 == 0b001, is_unsigned, prefix);
+        const hi = parallelLane(16, r_rn >> 16, rm_hi, op2 == 0b011 or op2 == 0b010, is_unsigned, prefix);
+        out = lo[0] | (hi[0] << 16);
+        if (lo[1]) ge |= 0b0011;
+        if (hi[1]) ge |= 0b1100;
     }
     if (prefix == 0b01) {
-        cpsr.* = (cpsr.* & ~PsrFlags.GE_MASK) | (ge16 << 16);
+        cpsr.* = (cpsr.* & ~PsrFlags.GE_MASK) | (ge << 16);
     }
-    return out16;
+    return out;
+}
+
+test "ARMv6 parallel add/subtract decodes ADD8/SUB8/ADD16/SUB16/ASX/SAX" {
+    const enc = struct {
+        fn inst(op1: u32, op2: u32) u32 {
+            return 0xe600_0f10 | (op1 << 20) | (1 << 16) | (2 << 12) | (op2 << 5) | 3;
+        }
+    };
+    var cpsr: u32 = 0;
+    // UQSUB8: 1 - byte saturates to 1 where the byte is zero (glibc's string search)
+    try std.testing.expectEqual(@as(?u32, 0x0100_0100), executeMedia(enc.inst(0b00110, 0b111), 0x0101_0101, 0x0041_0062, 0, 0, &cpsr));
+    // UADD8 sets GE for lanes that carry out
+    try std.testing.expectEqual(@as(?u32, 0x0000_0002), executeMedia(enc.inst(0b00101, 0b100), 0x80ff_0001, 0x8001_0001, 0, 0, &cpsr));
+    try std.testing.expectEqual(@as(u32, 0b1100), (cpsr & PsrFlags.GE_MASK) >> 16);
+    // SSUB16 sets GE for non-negative lanes
+    try std.testing.expectEqual(@as(?u32, 0xffff_0002), executeMedia(enc.inst(0b00001, 0b011), 0x0001_0005, 0x0002_0003, 0, 0, &cpsr));
+    try std.testing.expectEqual(@as(u32, 0b0011), (cpsr & PsrFlags.GE_MASK) >> 16);
+    // UASX: low = Rn.lo - Rm.hi, high = Rn.hi + Rm.lo
+    try std.testing.expectEqual(@as(?u32, 0x0013_001b), executeMedia(enc.inst(0b00101, 0b001), 0x0010_0020, 0x0005_0003, 0, 0, &cpsr));
+    try std.testing.expectEqual(@as(u32, 0b0011), (cpsr & PsrFlags.GE_MASK) >> 16);
+    // SHADD8 halves signed sums
+    try std.testing.expectEqual(@as(?u32, 0x0000_0003), executeMedia(enc.inst(0b00011, 0b100), 0x0000_fe04, 0x0000_0202, 0, 0, &cpsr));
+    // op2 = 0b101 is unallocated
+    try std.testing.expectEqual(@as(?u32, null), executeMedia(enc.inst(0b00101, 0b101), 0, 0, 0, 0, &cpsr));
 }

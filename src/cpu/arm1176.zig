@@ -8381,3 +8381,97 @@ test "ARM1176 pre-decoded VFP load/store and double-precision arithmetic" {
 
 
 
+
+test "ARM1176 runs glibc's ARMv6 strlen (LDRD post-index, UQSUB8, REV, CLZ)" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+
+    // strlen from Raspbian trixie's armhf ld.so (glibc sysdeps/arm/armv6/strlen.S)
+    const strlen_code = [_]u32{
+        0xe5d02000,
+        0xe2003007,
+        0xe1a01000,
+        0xe263300f,
+        0xe3520000,
+        0x0a000016,
+        0xe5f02001,
+        0xe2533001,
+        0x13520000,
+        0x1afffffb,
+        0xe3520000,
+        0x0a000010,
+        0xe2800001,
+        0xe0c020d8,
+        0xe59fc03c,
+        0xf5d0f040,
+        0xe66c2ff2,
+        0xe66c3ff3,
+        0xf5d0f080,
+        0xe1933002,
+        0x00c020d8,
+        0x0afffff9,
+        0xe3520000,
+        0xe2400004,
+        0x01a02003,
+        0x12400004,
+        0xe6bf2f32,
+        0xe16f2f12,
+        0xe08001a2,
+        0xe0400001,
+        0xe12fff1e,
+        0x01010101,
+    };
+    const strings = [_][]const u8{ "cannot open shared object file", "libresolv.so.2", "a", "", "0123456789abcdefghijklmnopqrstuvwxyz" };
+    for (strings) |s| {
+        for (0..8) |alignment| {
+            @memset(ram, 0x55);
+            for (strlen_code, 0..) |inst, i| std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+            // The caller returns to an infinite loop at 0x1800
+            std.mem.writeInt(u32, ram[0x1800..][0..4], 0xeafffffe, .little);
+            const addr = 0x4000 + alignment;
+            @memcpy(ram[addr .. addr + s.len], s);
+            ram[addr + s.len] = 0;
+
+            var bus: TestBus = .{ .ram = ram };
+            var cpu: Arm1176(TestBus) = .{};
+            cpu.initReset(0x1000, 0, 0xffffffff, 0x2000);
+            cpu.r[0] = @intCast(addr);
+            cpu.r[14] = 0x1800;
+            var steps: usize = 0;
+            while (cpu.r[15] != 0x1800 and steps < 1000) : (steps += 1) _ = cpu.runSteps(&bus, 1);
+            std.testing.expectEqual(@as(u32, @intCast(s.len)), cpu.r[0]) catch |err| {
+                std.debug.print("strlen(\"{s}\") at +{d}\n", .{ s, alignment });
+                return err;
+            };
+        }
+    }
+}
