@@ -1,0 +1,16 @@
+FauxPi is a Raspberry Pi you don't have to plug in. It simulates the board itself — the processor, the graphics, the USB ports, the SD card — so Raspberry Pi OS and other Raspberry Pi software run unchanged, from the same SD card image you would write for the real thing.
+
+Boards:
+- Raspberry Pi 1 Model A+ and B+
+- Raspberry Pi 3 Model A+ and B+
+- Raspberry Pi Zero, Zero W and Zero 2 W
+
+Each board is simulated as it is built: its own processor, memory, clocks, USB hub and Ethernet controller, Wi-Fi and Bluetooth where it has them, and the device tree the firmware would give it. The boot reads config.txt, overlays and cmdline.txt from the SD card as the Raspberry Pi firmware does.
+
+What you get:
+- VideoCore IV graphics, with the HDMI display shown in a window and 3D drawn on your computer's GPU
+- A board you can handle: plug and unplug power, HDMI, the SD card, a USB keyboard, mouse and Ethernet, and watch the activity LED
+- GPIO pins you can inspect, and a CPU temperature you can set
+- Networking through your computer's connection, over Ethernet or Wi-Fi
+- HDMI and headphone audio
+- SD cards kept as copy-on-write images, so you can keep several and the original image is never changed

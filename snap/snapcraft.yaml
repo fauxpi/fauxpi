@@ -1,4 +1,5 @@
 name: fauxpi
+title: FauxPi
 base: core24
 version: '0.1.0'
 summary: Raspberry Pi hardware simulator
@@ -14,17 +15,44 @@ description: |
   - Copy-on-write QCOW2 SD card image management
   - USB HID keyboard/mouse, user-mode NAT Ethernet & Wi-Fi, and audio playback
 license: MIT
+website: https://github.com/robert-ancell/fauxpi
+source-code: https://github.com/robert-ancell/fauxpi
+issues: https://github.com/robert-ancell/fauxpi/issues
+contact: https://github.com/robert-ancell/fauxpi/issues
 grade: stable
 confinement: strict
 icon: data/io.github.robert_ancell.FauxPi.svg
+
+# FauxPi loads its audio libraries with dlopen, which the linter can't see
+lint:
+  ignore:
+    - library:
+        - usr/lib/*/libasound.so*
+        - usr/lib/*/libpulse.so*
+        - usr/lib/*/libpulse-simple.so*
 
 platforms:
   amd64:
   arm64:
 
+# EGL (for VideoCore IV graphics) comes from the mesa-2404 snap
+plugs:
+  gpu-2404:
+    interface: content
+    target: $SNAP/gpu-2404
+    default-provider: mesa-2404
+
+layout:
+  /usr/share/libdrm:
+    bind: $SNAP/gpu-2404/libdrm
+  /usr/share/drirc.d:
+    symlink: $SNAP/gpu-2404/drirc.d
+
 apps:
   fauxpi:
     command: usr/bin/fauxpi
+    command-chain:
+      - bin/gpu-2404-wrapper
     desktop: usr/share/applications/io.github.robert_ancell.FauxPi.desktop
     common-id: io.github.robert_ancell.FauxPi
     environment:
@@ -34,13 +62,17 @@ apps:
     plugs:
       - wayland
       - desktop
+      - opengl
       - audio-playback
       - network
+      - home
 
 parts:
   fauxpi:
     plugin: nil
+    # The committed tree, not the folder: build caches there run to gigabytes
     source: .
+    source-type: git
     build-packages:
       - ca-certificates
       - curl
@@ -58,3 +90,13 @@ parts:
         "$CRAFT_PART_INSTALL/usr/share/icons/hicolor/scalable/apps/io.github.robert_ancell.FauxPi.svg"
       install -Dm644 data/io.github.robert_ancell.FauxPi.metainfo.xml \
         "$CRAFT_PART_INSTALL/usr/share/metainfo/io.github.robert_ancell.FauxPi.metainfo.xml"
+
+  gpu-2404:
+    after: [fauxpi]
+    source: https://github.com/canonical/gpu-snap.git
+    plugin: dump
+    override-prime: |
+      craftctl default
+      ${CRAFT_PART_SRC}/bin/gpu-2404-cleanup mesa-2404
+    prime:
+      - bin/gpu-2404-wrapper
