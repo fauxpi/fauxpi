@@ -9214,3 +9214,102 @@ test "ARM32 JIT traces run media, CRC32 and saturating instructions through the 
     try std.testing.expectEqualSlices(u32, results[1].r[0..13], results[0].r[0..13]);
     try std.testing.expectEqual(results[1].cpsr, results[0].cpsr);
 }
+
+test "ARM32 JIT traces run Advanced SIMD and VFP instructions through the interpreter, trapping while VFP is off" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+    const Cpu = Arm1176(TestBus);
+    const allocator = std.testing.allocator;
+
+    // loop: vld1.8 {d0}, [r4]!; vadd.i8 d1, d1, d0; uadd8 r6, r6, r7; sel r8, r6, r7;
+    //       crc32w r9, r9, r6; vmov.u8 r11, d1[3]; vcvtb.f32.f16 s4, s2; subs r0, r0, #1; bne loop
+    const prog = [_]u32{ 0xf424070d, 0xf2011800, 0xe6566f97, 0xe6868fb7, 0xe1499046, 0xeed1bb70, 0xeeb22a41, 0xe2500001, 0x1afffff6, 0xeafffffe };
+    const iterations = 40;
+
+    const Result = struct { r: [16]u32, cpsr: u32, s: [64]u32 };
+    var results: [2]Result = undefined;
+    var rams: [2][]u8 = undefined;
+    for (0..2) |run| {
+        const ram = try allocator.alloc(u8, 64 * 1024);
+        rams[run] = ram;
+        for (ram, 0..) |*b, i| b.* = @truncate(i *% 37 +% 11);
+        for (prog, 0..) |inst, i| std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+        for (0..8) |i| std.mem.writeInt(u32, ram[i * 4 ..][0..4], 0xeafffffe, .little);
+        var bus: TestBus = .{ .ram = ram };
+        const cpu = try allocator.create(Cpu);
+        defer allocator.destroy(cpu);
+        cpu.* = .{};
+        cpu.initReset(0x1000, 0, 0, 0);
+        cpu.mmu.is_cortex_a53 = true;
+        cpu.vfp.is_vfpv4 = true;
+        cpu.mmu.cpacr = 0xf << 20;
+        cpu.vfp.fpexc = 1 << 30;
+        cpu.r[0] = iterations;
+        cpu.r[4] = 0x3000;
+        cpu.r[6] = 0x1234_5678;
+        cpu.r[7] = 0x80c0_f001;
+        cpu.r[9] = 0xffff_ffff;
+        cpu.vfp.setDU64(1, 0x0102_0304_0506_3c00);
+        if (run == 0) {
+            // With the JIT: the loop is hot and compiles to a trace
+            var steps: usize = 0;
+            cpu.setCpsr(0x10); // user mode
+            var trapped = false;
+            while (cpu.r[15] != 0x1024 and steps < 400) : (steps += 1) {
+                _ = cpu.runSteps(&bus, 16);
+                // Lazy VFP context switching: disable VFP part-way, then service the trap as the kernel does
+                if (!trapped and cpu.r[0] <= iterations - 20) {
+                    cpu.vfp.fpexc = 0;
+                    trapped = true;
+                }
+                if (cpu.mode() == .und) {
+                    cpu.vfp.fpexc = 1 << 30;
+                    const ret = cpu.r[14] -% 4;
+                    cpu.setCpsr(cpu.getSpsr());
+                    cpu.r[15] = ret;
+                }
+            }
+            if (jit_mod.is_x86_64_linux) {
+                const page_idx: usize = ((0x1000 >> 12) ^ (0x1000 >> 16) ^ (0x1000 >> 20)) & (icache_pages - 1);
+                try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024].op))));
+            }
+        } else {
+            // Without: one instruction at a time through the interpreter
+            cpu.setCpsr(0x10);
+            while (cpu.r[15] != 0x1024) cpu.stepOne(&bus);
+        }
+        results[run] = .{ .r = cpu.r, .cpsr = cpu.cpsr, .s = cpu.vfp.s };
+    }
+    defer for (rams) |ram| allocator.free(ram);
+
+    try std.testing.expectEqual(@as(u32, 0), results[0].r[0]);
+    try std.testing.expectEqual(@as(u32, 0x3000 + iterations * 8), results[0].r[4]);
+    try std.testing.expectEqualSlices(u32, results[1].r[0..13], results[0].r[0..13]);
+    try std.testing.expectEqual(results[1].cpsr, results[0].cpsr);
+    try std.testing.expectEqualSlices(u32, &results[1].s, &results[0].s);
+}

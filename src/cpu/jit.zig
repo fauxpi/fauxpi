@@ -4285,10 +4285,6 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
         /// Instructions a trace runs by calling back into the interpreter (`jitSlowExec32`): ones too
         /// varied to emit inline but common in hot loops, and that cannot change the mode, the
         /// interrupt masks or the data endianness.
-        ///
-        /// Advanced SIMD, the remaining VFP data processing and the CP10/CP11 register transfers are
-        /// not included yet: with them, a 32-bit Raspberry Pi OS boot on the Pi 3 drops to emergency
-        /// mode under `--clock instructions --sequential-cores` (other clock and core modes boot).
         pub fn isInterpretedInTrace(d: DecodedSlot) bool {
             const raw = d.raw;
             const op: ArmOp = @fromBackingInt(@intCast(d.op));
@@ -4300,6 +4296,12 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                     0b0100, 0b0101, 0b1000, 0b1010, 0b1100, 0b1110 => true,
                     else => false,
                 },
+                // Advanced SIMD data processing and element/structure loads and stores
+                .unconditional => (raw & 0xfe00_0000) == 0xf200_0000 or (raw & 0xff10_0000) == 0xf400_0000,
+                // VFP data processing the trace does not emit inline (conversions, VSQRT, VCVTB/VCVTT, ...)
+                .vfp_dp_al => true,
+                // Transfers between core registers and CP10/CP11: VMOV to and from scalars, VDUP, VMRS, VMSR
+                .coproc_svc => (raw >> 28) != 0xf and (raw & 0x0f00_0e10) == 0x0e00_0a10,
                 else => false,
             };
         }
@@ -6288,7 +6290,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                         emitSlowVfpCall(&em, slow_vfp, done_vfp, pc_page_off, raw, abort_epilogue_label);
                     },
 
-                    .media, .misc_000 => {
+                    .media, .misc_000, .unconditional, .vfp_dp_al, .coproc_svc => {
                         emitSlowExecCall(&em, pc_page_off, raw, abort_epilogue_label);
                     },
 
