@@ -16,6 +16,7 @@ const aarch64_mod = @import("aarch64.zig");
 const atomic_ram = @import("atomic_ram.zig");
 const jit_mod = @import("jit.zig");
 const cp14 = @import("cp14.zig");
+const neon = @import("neon.zig");
 
 pub const Mmu = mmu_mod.Mmu;
 pub const Vfp = vfp_mod.Vfp;
@@ -5006,6 +5007,52 @@ pub fn Arm1176(comptime Bus: type) type {
                 }
                 return;
             }
+
+            // 5. PLI (immediate and register) is a hint
+            if ((inst & 0x0d70_0000) == 0x0450_0000) return;
+
+            // 6. Advanced SIMD data processing (`1111 001U`) and element/structure load/store (`1111 0100 xxx0`)
+            if ((inst & 0x0e00_0000) == 0x0200_0000 or (inst & 0x0f10_0000) == 0x0400_0000) {
+                self.executeAdvancedSimd(bus, inst_pc, inst);
+                return;
+            }
+
+            self.enterException(.und, 0x04, inst_pc +% 4, false);
+        }
+
+        /// Whether Advanced SIMD instructions may execute: only the Cortex-A53 has them, and they
+        /// need CP10 access, `FPEXC.EN` and `CPACR.ASEDIS` clear.
+        fn advancedSimdEnabled(self: *const Self) bool {
+            if (!self.mmu.is_cortex_a53) return false;
+            const cp10_acc: u2 = @truncate((self.mmu.cpacr >> 20) & 3);
+            if (cp10_acc == 0b00 or (cp10_acc == 0b01 and !self.isPrivileged())) return false;
+            if ((self.mmu.cpacr & (1 << 31)) != 0) return false;
+            return self.vfp.isEnabled();
+        }
+
+        pub inline fn bigEndianData(self: *const Self) bool {
+            return (self.cpsr & PsrFlags.E) != 0;
+        }
+
+        noinline fn executeAdvancedSimd(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
+            if (!self.advancedSimdEnabled()) {
+                self.enterException(.und, 0x04, inst_pc +% 4, false);
+                return;
+            }
+            if ((inst & 0x0e00_0000) == 0x0200_0000) {
+                if (!neon.executeDataProcessing(&self.vfp, inst)) self.enterException(.und, 0x04, inst_pc +% 4, false);
+                return;
+            }
+            var fault_addr: u32 = 0;
+            neon.executeLoadStore(self, bus, inst, &fault_addr) catch |err| switch (err) {
+                error.Undefined => self.enterException(.und, 0x04, inst_pc +% 4, false),
+                error.Abort => self.enterException(.abt, 0x10, inst_pc +% 8, false),
+                error.Alignment => {
+                    const access: mmu_mod.AccessKind = if ((inst & (1 << 21)) != 0) .read else .write;
+                    self.mmu.recordFault(fault_addr, access, if (self.mmu.isLpae()) 0b100001 else 0b000001, 0);
+                    self.enterException(.abt, 0x10, inst_pc +% 8, false);
+                },
+            };
         }
 
         pub noinline fn executeGroup000(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
@@ -6230,6 +6277,11 @@ pub fn Arm1176(comptime Bus: type) type {
 
             // 3. 32-bit transfers between ARM core register and VFP (`VMOV Sn, Rt` / `VMOV Dm[x], Rt`)
             if ((inst & 0x0f00_0010) == 0x0e00_0010) {
+                if (is_double and self.mmu.is_cortex_a53) {
+                    // 8, 16 and 32-bit scalars and VDUP (Advanced SIMD)
+                    if (!neon.executeCoreTransfer(&self.vfp, &self.r, inst)) self.enterException(.und, 0x04, inst_pc +% 4, false);
+                    return;
+                }
                 const opc1: u3 = @truncate((inst >> 21) & 7);
                 const l = (inst & (1 << 20)) != 0;
                 const vn: u5 = @truncate((inst >> 16) & 0xf);

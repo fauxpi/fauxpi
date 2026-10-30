@@ -184,7 +184,7 @@ pub const Vfp = struct {
         return switch (reg) {
             0 => if (self.is_vfpv4) 0x410340f4 else self.fpsid,
             1 => self.fpscr,
-            6 => if (self.is_vfpv4) 0x10000011 else 0x00000000, // MVFR1 (FMA = VFPv4)
+            6 => if (self.is_vfpv4) 0x12111111 else 0x00000000, // MVFR1: Cortex-A53 (VFPv4, half-precision, Advanced SIMD)
             7 => if (self.is_vfpv4) 0x10110222 else 0x11110222, // MVFR0 (A_SIMD=2 -> 32 D regs)
             8 => self.fpexc,
             9 => self.fpinst,
