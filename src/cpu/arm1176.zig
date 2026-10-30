@@ -5284,6 +5284,23 @@ pub fn Arm1176(comptime Bus: type) type {
                         self.setPcWithInterworking(target);
                     }
                 },
+                0b0100 => {
+                    // CRC32{C}{B,H,W} Rd, Rn, Rm (ARMv8 CRC32; sz in bits 22:21, C in bit 9)
+                    if (!self.mmu.is_cortex_a53 or op1 == 0b11) {
+                        self.enterException(.und, 0x04, inst_pc +% 4, false);
+                        return;
+                    }
+                    const rn: u4 = @truncate((inst >> 16) & 0xf);
+                    const poly: u32 = if ((inst & (1 << 9)) != 0) 0x82f6_3b78 else 0xedb8_8320;
+                    var crc = self.r[rn];
+                    var v = self.r[rm];
+                    for (0..@as(usize, 1) << op1) |_| {
+                        crc ^= @as(u8, @truncate(v));
+                        for (0..8) |_| crc = (crc >> 1) ^ (if ((crc & 1) != 0) poly else 0);
+                        v >>= 8;
+                    }
+                    self.r[rd] = crc;
+                },
                 0b0101 => {
                     // Saturating add/subtract: QADD (00), QSUB (01), QDADD (10), QDSUB (11)
                     const rn: u4 = @truncate((inst >> 16) & 0xf);
@@ -8977,4 +8994,69 @@ test "ARM1176 SMLALD and SMLSLD accumulate dual 16-bit products into 64 bits" {
     try std.testing.expectEqual(@as(u64, 0xffff_ffff_ffff_fff5), pair.get(&cpu, 10));
     try std.testing.expectEqual(@as(u32, @backingInt(Mode.und)), cpu.cpsr & PsrFlags.MODE_MASK);
     try std.testing.expectEqual(@as(u32, 0x04), cpu.r[15]);
+}
+
+test "Cortex-A53 AArch32 CRC32 and CRC32C instructions" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+    @memset(ram, 0);
+    // crc32w r0, r0, r2; crc32w r0, r0, r3; crc32b r0, r0, r4; crc32cw r1, r1, r2; crc32cw r1, r1, r3;
+    // crc32cb r1, r1, r4; crc32h r5, r6, r7; b .
+    const prog = [_]u32{ 0xe1400042, 0xe1400043, 0xe1000044, 0xe1411242, 0xe1411243, 0xe1011244, 0xe1265047, 0xeafffffe };
+    for (prog, 0..) |inst, i| std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+    std.mem.writeInt(u32, ram[0x04..][0..4], 0xeafffffe, .little); // Undefined Instruction vector: b .
+
+    // The instructions update a CRC without the conventional inversions, so the standard check
+    // values of "123456789" come from starting at all-ones and inverting the result.
+    var bus: TestBus = .{ .ram = ram };
+    var cpu: Arm1176(TestBus) = .{};
+    cpu.initReset(0x1000, 0, 0xffffffff, 0x2000);
+    cpu.mmu.is_cortex_a53 = true;
+    cpu.r[0] = 0xffff_ffff;
+    cpu.r[1] = 0xffff_ffff;
+    cpu.r[2] = std.mem.readInt(u32, "1234", .little);
+    cpu.r[3] = std.mem.readInt(u32, "5678", .little);
+    cpu.r[4] = 0xffff_ff00 | '9'; // only the low byte is used
+    cpu.r[6] = 0x1234_5678;
+    cpu.r[7] = 0xffff_abcd; // only the low halfword is used
+    _ = cpu.runSteps(&bus, prog.len - 1);
+    try std.testing.expectEqual(@as(u32, 0xcbf4_3926), ~cpu.r[0]);
+    try std.testing.expectEqual(@as(u32, 0xe306_9283), ~cpu.r[1]);
+    try std.testing.expectEqual(@as(u32, 0x5abe_c668), cpu.r[5]);
+
+    // The ARM1176 has no CRC32 instructions
+    var v6: Arm1176(TestBus) = .{};
+    v6.initReset(0x1000, 0, 0xffffffff, 0x2000);
+    _ = v6.runSteps(&bus, 1);
+    try std.testing.expectEqual(@as(u32, @backingInt(Mode.und)), v6.cpsr & PsrFlags.MODE_MASK);
+    try std.testing.expectEqual(@as(u32, 0x04), v6.r[15]);
 }

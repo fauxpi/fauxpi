@@ -1166,7 +1166,7 @@ pub const Mmu = struct {
                     2 => if (self.is_cortex_a53) 0x21232042 else 0x11231111, // ID_ISAR2
                     3 => if (self.is_cortex_a53) 0x01112131 else 0x01102131, // ID_ISAR3
                     4 => if (self.is_cortex_a53) 0x00011142 else 0x00000141, // ID_ISAR4
-                    5 => if (self.is_cortex_a53) 0x00011121 else 0x00000000, // ID_ISAR5
+                    5 => if (self.is_cortex_a53) 0x00010001 else 0x00000000, // ID_ISAR5 (SEVL, CRC32; BCM2837 has no Crypto)
                     else => 0,
                 },
                 else => 0,
