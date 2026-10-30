@@ -4813,7 +4813,7 @@ pub fn Arm1176(comptime Bus: type) type {
             }
         }
 
-        fn executeArm(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
+        pub fn executeArm(self: *Self, bus: *Bus, inst_pc: u32, inst: u32) void {
             const cond: u4 = @truncate(inst >> 28);
             if (cond == 0xf) {
                 self.executeUnconditional(bus, inst_pc, inst);
@@ -9111,4 +9111,81 @@ test "Cortex-A53 AArch32 CRC32 and CRC32C instructions" {
     _ = v6.runSteps(&bus, 1);
     try std.testing.expectEqual(@as(u32, @backingInt(Mode.und)), v6.cpsr & PsrFlags.MODE_MASK);
     try std.testing.expectEqual(@as(u32, 0x04), v6.r[15]);
+}
+
+test "ARM32 JIT traces run media, CRC32 and saturating instructions through the interpreter" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+    const Cpu = Arm1176(TestBus);
+    const allocator = std.testing.allocator;
+
+    // loop: uadd8 r6, r6, r7; sel r8, r6, r7; uqsub8 r10, r6, r7; crc32w r9, r9, r6;
+    //       qadd r12, r12, r7; smlabb r11, r6, r7, r11; subs r0, r0, #1; bne loop
+    const prog = [_]u32{ 0xe6566f97, 0xe6868fb7, 0xe666aff7, 0xe1499046, 0xe107c05c, 0xe10bb786, 0xe2500001, 0x1afffff7, 0xeafffffe };
+    const iterations = 40;
+
+    const Result = struct { r: [16]u32, cpsr: u32 };
+    var results: [2]Result = undefined;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+    for (0..2) |run| {
+        @memset(ram, 0);
+        for (prog, 0..) |inst, i| std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+        var bus: TestBus = .{ .ram = ram };
+        const cpu = try allocator.create(Cpu);
+        defer allocator.destroy(cpu);
+        cpu.* = .{};
+        cpu.initReset(0x1000, 0, 0, 0);
+        cpu.mmu.is_cortex_a53 = true;
+        cpu.setCpsr(0x10); // user mode
+        cpu.r[0] = iterations;
+        cpu.r[6] = 0x1234_5678;
+        cpu.r[7] = 0x80c0_f001;
+        cpu.r[9] = 0xffff_ffff;
+        cpu.r[11] = 0x10;
+        cpu.r[12] = 0x7000_0000;
+        if (run == 0) {
+            // With the JIT: the loop is hot and compiles to a trace
+            var steps: usize = 0;
+            while (cpu.r[15] != 0x1020 and steps < 100) : (steps += 1) _ = cpu.runSteps(&bus, 64);
+            if (jit_mod.is_x86_64_linux) {
+                const page_idx: usize = ((0x1000 >> 12) ^ (0x1000 >> 16) ^ (0x1000 >> 20)) & (icache_pages - 1);
+                try std.testing.expectEqual(ArmOp.jit_trace, @as(ArmOp, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024].op))));
+            }
+        } else {
+            // Without: one instruction at a time through the interpreter
+            while (cpu.r[15] != 0x1020) cpu.stepOne(&bus);
+        }
+        results[run] = .{ .r = cpu.r, .cpsr = cpu.cpsr };
+    }
+
+    try std.testing.expectEqual(@as(u32, 0), results[0].r[0]);
+    try std.testing.expect((results[1].cpsr & PsrFlags.Q) != 0); // QADD saturated
+    try std.testing.expectEqualSlices(u32, results[1].r[0..13], results[0].r[0..13]);
+    try std.testing.expectEqual(results[1].cpsr, results[0].cpsr);
 }

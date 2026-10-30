@@ -4219,6 +4219,38 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
             return 0;
         }
 
+        /// Runs one instruction through the interpreter from a trace. Returns non-zero if the trace
+        /// must exit because the instruction took an exception or wrote the PC.
+        pub fn jitSlowExec32(
+            cpu_opaque: *anyopaque,
+            bus_opaque: *anyopaque,
+            pc_page_off: u32,
+            raw_inst: u32,
+        ) callconv(.c) u64 {
+            const cpu: *CpuType = @ptrCast(@alignCast(cpu_opaque));
+            const bus: *Bus = @ptrCast(@alignCast(bus_opaque));
+            const trace_pc = cpu.r[15];
+            const cur_pc = trace_pc +% pc_page_off;
+            cpu.r[15] = cur_pc +% 4;
+            cpu.executeArm(bus, cur_pc, raw_inst);
+            if (cpu.r[15] != cur_pc +% 4) return 1;
+            cpu.r[15] = trace_pc;
+            return 0;
+        }
+
+        fn emitSlowExecCall(em: *X64Emitter, pc_page_off: u32, raw: u32, abort_epilogue_label: u16) void {
+            emitSpillPinned32(em);
+            em.movRegReg(true, .rdi, .rbx);
+            em.movRegReg(true, .rsi, .r12);
+            em.movImm32(.rdx, pc_page_off);
+            em.movImm32(.rcx, raw);
+            em.movImm64(.r11, @intFromPtr(&jitSlowExec32));
+            em.callReg(.r11);
+            em.testRegReg(true, .rax, .rax);
+            em.jccLabel(.ne, abort_epilogue_label);
+            emitReloadPinned32(em);
+        }
+
         fn emitVfpReadyCheck(em: *X64Emitter, slow_label: u16) void {
             em.movRegMem(false, .rax, .rbx, off_vfp_fpexc);
             em.testRegImm32(false, .rax, 1 << 30);
@@ -4250,9 +4282,32 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
             em.bindLabel(done_label);
         }
 
+        /// Instructions a trace runs by calling back into the interpreter (`jitSlowExec32`): ones too
+        /// varied to emit inline but common in hot loops, and that cannot change the mode, the
+        /// interrupt masks or the data endianness.
+        ///
+        /// Advanced SIMD, the remaining VFP data processing and the CP10/CP11 register transfers are
+        /// not included yet: with them, a 32-bit Raspberry Pi OS boot on the Pi 3 drops to emergency
+        /// mode under `--clock instructions --sequential-cores` (other clock and core modes boot).
+        pub fn isInterpretedInTrace(d: DecodedSlot) bool {
+            const raw = d.raw;
+            const op: ArmOp = @fromBackingInt(@intCast(d.op));
+            return switch (op) {
+                // ARMv6 media: parallel add/subtract, SEL, saturation, packing, SMLAD/SMLALD, SMMUL, USAD8
+                .media => (raw >> 28) != 0xf,
+                // CRC32 (op2 = 0100), QADD/QSUB/QDADD/QDSUB (0101), SMLA<x><y>/SMLAW/SMLAL<x><y>/SMUL<x><y> (1xx0)
+                .misc_000 => (raw >> 28) != 0xf and switch ((raw >> 4) & 0xf) {
+                    0b0100, 0b0101, 0b1000, 0b1010, 0b1100, 0b1110 => true,
+                    else => false,
+                },
+                else => false,
+            };
+        }
+
         pub fn canCompileSlot(d: DecodedSlot) bool {
             const raw = d.raw;
             const op: ArmOp = @fromBackingInt(@intCast(d.op));
+            if (isInterpretedInTrace(d)) return true;
             if ((raw >> 28) == 0xf) return op == .nop_al or op == .clrex_al;
             return switch (op) {
                 .nop_al,
@@ -6229,6 +6284,10 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
                         em.movMemReg(false, .rbx, off_vfp_fpscr, .rcx);
                         em.jmpLabel(done_vfp);
                         emitSlowVfpCall(&em, slow_vfp, done_vfp, pc_page_off, raw, abort_epilogue_label);
+                    },
+
+                    .media, .misc_000 => {
+                        emitSlowExecCall(&em, pc_page_off, raw, abort_epilogue_label);
                     },
 
                     else => unreachable,
