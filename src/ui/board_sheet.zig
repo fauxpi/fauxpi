@@ -868,6 +868,12 @@ pub const BoardUi = struct {
         return &self.sd_cards.items[idx];
     }
 
+    /// Whether there is a card image to insert.
+    pub fn hasActiveSdCard(self: *const BoardUi) bool {
+        const idx = self.selected_sd_card_idx orelse return false;
+        return idx < self.sd_cards.items.len;
+    }
+
     pub fn activeSdCardName(self: *const BoardUi) []const u8 {
         const idx = self.selected_sd_card_idx orelse return "";
         if (idx >= self.sd_cards.items.len) return "";
@@ -2889,9 +2895,11 @@ pub const BoardUi = struct {
                 const tr = boardTransform(drawing, self.board_rect);
                 if (targetAt(drawing, .{ (x - tr.x) / tr.scale, (y - tr.y) / tr.scale }, status.sd_connected)) |target| {
                     return switch (target) {
-                        .sd_connector => .toggle_sd,
-                        .sd_card => blk: {
+                        // Without a card image there is nothing to insert: like the card, the
+                        // slot then offers to create one
+                        .sd_connector, .sd_card => blk: {
                             if (status.sd_connected) break :blk .toggle_sd;
+                            if (target == .sd_connector and self.hasActiveSdCard()) break :blk .toggle_sd;
                             if (self.sd_cards.items.len == 0) {
                                 // Initial list is empty: skip the card list and go directly to the Create Card UI
                                 self.sd_card_menu_open = false;
@@ -4435,6 +4443,7 @@ pub const BoardUi = struct {
                     status.sd_connected,
                     hovered,
                     sd_card_name,
+                    self.hasActiveSdCard(),
                 );
                 if (show_sd_warning) {
                     drawSdSocketWarning(c, slot_r, s, part.underside);
@@ -4665,6 +4674,8 @@ pub fn drawSdCard(
     connected: bool,
     hovered: bool,
     card_name: []const u8,
+    /// Whether there is a card image to insert; without one the card is a dashed outline.
+    available: bool,
 ) void {
     const cy = slot_r.y + slot_r.h * 0.5;
     const card_h = slot_r.h * 0.80;
@@ -4715,7 +4726,11 @@ pub fn drawSdCard(
         const radii: Radii = .{ .tl = 0.8 * s, .bl = 0.8 * s, .tr = 0.4 * s, .br = 0.4 * s };
         c.fillRoundedRect(card_rect, radii, surface_bg);
         c.fillRoundedRect(card_rect, radii, if (hovered) accent.withAlpha(0.28) else ink.withAlpha(0.08));
-        c.strokeRoundedRect(card_rect, radii, heavy_w, ink);
+        if (available) {
+            c.strokeRoundedRect(card_rect, radii, heavy_w, ink);
+        } else {
+            c.strokeDashedRect(card_rect, heavy_w, 1.0 * s, ink);
+        }
 
         // Exposed contact pads along the right edge facing the slot
         const pad_w = 2.2 * s;
@@ -6009,6 +6024,15 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     const sd_card_removed_x = tr.x + (-8.0) * tr.scale;
     const sd_y = tr.y + 13.3 * tr.scale;
     try testing.expectEqual(@as(usize, 0), ui.sd_cards.items.len);
+
+    // With no card image there is nothing to insert: clicking the slot opens the popup too
+    const sd_slot_x = tr.x + 6.75 * tr.scale;
+    _ = ui.pointerButton(sd_slot_x, sd_y, true, status, &hw);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(sd_slot_x, sd_y, false, status, &hw));
+    try testing.expect(ui.sd_manage_open);
+    ui.sd_manage_open = false;
+    ui.sd_create_open = false;
+
     _ = ui.pointerButton(sd_card_removed_x, sd_y, true, status, &hw);
     try testing.expectEqual(Action.consumed, ui.pointerButton(sd_card_removed_x, sd_y, false, status, &hw));
     try testing.expect(!ui.sd_card_menu_open);

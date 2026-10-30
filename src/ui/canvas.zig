@@ -190,6 +190,23 @@ pub const Canvas = struct {
         c.roundedRect(r, .{}, width, color);
     }
 
+    /// Strokes the inside edge of `r` as dashes `dash` long, with gaps as long, from each corner.
+    pub fn strokeDashedRect(c: *Canvas, r: Rect, width: f32, dash: f32, color: Color) void {
+        if (dash <= 0) return c.strokeRect(r, width, color);
+        var x = r.x;
+        while (x < r.x + r.w) : (x += 2 * dash) {
+            const len = @min(dash, r.x + r.w - x);
+            c.fillRect(.{ .x = x, .y = r.y, .w = len, .h = width }, color);
+            c.fillRect(.{ .x = x, .y = r.y + r.h - width, .w = len, .h = width }, color);
+        }
+        var y = r.y;
+        while (y < r.y + r.h) : (y += 2 * dash) {
+            const len = @min(dash, r.y + r.h - y);
+            c.fillRect(.{ .x = r.x, .y = y, .w = width, .h = len }, color);
+            c.fillRect(.{ .x = r.x + r.w - width, .y = y, .w = width, .h = len }, color);
+        }
+    }
+
     pub fn fillRoundedRect(c: *Canvas, r: Rect, radii: Radii, color: Color) void {
         c.roundedRect(r, radii, fill_stroke, color);
     }

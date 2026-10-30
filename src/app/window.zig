@@ -466,6 +466,8 @@ pub fn handlePointerButton(win: anytype, button_bit: u8, pressed: bool, sx_f64: 
                 return;
             },
             .toggle_sd => {
+                // A card can't go in without an image
+                if (!win.status.sd_connected and !win.ui.hasActiveSdCard()) return;
                 win.status.sd_connected = !win.status.sd_connected;
                 if (win.status.sd_connected) {
                     win.sd_reconnected = true;
