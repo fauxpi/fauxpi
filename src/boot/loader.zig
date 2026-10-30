@@ -76,7 +76,8 @@ pub const BootConfig = struct {
 
     pub fn parseForModel(text: []const u8, board_model: BoardModel) BootConfig {
         var cfg: BootConfig = .{
-            .kernel = if (board_model.isBcm2837()) "kernel8.img" else "kernel.img",
+            // The firmware starts a 32-bit kernel unless `arm_64bit=1`: `kernel7.img` on BCM2837 boards
+            .kernel = if (board_model.isBcm2837()) "kernel7.img" else "kernel.img",
         };
         var section_active = true;
         var lines = std.mem.tokenizeAny(u8, text, "\r\n");
@@ -275,13 +276,17 @@ pub fn loadFromSdImageForModel(
     const cfg = BootConfig.parseForModel(config_txt, board_model);
 
     // The firmware starts the kernel in AArch64 on 64-bit boards with `arm_64bit=1`, or, when
-    // `arm_64bit` is unset, for its default 64-bit kernel name `kernel8.img`.
+    // `arm_64bit` is unset, for the 64-bit kernel name `kernel8.img`.
     var kernel_name = cfg.kernel;
     const kernel_bytes = blk: {
         const kernel_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, cfg.kernel });
         if (fs.readFileAlloc(alloc, kernel_path)) |kb| break :blk kb else |err| {
             if (board_model.isBcm2837() and !cfg.kernel_explicit) {
-                for ([_][]const u8{ "kernel7.img", "kernel.img" }) |fb_name| {
+                const fallbacks: []const []const u8 = if (cfg.arm_64bit orelse false)
+                    &.{ "kernel7.img", "kernel.img" }
+                else
+                    &.{ "kernel.img", "kernel8.img" };
+                for (fallbacks) |fb_name| {
                     const fallback_path = try std.fmt.allocPrint(alloc, "{s}{s}", .{ cfg.os_prefix, fb_name });
                     if (fs.readFileAlloc(alloc, fallback_path)) |kb| {
                         kernel_name = fb_name;
@@ -298,6 +303,8 @@ pub fn loadFromSdImageForModel(
             return err;
         }
     };
+
+    const boot64 = board_model.isBcm2837() and (cfg.arm_64bit orelse std.mem.eql(u8, kernel_name, "kernel8.img"));
 
     const dtb_bytes = blk: {
         if (cfg.device_tree) |dt_override| {
@@ -318,11 +325,11 @@ pub fn loadFromSdImageForModel(
             return err;
         };
     } else if (cfg.auto_initramfs) blk: {
-        const auto_name = if (std.mem.indexOf(u8, cfg.kernel, "8") != null or (cfg.arm_64bit orelse board_model.isBcm2837()))
+        const auto_name = if (boot64)
             "initramfs8"
-        else if (std.mem.indexOf(u8, cfg.kernel, "7l") != null)
+        else if (std.mem.indexOf(u8, kernel_name, "7l") != null)
             "initramfs7l"
-        else if (std.mem.indexOf(u8, cfg.kernel, "7") != null)
+        else if (std.mem.indexOf(u8, kernel_name, "7") != null)
             "initramfs7"
         else
             "initramfs";
@@ -345,7 +352,6 @@ pub fn loadFromSdImageForModel(
         };
     }
 
-    const boot64 = board_model.isBcm2837() and (cfg.arm_64bit orelse std.mem.eql(u8, kernel_name, "kernel8.img"));
     return loadDirectWithOverlays(allocator, ram, kernel_bytes, dtb_bytes, initrd_bytes, full_cmdline, overlays, .{
         .ram_bytes = board_model.ramBytes(),
         .aarch64 = boot64,
@@ -746,6 +752,12 @@ test "parse config.txt" {
     const cfg64 = BootConfig.parseForModel("arm_64bit=1\n", .pi_3_b_plus);
     try std.testing.expectEqualStrings("kernel8.img", cfg64.kernel);
     try std.testing.expectEqual(@as(?bool, true), cfg64.arm_64bit);
+
+    // Without arm_64bit the firmware starts the 32-bit kernel on BCM2837 boards
+    const cfg_default = BootConfig.parseForModel("auto_initramfs=1\n", .pi_3_b_plus);
+    try std.testing.expectEqualStrings("kernel7.img", cfg_default.kernel);
+    try std.testing.expectEqual(@as(?bool, null), cfg_default.arm_64bit);
+    try std.testing.expectEqualStrings("kernel7.img", BootConfig.parseForModel("", .pi_zero_2_w).kernel);
 
     const cfg32 = BootConfig.parseForModel("arm_64bit=0\n", .pi_3_b_plus);
     try std.testing.expectEqualStrings("kernel7.img", cfg32.kernel);
