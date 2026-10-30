@@ -5880,9 +5880,22 @@ pub fn Arm1176(comptime Bus: type) type {
             if ((op1 & 0b11000) == 0b10000 or (op1 == 0b11000 and op2 == 0b000)) {
                 const r_rn = self.r[rm_idx];
                 const r_rm = self.r[rs_idx];
+                if (op1 == 0b10100 and (op2 & 0b100) == 0) {
+                    // SMLALD / SMLSLD: RdHi:RdLo += Rn.lo * Rm.lo +/- Rn.hi * Rm.hi (X swaps Rm's halves)
+                    const m = if ((op2 & 1) != 0) std.math.rotr(u32, r_rm, 16) else r_rm;
+                    const p1: i64 = @as(i64, @as(i16, @bitCast(@as(u16, @truncate(r_rn))))) * @as(i16, @bitCast(@as(u16, @truncate(m))));
+                    const p2: i64 = @as(i64, @as(i16, @bitCast(@as(u16, @truncate(r_rn >> 16))))) * @as(i16, @bitCast(@as(u16, @truncate(m >> 16))));
+                    const acc: i64 = @bitCast((@as(u64, self.r[rn_idx]) << 32) | self.r[rd_idx]);
+                    const res: u64 = @bitCast(acc +% (if ((op2 & 0b010) != 0) p1 - p2 else p1 + p2));
+                    self.r[rd_idx] = @truncate(res);
+                    self.r[rn_idx] = @truncate(res >> 32);
+                    return;
+                }
                 const r_ra = if (rd_idx == 15) 0 else self.r[rd_idx];
                 if (dec.executeMedia(inst, r_rn, r_rm, self.r[rn_idx], r_ra, &self.cpsr)) |res| {
                     self.r[rn_idx] = res;
+                } else {
+                    self.enterException(.und, 0x04, inst_pc +% 4, false);
                 }
                 return;
             }
@@ -8889,4 +8902,70 @@ test "ARM1176 Thumb CPSIE/CPSID mask and unmask exceptions" {
     _ = user.runSteps(&bus, 1);
     try std.testing.expectEqual(@as(u32, 0), user.cpsr & (PsrFlags.A | PsrFlags.I | PsrFlags.F));
     try std.testing.expectEqual(@as(u32, 0x1102), user.r[15]);
+}
+
+test "ARM1176 SMLALD and SMLSLD accumulate dual 16-bit products into 64 bits" {
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const ram = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(ram);
+    @memset(ram, 0);
+    // smlald r2, r3, r0, r1; smlaldx r4, r5, r0, r1; smlsld r6, r7, r0, r1; smlsldx r8, r9, r0, r1;
+    // smlsldx r10, r11, r0, r1; then an unallocated signed multiply (op1 = 010)
+    const prog = [_]u32{ 0xe7432110, 0xe7454130, 0xe7476150, 0xe7498170, 0xe74ba170, 0xe7201110, 0xeafffffe };
+    for (prog, 0..) |inst, i| std.mem.writeInt(u32, ram[0x1000 + i * 4 ..][0..4], inst, .little);
+    std.mem.writeInt(u32, ram[0x04..][0..4], 0xeafffffe, .little); // Undefined Instruction vector: b .
+
+    var bus: TestBus = .{ .ram = ram };
+    var cpu: Arm1176(TestBus) = .{};
+    cpu.initReset(0x1000, 0, 0xffffffff, 0x2000);
+    cpu.r[0] = 0x0003_fffe; // Rn: high 3, low -2
+    cpu.r[1] = 0xfffb_0007; // Rm: high -5, low 7
+    inline for (.{ 2, 4, 6, 8 }) |lo| {
+        cpu.r[lo] = 0xffff_fff0;
+        cpu.r[lo + 1] = 1;
+    }
+    cpu.r[10] = 0;
+    cpu.r[11] = 0;
+    _ = cpu.runSteps(&bus, prog.len - 1);
+
+    const pair = struct {
+        fn get(c: *const Arm1176(TestBus), lo: usize) u64 {
+            return (@as(u64, c.r[lo + 1]) << 32) | c.r[lo];
+        }
+    };
+    try std.testing.expectEqual(@as(u64, 0x1_ffff_ffd3), pair.get(&cpu, 2)); // -2*7 + 3*-5 = -29
+    try std.testing.expectEqual(@as(u64, 0x2_0000_000f), pair.get(&cpu, 4)); // -2*-5 + 3*7 = 31
+    try std.testing.expectEqual(@as(u64, 0x1_ffff_fff1), pair.get(&cpu, 6)); // -14 - -15 = 1
+    try std.testing.expectEqual(@as(u64, 0x1_ffff_ffe5), pair.get(&cpu, 8)); // 10 - 21 = -11
+    try std.testing.expectEqual(@as(u64, 0xffff_ffff_ffff_fff5), pair.get(&cpu, 10));
+    try std.testing.expectEqual(@as(u32, @backingInt(Mode.und)), cpu.cpsr & PsrFlags.MODE_MASK);
+    try std.testing.expectEqual(@as(u32, 0x04), cpu.r[15]);
 }
