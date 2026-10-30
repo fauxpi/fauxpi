@@ -1571,7 +1571,12 @@ pub fn Arm1176(comptime Bus: type) type {
         /// Total executed instructions
         cycles: u64 = 0,
         last_inst: u32 = 0,
+        /// PC of a possible spin-wait (a short loop around a barrier, or a call to an empty
+        /// function), and a hash of r0..r14 when it last ran. A spin-wait runs again with the same
+        /// registers; a loop that is making progress, such as a TLB or cache maintenance loop
+        /// stepping through addresses, does not, and keeps its slice.
         last_dmb_pc: u32 = 0xffff_ffff,
+        spin_regs: u64 = 0,
 
         /// Direct-mapped decoded instruction cache (`icache_size` entries, lazily cleared per 64-word block)
         icache: [icache_size]DecodedSlot = undefined,
@@ -3969,14 +3974,14 @@ pub fn Arm1176(comptime Bus: type) type {
                             const shift_imm: i32 = @bitCast(imm32);
                             if (shift_imm >= -28 and shift_imm < 0) {
                                 if (self.last_dmb_pc == pc) {
-                                    if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                                    if (self.spinRepeated() and atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
                                         self.yield_slice = true;
                                     }
                                 } else if ((pc & 0xfff) < 0xffc and (pc & 0xffff_f000) == code_vbase) {
                                     const next_paddr = code_pbase | ((pc +% 4) & 0xfff);
                                     const next_inst = std.mem.readInt(u32, bus.ram[next_paddr..][0..4], .little);
                                     if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) {
-                                        self.last_dmb_pc = pc;
+                                        self.noteSpinCandidate(pc);
                                     }
                                 }
                             }
@@ -3990,7 +3995,7 @@ pub fn Arm1176(comptime Bus: type) type {
                             self.r[14] = pc +% 4;
                             if (inst >= 0xe000_0000) {
                                 if (self.last_dmb_pc == pc) {
-                                    if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
+                                    if (self.spinRepeated() and atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
                                         self.yield_slice = true;
                                     }
                                 } else {
@@ -3999,7 +4004,7 @@ pub fn Arm1176(comptime Bus: type) type {
                                         const target_paddr = tslot.pbase | (target_pc & 0xfff);
                                         const target_inst = std.mem.readInt(u32, bus.ram[target_paddr..][0..4], .little);
                                         if (target_inst == 0xe12fff1e) {
-                                            self.last_dmb_pc = pc;
+                                            self.noteSpinCandidate(pc);
                                         }
                                     }
                                 }
@@ -4102,13 +4107,13 @@ pub fn Arm1176(comptime Bus: type) type {
                         .clrex_al => self.excl_valid = false,
                         .dmb_dsb_v7_al => {
                             self.memoryBarrier(bus, d.rd != 0);
-                            if (self.last_dmb_pc == pc) {
+                            if (self.last_dmb_pc == pc and self.spinRepeated()) {
                                 if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
                                     self.yield_slice = true;
                                     break :step_loop;
                                 }
                             } else {
-                                self.last_dmb_pc = pc;
+                                self.noteSpinCandidate(pc);
                                 atomic_ram.signalEvent(bus);
                             }
                         },
@@ -4789,6 +4794,26 @@ pub fn Arm1176(comptime Bus: type) type {
             self.executeArm(bus, pc, inst);
         }
 
+        inline fn spinRegsHash(self: *const Self) u64 {
+            var h: u64 = 0xcbf2_9ce4_8422_2325;
+            for (self.r[0..15]) |v| h = (h ^ v) *% 0x0000_0100_0000_01b3;
+            return h;
+        }
+
+        /// Starts watching `pc` as a possible spin-wait.
+        inline fn noteSpinCandidate(self: *Self, pc: u32) void {
+            self.last_dmb_pc = pc;
+            self.spin_regs = self.spinRegsHash();
+        }
+
+        /// The spin-wait at `last_dmb_pc` ran again: true if no register changed since last time.
+        inline fn spinRepeated(self: *Self) bool {
+            const h = self.spinRegsHash();
+            if (h == self.spin_regs) return true;
+            self.spin_regs = h;
+            return false;
+        }
+
         inline fn getReg(self: *const Self, idx: u4, inst_pc: u32) u32 {
             return if (idx == 15) (inst_pc +% 8) else self.r[idx];
         }
@@ -4845,27 +4870,27 @@ pub fn Arm1176(comptime Bus: type) type {
                     if (link) {
                         self.r[14] = inst_pc +% 4;
                         if (self.last_dmb_pc == inst_pc) {
-                            self.yield_slice = true;
+                            if (self.spinRepeated()) self.yield_slice = true;
                         } else {
                             const tslot = self.mmu.soft_tlb32[priv][(target_pc >> 12) & Mmu.soft_tlb_mask];
                             if ((target_pc & 0xffff_f000) == tslot.x_vbase) {
                                 const target_paddr = tslot.pbase | (target_pc & 0xfff);
                                 const target_inst = std.mem.readInt(u32, bus.ram[target_paddr..][0..4], .little);
                                 if (target_inst == 0xe12fff1e) {
-                                    self.last_dmb_pc = inst_pc;
+                                    self.noteSpinCandidate(inst_pc);
                                 }
                             }
                         }
                     } else if (shift_imm >= -28 and shift_imm < 0) {
                         if (self.last_dmb_pc == inst_pc) {
-                            self.yield_slice = true;
+                            if (self.spinRepeated()) self.yield_slice = true;
                         } else {
                             const islot = self.mmu.soft_tlb32[priv][(inst_pc >> 12) & Mmu.soft_tlb_mask];
                             if ((inst_pc & 0xfff) < 0xffc and (inst_pc & 0xffff_f000) == islot.x_vbase) {
                                 const next_paddr = islot.pbase | ((inst_pc +% 4) & 0xfff);
                                 const next_inst = std.mem.readInt(u32, bus.ram[next_paddr..][0..4], .little);
                                 if ((next_inst & 0x0fff_ffe0) == 0x057f_f040) {
-                                    self.last_dmb_pc = inst_pc;
+                                    self.noteSpinCandidate(inst_pc);
                                 }
                             }
                         }
@@ -4924,13 +4949,13 @@ pub fn Arm1176(comptime Bus: type) type {
                     self.excl_valid = false;
                 } else if ((inst & 0x0fff_ffe0) == 0x057f_f040) {
                     self.memoryBarrier(bus, (inst & 0x10) == 0);
-                    // DSB / DMB: yield slice if repeated at the same PC within the current slice
-                    if (self.last_dmb_pc == inst_pc) {
+                    // DSB / DMB: yield slice if repeated at the same PC, with the same registers, within the current slice
+                    if (self.last_dmb_pc == inst_pc and self.spinRepeated()) {
                         if (atomic_ram.onSpinWait(bus, self.mmu.core_id, &self.mmu, &self.spin_wait_count)) {
                             self.yield_slice = true;
                         }
                     } else {
-                        self.last_dmb_pc = inst_pc;
+                        self.noteSpinCandidate(inst_pc);
                         atomic_ram.signalEvent(bus);
                     }
                 } else if ((inst & 0x0fff_fff0) == 0x057f_f060) {
