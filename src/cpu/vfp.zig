@@ -8,6 +8,118 @@
 
 const std = @import("std");
 
+/// How a conversion to or from half precision treats its operands (from FPSCR).
+pub const HalfMode = struct {
+    /// Alternative Half-Precision format: no infinities or NaNs, exponent 31 holds normal numbers
+    ahp: bool = false,
+    /// Default NaN
+    dn: bool = false,
+    /// Flush single/double-precision denormal inputs to zero
+    fz: bool = false,
+    /// Rounding mode: 0 nearest even, 1 towards +infinity, 2 towards -infinity, 3 towards zero
+    rmode: u2 = 0,
+
+    pub fn fromFpscr(fpscr: u32) HalfMode {
+        return .{
+            .ahp = (fpscr & (1 << 26)) != 0,
+            .dn = (fpscr & (1 << 25)) != 0,
+            .fz = (fpscr & (1 << 24)) != 0,
+            .rmode = @truncate(fpscr >> 22),
+        };
+    }
+};
+
+/// Rounds a finite, non-negative `a` to a half-precision magnitude (exponent and fraction bits).
+fn roundToHalf(a: f64, negative: bool, m: HalfMode) u16 {
+    if (a == 0) return 0;
+    const emax: i32 = if (m.ahp) 16 else 15;
+    const fr = std.math.frexp(a);
+    var e: i32 = fr.exponent - 1;
+    const subnormal = e < -14;
+    // The value in units of the result's last place
+    const q: f64 = if (subnormal) a * 16777216.0 else std.math.ldexp(a, 10 - e);
+    const fl = @floor(q);
+    const away = switch (m.rmode) {
+        0 => (q - fl > 0.5) or (q - fl == 0.5 and @mod(fl, 2) != 0),
+        1 => q != fl and !negative,
+        2 => q != fl and negative,
+        3 => false,
+    };
+    var qi: u32 = @intFromFloat(if (away) fl + 1 else fl);
+    if (subnormal) return @intCast(qi); // rounding up to 1024 gives the smallest normal
+    if (qi == 2048) {
+        e += 1;
+        qi = 1024;
+    }
+    if (e > emax) {
+        if (m.ahp) return 0x7fff;
+        // Overflow: infinity, unless rounding towards zero (or away from this sign) gives the largest finite
+        const to_inf = switch (m.rmode) {
+            0 => true,
+            1 => !negative,
+            2 => negative,
+            3 => false,
+        };
+        return if (to_inf) 0x7c00 else 0x7bff;
+    }
+    return @as(u16, @intCast(e + 15)) << 10 | @as(u16, @intCast(qi - 1024));
+}
+
+pub fn singleToHalf(bits_in: u32, m: HalfMode) u16 {
+    var bits = bits_in;
+    if (m.fz and (bits & 0x7f80_0000) == 0) bits &= 0x8000_0000;
+    const sign: u16 = @truncate((bits >> 16) & 0x8000);
+    if ((bits & 0x7f80_0000) == 0x7f80_0000) {
+        if ((bits & 0x007f_ffff) != 0) { // NaN
+            if (m.ahp) return 0;
+            if (m.dn) return 0x7e00;
+            return sign | 0x7e00 | @as(u16, @truncate((bits >> 13) & 0x3ff));
+        }
+        return sign | @as(u16, if (m.ahp) 0x7fff else 0x7c00);
+    }
+    return sign | roundToHalf(@abs(@as(f64, @as(f32, @bitCast(bits)))), sign != 0, m);
+}
+
+pub fn doubleToHalf(bits_in: u64, m: HalfMode) u16 {
+    var bits = bits_in;
+    if (m.fz and (bits & 0x7ff0_0000_0000_0000) == 0) bits &= 0x8000_0000_0000_0000;
+    const sign: u16 = @truncate((bits >> 48) & 0x8000);
+    if ((bits & 0x7ff0_0000_0000_0000) == 0x7ff0_0000_0000_0000) {
+        if ((bits & 0x000f_ffff_ffff_ffff) != 0) {
+            if (m.ahp) return 0;
+            if (m.dn) return 0x7e00;
+            return sign | 0x7e00 | @as(u16, @truncate((bits >> 42) & 0x3ff));
+        }
+        return sign | @as(u16, if (m.ahp) 0x7fff else 0x7c00);
+    }
+    return sign | roundToHalf(@abs(@as(f64, @bitCast(bits))), sign != 0, m);
+}
+
+/// The value of half-precision `h`, or null for a NaN (in IEEE format).
+fn halfValue(h: u16, ahp: bool) ?f64 {
+    const exp: u16 = (h >> 10) & 0x1f;
+    const frac: f64 = @floatFromInt(h & 0x3ff);
+    const mag: f64 = if (exp == 0)
+        std.math.ldexp(frac, -24)
+    else if (exp == 31 and !ahp)
+        (if ((h & 0x3ff) != 0) return null else std.math.inf(f64))
+    else
+        std.math.ldexp(1024 + frac, @as(i32, exp) - 25);
+    return if ((h & 0x8000) != 0) -mag else mag;
+}
+
+pub fn halfToSingle(h: u16, m: HalfMode) u32 {
+    if (halfValue(h, m.ahp)) |x| return @bitCast(@as(f32, @floatCast(x)));
+    if (m.dn) return 0x7fc0_0000;
+    return (@as(u32, h & 0x8000) << 16) | 0x7fc0_0000 | (@as(u32, h & 0x3ff) << 13);
+}
+
+pub fn halfToDouble(h: u16, m: HalfMode) u64 {
+    if (halfValue(h, m.ahp)) |x| return @bitCast(x);
+    if (m.dn) return 0x7ff8_0000_0000_0000;
+    return (@as(u64, h & 0x8000) << 48) | 0x7ff8_0000_0000_0000 | (@as(u64, h & 0x3ff) << 42);
+}
+
 pub const Vfp = struct {
     /// 64 32-bit words backing `s0..s31` (first 32 words) and `d0..d31` (all 64 words)
     s: [64]u32 = @splat(0),
@@ -262,6 +374,20 @@ pub const Vfp = struct {
                     self.updateCmpFlags(f64, self.getD(dd), 0.0);
                 }
             },
+            0b00100, 0b00101 => {
+                // VCVTB / VCVTT from half precision (bottom or top half of Sm) to single or double
+                const shift: u5 = if ((sn & 1) != 0) 16 else 0;
+                const h: u16 = @truncate(self.s[sm] >> shift);
+                const m = HalfMode.fromFpscr(self.fpscr);
+                if (!is_double) self.s[sd] = halfToSingle(h, m) else self.setDU64(dd, halfToDouble(h, m));
+            },
+            0b00110, 0b00111 => {
+                // VCVTB / VCVTT from single or double to half precision (bottom or top half of Sd)
+                const shift: u5 = if ((sn & 1) != 0) 16 else 0;
+                const m = HalfMode.fromFpscr(self.fpscr);
+                const h: u32 = if (!is_double) singleToHalf(self.s[sm], m) else doubleToHalf(self.getDU64(dm), m);
+                self.s[sd] = (self.s[sd] & ~(@as(u32, 0xffff) << shift)) | (h << shift);
+            },
             0b01111 => {
                 // VCVT.F64.F32 / VCVT.F32.F64
                 if (!is_double) {
@@ -333,4 +459,45 @@ test "VFPv2/VFPv4 single and double precision operations, D16..D31, and VMOV imm
     // VMOV.F64 d16, #1.0 (imm8 = 0x70 -> Vn=7, Vm=0, D=1, Vd=0 -> 0xeef70b00)
     vfp.executeDataProc(0xeef7_0b00);
     try std.testing.expectEqual(@as(f64, 1.0), vfp.getD(16));
+}
+
+test "VCVTB and VCVTT convert between half precision and single or double precision" {
+    var vfp: Vfp = .{ .is_vfpv4 = true };
+    vfp.fpexc = 1 << 30;
+    vfp.s[0] = 0xdead_beef;
+    vfp.setS(1, 1.0);
+    vfp.setS(2, 65520.0); // halfway between the largest half (65504) and the next binade
+    vfp.executeDataProc(0xeeb30a60); // vcvtb.f16.f32 s0, s1
+    vfp.executeDataProc(0xeeb30ac1); // vcvtt.f16.f32 s0, s2
+    try std.testing.expectEqual(@as(u32, 0x7c00_3c00), vfp.s[0]); // 65520 rounds to infinity
+    vfp.executeDataProc(0xeef21a40); // vcvtb.f32.f16 s3, s0
+    try std.testing.expectEqual(@as(f32, 1.0), vfp.getS(3));
+
+    // Rounding towards zero gives the largest finite half instead
+    vfp.fpscr = 3 << 22;
+    vfp.executeDataProc(0xeeb30ac1);
+    try std.testing.expectEqual(@as(u32, 0x7bff), vfp.s[0] >> 16);
+
+    // Alternative half precision: no infinities, so 65520 rounds up to 65536
+    vfp.fpscr = 1 << 26;
+    vfp.executeDataProc(0xeeb30ac1);
+    try std.testing.expectEqual(@as(u32, 0x7c00), vfp.s[0] >> 16);
+    vfp.executeDataProc(0xeeb22ac0); // vcvtt.f32.f16 s4, s0
+    try std.testing.expectEqual(@as(f32, 65536.0), vfp.getS(4));
+
+    // NaNs keep their payload unless FPSCR.DN is set
+    vfp.fpscr = 0;
+    vfp.s[2] = 0xffc0_2000;
+    vfp.executeDataProc(0xeeb30ac1);
+    try std.testing.expectEqual(@as(u32, 0xfe01), vfp.s[0] >> 16);
+    vfp.fpscr = 1 << 25;
+    vfp.executeDataProc(0xeeb30ac1);
+    try std.testing.expectEqual(@as(u32, 0x7e00), vfp.s[0] >> 16);
+
+    // From double precision, into the top half of s5
+    vfp.fpscr = 0;
+    vfp.s[5] = 0x0000_1234;
+    vfp.setD(4, -0.5);
+    vfp.executeDataProc(0xeef32bc4); // vcvtt.f16.f64 s5, d4
+    try std.testing.expectEqual(@as(u32, 0xb800_1234), vfp.s[5]);
 }
