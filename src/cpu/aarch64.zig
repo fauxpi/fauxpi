@@ -1068,6 +1068,23 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
             return false;
         }
 
+        inline fn spinRegsHash64(cpu: *const CpuType) u64 {
+            var h: u64 = 0xcbf2_9ce4_8422_2325;
+            for (cpu.x[0..31]) |v| h = (h ^ v) *% 0x0000_0100_0000_01b3;
+            return h;
+        }
+
+        /// A barrier close after the last one (`last_dmb_pc`) may be a spin-wait. It is one only if
+        /// x0..x30 are unchanged since that barrier, as for a core re-reading an unchanged flag;
+        /// a loop making progress, such as a TLB maintenance loop, changes them.
+        inline fn barrierSpins64(cpu: *CpuType, pc32: u32) bool {
+            const h = spinRegsHash64(cpu);
+            const spins = (cpu.last_dmb_pc ^ pc32) < 256 and h == cpu.spin_regs;
+            cpu.last_dmb_pc = pc32;
+            cpu.spin_regs = h;
+            return spins;
+        }
+
         inline fn noteBackwardBranch64(
             cpu: *CpuType,
             comptime SlotType: type,
@@ -4864,15 +4881,12 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                                         atomic_ram.fence(&cpu.fence_word);
                                         if (d.imm == 4) bus.smp.broadcastTlb(cpu.mmu.core_id, &cpu.mmu);
                                     }
-                                    const pc32: u32 = @truncate(cur_pc);
-                                    if ((cpu.last_dmb_pc ^ pc32) < 256) {
-                                        cpu.last_dmb_pc = pc32;
+                                    if (barrierSpins64(cpu, @truncate(cur_pc))) {
                                         if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
                                             cpu.yield_slice = true;
                                             break :step_loop;
                                         }
                                     } else {
-                                        cpu.last_dmb_pc = pc32;
                                         atomic_ram.signalEvent(bus);
                                     }
                                 },
@@ -5859,13 +5873,11 @@ pub fn Aarch64Exec(comptime CpuType: type, comptime Bus: type) type {
                             // DSB completes this core's TLBI ...IS on every other core
                             if (op2 == 4) bus.smp.broadcastTlb(cpu.mmu.core_id, &cpu.mmu);
                         }
-                        const pc32: u32 = @truncate(cur_pc);
-                        if ((cpu.last_dmb_pc ^ pc32) < 256) {
+                        if (barrierSpins64(cpu, @truncate(cur_pc))) {
                             if (atomic_ram.onSpinWait(bus, cpu.mmu.core_id, &cpu.mmu, &cpu.spin_wait_count)) {
                                 cpu.yield_slice = true;
                             }
                         }
-                        cpu.last_dmb_pc = pc32;
                     }
                 } else if (crn == 4) {
                     // MSR (immediate): SPSel (op1=0, op2=5), DAIFSet (op1=3, op2=6), DAIFClr (op1=3, op2=7)

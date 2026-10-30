@@ -2569,7 +2569,8 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
             }
             if (end_word_req < 1024) {
                 const next_raw = std.mem.readInt(u32, code_page_ptr[@as(usize, end_word_req) * 4 ..][0..4], .little);
-                if ((next_raw & 0xffff_f09f) == 0xd503_309f) return true;
+                // As for ARM32: a loop with side effects or a moving count before a barrier is doing work
+                if ((next_raw & 0xffff_f09f) == 0xd503_309f) return !has_side_effect and (written & read_before_write) == 0;
             }
             return !has_side_effect and has_load and (written & read_before_write) == 0;
         }
