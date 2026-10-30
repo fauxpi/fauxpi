@@ -1548,8 +1548,9 @@ pub fn Arm1176(comptime Bus: type) type {
         mmu: Mmu = .{},
         /// CP10/CP11 VFPv2 Floating-Point Coprocessor
         vfp: Vfp = .{},
-        /// CP14 debug unit (ARM1176 only)
+        /// CP14 debug unit, for an ARM1176 or (in AArch32) a Cortex-A53
         debug: cp14.Arm1176Debug = .{},
+        debug_v8: cp14.CortexA53Debug = .{},
 
         /// Exclusive monitor state (`LDREX` / `STREX` / `CLREX`)
         excl_valid: bool = false,
@@ -1713,6 +1714,7 @@ pub fn Arm1176(comptime Bus: type) type {
             self.mmu = .{};
             self.vfp = .{};
             self.debug = .{};
+            self.debug_v8 = .{};
             self.excl_valid = false;
             self.excl_paddr = 0;
             self.excl_val = 0;
@@ -5994,24 +5996,31 @@ pub fn Arm1176(comptime Bus: type) type {
             }
 
             // 3. CP14 debug unit (MRC / MCR)
-            if (cp_num == 14 and !self.mmu.is_cortex_a53 and (inst & 0x0f00_0010) == 0x0e00_0010) {
+            if (cp_num == 14 and (inst & 0x0f00_0010) == 0x0e00_0010) {
                 const opc1: u3 = @truncate((inst >> 21) & 7);
                 const l = (inst & (1 << 20)) != 0;
                 const crn: u4 = @truncate((inst >> 16) & 0xf);
                 const rt: u4 = @truncate((inst >> 12) & 0xf);
                 const crm: u4 = @truncate(inst & 0xf);
                 const opc2: u3 = @truncate((inst >> 5) & 7);
-                if (!self.debug.accessible(opc1, crn, crm, opc2, self.isPrivileged(), l)) {
+                const v8 = self.mmu.is_cortex_a53;
+                const ok = if (v8)
+                    self.debug_v8.accessible(opc1, crn, crm, opc2, self.isPrivileged(), l)
+                else
+                    self.debug.accessible(opc1, crn, crm, opc2, self.isPrivileged(), l);
+                if (!ok) {
                     self.enterException(.und, 0x04, inst_pc +% 4, false);
                     return;
                 }
                 if (l) {
-                    const val = self.debug.read(crm, opc2);
+                    const val = if (v8) self.debug_v8.read(crn, crm, opc2) else self.debug.read(crm, opc2);
                     if (rt == 15) {
                         self.cpsr = (self.cpsr & 0x0fff_ffff) | (val & 0xf000_0000);
                     } else {
                         self.r[rt] = val;
                     }
+                } else if (v8) {
+                    self.debug_v8.write(crn, crm, opc2, self.r[rt]);
                 } else {
                     self.debug.write(crm, opc2, self.r[rt]);
                 }
