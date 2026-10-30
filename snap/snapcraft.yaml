@@ -87,8 +87,14 @@ parts:
     stage-packages:
       - libpulse0
       - libasound2t64
+    # Build for a CPU every machine of the architecture has, not the build machine's own CPU
+    # (Zig's default): x86-64-v2 has the CMPXCHG16B that src/cpu/atomic_ram.zig needs
     override-build: |
-      ./scripts/zig build -Doptimize=ReleaseFast --prefix "$CRAFT_PART_INSTALL/usr"
+      case "$CRAFT_ARCH_BUILD_FOR" in
+        amd64) cpu=x86_64_v2 ;;
+        *) cpu=baseline ;;
+      esac
+      ./scripts/zig build -Doptimize=ReleaseFast -Dcpu=$cpu --prefix "$CRAFT_PART_INSTALL/usr"
       install -Dm644 data/io.github.fauxpi.Fauxpi.desktop \
         "$CRAFT_PART_INSTALL/usr/share/applications/io.github.fauxpi.Fauxpi.desktop"
       install -Dm644 data/io.github.fauxpi.Fauxpi.svg \
