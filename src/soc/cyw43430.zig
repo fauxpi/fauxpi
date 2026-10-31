@@ -65,6 +65,16 @@ pub const Chip = enum {
     fn dualBand(self: Chip) bool {
         return self == .cyw43455;
     }
+
+    /// Channel widths (WLC_BW_20MHZ_BIT 1, 40MHZ 2, 80MHZ 4) the chip supports in `band`
+    /// (WLC_BAND_5G = 1, WLC_BAND_2G = 2): the CYW43430 is 20 MHz only; the CYW43455 adds
+    /// 40 MHz in both bands and 80 MHz (802.11ac) at 5 GHz.
+    fn bandwidths(self: Chip, band: u32) u32 {
+        return switch (self) {
+            .cyw43430 => if (band == 2) 1 else 0,
+            .cyw43455 => if (band == 2) 1 | 2 else if (band == 1) 1 | 2 | 4 else 0,
+        };
+    }
 };
 
 pub const Cyw43430 = struct {
@@ -231,6 +241,8 @@ pub const Cyw43430 = struct {
     country_abrev: [4]u8 = .{ '0', '0', 0, 0 },
     country_rev: i32 = 0,
     country_ccode: [4]u8 = .{ '0', '0', 0, 0 },
+    /// `bw_cap` the host set for the 5 GHz and 2.4 GHz bands, if any (`null` = all supported)
+    bw_cap: [2]?u32 = .{ null, null },
 
     rx_frames: [MAX_RX_FRAMES][MAX_FRAME_LEN]u8 = undefined,
     rx_frame_lens: [MAX_RX_FRAMES]usize = @splat(0),
@@ -926,12 +938,16 @@ pub const Cyw43430 = struct {
                             std.mem.writeInt(u16, dst[6..8], 0, .little);
                         }
                     } else if (std.mem.eql(u8, var_name, "nmode") or
-                        std.mem.eql(u8, var_name, "rxchain") or
-                        std.mem.eql(u8, var_name, "bw_cap"))
+                        std.mem.eql(u8, var_name, "rxchain"))
                     {
                         if (dst.len >= 4) std.mem.writeInt(u32, dst[0..4], 1, .little);
-                    } else if (std.mem.eql(u8, var_name, "vhtmode") or
-                        std.mem.eql(u8, var_name, "per_chan_info") or
+                    } else if (std.mem.eql(u8, var_name, "bw_cap")) {
+                        // Queried with the band (WLC_BAND_5G = 1, WLC_BAND_2G = 2) as the argument
+                        const band: u32 = if (arg.len >= 4) std.mem.readInt(u32, arg[0..4], .little) else 2;
+                        if (dst.len >= 4) std.mem.writeInt(u32, dst[0..4], self.bandBwCap(band), .little);
+                    } else if (std.mem.eql(u8, var_name, "vhtmode")) {
+                        if (dst.len >= 4) std.mem.writeInt(u32, dst[0..4], @intFromBool(self.chip.bandwidths(1) & 4 != 0), .little);
+                    } else if (std.mem.eql(u8, var_name, "per_chan_info") or
                         std.mem.eql(u8, var_name, "ampdu_ba_wsize") or
                         std.mem.eql(u8, var_name, "mpc"))
                     {
@@ -941,34 +957,21 @@ pub const Cyw43430 = struct {
                     } else if (std.mem.eql(u8, var_name, "qtxpower")) {
                         if (dst.len >= 4) std.mem.writeInt(u32, dst[0..4], 80, .little); // 20 dBm (80 qdBm)
                     } else if (std.mem.eql(u8, var_name, "chanspecs")) {
-                        // struct brcmf_chanspec_list { __le32 count; __le32 element[]; }
-                        // Note: brcmf_enable_bw40_2g passes a 40 MHz chanspec filter (0x1800) in arg[0..2].
-                        // Only 20 MHz channels are offered, so return count=0 for 40 MHz queries.
+                        // struct brcmf_chanspec_list { __le32 count; __le32 element[]; }. A chanspec
+                        // argument with a bandwidth (brcmf_enable_bw40_2g passes 2.4 GHz 40 MHz,
+                        // 0x1800) asks for just that band and width.
                         const q_chspec: u16 = if (arg.len >= 2) std.mem.readInt(u16, arg[0..2], .little) else 0;
-                        if ((q_chspec & 0x3800) == 0x1800) {
-                            if (dst.len >= 4) std.mem.writeInt(u32, dst[0..4], 0, .little);
-                        } else if (dst.len >= 4) {
-                            // D11AC 20 MHz chanspecs (bw=20MHz 0x1000): 2.4 GHz channels 1..11 (band 0x0000),
-                            // then on dual-band chips the 5 GHz channels outside DFS (band 0xc000)
-                            const ch_5g = [_]u32{ 36, 40, 44, 48, 149, 153, 157, 161, 165 };
-                            var list: [11 + ch_5g.len]u32 = undefined;
-                            var count: usize = 0;
-                            for (1..12) |ch| {
-                                list[count] = 0x1000 | @as(u32, @intCast(ch));
-                                count += 1;
-                            }
-                            if (self.chip.dualBand()) {
-                                for (ch_5g) |ch| {
-                                    list[count] = 0xd000 | ch;
-                                    count += 1;
-                                }
-                            }
-                            count = @min(count, (dst.len - 4) / 4);
-                            std.mem.writeInt(u32, dst[0..4], @intCast(count), .little);
-                            for (list[0..count], 0..) |chanspec, i| {
-                                std.mem.writeInt(u32, dst[4 + i * 4 ..][0..4], chanspec, .little);
-                            }
+                        const filter: ?u16 = if ((q_chspec & 0x3800) != 0) q_chspec & 0xf800 else null;
+                        var list: [64]u16 = undefined;
+                        const all = self.chanspecs(&list);
+                        var count: usize = 0;
+                        for (all) |chanspec| {
+                            if (filter) |f| if ((chanspec & 0xf800) != f) continue;
+                            if (4 + (count + 1) * 4 > dst.len) break;
+                            std.mem.writeInt(u32, dst[4 + count * 4 ..][0..4], chanspec, .little);
+                            count += 1;
                         }
+                        if (dst.len >= 4) std.mem.writeInt(u32, dst[0..4], @intCast(count), .little);
                     } else if (std.mem.eql(u8, var_name, "country")) {
                         if (dst.len >= 12) {
                             @memcpy(dst[0..4], &self.country_abrev);
@@ -995,6 +998,21 @@ pub const Cyw43430 = struct {
                             @memcpy(&self.country_abrev, arg[0..4]);
                             self.country_rev = std.mem.readInt(i32, arg[4..8], .little);
                             @memcpy(&self.country_ccode, arg[8..12]);
+                        }
+                    } else if (std.mem.eql(u8, var_name, "bw_cap")) {
+                        // struct brcmf_fil_bwcap_le { __le32 band; __le32 bw_cap; }
+                        if (arg.len >= 8) {
+                            const band = std.mem.readInt(u32, arg[0..4], .little);
+                            const bw = std.mem.readInt(u32, arg[4..8], .little);
+                            // A width the chip lacks is BCME_BADARG: brcmfmac asks for 40 MHz at
+                            // 2.4 GHz on every chip and only keeps HT40 there if this succeeds
+                            const supported = self.chip.bandwidths(band);
+                            if ((band == 1 or band == 2) and bw != 0 and (bw & ~supported) == 0) {
+                                self.bw_cap[band - 1] = bw;
+                            } else {
+                                status = -2;
+                                flags |= BCDC_DCMD_ERROR;
+                            }
                         }
                     } else if (std.mem.eql(u8, var_name, "escan")) {
                         trigger_escan = true;
@@ -1071,6 +1089,70 @@ pub const Cyw43430 = struct {
         if (trigger_escan) {
             self.queueEscanCompleteEvent();
         }
+    }
+
+    /// The channel widths enabled in `band`: what the host set with `bw_cap`, or all supported
+    fn bandBwCap(self: *const Cyw43430, band: u32) u32 {
+        const supported = self.chip.bandwidths(band);
+        if (band == 1 or band == 2) {
+            if (self.bw_cap[band - 1]) |bw| return bw & supported;
+        }
+        return supported;
+    }
+
+    /// The D11AC chanspecs the chip offers (center channel | sideband | width | band): the
+    /// 2.4 GHz channels 1..11 and, on dual-band chips, the 5 GHz channels outside DFS. All the
+    /// 20 MHz channels come first, then the 40 MHz and 80 MHz ones, in the order brcmfmac expects.
+    fn chanspecs(self: *const Cyw43430, out: *[64]u16) []const u16 {
+        const band_2g: u16 = 0x0000;
+        const band_5g: u16 = 0xc000;
+        const bw_20: u16 = 0x1000;
+        const bw_40: u16 = 0x1800;
+        const bw_80: u16 = 0x2000;
+        const ch_5g = [_]u16{ 36, 40, 44, 48, 149, 153, 157, 161, 165 };
+        const bw_2g = self.bandBwCap(2);
+        const bw_5g = if (self.chip.dualBand()) self.bandBwCap(1) else 0;
+        var n: usize = 0;
+        if (bw_2g & 1 != 0) {
+            for (1..12) |ch| {
+                out[n] = band_2g | bw_20 | @as(u16, @intCast(ch));
+                n += 1;
+            }
+        }
+        if (bw_5g & 1 != 0) {
+            for (ch_5g) |ch| {
+                out[n] = band_5g | bw_20 | ch;
+                n += 1;
+            }
+        }
+        // 40 MHz: the control channel is the lower (sideband L, 0x000) or upper (U, 0x100)
+        // 20 MHz half, 2 channels below or above the center
+        if (bw_2g & 2 != 0) {
+            for (3..10) |center| {
+                for ([_]u16{ 0x000, 0x100 }) |sb| {
+                    out[n] = band_2g | bw_40 | sb | @as(u16, @intCast(center));
+                    n += 1;
+                }
+            }
+        }
+        if (bw_5g & 2 != 0) {
+            for ([_]u16{ 38, 46, 151, 159 }) |center| {
+                for ([_]u16{ 0x000, 0x100 }) |sb| {
+                    out[n] = band_5g | bw_40 | sb | center;
+                    n += 1;
+                }
+            }
+        }
+        // 80 MHz: control channel 6, 2 below or 2, 6 above the center (sidebands LL..UU)
+        if (bw_5g & 4 != 0) {
+            for ([_]u16{ 42, 155 }) |center| {
+                for ([_]u16{ 0x000, 0x100, 0x200, 0x300 }) |sb| {
+                    out[n] = band_5g | bw_80 | sb | center;
+                    n += 1;
+                }
+            }
+        }
+        return out[0..n];
     }
 
     fn queueEscanCompleteEvent(self: *Cyw43430) void {
@@ -1250,4 +1332,89 @@ test "Cyw43430 reports the version of the firmware the host downloaded" {
         "wl0: Jun 14 2023 07:28:04 version 7.45.96.s1 (gf031a129) FWID 01-70bd2af7\n",
         chip.fw_version[0..chip.fw_version_len],
     );
+}
+
+/// Sends BCDC GET_VAR(`name`, `arg`) on Function 2 and returns the reply body in `reply`
+fn testGetVar(chip: *Cyw43430, name: []const u8, arg: []const u8, reply: *[1600]u8) []const u8 {
+    var tx: [256]u8 = @splat(0);
+    const body_len = name.len + 1 + arg.len;
+    const total: u16 = @intCast(12 + 16 + body_len);
+    std.mem.writeInt(u16, tx[0..2], total, .little);
+    std.mem.writeInt(u16, tx[2..4], ~total, .little);
+    tx[7] = 12; // doff, SDPCM_CONTROL_CHANNEL
+    std.mem.writeInt(u32, tx[12..16], 262, .little); // BRCMF_C_GET_VAR
+    std.mem.writeInt(u32, tx[16..20], 1024, .little); // len: the host's buffer
+    @memcpy(tx[28..][0..name.len], name);
+    @memcpy(tx[28 + name.len + 1 ..][0..arg.len], arg);
+    chip.writeExtended(2, 0, true, tx[0..total]);
+    chip.readExtended(2, 0, true, reply);
+    const len = std.mem.readInt(u16, reply[0..2], .little);
+    return reply[12 + 16 .. len];
+}
+
+test "Cyw43455 reports 40 MHz at 2.4 GHz and 40/80 MHz with VHT at 5 GHz" {
+    var chip = Cyw43430{ .chip = .cyw43455 };
+    chip.writeByte(0, 0x04, 0x07);
+    var reply: [1600]u8 = undefined;
+
+    const le = std.mem.toBytes;
+    var r = testGetVar(&chip, "bw_cap", &le(@as(u32, 2)), &reply);
+    try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, r[0..4], .little));
+    r = testGetVar(&chip, "bw_cap", &le(@as(u32, 1)), &reply);
+    try std.testing.expectEqual(@as(u32, 7), std.mem.readInt(u32, r[0..4], .little));
+    r = testGetVar(&chip, "vhtmode", "", &reply);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, r[0..4], .little));
+
+    // All chanspecs: every 20 MHz channel before any wider one
+    r = testGetVar(&chip, "chanspecs", &le(@as(u32, 0)), &reply);
+    const count = std.mem.readInt(u32, r[0..4], .little);
+    try std.testing.expectEqual(@as(u32, 11 + 9 + 14 + 8 + 8), count);
+    var seen_wide = false;
+    var has_80_ll_36 = false;
+    for (0..count) |i| {
+        const cs = std.mem.readInt(u32, r[4 + i * 4 ..][0..4], .little);
+        const bw = cs & 0x3800;
+        if (bw != 0x1000) seen_wide = true else try std.testing.expect(!seen_wide);
+        if (cs == 0xe02a) has_80_ll_36 = true; // 5 GHz 80 MHz center 42, control channel 36
+    }
+    try std.testing.expect(has_80_ll_36);
+
+    // brcmf_enable_bw40_2g's query: only the 2.4 GHz 40 MHz chanspecs
+    r = testGetVar(&chip, "chanspecs", &le(@as(u32, 0x1800)), &reply);
+    try std.testing.expectEqual(@as(u32, 14), std.mem.readInt(u32, r[0..4], .little));
+    for (0..14) |i| try std.testing.expectEqual(@as(u32, 0x1800), std.mem.readInt(u32, r[4 + i * 4 ..][0..4], .little) & 0xf800);
+}
+
+test "Cyw43430 reports 20 MHz channels at 2.4 GHz only" {
+    var chip = Cyw43430{};
+    chip.writeByte(0, 0x04, 0x07);
+    var reply: [1600]u8 = undefined;
+
+    const le = std.mem.toBytes;
+    var r = testGetVar(&chip, "bw_cap", &le(@as(u32, 2)), &reply);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, r[0..4], .little));
+    r = testGetVar(&chip, "vhtmode", "", &reply);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, r[0..4], .little));
+    r = testGetVar(&chip, "chanspecs", &le(@as(u32, 0)), &reply);
+    try std.testing.expectEqual(@as(u32, 11), std.mem.readInt(u32, r[0..4], .little));
+    r = testGetVar(&chip, "chanspecs", &le(@as(u32, 0x1800)), &reply);
+    try std.testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, r[0..4], .little));
+
+    // brcmf_enable_bw40_2g's SET_VAR("bw_cap", { WLC_BAND_2G, 20/40 MHz }) fails
+    var tx: [64]u8 = @splat(0);
+    const total: u16 = 12 + 16 + 15;
+    std.mem.writeInt(u16, tx[0..2], total, .little);
+    std.mem.writeInt(u16, tx[2..4], ~total, .little);
+    tx[7] = 12;
+    std.mem.writeInt(u32, tx[12..16], 263, .little); // BRCMF_C_SET_VAR
+    std.mem.writeInt(u32, tx[16..20], 15, .little);
+    std.mem.writeInt(u32, tx[20..24], 0x0001_0002, .little); // reqid 1, BCDC_DCMD_SET
+    @memcpy(tx[28..35], "bw_cap\x00");
+    std.mem.writeInt(u32, tx[35..39], 2, .little);
+    std.mem.writeInt(u32, tx[39..43], 3, .little);
+    chip.writeExtended(2, 0, true, tx[0..total]);
+    chip.readExtended(2, 0, true, &reply);
+    try std.testing.expect(std.mem.readInt(u32, reply[12 + 8 ..][0..4], .little) & 1 != 0); // BCDC_DCMD_ERROR
+    r = testGetVar(&chip, "bw_cap", &le(@as(u32, 2)), &reply);
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, r[0..4], .little));
 }
