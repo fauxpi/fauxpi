@@ -1,20 +1,75 @@
-//! Broadcom BCM43430 / Cypress CYW43430 SDIO 802.11b/g/n Wi-Fi Controller Emulation.
+//! Broadcom / Cypress SDIO Wi-Fi Controller Emulation.
 //!
 //! Emulates the onboard wireless controller attached to the BCM2835 Arasan SDHCI
-//! interface (`/soc/mmc@7e300000`) on Raspberry Pi Zero W and Raspberry Pi Zero 2 W:
+//! interface (`/soc/mmc@7e300000`), one of:
+//! - CYW43430 (BCM43438, 802.11b/g/n) on the Raspberry Pi Zero W and Zero 2 W: an ARM
+//!   Cortex-M3 with 512 KiB of SOCRAM at `0x00000000`, SDIO ID `0x02d0:0xa9a6`
+//! - CYW43455 (802.11a/b/g/n/ac) on the Raspberry Pi 3 Model A+ and B+: an ARM Cortex-R4
+//!   with 800 KiB of TCM at `0x00198000`, SDIO ID `0x02d0:0xa9bf`
+//!
 //! - SDIO bus protocol (`CMD5`, `CMD3`, `CMD7`, `CMD52`, `CMD53`)
-//! - Function 0: CCCR, FBR1, FBR2, and CIS tuples (`0x02d0:0xa9a6`)
+//! - Function 0: CCCR, FBR1, FBR2, and CIS tuples
 //! - Function 1: Backplane window (`SBSDIO_FUNC1_SBADDR*`), clock/sleep CSRs,
-//!   AI/DMP cores (ChipCommon `0x800`, SDIO Device `0x829`, SOCRAM `0x80e`,
-//!   ARM CM3 `0x82a`, 802.11 `0x812`), and 512 KiB chip RAM (`0x00000000..0x0007ffff`)
+//!   AI/DMP cores (ChipCommon `0x800`, 802.11 `0x812`, SDIO Device `0x829`, and the ARM CM3
+//!   `0x82a` and SOCRAM `0x80e` or the ARM CR4 `0x83e`), and the chip RAM
 //! - Function 2: SDPCM + BCDC control/event protocol (`brcmfmac` driver interface)
 
 const std = @import("std");
 
+pub const Chip = enum {
+    cyw43430,
+    cyw43455,
+
+    /// ChipCommon chip ID: 43430, or 0x4345 for the BCM4345 family
+    pub fn id(self: Chip) u16 {
+        return switch (self) {
+            .cyw43430 => 43430,
+            .cyw43455 => 0x4345,
+        };
+    }
+
+    /// Chip revision: BCM43430A1 (`brcmfmac43430-sdio`), BCM4345C0 (rev 6, `brcmfmac43455-sdio`)
+    pub fn rev(self: Chip) u16 {
+        return switch (self) {
+            .cyw43430 => 1,
+            .cyw43455 => 6,
+        };
+    }
+
+    pub fn sdioDeviceId(self: Chip) u16 {
+        return switch (self) {
+            .cyw43430 => 0xa9a6,
+            .cyw43455 => 0xa9bf,
+        };
+    }
+
+    /// Backplane address of the chip RAM (SOCRAM, or the Cortex-R4's TCM)
+    pub fn ramBase(self: Chip) u32 {
+        return switch (self) {
+            .cyw43430 => 0,
+            .cyw43455 => 0x198000,
+        };
+    }
+
+    pub fn ramSize(self: Chip) u32 {
+        return switch (self) {
+            .cyw43430 => 512 * 1024,
+            .cyw43455 => 800 * 1024,
+        };
+    }
+
+    fn hasCortexR4(self: Chip) bool {
+        return self == .cyw43455;
+    }
+
+    fn dualBand(self: Chip) bool {
+        return self == .cyw43455;
+    }
+};
+
 pub const Cyw43430 = struct {
-    pub const CHIP_ID: u16 = 43430; // 0xa9a6
-    pub const CHIP_REV: u16 = 1; // BCM43430A1 -> brcmfmac43430-sdio.bin
-    pub const RAM_SIZE: usize = 512 * 1024;
+    /// Largest chip RAM of any `Chip`
+    pub const RAM_SIZE: usize = 800 * 1024;
     pub const MAX_RX_FRAMES: usize = 8;
     pub const MAX_FRAME_LEN: usize = 2048;
 
@@ -40,14 +95,14 @@ pub const Cyw43430 = struct {
     const CC_BASE: u32 = 0x18000000;
     const D11_BASE: u32 = 0x18001000;
     const SDIO_BASE: u32 = 0x18002000;
-    const ARMCM3_BASE: u32 = 0x18003000;
+    const ARM_BASE: u32 = 0x18003000; // ARM CM3 or CR4
     const SOCRAM_BASE: u32 = 0x18004000;
     const EROM_BASE: u32 = 0x18000800;
 
     const CC_WRAP: u32 = 0x18100000;
     const D11_WRAP: u32 = 0x18101000;
     const SDIO_WRAP: u32 = 0x18102000;
-    const ARMCM3_WRAP: u32 = 0x18103000;
+    const ARM_WRAP: u32 = 0x18103000;
     const SOCRAM_WRAP: u32 = 0x18104000;
 
     // SDIO core interrupt bits (struct sdpcmd_regs)
@@ -124,6 +179,7 @@ pub const Cyw43430 = struct {
     const BCDC_DCMD_ERROR: u32 = 0x01;
     const BCDC_DCMD_SET: u32 = 0x02;
 
+    chip: Chip = .cyw43430,
     mac_address: [6]u8 = .{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 },
 
     // Function 0 CCCR & FBR state
@@ -148,9 +204,16 @@ pub const Cyw43430 = struct {
     func1_wakeupctrl: u8 = 0,
     func1_sleepcsr: u8 = 0x03,
 
-    // Backplane core wrapper states: [0]=CC, [1]=D11, [2]=SDIO, [3]=ARMCM3, [4]=SOCRAM
+    // Backplane core wrapper states: [0]=CC, [1]=D11, [2]=SDIO, [3]=ARM CM3 / CR4, [4]=SOCRAM
     wrap_ioctl: [5]u32 = .{ 1, 1, 1, 1, 1 },
-    wrap_reset: [5]u32 = .{ 0, 0, 0, 1, 0 }, // ARM CM3 starts in reset until firmware loaded
+    wrap_reset: [5]u32 = .{ 0, 0, 0, 1, 0 }, // the ARM starts in reset until firmware loaded
+    arm_running: bool = false,
+    /// Cortex-R4 reset vector, written to backplane address 0 before the core is started
+    cr4_reset_vector: u32 = 0,
+    cr4_bankidx: u32 = 0,
+    /// The `ver` string, from the version trailer of the firmware the host downloaded
+    fw_version: [128]u8 = @splat(0),
+    fw_version_len: usize = 0,
 
     // SOCRAM & SDIO core registers
     socram_bankidx: u32 = 0,
@@ -176,12 +239,19 @@ pub const Cyw43430 = struct {
     rx_count: usize = 0,
     rx_frame_offset: usize = 0,
 
-    // 512 KiB chip RAM for firmware & NVRAM upload/verification
+    // Chip RAM for firmware & NVRAM upload/verification (`chip.ramSize()` bytes used)
     chip_ram: [RAM_SIZE]u8 = @splat(0),
 
     pub fn reset(self: *Cyw43430) void {
         const mac = self.mac_address;
-        self.* = .{ .mac_address = mac };
+        const chip = self.chip;
+        self.* = .{ .chip = chip, .mac_address = mac };
+    }
+
+    /// Offset into `chip_ram` of the `len` bytes at backplane address `addr`, if they are RAM
+    inline fn ramOffset(self: *const Cyw43430, addr: u32, len: u32) ?u32 {
+        const off = addr -% self.chip.ramBase();
+        return if (off < self.chip.ramSize() and self.chip.ramSize() - off >= len) off else null;
     }
 
     pub fn cardIntPending(self: *const Cyw43430) bool {
@@ -323,7 +393,7 @@ pub const Cyw43430 = struct {
             0x211 => @truncate(self.fbr2_blksize >> 8),
 
             // Common CIS at 0x1000..0x10ff
-            0x1000...0x10ff => readCisCommon(addr - 0x1000),
+            0x1000...0x10ff => readCisCommon(addr - 0x1000, self.chip.sdioDeviceId()),
             // Function 1 CIS at 0x1100..0x11ff
             0x1100...0x11ff => readCisFunc(addr - 0x1100, 64),
             // Function 2 CIS at 0x1200..0x12ff
@@ -353,13 +423,13 @@ pub const Cyw43430 = struct {
         }
     }
 
-    fn readCisCommon(off: u17) u8 {
-        // CISTPL_MANFID (0x20, len 4): vendor 0x02d0 (Broadcom), device 0xa9a6 (BCM43430)
+    fn readCisCommon(off: u17, device_id: u16) u8 {
+        // CISTPL_MANFID (0x20, len 4): vendor 0x02d0 (Broadcom), device
         // CISTPL_FUNCE (0x22, len 4): type 0x00, fn0_blk_size=64 (0x0040), max_tran_speed=0x32 (25 MHz)
         // CISTPL_END (0xff)
         const cis_common = [_]u8{
-            0x20, 0x04, 0xd0, 0x02, 0xa6, 0xa9,
-            0x22, 0x04, 0x00, 0x40, 0x00, 0x32,
+            0x20, 0x04, 0xd0, 0x02, @truncate(device_id), @truncate(device_id >> 8),
+            0x22, 0x04, 0x00, 0x40, 0x00,                 0x32,
             0xff,
         };
         if (off < cis_common.len) return cis_common[off];
@@ -450,8 +520,8 @@ pub const Cyw43430 = struct {
             return;
         }
         const bp_addr = self.backplaneWindowBase() + (@as(u32, addr) & 0x07fff);
-        if (bp_addr < RAM_SIZE) {
-            self.chip_ram[bp_addr] = val;
+        if (self.ramOffset(bp_addr, 1)) |off| {
+            self.chip_ram[off] = val;
             return;
         }
         const aligned = bp_addr & ~@as(u32, 3);
@@ -462,19 +532,20 @@ pub const Cyw43430 = struct {
     }
 
     pub fn readBackplane32(self: *const Cyw43430, addr: u32) u32 {
-        if (addr + 4 <= RAM_SIZE) {
-            return std.mem.readInt(u32, self.chip_ram[addr..][0..4], .little);
+        if (self.ramOffset(addr, 4)) |off| {
+            return std.mem.readInt(u32, self.chip_ram[off..][0..4], .little);
         }
+        if (self.chip.hasCortexR4() and addr == 0) return self.cr4_reset_vector;
 
         // DMP EROM table at 0x18000800..0x18000900
         if (addr >= EROM_BASE and addr < EROM_BASE + 0x100) {
-            return readEromWord((addr - EROM_BASE) / 4);
+            return self.readEromWord((addr - EROM_BASE) / 4);
         }
 
         // ChipCommon (0x18000000..0x18000fff)
         if (addr >= CC_BASE and addr < CC_BASE + 0x1000) {
             return switch (addr - CC_BASE) {
-                0x000 => (1 << 28) | (@as(u32, CHIP_REV) << 16) | CHIP_ID, // SOCI_AI (1<<28) | rev 1 | 43430
+                0x000 => (1 << 28) | (@as(u32, self.chip.rev()) << 16) | self.chip.id(), // SOCI_AI (1<<28) | rev | chip
                 0x004 => 0x10000000, // CC_CAP_PMU
                 0x0fc => EROM_BASE, // eromptr
                 0x190 => 0x00000000, // clk_ctl_st
@@ -502,8 +573,18 @@ pub const Cyw43430 = struct {
             };
         }
 
+        // ARM CR4 core: one bank of TCM, (99 + 1) * 8 KiB = 800 KiB
+        if (self.chip.hasCortexR4() and addr >= ARM_BASE and addr < ARM_BASE + 0x1000) {
+            return switch (addr - ARM_BASE) {
+                0x004 => 1, // corecapabilities: 1 bank A, 0 bank B
+                0x040 => self.cr4_bankidx,
+                0x044 => 99, // bankinfo
+                else => 0,
+            };
+        }
+
         // SOCRAM core (0x18004000..0x18004fff)
-        if (addr >= SOCRAM_BASE and addr < SOCRAM_BASE + 0x1000) {
+        if (!self.chip.hasCortexR4() and addr >= SOCRAM_BASE and addr < SOCRAM_BASE + 0x1000) {
             return switch (addr - SOCRAM_BASE) {
                 0x000 => (1 << 4), // coreinfo: 1 bank (MEM_BMSHIFT = 4)
                 0x010 => self.socram_bankidx,
@@ -530,8 +611,16 @@ pub const Cyw43430 = struct {
     }
 
     pub fn writeBackplane32(self: *Cyw43430, addr: u32, val: u32) void {
-        if (addr + 4 <= RAM_SIZE) {
-            std.mem.writeInt(u32, self.chip_ram[addr..][0..4], val, .little);
+        if (self.ramOffset(addr, 4)) |off| {
+            std.mem.writeInt(u32, self.chip_ram[off..][0..4], val, .little);
+            return;
+        }
+        if (self.chip.hasCortexR4() and addr == 0) {
+            self.cr4_reset_vector = val;
+            return;
+        }
+        if (self.chip.hasCortexR4() and addr >= ARM_BASE and addr < ARM_BASE + 0x1000) {
+            if (addr - ARM_BASE == 0x040) self.cr4_bankidx = val;
             return;
         }
 
@@ -557,7 +646,7 @@ pub const Cyw43430 = struct {
         }
 
         // SOCRAM core (0x18004000..0x18004fff)
-        if (addr >= SOCRAM_BASE and addr < SOCRAM_BASE + 0x1000) {
+        if (!self.chip.hasCortexR4() and addr >= SOCRAM_BASE and addr < SOCRAM_BASE + 0x1000) {
             switch (addr - SOCRAM_BASE) {
                 0x010 => self.socram_bankidx = val,
                 0x044 => self.socram_bankpda = val,
@@ -573,24 +662,62 @@ pub const Cyw43430 = struct {
             if (idx < 5) {
                 switch (off) {
                     0x408 => self.wrap_ioctl[idx] = val,
-                    0x800 => {
-                        self.wrap_reset[idx] = val;
-                        // When ARM CM3 core (idx 3) is released from reset (val == 0),
-                        // firmware is ready and signals HMB_DATA_FWREADY
-                        if (idx == 3 and val == 0) {
-                            self.publishShared();
-                            self.sdio_tohostmailboxdata = 0x00040008;
-                            self.sdio_intstatus |= I_HMB_HOST_INT;
-                        }
-                    },
+                    0x800 => self.wrap_reset[idx] = val,
                     else => {},
                 }
+                if (idx == 3) self.updateArm();
             }
             return;
         }
     }
 
     const I_HMB_SW_MASK_ACK: u32 = I_HMB_HOST_INT;
+
+    const ARMCR4_IOCTL_CPUHALT: u32 = 0x20;
+
+    /// The ARM runs once out of reset (BCMA_RESET_CTL clear) and, for the Cortex-R4, with
+    /// CPUHALT clear in its wrapper's BCMA_IOCTL. Starting it starts the downloaded firmware,
+    /// which signals HMB_DATA_FWREADY.
+    fn updateArm(self: *Cyw43430) void {
+        const running = (self.wrap_reset[3] & 1) == 0 and
+            (!self.chip.hasCortexR4() or (self.wrap_ioctl[3] & ARMCR4_IOCTL_CPUHALT) == 0);
+        if (running and !self.arm_running) {
+            self.readFirmwareVersion();
+            self.publishShared();
+            self.sdio_tohostmailboxdata = 0x00040008;
+            self.sdio_intstatus |= I_HMB_HOST_INT;
+        }
+        self.arm_running = running;
+    }
+
+    /// Builds the `ver` reply ("wl0: Aug 29 2023 01:51:02 version 7.45.265 (28bca26 CY)
+    /// FWID 01-b677b91b") from the trailer firmware images end with ("... Version: 7.45.265
+    /// (28bca26 CY) CRC: 68bafb8c Date: Tue 2023-08-29 01:51:02 PDT Ucode Ver: 1043.2170
+    /// FWID 01-b677b91b"; some write "FWID: 01-...").
+    fn readFirmwareVersion(self: *Cyw43430) void {
+        self.fw_version_len = 0;
+        const ram = self.chip_ram[0..self.chip.ramSize()];
+        const v = std.mem.lastIndexOf(u8, ram, " Version: ") orelse return;
+        const trailer = std.mem.sliceTo(ram[v + 10 .. @min(ram.len, v + 400)], 0);
+        const ver_end = std.mem.indexOf(u8, trailer, " CRC: ") orelse return;
+        const date_at = std.mem.indexOf(u8, trailer, " Date: ") orelse return;
+        const fwid_at = std.mem.indexOf(u8, trailer, " FWID") orelse return;
+        // "Tue 2023-08-29 01:51:02 PDT": weekday, date, time
+        var date_it = std.mem.tokenizeScalar(u8, trailer[date_at + 7 ..], ' ');
+        _ = date_it.next() orelse return;
+        const ymd = date_it.next() orelse return;
+        const time = date_it.next() orelse return;
+        if (ymd.len != 10) return;
+        const month = std.fmt.parseInt(u8, ymd[5..7], 10) catch return;
+        if (month < 1 or month > 12) return;
+        const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+        var fwid_it = std.mem.tokenizeAny(u8, trailer[fwid_at + 5 ..], ": \n");
+        const fwid = fwid_it.next() orelse return;
+        const out = std.fmt.bufPrint(&self.fw_version, "wl0: {s} {s} {s} {s} version {s} FWID {s}\n", .{
+            months[month - 1], ymd[8..10], ymd[0..4], time, trailer[0..ver_end], fwid,
+        }) catch return;
+        self.fw_version_len = out.len;
+    }
 
     const SDPCM_SHARED_VERSION: u32 = 3;
     const SDPCM_SHARED_SIZE: u32 = 76; // struct sdpcm_shared
@@ -601,7 +728,8 @@ pub const Cyw43430 = struct {
     /// (empty) console log, and overwrites the last word of RAM, which held the NVRAM length
     /// token, with its address. `brcmfmac` reads it to find the console and trap information.
     fn publishShared(self: *Cyw43430) void {
-        const ram_size: u32 = RAM_SIZE;
+        const ram_size = self.chip.ramSize();
+        const base = self.chip.ramBase();
         // The NVRAM, ending in its length token (~words << 16 | words), sits at the top of RAM
         const token = std.mem.readInt(u32, self.chip_ram[ram_size - 4 ..][0..4], .little);
         const words = token & 0xffff;
@@ -613,18 +741,19 @@ pub const Cyw43430 = struct {
 
         @memset(self.chip_ram[shared .. ram_size - nvram_len], 0);
         // struct rte_console: vcons_in, vcons_out, then rte_log_le { buf, buf_size, idx, buf }
-        self.writeRam32(console + 8, console_buf);
+        self.writeRam32(console + 8, base + console_buf);
         self.writeRam32(console + 12, CONSOLE_BUF_SIZE);
-        self.writeRam32(console + 20, console_buf);
+        self.writeRam32(console + 20, base + console_buf);
         // struct sdpcm_shared: flags, trap_addr, assert_exp_addr, assert_file_addr, assert_line,
         // console_addr, msgtrace_addr, tag[32], brpt_addr
         self.writeRam32(shared, SDPCM_SHARED_VERSION);
-        self.writeRam32(shared + 20, console);
-        self.writeRam32(ram_size - 4, shared);
+        self.writeRam32(shared + 20, base + console);
+        self.writeRam32(ram_size - 4, base + shared);
     }
 
-    fn writeRam32(self: *Cyw43430, addr: u32, val: u32) void {
-        std.mem.writeInt(u32, self.chip_ram[addr..][0..4], val, .little);
+    /// Writes the RAM word at offset `off` (not a backplane address)
+    fn writeRam32(self: *Cyw43430, off: u32, val: u32) void {
+        std.mem.writeInt(u32, self.chip_ram[off..][0..4], val, .little);
     }
 
     fn eromCoreEntry(comptime core_id: u16, comptime rev: u8, comptime base: u32, comptime wrap: u32) [4]u32 {
@@ -640,13 +769,19 @@ pub const Cyw43430 = struct {
         };
     }
 
-    fn readEromWord(word_idx: u32) u32 {
-        const erom_table = eromCoreEntry(0x800, 49, CC_BASE, CC_WRAP) ++
+    fn readEromWord(self: *const Cyw43430, word_idx: u32) u32 {
+        const common = eromCoreEntry(0x800, 49, CC_BASE, CC_WRAP) ++
             eromCoreEntry(0x812, 42, D11_BASE, D11_WRAP) ++
-            eromCoreEntry(0x829, 12, SDIO_BASE, SDIO_WRAP) ++
-            eromCoreEntry(0x82a, 5, ARMCM3_BASE, ARMCM3_WRAP) ++
+            eromCoreEntry(0x829, 12, SDIO_BASE, SDIO_WRAP);
+        // ARM CM3 and SOCRAM, or an ARM CR4 with its own TCM
+        const cm3_table = common ++
+            eromCoreEntry(0x82a, 5, ARM_BASE, ARM_WRAP) ++
             eromCoreEntry(0x80e, 8, SOCRAM_BASE, SOCRAM_WRAP) ++
             [_]u32{0x0000000f}; // DMP_DESC_EOT
+        const cr4_table = common ++
+            eromCoreEntry(0x83e, 7, ARM_BASE, ARM_WRAP) ++
+            [_]u32{0x0000000f};
+        const erom_table: []const u32 = if (self.chip.hasCortexR4()) &cr4_table else &cm3_table;
         if (word_idx < erom_table.len) return erom_table[word_idx];
         return 0x0000000f;
     }
@@ -770,7 +905,8 @@ pub const Cyw43430 = struct {
                         if (dst.len >= 6) @memcpy(dst[0..6], &self.mac_address);
                         out_body_len = @max(max_body, 6);
                     } else if (std.mem.eql(u8, var_name, "ver")) {
-                        const ver_str = "wl0: Oct 23 2017 03:55:53 version 7.45.98.94 (r666254 CY) FWID 01-e58d219f\n\x00";
+                        const fallback = "wl0: Oct 23 2017 03:55:53 version 7.45.98.94 (r666254 CY) FWID 01-e58d219f\n";
+                        const ver_str = if (self.fw_version_len != 0) self.fw_version[0..self.fw_version_len] else fallback;
                         const n = @min(dst.len, ver_str.len);
                         @memcpy(dst[0..n], ver_str[0..n]);
                     } else if (std.mem.eql(u8, var_name, "clmver")) {
@@ -807,18 +943,30 @@ pub const Cyw43430 = struct {
                     } else if (std.mem.eql(u8, var_name, "chanspecs")) {
                         // struct brcmf_chanspec_list { __le32 count; __le32 element[]; }
                         // Note: brcmf_enable_bw40_2g passes a 40 MHz chanspec filter (0x1800) in arg[0..2].
-                        // BCM43430 is 20 MHz only in 2.4 GHz, so return count=0 for 40 MHz queries.
+                        // Only 20 MHz channels are offered, so return count=0 for 40 MHz queries.
                         const q_chspec: u16 = if (arg.len >= 2) std.mem.readInt(u16, arg[0..2], .little) else 0;
                         if ((q_chspec & 0x3800) == 0x1800) {
                             if (dst.len >= 4) std.mem.writeInt(u32, dst[0..4], 0, .little);
                         } else if (dst.len >= 4) {
-                            // D11AC 2.4 GHz 20 MHz chanspec: band=2G (0x0000), bw=20MHz (0x1000), ch=1..11
-                            const max_ch: u32 = @min(@as(u32, @intCast((dst.len - 4) / 4)), 11);
-                            std.mem.writeInt(u32, dst[0..4], max_ch, .little);
-                            for (0..max_ch) |ch_idx| {
-                                const ch: u32 = @intCast(ch_idx + 1);
-                                const chanspec: u32 = 0x1000 | ch;
-                                std.mem.writeInt(u32, dst[4 + ch_idx * 4 ..][0..4], chanspec, .little);
+                            // D11AC 20 MHz chanspecs (bw=20MHz 0x1000): 2.4 GHz channels 1..11 (band 0x0000),
+                            // then on dual-band chips the 5 GHz channels outside DFS (band 0xc000)
+                            const ch_5g = [_]u32{ 36, 40, 44, 48, 149, 153, 157, 161, 165 };
+                            var list: [11 + ch_5g.len]u32 = undefined;
+                            var count: usize = 0;
+                            for (1..12) |ch| {
+                                list[count] = 0x1000 | @as(u32, @intCast(ch));
+                                count += 1;
+                            }
+                            if (self.chip.dualBand()) {
+                                for (ch_5g) |ch| {
+                                    list[count] = 0xd000 | ch;
+                                    count += 1;
+                                }
+                            }
+                            count = @min(count, (dst.len - 4) / 4);
+                            std.mem.writeInt(u32, dst[0..4], @intCast(count), .little);
+                            for (list[0..count], 0..) |chanspec, i| {
+                                std.mem.writeInt(u32, dst[4 + i * 4 ..][0..4], chanspec, .little);
                             }
                         }
                     } else if (std.mem.eql(u8, var_name, "country")) {
@@ -869,11 +1017,11 @@ pub const Cyw43430 = struct {
                 @memset(dst, 0);
                 if (dst.len >= 48) {
                     std.mem.writeInt(u32, dst[0..4], 0x14e4, .little); // vendorid
-                    std.mem.writeInt(u32, dst[4..8], 0xa9a6, .little); // deviceid
+                    std.mem.writeInt(u32, dst[4..8], self.chip.sdioDeviceId(), .little); // deviceid
                     std.mem.writeInt(u32, dst[8..12], 1, .little); // radiorev
-                    std.mem.writeInt(u32, dst[12..16], CHIP_REV, .little); // chiprev
+                    std.mem.writeInt(u32, dst[12..16], self.chip.rev(), .little); // chiprev
                     std.mem.writeInt(u32, dst[20..24], 42, .little); // corerev
-                    std.mem.writeInt(u32, dst[44..48], CHIP_ID, .little); // chipnum
+                    std.mem.writeInt(u32, dst[44..48], self.chip.id(), .little); // chipnum
                 }
             },
             BRCMF_C_GET_VERSION => {
@@ -885,7 +1033,11 @@ pub const Cyw43430 = struct {
             BRCMF_C_GET_BANDLIST => {
                 const dst = resp_buf[16 .. 16 + max_body];
                 @memset(dst, 0);
-                if (dst.len >= 8) {
+                if (self.chip.dualBand() and dst.len >= 12) {
+                    std.mem.writeInt(u32, dst[0..4], 2, .little); // 2 bands
+                    std.mem.writeInt(u32, dst[4..8], 1, .little); // WLC_BAND_5G = 1
+                    std.mem.writeInt(u32, dst[8..12], 2, .little); // WLC_BAND_2G = 2
+                } else if (dst.len >= 8) {
                     std.mem.writeInt(u32, dst[0..4], 1, .little); // 1 band
                     std.mem.writeInt(u32, dst[4..8], 2, .little); // WLC_BAND_2G = 2
                 }
@@ -1011,21 +1163,91 @@ test "Cyw43430 CIS tuples, backplane ChipCommon/EROM, and BCDC cur_etheraddr" {
 
 test "Cyw43430 firmware start replaces the NVRAM token with its sdpcm_shared address" {
     var chip = Cyw43430{};
+    const top = chip.chip.ramSize();
     // brcmfmac downloads 0x2a0 bytes of NVRAM to the top of RAM, ending in its length token
     const words: u32 = 0x2a0 / 4;
-    chip.writeBackplane32(Cyw43430.RAM_SIZE - 4, (~words << 16) | words);
-    chip.writeBackplane32(Cyw43430.RAM_SIZE - 0x2a4, 0x3d6e6f6d); // NVRAM text
+    chip.writeBackplane32(top - 4, (~words << 16) | words);
+    chip.writeBackplane32(top - 0x2a4, 0x3d6e6f6d); // NVRAM text
 
     chip.writeBackplane32(0x18103800, 0); // release the ARM CM3 from reset
 
-    const shared = chip.readBackplane32(Cyw43430.RAM_SIZE - 4);
+    const shared = chip.readBackplane32(top - 4);
     try std.testing.expect(shared != 0 and ((~shared >> 16) & 0xffff) != (shared & 0xffff));
-    try std.testing.expect(shared < Cyw43430.RAM_SIZE - 0x2a4);
-    try std.testing.expectEqual(@as(u32, 0x3d6e6f6d), chip.readBackplane32(Cyw43430.RAM_SIZE - 0x2a4));
+    try std.testing.expect(shared < top - 0x2a4);
+    try std.testing.expectEqual(@as(u32, 0x3d6e6f6d), chip.readBackplane32(top - 0x2a4));
     try std.testing.expectEqual(@as(u32, 3), chip.readBackplane32(shared) & 0xff); // version
     const console = chip.readBackplane32(shared + 20);
     const buf = chip.readBackplane32(console + 8);
     try std.testing.expectEqual(@as(u32, 1024), chip.readBackplane32(console + 12)); // buf_size
     try std.testing.expectEqual(@as(u32, 0), chip.readBackplane32(console + 16)); // idx
-    try std.testing.expect(buf > console and buf + 1024 <= Cyw43430.RAM_SIZE - 0x2a4);
+    try std.testing.expect(buf > console and buf + 1024 <= top - 0x2a4);
+}
+
+test "Cyw43455 identifies as BCM4345/6 with an ARM CR4 and starts its firmware from TCM" {
+    var chip = Cyw43430{ .chip = .cyw43455 };
+
+    // SDIO device 0x02d0:0xa9bf and ChipCommon chip ID 0x4345 rev 6
+    try std.testing.expectEqual(@as(u8, 0xbf), chip.readByte(0, 0x1004));
+    try std.testing.expectEqual(@as(u8, 0xa9), chip.readByte(0, 0x1005));
+    try std.testing.expectEqual(@as(u32, 0x10064345), chip.readBackplane32(0x18000000));
+
+    // The EROM lists ChipCommon, 802.11, SDIO and an ARM CR4 (0x83e), and no SOCRAM
+    var i: u32 = 0;
+    var cores: [8]u32 = undefined;
+    var n: usize = 0;
+    while (i < 64) : (i += 4) {
+        const ci_a = chip.readBackplane32(0x18000800 + i * 4);
+        if (ci_a == 0x0000000f) break;
+        cores[n] = (ci_a >> 8) & 0xfff;
+        n += 1;
+    }
+    try std.testing.expectEqualSlices(u32, &.{ 0x800, 0x812, 0x829, 0x83e }, cores[0..n]);
+
+    // TCM size from the CR4 core: bank count in corecap, then bank 0's size
+    try std.testing.expectEqual(@as(u32, 1), chip.readBackplane32(0x18003004) & 0xf);
+    chip.writeBackplane32(0x18003040, 0);
+    try std.testing.expectEqual(chip.chip.ramSize(), ((chip.readBackplane32(0x18003044) & 0x7f) + 1) * 8192);
+
+    // Firmware goes to the TCM at 0x198000, NVRAM to its top, the reset vector to address 0
+    const base = chip.chip.ramBase();
+    const top = base + chip.chip.ramSize();
+    chip.writeBackplane32(base, 0xb8f0f00b);
+    try std.testing.expectEqual(@as(u32, 0xb8f0f00b), chip.readBackplane32(base));
+    const trailer = "43455c0-roml/43455_sdio Version: 7.45.265 (28bca26 CY) CRC: 68bafb8c Date: Tue 2023-08-29 01:51:02 PDT Ucode Ver: 1043.2170 FWID 01-b677b91b\x00";
+    for (0..trailer.len / 4) |w| chip.writeBackplane32(base + 0x1000 + @as(u32, @intCast(w)) * 4, std.mem.readInt(u32, trailer[w * 4 ..][0..4], .little));
+    const words: u32 = 0x2a0 / 4;
+    chip.writeBackplane32(top - 4, (~words << 16) | words);
+    chip.writeBackplane32(0, 0xb8f0f00b);
+
+    // brcmf_chip_cr4_set_passive leaves the core out of reset but halted: not started
+    chip.writeBackplane32(0x18103408, 0x20 | 0x3); // IOCTL: CPUHALT | FGC | CLK
+    chip.writeBackplane32(0x18103800, 0);
+    try std.testing.expectEqual(@as(u32, 0), chip.sdio_intstatus);
+    try std.testing.expectEqual(@as(u32, (~words << 16) | words), chip.readBackplane32(top - 4));
+
+    // brcmf_chip_cr4_set_active: reset with CPUHALT clear, which starts the firmware
+    chip.writeBackplane32(0x18103800, 1);
+    chip.writeBackplane32(0x18103408, 0x3);
+    chip.writeBackplane32(0x18103800, 0);
+    try std.testing.expect((chip.sdio_intstatus & 0x80) != 0); // I_HMB_HOST_INT: FWREADY
+    const shared = chip.readBackplane32(top - 4);
+    try std.testing.expect(shared >= base and shared < top - 0x2a4);
+    try std.testing.expectEqual(@as(u32, 3), chip.readBackplane32(shared) & 0xff);
+    try std.testing.expectEqualStrings(
+        "wl0: Aug 29 2023 01:51:02 version 7.45.265 (28bca26 CY) FWID 01-b677b91b\n",
+        chip.fw_version[0..chip.fw_version_len],
+    );
+}
+
+test "Cyw43430 reports the version of the firmware the host downloaded" {
+    var chip = Cyw43430{};
+    const trailer = "43430a1-roml/sdio-g-pool-p2p Version: 7.45.96.s1 (gf031a129) CRC: 6670a1e Date: Wed 2023-06-14 07:28:04 CST Ucode Ver: 1043.20744 FWID: 01-70bd2af7\x00\x00\x00\x00";
+    for (0..trailer.len / 4) |w| {
+        chip.writeBackplane32(0x2000 + @as(u32, @intCast(w)) * 4, std.mem.readInt(u32, trailer[w * 4 ..][0..4], .little));
+    }
+    chip.writeBackplane32(0x18103800, 0); // release the ARM CM3 from reset
+    try std.testing.expectEqualStrings(
+        "wl0: Jun 14 2023 07:28:04 version 7.45.96.s1 (gf031a129) FWID 01-70bd2af7\n",
+        chip.fw_version[0..chip.fw_version_len],
+    );
 }

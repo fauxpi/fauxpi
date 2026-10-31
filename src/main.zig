@@ -328,6 +328,10 @@ fn loadGuestBoot(
     soc.usb.hid.net.guest_mac = mac_address;
     soc.sdhci.wireless_enabled = board_model.hasWireless();
     soc.sdhci.wifi.mac_address = wifi_mac_address;
+    soc.sdhci.wifi.chip = switch (board_model) {
+        .pi_3_a_plus, .pi_3_b_plus => .cyw43455,
+        else => .cyw43430,
+    };
     soc.bt.enabled = board_model.hasWireless();
     soc.bt.chip = switch (board_model) {
         .pi_3_a_plus, .pi_3_b_plus => .bcm4345c0,
