@@ -15,6 +15,7 @@
 //! - Function 2: SDPCM + BCDC control/event protocol (`brcmfmac` driver interface)
 
 const std = @import("std");
+const net_mod = @import("../usb/net.zig");
 
 pub const Chip = enum {
     cyw43430,
@@ -80,7 +81,7 @@ pub const Chip = enum {
 pub const Cyw43430 = struct {
     /// Largest chip RAM of any `Chip`
     pub const RAM_SIZE: usize = 800 * 1024;
-    pub const MAX_RX_FRAMES: usize = 8;
+    pub const MAX_RX_FRAMES: usize = 32;
     pub const MAX_FRAME_LEN: usize = 2048;
 
     // SDIO Function 1 register offsets (0x10000..0x1001f)
@@ -246,6 +247,12 @@ pub const Cyw43430 = struct {
     /// SSID of the open access point scans find (none while empty)
     ap_ssid: [32]u8 = @splat(0),
     ap_ssid_len: u8 = 0,
+    /// The access point radio the host joined
+    joined: ?AccessPoint = null,
+    /// The network behind the access point: user-mode NAT on 10.0.3.0/24
+    net: net_mod.VirtualNetwork = .{ .subnet = 3 },
+    /// Last transmit sequence number the host may use, as last advertised in a received frame
+    tx_window_end: u8 = 0,
 
     rx_frames: [MAX_RX_FRAMES][MAX_FRAME_LEN]u8 = undefined,
     rx_frame_lens: [MAX_RX_FRAMES]usize = @splat(0),
@@ -262,7 +269,27 @@ pub const Cyw43430 = struct {
         const chip = self.chip;
         const ap_ssid = self.ap_ssid;
         const ap_ssid_len = self.ap_ssid_len;
+        const dhcp_enabled = self.net.dhcp_enabled;
+        self.net.deinit();
         self.* = .{ .chip = chip, .mac_address = mac, .ap_ssid = ap_ssid, .ap_ssid_len = ap_ssid_len };
+        self.net.dhcp_enabled = dhcp_enabled;
+    }
+
+    pub fn deinit(self: *Cyw43430) void {
+        self.net.deinit();
+    }
+
+    /// Services the network behind the access point (host sockets), passing what it has
+    /// for the guest to the host as received frames
+    pub fn pollNetwork(self: *Cyw43430) void {
+        if (self.joined == null) return;
+        self.net.poll();
+        self.deliverNetworkFrames();
+    }
+
+    /// True while the network behind the access point has frames the guest has not taken
+    pub fn hasPendingRx(self: *const Cyw43430) bool {
+        return self.joined != null and (self.net.hasRxFrame() or self.rx_count != 0);
     }
 
     /// Names the open access point scans find (up to 32 bytes of `ssid`)
@@ -835,7 +862,9 @@ pub const Cyw43430 = struct {
         frame[6] = 0; // len_nxtfrm = 0 (each frame header read individually)
         frame[7] = hdr_len; // data_offset = 12
         frame[8] = 0; // flow control = 0
-        frame[9] = self.host_tx_seq +% 32; // tx_seq_max window
+        // tx_seq_max: the host may send up to 32 frames past the last one it sent
+        self.tx_window_end = self.host_tx_seq +% 32;
+        frame[9] = self.tx_window_end;
         frame[10] = 0;
         frame[11] = 0;
 
@@ -875,6 +904,7 @@ pub const Cyw43430 = struct {
             self.rx_frame_offset = 0;
             self.rx_head = (self.rx_head + 1) % MAX_RX_FRAMES;
             self.rx_count -= 1;
+            if (self.joined != null) self.deliverNetworkFrames();
             if (self.rx_count == 0) {
                 self.sdio_intstatus &= ~I_HMB_FRAME_IND;
             } else {
@@ -897,6 +927,35 @@ pub const Cyw43430 = struct {
         const payload = data[doff..frm_len];
         if (channel == SDPCM_CONTROL_CHANNEL) {
             self.handleBcdcControl(payload);
+        } else if (channel == SDPCM_DATA_CHANNEL) {
+            self.handleDataFrame(payload);
+        }
+    }
+
+    /// A frame the host sends to the network: a BCDC data header (flags, priority, flags2,
+    /// data_offset in words of signalling TLVs), then an 802.3 frame
+    fn handleDataFrame(self: *Cyw43430, payload: []const u8) void {
+        if (payload.len < 4) return;
+        const start = 4 + @as(usize, payload[3]) * 4;
+        if (self.joined != null and start + 14 <= payload.len) {
+            self.net.handleTxFrame(payload[start..]);
+            self.deliverNetworkFrames();
+        }
+        // No reply to carry a new transmit window: send it in an empty frame
+        if (self.rx_count == 0 and (self.tx_window_end -% self.host_tx_seq) < 8) {
+            self.queueRxFrame(SDPCM_DATA_CHANNEL, &.{});
+        }
+    }
+
+    /// Moves the network's frames for the guest to the host, each after a BCDC data header
+    fn deliverNetworkFrames(self: *Cyw43430) void {
+        while (self.rx_count < MAX_RX_FRAMES) {
+            const frame = self.net.peekRxFrame() orelse break;
+            var buf: [4 + net_mod.VirtualNetwork.MAX_FRAME_LEN]u8 = undefined;
+            buf[0..4].* = .{ 0x20, 0, 0, 0 }; // BCDC_PROTO_VER << 4, priority, ifidx 0, data_offset
+            @memcpy(buf[4..][0..frame.len], frame);
+            self.queueRxFrame(SDPCM_DATA_CHANNEL, buf[0 .. 4 + frame.len]);
+            self.net.dropRxFrame();
         }
     }
 
@@ -916,6 +975,8 @@ pub const Cyw43430 = struct {
         var status: i32 = 0;
         var out_body_len: usize = max_body;
         var escan_params: ?[]const u8 = null;
+        var join: ?JoinRequest = null;
+        var leave = false;
 
         switch (cmd) {
             BRCMF_C_GET_VAR, BRCMF_C_SET_VAR => {
@@ -994,6 +1055,11 @@ pub const Cyw43430 = struct {
                     } else if (std.mem.eql(u8, var_name, "event_msgs")) {
                         const n = @min(dst.len, self.event_msgs.len);
                         @memcpy(dst[0..n], self.event_msgs[0..n]);
+                    } else if (std.mem.eql(u8, var_name, "assoc_info")) {
+                        // struct brcmf_cfg80211_assoc_ielen_le { req_len, resp_len }: no IEs kept
+                    } else if (std.mem.eql(u8, var_name, "sta_info") and self.joined != null) {
+                        self.writeStaInfo(dst);
+                        out_body_len = @min(max_body, STA_INFO_SIZE);
                     } else {
                         // Unsupported optional feature queries return -BRCMF_FW_UNSUPPORTED (-23)
                         status = -23;
@@ -1029,6 +1095,10 @@ pub const Cyw43430 = struct {
                         }
                     } else if (std.mem.eql(u8, var_name, "escan")) {
                         escan_params = arg;
+                    } else if (std.mem.eql(u8, var_name, "join")) {
+                        // struct brcmf_ext_join_params_le: ssid_le, scan_le, then assoc_le
+                        // (bssid at 56, chanspec_num at 64, chanspec_list at 68)
+                        join = JoinRequest.parse(arg, 56);
                     } else if (std.mem.eql(u8, var_name, "bus:rxglom") or
                         std.mem.eql(u8, var_name, "ulp_sdioctrl") or
                         std.mem.eql(u8, var_name, "pfn") or
@@ -1053,6 +1123,38 @@ pub const Cyw43430 = struct {
                     std.mem.writeInt(u32, dst[12..16], self.chip.rev(), .little); // chiprev
                     std.mem.writeInt(u32, dst[20..24], 42, .little); // corerev
                     std.mem.writeInt(u32, dst[44..48], self.chip.id(), .little); // chipnum
+                }
+            },
+            BRCMF_C_SET_SSID => {
+                // struct brcmf_join_params: ssid_le, then params_le (bssid at 36, chanspec_num at
+                // 44, chanspec_list at 48)
+                join = JoinRequest.parse(body, 36);
+                out_body_len = 0;
+            },
+            BRCMF_C_DISASSOC => {
+                leave = true;
+                out_body_len = 0;
+            },
+            BRCMF_C_GET_BSS_INFO, BRCMF_C_GET_BSSID, BRCMF_C_GET_RSSI, BRCMF_C_GET_RATE => {
+                const dst = resp_buf[16 .. 16 + max_body];
+                @memset(dst, 0);
+                if (self.joined) |ap| {
+                    switch (cmd) {
+                        // A length word, then struct brcmf_bss_info_le
+                        BRCMF_C_GET_BSS_INFO => if (dst.len >= 4 + BSS_INFO_SIZE + 64) {
+                            const n = self.writeBssInfo(ap, dst[4..]);
+                            std.mem.writeInt(u32, dst[0..4], n, .little);
+                        },
+                        BRCMF_C_GET_BSSID => if (dst.len >= 6) @memcpy(dst[0..6], &ap.bssid),
+                        // struct brcmf_scb_val_le { val, ea }
+                        BRCMF_C_GET_RSSI => if (dst.len >= 4) std.mem.writeInt(i32, dst[0..4], ap.rssi, .little),
+                        // In 500 kb/s units: 54 Mb/s
+                        BRCMF_C_GET_RATE => if (dst.len >= 4) std.mem.writeInt(u32, dst[0..4], 108, .little),
+                        else => unreachable,
+                    }
+                } else {
+                    status = -17; // BCME_NOTASSOCIATED
+                    flags |= BCDC_DCMD_ERROR;
                 }
             },
             BRCMF_C_GET_VERSION => {
@@ -1100,6 +1202,8 @@ pub const Cyw43430 = struct {
         self.queueRxFrame(SDPCM_CONTROL_CHANNEL, resp_buf[0 .. 16 + out_body_len]);
 
         if (escan_params) |params| self.runEscan(params);
+        if (join) |req| self.runJoin(req);
+        if (leave) self.leaveNetwork();
     }
 
     /// The channel widths enabled in `band`: what the host set with `bw_cap`, or all supported
@@ -1236,6 +1340,98 @@ pub const Cyw43430 = struct {
         self.queueEvent(BRCMF_E_ESCAN_RESULT, BRCMF_E_STATUS_SUCCESS, &.{});
     }
 
+    const BRCMF_E_SET_SSID: u32 = 0;
+    const BRCMF_E_AUTH: u32 = 3;
+    const BRCMF_E_ASSOC: u32 = 7;
+    const BRCMF_E_LINK: u32 = 16;
+    const BRCMF_E_STATUS_NO_NETWORKS: u32 = 3;
+    const BRCMF_EVENT_MSG_LINK: u16 = 0x01;
+    const STA_INFO_SIZE: usize = 84; // struct brcmf_sta_info_le, version 3
+
+    /// A join (SET_SSID, or the `join` iovar): an SSID, then a BSSID (broadcast or zero for any)
+    /// and the chanspecs to look on (none for all)
+    const JoinRequest = struct {
+        ssid_le: [36]u8,
+        bssid: [6]u8,
+        chanspecs: [4]u16,
+        n_chanspecs: usize,
+
+        fn parse(params: []const u8, bssid_at: usize) ?JoinRequest {
+            if (params.len < 36) return null;
+            var req: JoinRequest = .{ .ssid_le = params[0..36].*, .bssid = @splat(0xff), .chanspecs = undefined, .n_chanspecs = 0 };
+            if (params.len >= bssid_at + 6) req.bssid = params[bssid_at..][0..6].*;
+            const num_at = bssid_at + 8;
+            if (params.len >= num_at + 4) {
+                const n = std.mem.readInt(u32, params[num_at..][0..4], .little);
+                for (0..@min(n, req.chanspecs.len)) |i| {
+                    const at = num_at + 4 + i * 2;
+                    if (at + 2 > params.len) break;
+                    req.chanspecs[req.n_chanspecs] = std.mem.readInt(u16, params[at..][0..2], .little);
+                    req.n_chanspecs += 1;
+                }
+            }
+            return req;
+        }
+    };
+
+    /// Joins the access point radio the request picks (the strongest, given a choice). The
+    /// network is open, so the firmware authenticates and associates by itself: it reports
+    /// BRCMF_E_AUTH, BRCMF_E_ASSOC, link up and BRCMF_E_SET_SSID, or BRCMF_E_SET_SSID failing
+    /// with no networks.
+    fn runJoin(self: *Cyw43430, req: JoinRequest) void {
+        const any_bssid = std.mem.allEqual(u8, &req.bssid, 0xff) or std.mem.allEqual(u8, &req.bssid, 0);
+        var aps: [2]AccessPoint = undefined;
+        var best: ?AccessPoint = null;
+        if (std.mem.readInt(u32, req.ssid_le[0..4], .little) != 0 and self.ssidMatches(&req.ssid_le)) {
+            for (self.accessPoints(&aps)) |ap| {
+                if (!any_bssid and !std.mem.eql(u8, &req.bssid, &ap.bssid)) continue;
+                if (req.n_chanspecs != 0) {
+                    var listed = false;
+                    for (req.chanspecs[0..req.n_chanspecs]) |cs| {
+                        if ((cs & 0xff) == ap.channel) listed = true;
+                    }
+                    if (!listed) continue;
+                }
+                if (best == null or ap.rssi > best.?.rssi) best = ap;
+            }
+        }
+        if (self.joined) |old| self.queueLinkEvent(BRCMF_E_LINK, 0, 0, old.bssid);
+        self.joined = best;
+        const ap = best orelse {
+            self.queueLinkEvent(BRCMF_E_SET_SSID, BRCMF_E_STATUS_NO_NETWORKS, 0, @splat(0));
+            return;
+        };
+        self.queueLinkEvent(BRCMF_E_AUTH, BRCMF_E_STATUS_SUCCESS, 0, ap.bssid);
+        self.queueLinkEvent(BRCMF_E_ASSOC, BRCMF_E_STATUS_SUCCESS, 0, ap.bssid);
+        self.queueLinkEvent(BRCMF_E_LINK, BRCMF_E_STATUS_SUCCESS, BRCMF_EVENT_MSG_LINK, ap.bssid);
+        self.queueLinkEvent(BRCMF_E_SET_SSID, BRCMF_E_STATUS_SUCCESS, 0, ap.bssid);
+    }
+
+    /// Disassociates (BRCMF_C_DISASSOC): the link goes down
+    fn leaveNetwork(self: *Cyw43430) void {
+        const ap = self.joined orelse return;
+        self.joined = null;
+        self.queueLinkEvent(BRCMF_E_LINK, BRCMF_E_STATUS_SUCCESS, 0, ap.bssid);
+    }
+
+    fn queueLinkEvent(self: *Cyw43430, event_type: u32, status: u32, flags: u16, addr: [6]u8) void {
+        self.queueEventFrom(event_type, status, flags, addr, &.{});
+    }
+
+    /// The access point as a station seen from this one (struct brcmf_sta_info_le version 3):
+    /// authenticated, associated and authorized
+    fn writeStaInfo(self: *const Cyw43430, dst: []u8) void {
+        const ap = self.joined orelse return;
+        if (dst.len < STA_INFO_SIZE) return;
+        @memset(dst[0..STA_INFO_SIZE], 0);
+        std.mem.writeInt(u16, dst[0..2], 3, .little); // ver
+        std.mem.writeInt(u16, dst[2..4], STA_INFO_SIZE, .little); // len
+        std.mem.writeInt(u16, dst[4..6], if (ap.band_5g) 0x0001 else 0x0401, .little); // cap
+        // flags: BRCMF_STA_AUTHE | BRCMF_STA_ASSOC | BRCMF_STA_AUTHO
+        std.mem.writeInt(u32, dst[8..12], 0x08 | 0x10 | 0x20, .little);
+        @memcpy(dst[16..22], &ap.bssid); // ea
+    }
+
     /// Whether the access point answers to `ssid_le` (struct brcmf_ssid_le: length, SSID);
     /// an empty SSID is a wildcard
     fn ssidMatches(self: *const Cyw43430, ssid_le: *const [36]u8) bool {
@@ -1246,7 +1442,19 @@ pub const Cyw43430 = struct {
 
     fn queueEscanResult(self: *Cyw43430, sync_id: u16, ap: AccessPoint) void {
         var buf: [ESCAN_RESULT_FIXED + BSS_INFO_SIZE + 64]u8 = @splat(0);
-        const bi = buf[ESCAN_RESULT_FIXED..];
+        const bi_len = self.writeBssInfo(ap, buf[ESCAN_RESULT_FIXED..]);
+
+        // struct brcmf_escan_result_le: buflen, version, sync_id, bss_count, bss_info_le
+        const buflen: u32 = @intCast(ESCAN_RESULT_FIXED + bi_len);
+        std.mem.writeInt(u32, buf[0..4], buflen, .little);
+        std.mem.writeInt(u32, buf[4..8], 109, .little);
+        std.mem.writeInt(u16, buf[8..10], sync_id, .little);
+        std.mem.writeInt(u16, buf[10..12], 1, .little);
+        self.queueEvent(BRCMF_E_ESCAN_RESULT, BRCMF_E_STATUS_PARTIAL, buf[0..buflen]);
+    }
+
+    /// Writes `ap`'s struct brcmf_bss_info_le, with its IEs, to the zeroed `bi`; returns its length
+    fn writeBssInfo(self: *const Cyw43430, ap: AccessPoint, bi: []u8) u32 {
         const ssid = self.ap_ssid[0..self.ap_ssid_len];
         // Rates in 500 kb/s units, 0x80 marking the basic rates: 1, 2, 5.5, 11 Mb/s (basic) and
         // 6..54 Mb/s at 2.4 GHz; 6, 12, 24 Mb/s (basic) and 9..54 Mb/s at 5 GHz
@@ -1301,19 +1509,17 @@ pub const Cyw43430 = struct {
         std.mem.writeInt(u16, bi[116..118], BSS_INFO_SIZE, .little); // ie_offset
         std.mem.writeInt(u32, bi[120..124], @intCast(n), .little); // ie_length
         std.mem.writeInt(u16, bi[124..126], @intCast(ap.rssi + 92), .little); // SNR
-
-        // struct brcmf_escan_result_le: buflen, version, sync_id, bss_count, bss_info_le
-        const buflen: u32 = @intCast(ESCAN_RESULT_FIXED + bi_len);
-        std.mem.writeInt(u32, buf[0..4], buflen, .little);
-        std.mem.writeInt(u32, buf[4..8], 109, .little);
-        std.mem.writeInt(u16, buf[8..10], sync_id, .little);
-        std.mem.writeInt(u16, buf[10..12], 1, .little);
-        self.queueEvent(BRCMF_E_ESCAN_RESULT, BRCMF_E_STATUS_PARTIAL, buf[0..buflen]);
+        return bi_len;
     }
 
     /// Queues a firmware event (BCDC header, ethernet header, struct brcm_ethhdr, then
     /// struct brcmf_event_msg_be followed by `data`) on the SDPCM event channel
     fn queueEvent(self: *Cyw43430, event_type: u32, status: u32, data: []const u8) void {
+        self.queueEventFrom(event_type, status, 0, self.mac_address, data);
+    }
+
+    /// Queues a firmware event about `addr` (the peer, or this station)
+    fn queueEventFrom(self: *Cyw43430, event_type: u32, status: u32, flags: u16, addr: [6]u8, data: []const u8) void {
         var evt: [76 + 512]u8 = @splat(0);
         if (data.len > evt.len - 76) return;
 
@@ -1339,13 +1545,13 @@ pub const Cyw43430 = struct {
 
         // 4. struct brcmf_event_msg_be (48 bytes at evt[28..76])
         std.mem.writeInt(u16, evt[28..30], 2, .big); // version = 2
-        std.mem.writeInt(u16, evt[30..32], 0, .big); // flags = 0
+        std.mem.writeInt(u16, evt[30..32], flags, .big);
         std.mem.writeInt(u32, evt[32..36], event_type, .big);
         std.mem.writeInt(u32, evt[36..40], status, .big);
         std.mem.writeInt(u32, evt[40..44], 0, .big); // reason = 0
         std.mem.writeInt(u32, evt[44..48], 0, .big); // auth_type = 0
         std.mem.writeInt(u32, evt[48..52], @intCast(data.len), .big); // datalen
-        @memcpy(evt[52..58], &self.mac_address); // addr
+        @memcpy(evt[52..58], &addr);
         @memcpy(evt[58..63], "wlan0"); // ifname
         evt[74] = 0; // ifidx
         evt[75] = 0; // bsscfgidx
@@ -1663,4 +1869,141 @@ test "Cyw43430 scans find only the access point's 2.4 GHz radio" {
     var bss: [4][256]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try testEscan(&chip, "", &.{}, &bss));
     try std.testing.expectEqual(@as(u8, 6), bss[0][88]);
+}
+
+/// Sends BCDC command `cmd` (SET when `set`) with `body`, and returns the reply body
+fn testDcmd(chip: *Cyw43430, cmd: u32, set: bool, body: []const u8, reply: *[2048]u8) []const u8 {
+    var tx: [512]u8 = @splat(0);
+    const total: u16 = @intCast(12 + 16 + body.len);
+    std.mem.writeInt(u16, tx[0..2], total, .little);
+    std.mem.writeInt(u16, tx[2..4], ~total, .little);
+    tx[7] = 12; // SDPCM_CONTROL_CHANNEL
+    std.mem.writeInt(u32, tx[12..16], cmd, .little);
+    std.mem.writeInt(u32, tx[16..20], if (set) @intCast(body.len) else 1536, .little);
+    std.mem.writeInt(u32, tx[20..24], if (set) 0x0001_0002 else 0x0001_0000, .little);
+    @memcpy(tx[28..][0..body.len], body);
+    chip.writeExtended(2, 0, true, tx[0..total]);
+    chip.readExtended(2, 0, true, reply);
+    std.debug.assert(reply[5] & 0x0f == 0);
+    const len = std.mem.readInt(u16, reply[0..2], .little);
+    return reply[12 + 16 .. len];
+}
+
+const TestEvent = struct { event_type: u32, status: u32, flags: u16, addr: [6]u8 };
+
+fn testReadEvent(chip: *Cyw43430) !TestEvent {
+    var frame: [2048]u8 = undefined;
+    chip.readExtended(2, 0, true, &frame);
+    try std.testing.expectEqual(@as(u8, 1), frame[5] & 0x0f); // SDPCM_EVENT_CHANNEL
+    const evt = frame[12 + 4 ..];
+    return .{
+        .event_type = std.mem.readInt(u32, evt[28..32], .big),
+        .status = std.mem.readInt(u32, evt[32..36], .big),
+        .flags = std.mem.readInt(u16, evt[26..28], .big),
+        .addr = evt[48..54].*,
+    };
+}
+
+/// struct brcmf_ext_join_params_le for `ssid` (any BSSID) on `chanspec` (0 = any channel)
+fn testJoinParams(ssid: []const u8, chanspec: u16) [70]u8 {
+    var p: [70]u8 = @splat(0);
+    std.mem.writeInt(u32, p[0..4], @intCast(ssid.len), .little);
+    @memcpy(p[4..][0..ssid.len], ssid);
+    @memset(p[56..62], 0xff);
+    if (chanspec != 0) {
+        std.mem.writeInt(u32, p[64..68], 1, .little);
+        std.mem.writeInt(u16, p[68..70], chanspec, .little);
+    }
+    return p;
+}
+
+test "Cyw43430 joins the open access point and reaches its network" {
+    var chip = Cyw43430{ .mac_address = .{ 0xb8, 0x27, 0xeb, 0x01, 0x02, 0x03 } };
+    defer chip.deinit();
+    chip.writeByte(0, 0x04, 0x07);
+    chip.setAccessPointName("tokamak");
+    var reply: [2048]u8 = undefined;
+    var aps: [2]Cyw43430.AccessPoint = undefined;
+    const ap = chip.accessPoints(&aps)[0];
+
+    // Joining an SSID that is not there fails
+    var body: [80]u8 = @splat(0);
+    @memcpy(body[0..5], "join\x00");
+    body[5..75].* = testJoinParams("other", 0);
+    _ = testDcmd(&chip, 263, true, body[0..75], &reply);
+    var e = try testReadEvent(&chip);
+    try std.testing.expectEqual(@as(u32, 0), e.event_type); // BRCMF_E_SET_SSID
+    try std.testing.expectEqual(@as(u32, 3), e.status); // BRCMF_E_STATUS_NO_NETWORKS
+
+    // Joining it: authenticated, associated, link up, SET_SSID done
+    body[5..75].* = testJoinParams("tokamak", 0);
+    _ = testDcmd(&chip, 263, true, body[0..75], &reply);
+    for ([_]u32{ 3, 7, 16, 0 }) |want| {
+        e = try testReadEvent(&chip);
+        try std.testing.expectEqual(want, e.event_type);
+        try std.testing.expectEqual(@as(u32, 0), e.status);
+        try std.testing.expectEqualSlices(u8, &ap.bssid, &e.addr);
+        if (want == 16) try std.testing.expectEqual(@as(u16, 1), e.flags); // BRCMF_EVENT_MSG_LINK
+    }
+    var r = testDcmd(&chip, 136, false, &.{}, &reply); // BRCMF_C_GET_BSS_INFO
+    try std.testing.expectEqualStrings("tokamak", r[4 + 19 ..][0..r[4 + 18]]);
+    r = testDcmd(&chip, 23, false, &.{}, &reply); // BRCMF_C_GET_BSSID
+    try std.testing.expectEqualSlices(u8, &ap.bssid, r[0..6]);
+
+    // ARP for the gateway over the data channel: answered by 10.0.3.2
+    var tx: [128]u8 = @splat(0);
+    const arp = tx[12 + 4 ..];
+    @memset(arp[0..6], 0xff);
+    @memcpy(arp[6..12], &chip.mac_address);
+    arp[12..22].* = .{ 0x08, 0x06, 0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01 };
+    @memcpy(arp[22..28], &chip.mac_address);
+    arp[28..32].* = .{ 10, 0, 3, 15 };
+    arp[38..42].* = .{ 10, 0, 3, 2 };
+    const total: u16 = 12 + 4 + 42;
+    std.mem.writeInt(u16, tx[0..2], total, .little);
+    std.mem.writeInt(u16, tx[2..4], ~total, .little);
+    tx[4] = 1;
+    tx[5] = 2; // SDPCM_DATA_CHANNEL
+    tx[7] = 12;
+    tx[12] = 0x20; // BCDC data header
+    chip.writeExtended(2, 0, true, tx[0..total]);
+    var frame: [2048]u8 = undefined;
+    chip.readExtended(2, 0, true, &frame);
+    try std.testing.expectEqual(@as(u8, 2), frame[5] & 0x0f);
+    const eth = frame[12 + 4 ..];
+    try std.testing.expectEqualSlices(u8, &.{ 0x08, 0x06 }, eth[12..14]);
+    try std.testing.expectEqualSlices(u8, &.{ 0x52, 0x55, 0x0a, 0x00, 0x03, 0x02 }, eth[22..28]);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 0, 3, 2 }, eth[28..32]);
+
+    // Disassociating takes the link down
+    _ = testDcmd(&chip, 52, true, &.{}, &reply); // BRCMF_C_DISASSOC
+    e = try testReadEvent(&chip);
+    try std.testing.expectEqual(@as(u32, 16), e.event_type);
+    try std.testing.expectEqual(@as(u16, 0), e.flags);
+}
+
+test "Cyw43455 joins the access point's 5 GHz radio when asked for its channel" {
+    var chip = Cyw43430{ .chip = .cyw43455 };
+    defer chip.deinit();
+    chip.writeByte(0, 0x04, 0x07);
+    chip.setAccessPointName("tokamak");
+    var reply: [2048]u8 = undefined;
+    var aps: [2]Cyw43430.AccessPoint = undefined;
+    const ap_5g = chip.accessPoints(&aps)[1];
+
+    // BRCMF_C_SET_SSID with struct brcmf_join_params on 5 GHz channel 36
+    var body: [50]u8 = @splat(0);
+    std.mem.writeInt(u32, body[0..4], 7, .little);
+    @memcpy(body[4..11], "tokamak");
+    @memset(body[36..42], 0xff);
+    std.mem.writeInt(u32, body[44..48], 1, .little);
+    std.mem.writeInt(u16, body[48..50], 0xd024, .little);
+    _ = testDcmd(&chip, 26, true, &body, &reply);
+    for ([_]u32{ 3, 7, 16, 0 }) |want| {
+        const e = try testReadEvent(&chip);
+        try std.testing.expectEqual(want, e.event_type);
+        try std.testing.expectEqualSlices(u8, &ap_5g.bssid, &e.addr);
+    }
+    const r = testDcmd(&chip, 127, false, &.{}, &reply); // BRCMF_C_GET_RSSI
+    try std.testing.expectEqual(@as(i32, ap_5g.rssi), std.mem.readInt(i32, r[0..4], .little));
 }

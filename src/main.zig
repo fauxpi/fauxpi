@@ -313,6 +313,7 @@ fn loadGuestBoot(
     const saved_hdr_ext_mask = soc.gpio.ext_mask & gpio.Gpio.HEADER_PIN_MASK;
     const saved_hdr_ext_level = soc.gpio.ext_level & gpio.Gpio.HEADER_PIN_MASK;
     soc.usb.hid.net.deinit();
+    soc.sdhci.wifi.deinit();
     @memset(ram[0..@min(board_model.ramBytes(), ram.len)], 0);
     soc.initInPlace(ram, opts.width, opts.height);
     soc.mailbox.fb_allocated = true;
@@ -424,6 +425,7 @@ fn syncWindowPeripheralsToSoc(w: *const window.Window, soc: *Bcm2835) void {
     soc.usb.hid.mouse_connected = w.status.usb_mouse_connected;
     soc.usb.hid.ethernet_connected = w.status.ethernet_connected;
     soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
+    soc.sdhci.wifi.net.dhcp_enabled = w.status.dhcp_enabled;
 }
 
 fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliOptions) !void {
@@ -455,6 +457,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     defer gpa.destroy(soc);
     soc.initInPlace(ram, opts.width, opts.height);
     defer soc.usb.hid.net.deinit();
+    defer soc.sdhci.wifi.deinit();
     const cpus = try gpa.create([4]Cpu);
     defer gpa.destroy(cpus);
     for (cpus) |*cpu| cpu.resetInPlace();
@@ -474,6 +477,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
     if (!opts.headless) {
         wl_win = try window.Window.create(gpa, environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
+        wl_win.?.wifi_net = &soc.sdhci.wifi.net;
         wl_win.?.status.power_connected = opts.power;
         if (opts.sd_path) |sd_path| {
             if (qcow2.Qcow2Disk.getFileSizeLinux(sd_path)) |fsize| {
@@ -618,6 +622,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             }
 
             soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
+
+            soc.sdhci.wifi.net.dhcp_enabled = w.status.dhcp_enabled;
             soc.setCpuTemperatureCelsius(w.status.cpu_temperature_c);
 
             if (!w.status.power_connected or !guest_booted) {
@@ -791,6 +797,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
 
         if (all_wfi) {
             soc.usb.pollNetwork(soc.vc_ram);
+            soc.sdhci.wifi.pollNetwork();
             soc.usb.wakeIfPending();
             soc.updateIrqs();
             for (0..num_cores) |i| {
@@ -835,7 +842,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     soc.usb.pending_csplit_sof or
                     (soc.usb.sof_wakeup_frames > 0) or
                     soc.usb.hid.hasPendingInterruptIn() or
-                    soc.usb.hid.hasEthBulkIn();
+                    soc.usb.hid.hasEthBulkIn() or
+                    soc.sdhci.wifi.hasPendingRx();
 
                 const sleep_start_ns = monotonicNs();
                 const sleep_us: u64 = if (guest_vblank_irq_enabled or has_activity) blk: {
@@ -857,6 +865,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 if (realtime) {
                     // Guest time catches up with the host clock on the next pass.
                     soc.usb.pollNetwork(soc.vc_ram);
+                    soc.sdhci.wifi.pollNetwork();
                     soc.usb.wakeIfPending();
                     soc.updateIrqs();
                     noteRealtimeIdle(&rt_idle_no_deadline_since_ns, timer_wait_us, cpus);
@@ -865,7 +874,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     const elapsed_sleep_us = @max((sleep_end_ns -| sleep_start_ns) / 1000, 1);
                     const woke_for_event = (!had_ui_dirty and w.ui_dirty) or
                         (!had_pending_in and soc.usb.hid.hasPendingInterruptIn()) or
-                        soc.usb.hid.hasEthBulkIn();
+                        soc.usb.hid.hasEthBulkIn() or
+                        soc.sdhci.wifi.hasPendingRx();
                     const jump = if (woke_for_event)
                         @min(elapsed_sleep_us, timer_wait_us)
                     else
@@ -875,6 +885,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     soc.pm.advance(jump);
                     soc.advanceAudio(jump);
                     soc.usb.pollNetwork(soc.vc_ram);
+                    soc.sdhci.wifi.pollNetwork();
                     soc.usb.wakeIfPending();
                     for (0..num_cores) |i| {
                         if (!cpus[i].halted_spin) {
@@ -900,12 +911,14 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 const usb_active = soc.usb.pending_csplit_sof or
                     (soc.usb.sof_wakeup_frames > 0) or
                     soc.usb.hid.hasPendingInterruptIn() or
-                    soc.usb.hid.hasEthBulkIn();
+                    soc.usb.hid.hasEthBulkIn() or
+                    soc.sdhci.wifi.hasPendingRx();
                 const until_vblank_us: u64 = 16_667 -| (soc.timer.counter -| last_guest_vblank_us);
                 var sleep_us = @min(timer_wait_us, @max(until_vblank_us, 1));
                 if (usb_active) sleep_us = @min(sleep_us, 1000);
                 host_posix.sleepUs(sleep_us);
                 soc.usb.pollNetwork(soc.vc_ram);
+                soc.sdhci.wifi.pollNetwork();
                 soc.usb.wakeIfPending();
                 soc.updateIrqs();
                 noteRealtimeIdle(&rt_idle_no_deadline_since_ns, timer_wait_us, cpus);
@@ -926,7 +939,8 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 const usb_active = soc.usb.pending_csplit_sof or
                     (soc.usb.sof_wakeup_frames > 0) or
                     soc.usb.hid.hasPendingInterruptIn() or
-                    soc.usb.hid.hasEthBulkIn();
+                    soc.usb.hid.hasEthBulkIn() or
+                    soc.sdhci.wifi.hasPendingRx();
                 const until_vblank_us: u64 = 16_667 -| (soc.timer.counter -| last_guest_vblank_us);
                 var jump = @min(timer_wait_us, @max(until_vblank_us, 1));
                 if (usb_active) jump = @min(jump, 1000);
@@ -981,6 +995,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 soc.setAudioConnected(w.status.audio_connected);
                 soc.setCpuTemperatureCelsius(w.status.cpu_temperature_c);
                 soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
+                soc.sdhci.wifi.net.dhcp_enabled = w.status.dhcp_enabled;
                 soc.usb.wakeIfPending();
                 soc.updateIrqs();
 

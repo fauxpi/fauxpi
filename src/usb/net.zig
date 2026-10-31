@@ -1,8 +1,9 @@
 const std = @import("std");
 const host_posix = @import("../host/posix.zig");
 
-/// User-mode NAT / SLIRP virtual network stack for CDC-ECM USB Ethernet.
+/// User-mode NAT / SLIRP virtual network stack for the emulated Ethernet and Wi-Fi.
 /// Provides virtual gateway `10.0.2.2` (`52:55:0a:00:02:02`), DHCP server (`10.0.2.15/24`),
+/// or the same on another 10.0.x.0/24 (`subnet`),
 /// ARP responder, ICMP Echo responder, built-in SNTP server (UDP 123), and non-blocking
 /// UDP/TCP NAT forwarding via unprivileged host sockets.
 pub const VirtualNetwork = struct {
@@ -50,6 +51,8 @@ pub const VirtualNetwork = struct {
         last_tick: u64 = 0,
     };
 
+    /// Third octet of the network's 10.0.x.0/24 addresses (`GATEWAY_IP` etc. are for 2)
+    subnet: u8 = 2,
     guest_mac: [6]u8 = DEFAULT_GUEST_MAC,
     guest_ip: [4]u8 = DEFAULT_GUEST_IP,
     dhcp_enabled: bool = true,
@@ -66,6 +69,23 @@ pub const VirtualNetwork = struct {
 
     udp_sessions: [MAX_UDP_SESSIONS]UdpSession = @splat(.{}),
     tcp_conns: [MAX_TCP_CONNS]TcpConn = @splat(.{}),
+
+    /// The network's addresses: gateway 10.0.<subnet>.2, guest 10.0.<subnet>.15
+    pub fn gatewayIp(self: *const VirtualNetwork) [4]u8 {
+        return .{ 10, 0, self.subnet, 2 };
+    }
+
+    pub fn defaultGuestIp(self: *const VirtualNetwork) [4]u8 {
+        return .{ 10, 0, self.subnet, 15 };
+    }
+
+    fn broadcastIp(self: *const VirtualNetwork) [4]u8 {
+        return .{ 10, 0, self.subnet, 255 };
+    }
+
+    pub fn gatewayMac(self: *const VirtualNetwork) [6]u8 {
+        return .{ 0x52, 0x55, 0x0a, 0x00, self.subnet, 0x02 };
+    }
 
     pub fn deinit(self: *VirtualNetwork) void {
         for (&self.udp_sessions) |*s| {
@@ -150,13 +170,13 @@ pub const VirtualNetwork = struct {
         }
 
         // Do not reply to ARP DAD probes for the guest's own IP address
-        if (std.mem.eql(u8, tpa, &self.guest_ip) or std.mem.eql(u8, tpa, &DEFAULT_GUEST_IP)) {
-            if (!std.mem.eql(u8, tpa, &GATEWAY_IP)) return;
+        if (std.mem.eql(u8, tpa, &self.guest_ip) or std.mem.eql(u8, tpa, &self.defaultGuestIp())) {
+            if (!std.mem.eql(u8, tpa, &self.gatewayIp())) return;
         }
 
         var reply: [42]u8 = @splat(0);
         @memcpy(reply[0..6], sha);
-        @memcpy(reply[6..12], &GATEWAY_MAC);
+        @memcpy(reply[6..12], &self.gatewayMac());
         std.mem.writeInt(u16, reply[12..14], 0x0806, .big);
 
         std.mem.writeInt(u16, reply[14..16], 1, .big); // Ethernet
@@ -164,7 +184,7 @@ pub const VirtualNetwork = struct {
         reply[18] = 6;
         reply[19] = 4;
         std.mem.writeInt(u16, reply[20..22], 2, .big); // ARP Reply
-        @memcpy(reply[22..28], &GATEWAY_MAC);
+        @memcpy(reply[22..28], &self.gatewayMac());
         @memcpy(reply[28..32], tpa);
         @memcpy(reply[32..38], sha);
         @memcpy(reply[38..42], spa);
@@ -272,7 +292,7 @@ pub const VirtualNetwork = struct {
             else => return,
         };
 
-        self.guest_ip = DEFAULT_GUEST_IP;
+        self.guest_ip = self.defaultGuestIp();
 
         var bootp: [300]u8 = @splat(0);
         bootp[0] = 2; // BOOTREPLY
@@ -281,8 +301,8 @@ pub const VirtualNetwork = struct {
         bootp[3] = 0;
         @memcpy(bootp[4..8], data[4..8]); // xid
         @memcpy(bootp[10..12], data[10..12]); // flags
-        @memcpy(bootp[16..20], &DEFAULT_GUEST_IP); // yiaddr
-        @memcpy(bootp[20..24], &GATEWAY_IP); // siaddr
+        @memcpy(bootp[16..20], &self.defaultGuestIp()); // yiaddr
+        @memcpy(bootp[20..24], &self.gatewayIp()); // siaddr
         @memcpy(bootp[28..44], data[28..44]); // chaddr
         @memcpy(bootp[236..240], &[4]u8{ 99, 130, 83, 99 }); // magic cookie
 
@@ -296,7 +316,7 @@ pub const VirtualNetwork = struct {
         // Option 54: Server Identifier (10.0.2.2)
         bootp[o + 0] = 54;
         bootp[o + 1] = 4;
-        @memcpy(bootp[o + 2 .. o + 6], &GATEWAY_IP);
+        @memcpy(bootp[o + 2 .. o + 6], &self.gatewayIp());
         o += 6;
 
         // Option 51: IP Address Lease Time (86400s)
@@ -314,33 +334,33 @@ pub const VirtualNetwork = struct {
         // Option 28: Broadcast Address (10.0.2.255)
         bootp[o + 0] = 28;
         bootp[o + 1] = 4;
-        @memcpy(bootp[o + 2 .. o + 6], &BROADCAST_IP);
+        @memcpy(bootp[o + 2 .. o + 6], &self.broadcastIp());
         o += 6;
 
         // Option 3: Router (10.0.2.2)
         bootp[o + 0] = 3;
         bootp[o + 1] = 4;
-        @memcpy(bootp[o + 2 .. o + 6], &GATEWAY_IP);
+        @memcpy(bootp[o + 2 .. o + 6], &self.gatewayIp());
         o += 6;
 
         // Option 6: DNS Server (10.0.2.2)
         bootp[o + 0] = 6;
         bootp[o + 1] = 4;
-        @memcpy(bootp[o + 2 .. o + 6], &GATEWAY_IP);
+        @memcpy(bootp[o + 2 .. o + 6], &self.gatewayIp());
         o += 6;
 
         // Option 42: NTP Server (10.0.2.2)
         bootp[o + 0] = 42;
         bootp[o + 1] = 4;
-        @memcpy(bootp[o + 2 .. o + 6], &GATEWAY_IP);
+        @memcpy(bootp[o + 2 .. o + 6], &self.gatewayIp());
         o += 6;
 
         // Option 255: End
         bootp[o] = 255;
         o += 1;
 
-        const dst_ip = if ((data[10] & 0x80) != 0) [4]u8{ 255, 255, 255, 255 } else DEFAULT_GUEST_IP;
-        self.sendUdpPacket(GATEWAY_IP, 67, dst_ip, 68, bootp[0..o]);
+        const dst_ip = if ((data[10] & 0x80) != 0) [4]u8{ 255, 255, 255, 255 } else self.defaultGuestIp();
+        self.sendUdpPacket(self.gatewayIp(), 67, dst_ip, 68, bootp[0..o]);
     }
 
     fn handleSntp(self: *VirtualNetwork, src_ip: [4]u8, src_port: u16, dst_ip: [4]u8, req: []const u8) void {
@@ -368,7 +388,7 @@ pub const VirtualNetwork = struct {
         std.mem.writeInt(u32, rep[40..44], ntp_sec, .big);
         std.mem.writeInt(u32, rep[44..48], ntp_frac, .big);
 
-        const reply_src = if (std.mem.eql(u8, &dst_ip, &[4]u8{ 255, 255, 255, 255 })) GATEWAY_IP else dst_ip;
+        const reply_src = if (std.mem.eql(u8, &dst_ip, &[4]u8{ 255, 255, 255, 255 })) self.gatewayIp() else dst_ip;
         self.sendUdpPacket(reply_src, 123, src_ip, src_port, &rep);
     }
 
@@ -398,7 +418,7 @@ pub const VirtualNetwork = struct {
     }
 
     fn mapTargetIp(self: *VirtualNetwork, dst_ip: [4]u8, dst_port: u16) [4]u8 {
-        if (std.mem.eql(u8, &dst_ip, &GATEWAY_IP)) {
+        if (std.mem.eql(u8, &dst_ip, &self.gatewayIp())) {
             if (dst_port == 53) {
                 return self.resolveHostDns();
             }
@@ -717,7 +737,7 @@ pub const VirtualNetwork = struct {
         const dst_mac = if (is_bcast) [6]u8{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } else self.guest_mac;
 
         @memcpy(frame[0..6], &dst_mac);
-        @memcpy(frame[6..12], &GATEWAY_MAC);
+        @memcpy(frame[6..12], &self.gatewayMac());
         std.mem.writeInt(u16, frame[12..14], 0x0800, .big);
 
         const ip = frame[14..34];

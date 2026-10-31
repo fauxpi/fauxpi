@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const host_posix = @import("../host/posix.zig");
 const UsbHidComposite = @import("../usb/hid.zig").UsbHidComposite;
+const VirtualNetwork = @import("../usb/net.zig").VirtualNetwork;
 const Gpio = @import("../soc/gpio.zig").Gpio;
 const board_sheet = @import("../ui/board_sheet.zig");
 const window = @import("window.zig");
@@ -349,6 +350,8 @@ pub const WindowsWindow = struct {
     keys_down: std.StaticBitSet(256) = .empty,
 
     hid: ?*UsbHidComposite = null,
+    /// The Wi-Fi network, whose sockets wake event waits as Ethernet's do
+    wifi_net: ?*VirtualNetwork = null,
     gpio: *Gpio,
     ui: board_sheet.BoardUi,
     status: board_sheet.SystemStatus = .{},
@@ -650,6 +653,10 @@ pub const WindowsWindow = struct {
                     eff_timeout_ms = @min(eff_timeout_ms, 2);
                 }
             }
+        }
+        if (self.wifi_net) |wn| {
+            var net_fds: [32]host_posix.pollfd = undefined;
+            if (wn.fillPollFds(&net_fds) > 0) eff_timeout_ms = @min(eff_timeout_ms, 2);
         }
 
         if (eff_timeout_ms > 0) {

@@ -12,6 +12,7 @@ const client = @import("../wayland/client.zig");
 const protocol = @import("../wayland/protocol.zig");
 const portal = @import("../wayland/portal.zig");
 const UsbHidComposite = @import("../usb/hid.zig").UsbHidComposite;
+const VirtualNetwork = @import("../usb/net.zig").VirtualNetwork;
 const Gpio = @import("../soc/gpio.zig").Gpio;
 const board_sheet = @import("../ui/board_sheet.zig");
 const window = @import("window.zig");
@@ -89,6 +90,8 @@ pub const WaylandWindow = struct {
     keys_down: std.StaticBitSet(256) = .empty,
 
     hid: ?*UsbHidComposite = null,
+    /// The Wi-Fi network, whose sockets wake event waits as Ethernet's do
+    wifi_net: ?*VirtualNetwork = null,
     gpio: *Gpio,
     ui: board_sheet.BoardUi,
     status: board_sheet.SystemStatus = .{},
@@ -446,7 +449,7 @@ pub const WaylandWindow = struct {
             }
         }
 
-        var fds: [2 + 32]linux.pollfd = undefined;
+        var fds: [2 + 64]linux.pollfd = undefined;
         var nfds: usize = 1;
         fds[0] = .{ .fd = self.display.conn.fd, .events = linux.POLL.IN, .revents = 0 };
         if (self.picker.fd >= 0) {
@@ -458,6 +461,7 @@ pub const WaylandWindow = struct {
                 nfds += h.net.fillPollFds(fds[nfds..]);
             }
         }
+        if (self.wifi_net) |n| nfds += n.fillPollFds(fds[nfds..]);
 
         var eff_timeout_ms: i32 = if (timeout_us) |us|
             @intCast(@min((us + 999) / 1000, @as(u64, std.math.maxInt(i32))))
