@@ -4046,21 +4046,11 @@ pub const BoardUi = struct {
             _ = c.drawText(11.5, pr.x + 16.0, row_sec_y + 30.0, net_sub, if (pw_invalid) t.@"error" else t.on_surface_variant);
             self.paintMenuButton(c, self.wifi_security_btn_rect, self.wifi_security.label(), self.wifi_security_menu_open, self.wifi_security_btn_hovered, false);
 
-            // The password shows while being typed, otherwise as dots (none for an open network);
-            // only its end fits the field
+            // The password shows as text (dimmed for an open network); only its end fits the field
             const pw_focused = !pw_disabled and self.focused_field == .wifi_password;
-            var pw_disp_buf: [26 * 3 + 1]u8 = undefined;
-            const pw_disp = if (pw_focused) blk: {
-                const tail = pw[pw.len -| 24..];
-                break :blk std.fmt.bufPrint(&pw_disp_buf, "{s}|", .{tail}) catch tail;
-            } else blk: {
-                var n: usize = 0;
-                for (0..if (pw_disabled) 0 else @min(pw.len, 24)) |_| {
-                    @memcpy(pw_disp_buf[n..][0..3], "\u{2022}");
-                    n += 3;
-                }
-                break :blk pw_disp_buf[0..n];
-            };
+            var pw_disp_buf: [26]u8 = undefined;
+            const tail = pw[pw.len -| 24..];
+            const pw_disp = if (pw_focused) std.fmt.bufPrint(&pw_disp_buf, "{s}|", .{tail}) catch tail else tail;
             self.paintTextField(c, self.wifi_password_field_rect, pw_disp, pw_focused, self.wifi_password_field_hovered, pw_disabled);
         }
 
