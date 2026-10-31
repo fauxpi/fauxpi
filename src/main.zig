@@ -182,7 +182,7 @@ fn printUsage(sandboxed: bool) void {
         \\  --model <model>     Board to emulate: zero, zero-w, zero-2-w, 1a+, 1b+, 3a+, 3b+ (default)
         \\  --hdmi-size <WxH>   HDMI output size in pixels (default: 1280x720)
         \\  --wifi-password <p> Secure the emulated Wi-Fi network with WPA2 and passphrase <p> (8-63
-        \\                      characters); without it the network is open
+        \\                      characters), overriding the board settings
         \\
     );
     if (!sandboxed) host_posix.writeStdout(
@@ -358,7 +358,7 @@ fn loadGuestBoot(
     var host_name_buf: [64]u8 = undefined;
     const host_name = host_posix.hostName(&host_name_buf);
     soc.sdhci.wifi.setAccessPointName(if (host_name.len != 0) host_name else "FauxPi");
-    soc.sdhci.wifi.setAccessPointPassphrase(opts.wifi_password orelse "");
+    syncWifiSecurity(soc, null, opts);
     soc.bt.enabled = board_model.hasWireless();
     soc.bt.chip = switch (board_model) {
         .pi_3_a_plus, .pi_3_b_plus => .bcm4345c0,
@@ -435,6 +435,17 @@ fn noteRealtimeIdle(since_ns: *?u64, timer_wait_us: u64, cpus: *[4]Cpu) void {
     } else {
         since_ns.* = since;
     }
+}
+
+/// The emulated Wi-Fi access point's security: `--wifi-password` if given, else the board settings
+fn syncWifiSecurity(soc: *Bcm2835, w: ?*const window.Window, opts: CliOptions) void {
+    if (opts.wifi_password) |p| return soc.sdhci.wifi.setAccessPointSecurity(.wpa2_personal, p);
+    const ui = &(w orelse return soc.sdhci.wifi.setAccessPointSecurity(.open, "")).ui;
+    const security: cyw43430.Cyw43430.Security = switch (ui.wifi_security) {
+        .open => .open,
+        .wpa2_personal => .wpa2_personal,
+    };
+    soc.sdhci.wifi.setAccessPointSecurity(security, ui.wifiPassword());
 }
 
 fn syncWindowPeripheralsToSoc(w: *const window.Window, soc: *Bcm2835) void {
@@ -646,6 +657,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             soc.usb.hid.net.dhcp_enabled = w.status.dhcp_enabled;
 
             soc.sdhci.wifi.net.dhcp_enabled = w.status.dhcp_enabled;
+            syncWifiSecurity(soc, w, opts);
             soc.setCpuTemperatureCelsius(w.status.cpu_temperature_c);
 
             if (!w.status.power_connected or !guest_booted) {

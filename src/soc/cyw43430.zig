@@ -249,7 +249,8 @@ pub const Cyw43430 = struct {
     /// SSID of the open access point scans find (none while empty)
     ap_ssid: [32]u8 = @splat(0),
     ap_ssid_len: u8 = 0,
-    /// WPA2-Personal passphrase of the access point (an open network while empty)
+    /// Security of the access point, and its WPA2-Personal passphrase
+    ap_security: Security = .open,
     ap_passphrase: [63]u8 = @splat(0),
     ap_passphrase_len: u8 = 0,
     /// Security the host set for joining: `wsec` (AES_ENABLED 4 for CCMP), `wpa_auth`
@@ -284,6 +285,7 @@ pub const Cyw43430 = struct {
         const chip = self.chip;
         const ap_ssid = self.ap_ssid;
         const ap_ssid_len = self.ap_ssid_len;
+        const ap_security = self.ap_security;
         const ap_passphrase = self.ap_passphrase;
         const ap_passphrase_len = self.ap_passphrase_len;
         const dhcp_enabled = self.net.dhcp_enabled;
@@ -293,23 +295,34 @@ pub const Cyw43430 = struct {
             .mac_address = mac,
             .ap_ssid = ap_ssid,
             .ap_ssid_len = ap_ssid_len,
+            .ap_security = ap_security,
             .ap_passphrase = ap_passphrase,
             .ap_passphrase_len = ap_passphrase_len,
         };
         self.net.dhcp_enabled = dhcp_enabled;
     }
 
-    /// Secures the access point with WPA2-Personal and `passphrase` (8..63 characters), or
-    /// leaves it open for an empty one
-    pub fn setAccessPointPassphrase(self: *Cyw43430, passphrase: []const u8) void {
+    pub const Security = enum { open, wpa2_personal };
+
+    /// Sets the access point's security, and for WPA2-Personal its passphrase (8 to 63
+    /// characters to be usable). Reconfiguring the access point disconnects its station.
+    pub fn setAccessPointSecurity(self: *Cyw43430, security: Security, passphrase: []const u8) void {
         const n = @min(passphrase.len, self.ap_passphrase.len);
+        if (security == self.ap_security and std.mem.eql(u8, passphrase[0..n], self.ap_passphrase[0..self.ap_passphrase_len])) return;
+        self.ap_security = security;
         @memset(&self.ap_passphrase, 0);
         @memcpy(self.ap_passphrase[0..n], passphrase[0..n]);
         self.ap_passphrase_len = @intCast(n);
+        if (self.joined) |ap| {
+            self.joined = null;
+            self.authorized = false;
+            self.authenticator = null;
+            self.queueEventFrom(BRCMF_E_DEAUTH_IND, BRCMF_E_STATUS_SUCCESS, WLAN_REASON_DEAUTH_LEAVING, 0, ap.bssid, &.{});
+        }
     }
 
     fn secured(self: *const Cyw43430) bool {
-        return self.ap_passphrase_len != 0;
+        return self.ap_security == .wpa2_personal;
     }
 
     pub fn deinit(self: *Cyw43430) void {
@@ -1434,6 +1447,7 @@ pub const Cyw43430 = struct {
     const BRCMF_E_DEAUTH_IND: u32 = 6;
     const BRCMF_E_STATUS_FAIL: u32 = 1;
     const WLAN_REASON_4WAY_HANDSHAKE_TIMEOUT: u32 = 15;
+    const WLAN_REASON_DEAUTH_LEAVING: u32 = 3;
 
     /// The station's EAPOL frame (802.1X header onwards): the 4-way handshake. A MIC that
     /// does not verify means another passphrase, and the access point deauthenticates.
@@ -2186,7 +2200,7 @@ test "Cyw43430 WPA2 access point runs the 4-way handshake before passing data" {
         defer chip.deinit();
         chip.writeByte(0, 0x04, 0x07);
         chip.setAccessPointName("tokamak");
-        chip.setAccessPointPassphrase("correct horse");
+        chip.setAccessPointSecurity(.wpa2_personal, "correct horse");
         var reply: [2048]u8 = undefined;
         var aps: [2]Cyw43430.AccessPoint = undefined;
         const ap = chip.accessPoints(&aps)[0];
@@ -2246,4 +2260,25 @@ test "Cyw43430 WPA2 access point runs the 4-way handshake before passing data" {
         testStationKey(&chip, ap, &m3, wpa2.KI_VERSION_2 | wpa2.KI_PAIRWISE | wpa2.KI_MIC | wpa2.KI_SECURE, @splat(0), &.{}, ptk.kck);
         try std.testing.expect(chip.authorized);
     }
+}
+
+test "Cyw43430 reconfiguring the access point's security disconnects its station" {
+    var chip = Cyw43430{};
+    defer chip.deinit();
+    chip.writeByte(0, 0x04, 0x07);
+    chip.setAccessPointName("tokamak");
+    var reply: [2048]u8 = undefined;
+    var body: [80]u8 = @splat(0);
+    @memcpy(body[0..5], "join\x00");
+    body[5..75].* = testJoinParams("tokamak", 0);
+    _ = testDcmd(&chip, 263, true, body[0..75], &reply);
+    for (0..4) |_| _ = try testReadEvent(&chip);
+    try std.testing.expect(chip.authorized);
+
+    chip.setAccessPointSecurity(.open, ""); // unchanged: still connected
+    try std.testing.expect(chip.authorized);
+    chip.setAccessPointSecurity(.wpa2_personal, "correct horse");
+    const e = try testReadEvent(&chip);
+    try std.testing.expectEqual(@as(u32, 6), e.event_type); // BRCMF_E_DEAUTH_IND
+    try std.testing.expect(chip.joined == null and !chip.authorized);
 }

@@ -136,11 +136,47 @@ pub const Action = enum {
     close,
 };
 
+/// Security of the emulated Wi-Fi access point
+pub const WifiSecurity = enum {
+    open,
+    wpa2_personal,
+
+    pub const all = [_]WifiSecurity{ .open, .wpa2_personal };
+
+    pub fn label(self: WifiSecurity) []const u8 {
+        return switch (self) {
+            .open => "Open",
+            .wpa2_personal => "WPA2-Personal",
+        };
+    }
+
+    /// Name in `settings.json`
+    pub fn id(self: WifiSecurity) []const u8 {
+        return switch (self) {
+            .open => "open",
+            .wpa2_personal => "wpa2_personal",
+        };
+    }
+
+    pub fn fromId(s: []const u8) ?WifiSecurity {
+        for (all) |sec| if (std.mem.eql(u8, s, sec.id())) return sec;
+        return null;
+    }
+};
+
+/// A WPA2 passphrase is 8 to 63 characters of printable ASCII
+pub fn isValidWifiPassword(p: []const u8) bool {
+    if (p.len < 8 or p.len > 63) return false;
+    for (p) |ch| if (ch < 0x20 or ch > 0x7e) return false;
+    return true;
+}
+
 pub const FocusedSettingField = enum {
     none,
     serial,
     mac,
     wifi_mac,
+    wifi_password,
     sd_card_name,
     sd_card_rename,
 };
@@ -310,6 +346,10 @@ pub const BoardUi = struct {
     serial_field_hovered: bool = false,
     mac_field_hovered: bool = false,
     wifi_mac_field_hovered: bool = false,
+    wifi_security_btn_hovered: bool = false,
+    wifi_security_menu_open: bool = false,
+    hovered_wifi_security_idx: ?usize = null,
+    wifi_password_field_hovered: bool = false,
     dhcp_toggle_hovered: bool = false,
     focused_field: FocusedSettingField = .none,
 
@@ -319,6 +359,10 @@ pub const BoardUi = struct {
     mac_len: usize = 12,
     wifi_mac_hex: [12]u8 = "B827EB654321".*,
     wifi_mac_len: usize = 12,
+    /// The emulated Wi-Fi access point's security, and its WPA2 passphrase
+    wifi_security: WifiSecurity = .open,
+    wifi_password_buf: [63]u8 = @splat(0),
+    wifi_password_len: usize = 0,
 
     /// Persistent storage paths under `$XDG_DATA_HOME/fauxpi`.
     data_dir_buf: [512]u8 = @splat(0),
@@ -399,6 +443,9 @@ pub const BoardUi = struct {
     serial_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     mac_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     wifi_mac_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    wifi_security_btn_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    wifi_security_menu_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    wifi_password_field_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     dhcp_toggle_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_card_menu_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     sd_manage_rect: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -439,6 +486,9 @@ pub const BoardUi = struct {
         serial_field_hovered: bool,
         mac_field_hovered: bool,
         wifi_mac_field_hovered: bool,
+        wifi_security_btn_hovered: bool,
+        hovered_wifi_security_idx: ?usize,
+        wifi_password_field_hovered: bool,
         dhcp_toggle_hovered: bool,
         hovered_sd_menu_idx: ?usize,
         hovered_sd_size_idx: ?usize,
@@ -467,6 +517,9 @@ pub const BoardUi = struct {
             .serial_field_hovered = self.serial_field_hovered,
             .mac_field_hovered = self.mac_field_hovered,
             .wifi_mac_field_hovered = self.wifi_mac_field_hovered,
+            .wifi_security_btn_hovered = self.wifi_security_btn_hovered,
+            .hovered_wifi_security_idx = self.hovered_wifi_security_idx,
+            .wifi_password_field_hovered = self.wifi_password_field_hovered,
             .dhcp_toggle_hovered = self.dhcp_toggle_hovered,
             .hovered_sd_menu_idx = self.hovered_sd_menu_idx,
             .hovered_sd_size_idx = self.hovered_sd_size_idx,
@@ -682,6 +735,8 @@ pub const BoardUi = struct {
         serial: ?[]const u8 = null,
         mac_address: ?[]const u8 = null,
         wifi_mac_address: ?[]const u8 = null,
+        wifi_security: ?[]const u8 = null,
+        wifi_password: ?[]const u8 = null,
         dhcp_enabled: ?bool = null,
         selected_sd_card: ?[]const u8 = null,
         sd_connected: ?bool = null,
@@ -720,6 +775,17 @@ pub const BoardUi = struct {
             }
         }
 
+        var esc_password_buf: [2 * 63]u8 = undefined;
+        var esc_password_len: usize = 0;
+        for (self.wifiPassword()) |ch| {
+            if (ch == '"' or ch == '\\') {
+                esc_password_buf[esc_password_len] = '\\';
+                esc_password_len += 1;
+            }
+            esc_password_buf[esc_password_len] = ch;
+            esc_password_len += 1;
+        }
+
         var json_buf: [2048]u8 = undefined;
         const json_str = try std.fmt.bufPrint(
             &json_buf,
@@ -728,6 +794,8 @@ pub const BoardUi = struct {
             \\  "serial": "{s}",
             \\  "mac_address": "{s}",
             \\  "wifi_mac_address": "{s}",
+            \\  "wifi_security": "{s}",
+            \\  "wifi_password": "{s}",
             \\  "dhcp_enabled": {},
             \\  "selected_sd_card": "{s}",
             \\  "sd_connected": {},
@@ -747,6 +815,8 @@ pub const BoardUi = struct {
                 self.serial_hex[0..self.serial_len],
                 self.mac_hex[0..self.mac_len],
                 self.wifi_mac_hex[0..self.wifi_mac_len],
+                self.wifi_security.id(),
+                esc_password_buf[0..esc_password_len],
                 status.dhcp_enabled,
                 esc_name_buf[0..esc_len],
                 status.sd_connected,
@@ -812,6 +882,10 @@ pub const BoardUi = struct {
         status.serial_u64 = self.parsedSerial();
         status.mac_address = self.parsedMac();
         status.wifi_mac_address = self.parsedWifiMac();
+        if (cfg.wifi_security) |sec| {
+            if (WifiSecurity.fromId(sec)) |v| self.wifi_security = v;
+        }
+        if (cfg.wifi_password) |pw| self.setWifiPassword(pw);
 
         if (cfg.dhcp_enabled) |v| status.dhcp_enabled = v;
         if (cfg.gpio_connected) |v| status.gpio_connected = v;
@@ -846,6 +920,20 @@ pub const BoardUi = struct {
         }
         status.power_connected = false;
         return true;
+    }
+
+    pub fn wifiPassword(self: *const BoardUi) []const u8 {
+        return self.wifi_password_buf[0..self.wifi_password_len];
+    }
+
+    /// Sets the Wi-Fi password, keeping its printable ASCII characters (63 at most)
+    pub fn setWifiPassword(self: *BoardUi, pw: []const u8) void {
+        self.wifi_password_len = 0;
+        for (pw) |ch| {
+            if (ch < 0x20 or ch > 0x7e or self.wifi_password_len == self.wifi_password_buf.len) continue;
+            self.wifi_password_buf[self.wifi_password_len] = ch;
+            self.wifi_password_len += 1;
+        }
     }
 
     fn setHexField(self: *BoardUi, dst: []u8, dst_len: *usize, src: []const u8, uppercase: bool) void {
@@ -1762,7 +1850,7 @@ pub const BoardUi = struct {
         return (self.ctrl_mask != 0) or self.xkb_ctrl;
     }
 
-    /// Handles an evdev key press when a text field (`serial`, `mac`, `wifi_mac`, `sd_card_name`, or `sd_card_rename`) is focused.
+    /// Handles an evdev key press when a text field (`serial`, `mac`, `wifi_mac`, `wifi_password`, `sd_card_name`, or `sd_card_rename`) is focused.
     /// Returns true if the key was consumed by the editor.
     pub fn handleKey(self: *BoardUi, evdev_key: u32) bool {
         if (!self.sheet_open or self.focused_field == .none or self.isCreatingSdCard()) return false;
@@ -1810,6 +1898,9 @@ pub const BoardUi = struct {
                 .wifi_mac => if (self.wifi_mac_len > 0) {
                     self.wifi_mac_len -= 1;
                 },
+                .wifi_password => if (self.wifi_password_len > 0) {
+                    self.wifi_password_len -= 1;
+                },
                 .sd_card_name => if (self.new_card_name_len > 0) {
                     self.new_card_name_len -= 1;
                 },
@@ -1828,6 +1919,16 @@ pub const BoardUi = struct {
                 if (self.new_card_name_len < self.new_card_name_buf.len) {
                     self.new_card_name_buf[self.new_card_name_len] = ch;
                     self.new_card_name_len += 1;
+                }
+            }
+            return true;
+        }
+
+        if (self.focused_field == .wifi_password) {
+            if (self.lookupKeyChar(evdev_key)) |ch| {
+                if (ch >= 0x20 and ch <= 0x7e and self.wifi_password_len < self.wifi_password_buf.len) {
+                    self.wifi_password_buf[self.wifi_password_len] = ch;
+                    self.wifi_password_len += 1;
                 }
             }
             return true;
@@ -1858,7 +1959,7 @@ pub const BoardUi = struct {
                         self.wifi_mac_hex[self.wifi_mac_len] = std.ascii.toUpper(ch);
                         self.wifi_mac_len += 1;
                     },
-                    .sd_card_name, .sd_card_rename, .none => {},
+                    .wifi_password, .sd_card_name, .sd_card_rename, .none => {},
                 }
             }
             return true;
@@ -1872,11 +1973,16 @@ pub const BoardUi = struct {
         self.last_win_h = win_h;
         const cur_board = status.board_model;
         self.title = cur_board.windowTitle();
-        if (status.power_connected and self.focused_field != .sd_card_name and self.focused_field != .sd_card_rename) {
+        // The Wi-Fi network's settings stay editable while the board runs
+        if (status.power_connected and self.focused_field != .sd_card_name and self.focused_field != .sd_card_rename and self.focused_field != .wifi_password) {
             self.focused_field = .none;
             self.board_menu_open = false;
         }
-        if (!cur_board.hasWireless() and self.focused_field == .wifi_mac) {
+        if (!cur_board.hasWireless() and (self.focused_field == .wifi_mac or self.focused_field == .wifi_password)) {
+            self.focused_field = .none;
+        }
+        if (!cur_board.hasWireless()) self.wifi_security_menu_open = false;
+        if (self.wifi_security == .open and self.focused_field == .wifi_password) {
             self.focused_field = .none;
         }
 
@@ -1976,7 +2082,7 @@ pub const BoardUi = struct {
         const panel_x: f32 = @round(sheet_x + pad);
         const panel_w: f32 = @round(sheet_w - 2.0 * pad);
         const panel_y: f32 = @round(btn_y + btn_h + 12.0);
-        const panel_h: f32 = if (has_wifi) 292.0 else 242.0;
+        const panel_h: f32 = if (has_wifi) 322.0 else 230.0;
         self.settings_panel_rect = .{
             .x = panel_x,
             .y = panel_y,
@@ -1999,20 +2105,34 @@ pub const BoardUi = struct {
             .h = menu_h,
         };
 
-        const row1_y = panel_y + 94.0;
+        const row1_y = panel_y + 90.0;
         self.serial_field_rect = .{ .x = right_x - ctrl_w, .y = row1_y, .w = ctrl_w, .h = ctrl_h };
 
-        const row2_y = panel_y + 144.0;
+        const row2_y = panel_y + 136.0;
         self.mac_field_rect = .{ .x = right_x - ctrl_w, .y = row2_y, .w = ctrl_w, .h = ctrl_h };
 
         if (has_wifi) {
-            const row_wifi_y = panel_y + 194.0;
+            const row_wifi_y = panel_y + 182.0;
             self.wifi_mac_field_rect = .{ .x = right_x - ctrl_w, .y = row_wifi_y, .w = ctrl_w, .h = ctrl_h };
+            // Security menu and password field share a row
+            const row_security_y = panel_y + 228.0;
+            const sec_w: f32 = 144.0;
+            self.wifi_password_field_rect = .{ .x = right_x - ctrl_w, .y = row_security_y, .w = ctrl_w, .h = ctrl_h };
+            self.wifi_security_btn_rect = .{ .x = right_x - ctrl_w - 8.0 - sec_w, .y = row_security_y, .w = sec_w, .h = ctrl_h };
+            self.wifi_security_menu_rect = .{
+                .x = self.wifi_security_btn_rect.x,
+                .y = row_security_y + ctrl_h + 4.0,
+                .w = 176.0,
+                .h = @as(f32, @floatFromInt(WifiSecurity.all.len)) * menu_item_h + 8.0,
+            };
         } else {
             self.wifi_mac_field_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            self.wifi_security_btn_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            self.wifi_security_menu_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            self.wifi_password_field_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         }
 
-        const row_dhcp_y: f32 = if (has_wifi) (panel_y + 246.0) else (panel_y + 196.0);
+        const row_dhcp_y: f32 = if (has_wifi) (panel_y + 276.0) else (panel_y + 184.0);
         self.dhcp_toggle_rect = .{ .x = right_x - 52.0, .y = row_dhcp_y, .w = 52.0, .h = 28.0 };
 
         // SD Card selector popup menu (anchored near the SD card on the left of the board)
@@ -2512,8 +2632,18 @@ pub const BoardUi = struct {
             } else {
                 self.hovered_board_menu_idx = null;
             }
-            const over_open_menu = self.board_menu_open and self.board_menu_rect.contains(pt);
+            if (self.wifi_security_menu_open and self.wifi_security_menu_rect.contains(pt)) {
+                const rel_y = y - (self.wifi_security_menu_rect.y + 4.0);
+                const idx: usize = if (rel_y >= 0.0) @intFromFloat(@floor(rel_y / 32.0)) else WifiSecurity.all.len;
+                self.hovered_wifi_security_idx = if (idx < WifiSecurity.all.len) idx else null;
+            } else {
+                self.hovered_wifi_security_idx = null;
+            }
+            const over_open_menu = (self.board_menu_open and self.board_menu_rect.contains(pt)) or
+                (self.wifi_security_menu_open and self.wifi_security_menu_rect.contains(pt));
             self.board_menu_btn_hovered = boot_editable and self.board_menu_btn_rect.contains(pt);
+            self.wifi_security_btn_hovered = !over_open_menu and self.wifi_security_btn_rect.contains(pt);
+            self.wifi_password_field_hovered = self.wifi_security != .open and !over_open_menu and self.wifi_password_field_rect.contains(pt);
             self.serial_field_hovered = boot_editable and !over_open_menu and self.serial_field_rect.contains(pt);
             self.mac_field_hovered = boot_editable and !over_open_menu and self.mac_field_rect.contains(pt);
             self.wifi_mac_field_hovered = boot_editable and !over_open_menu and self.wifi_mac_field_rect.contains(pt);
@@ -2524,6 +2654,9 @@ pub const BoardUi = struct {
             self.serial_field_hovered = false;
             self.mac_field_hovered = false;
             self.wifi_mac_field_hovered = false;
+            self.wifi_security_btn_hovered = false;
+            self.hovered_wifi_security_idx = null;
+            self.wifi_password_field_hovered = false;
             self.dhcp_toggle_hovered = false;
         }
 
@@ -2554,6 +2687,9 @@ pub const BoardUi = struct {
         self.serial_field_hovered = false;
         self.mac_field_hovered = false;
         self.wifi_mac_field_hovered = false;
+        self.wifi_security_btn_hovered = false;
+        self.hovered_wifi_security_idx = null;
+        self.wifi_password_field_hovered = false;
         self.dhcp_toggle_hovered = false;
         self.hovered_sd_menu_idx = null;
         self.hovered_sd_size_idx = null;
@@ -2858,7 +2994,37 @@ pub const BoardUi = struct {
                     self.hovered_board_menu_idx = null;
                 }
 
+                // The Wi-Fi security menu: pick a mode, or dismiss it
+                if (self.wifi_security_menu_open) {
+                    self.wifi_security_menu_open = false;
+                    self.hovered_wifi_security_idx = null;
+                    if (self.wifi_security_menu_rect.contains(pt)) {
+                        const rel_y = y - (self.wifi_security_menu_rect.y + 4.0);
+                        if (rel_y >= 0.0) {
+                            const idx: usize = @intFromFloat(@floor(rel_y / 32.0));
+                            if (idx < WifiSecurity.all.len) {
+                                self.wifi_security = WifiSecurity.all[idx];
+                                if (self.wifi_security == .wpa2_personal and self.wifi_password_len == 0) {
+                                    self.focused_field = .wifi_password;
+                                }
+                            }
+                        }
+                        return .consumed;
+                    }
+                    if (self.wifi_security_btn_rect.contains(pt)) return .consumed;
+                }
+
                 if (self.settings_panel_rect.contains(pt)) {
+                    if (self.wifi_security_btn_rect.contains(pt)) {
+                        self.focused_field = .none;
+                        self.board_menu_open = false;
+                        self.wifi_security_menu_open = true;
+                        return .consumed;
+                    }
+                    if (self.wifi_password_field_rect.contains(pt) and self.wifi_security != .open) {
+                        self.focused_field = .wifi_password;
+                        return .consumed;
+                    }
                     if (!status.power_connected) {
                         if (self.board_menu_btn_rect.contains(pt)) {
                             self.focused_field = .none;
@@ -3854,12 +4020,49 @@ pub const BoardUi = struct {
             var wifi_disp_buf: [20]u8 = undefined;
             const wifi_disp = formatMacDisplay(&wifi_disp_buf, self.wifi_mac_hex[0..self.wifi_mac_len], !boot_disabled and self.focused_field == .wifi_mac);
             self.paintTextField(c, self.wifi_mac_field_rect, wifi_disp, !boot_disabled and self.focused_field == .wifi_mac, self.wifi_mac_field_hovered, boot_disabled);
+
+            // Row 2c: the emulated access point's security and password (editable while running)
+            const row_sec_y = self.wifi_security_btn_rect.y;
+            const pw_disabled = self.wifi_security == .open;
+            const pw = self.wifiPassword();
+            const pw_invalid = !pw_disabled and !isValidWifiPassword(pw);
+            _ = c.drawText(14.0, pr.x + 16.0, row_sec_y + 15.0, "Wi-Fi Security", t.on_surface);
+            var host_buf: [64]u8 = undefined;
+            const host = host_posix.hostName(&host_buf);
+            var net_buf: [96]u8 = undefined;
+            const net_sub = if (pw_invalid)
+                "Password needs 8 to 63 characters"
+            else
+                std.fmt.bufPrint(&net_buf, "Emulated network \u{201c}{s}\u{201d}", .{if (host.len != 0) host else "FauxPi"}) catch "Emulated network";
+            _ = c.drawText(11.5, pr.x + 16.0, row_sec_y + 30.0, net_sub, if (pw_invalid) t.@"error" else t.on_surface_variant);
+            self.paintMenuButton(c, self.wifi_security_btn_rect, self.wifi_security.label(), self.wifi_security_menu_open, self.wifi_security_btn_hovered, false);
+
+            // The password shows while being typed, otherwise as dots (none for an open network);
+            // only its end fits the field
+            const pw_focused = !pw_disabled and self.focused_field == .wifi_password;
+            var pw_disp_buf: [26 * 3 + 1]u8 = undefined;
+            const pw_disp = if (pw_focused) blk: {
+                const tail = pw[pw.len -| 24..];
+                break :blk std.fmt.bufPrint(&pw_disp_buf, "{s}|", .{tail}) catch tail;
+            } else blk: {
+                var n: usize = 0;
+                for (0..if (pw_disabled) 0 else @min(pw.len, 24)) |_| {
+                    @memcpy(pw_disp_buf[n..][0..3], "\u{2022}");
+                    n += 3;
+                }
+                break :blk pw_disp_buf[0..n];
+            };
+            self.paintTextField(c, self.wifi_password_field_rect, pw_disp, pw_focused, self.wifi_password_field_hovered, pw_disabled);
         }
 
         // Row 3: DHCP Server Toggle
         const row3_y = self.dhcp_toggle_rect.y;
         _ = c.drawText(14.0, pr.x + 16.0, row3_y + 13.0, "DHCP Server", t.on_surface);
-        _ = c.drawText(11.5, pr.x + 16.0, row3_y + 28.0, "Lease 10.0.2.15/24 · Gateway & DNS 10.0.2.2", t.on_surface_variant);
+        const dhcp_sub = if (cur_board.hasWireless())
+            "Leases 10.0.2.15/24 (Ethernet), 10.0.3.15/24 (Wi-Fi) · Gateway & DNS .2"
+        else
+            "Lease 10.0.2.15/24 · Gateway & DNS 10.0.2.2";
+        _ = c.drawText(11.5, pr.x + 16.0, row3_y + 28.0, dhcp_sub, t.on_surface_variant);
 
         const sw = self.dhcp_toggle_rect;
         const sw_bg = if (status.dhcp_enabled) t.primary else t.surface_container_highest;
@@ -3878,6 +4081,8 @@ pub const BoardUi = struct {
         const state_txt = if (status.dhcp_enabled) "Enabled" else "Disabled";
         const st_w = c.measureText(13.0, state_txt);
         _ = c.drawText(13.0, sw.x - 10.0 - st_w, row3_y + 19.0, state_txt, if (status.dhcp_enabled) t.primary else t.on_surface_variant);
+
+        self.paintWifiSecurityMenu(c);
 
         // Draw floating Board popup menu last so it overlays lower rows cleanly
         if (self.board_menu_open and !boot_disabled) {
@@ -3901,6 +4106,29 @@ pub const BoardUi = struct {
                     if (is_sel) t.primary else t.on_surface,
                 );
             }
+        }
+    }
+
+    fn paintWifiSecurityMenu(self: *const BoardUi, c: *Canvas) void {
+        if (!self.wifi_security_menu_open) return;
+        const t = &self.theme;
+        const mr = self.wifi_security_menu_rect;
+        c.fillRoundedRect(mr, .all(8.0), t.surface_container_highest);
+        c.strokeRoundedRect(mr, .all(8.0), 1.2, t.primary);
+        const item_st: canvas_mod.Style = .{ .font = &self.font, .size = 13.0 };
+        for (WifiSecurity.all, 0..) |sec, idx| {
+            const item_r: Rect = .{ .x = mr.x + 4.0, .y = mr.y + 4.0 + @as(f32, @floatFromInt(idx)) * 32.0, .w = mr.w - 8.0, .h = 32.0 };
+            const is_sel = (sec == self.wifi_security);
+            if (is_sel or self.hovered_wifi_security_idx == idx) {
+                c.fillRoundedRect(item_r, .all(6.0), if (is_sel) t.secondary_container else t.surface);
+            }
+            _ = c.drawText(
+                13.0,
+                item_r.x + 10.0,
+                @round(item_r.y + (item_r.h - item_st.lineHeight()) * 0.5 + item_st.ascent()),
+                sec.label(),
+                if (is_sel) t.primary else t.on_surface,
+            );
         }
     }
 
@@ -6336,9 +6564,38 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     status.dhcp_enabled = false;
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
 
-    // 8. Clicking outside the sheet (near bottom of window) closes the sheet
-    _ = ui.pointerButton(640, 740, true, status, &hw);
-    _ = ui.pointerButton(640, 740, false, status, &hw);
+    // Wi-Fi security: choosing WPA2-Personal focuses the empty password, which takes printable
+    // characters and stays editable while the board is powered
+    try testing.expectEqual(WifiSecurity.open, ui.wifi_security);
+    const sec_r = ui.wifi_security_btn_rect;
+    _ = ui.pointerButton(sec_r.x + 10, sec_r.y + 10, true, status, &hw);
+    _ = ui.pointerButton(sec_r.x + 10, sec_r.y + 10, false, status, &hw);
+    try testing.expect(ui.wifi_security_menu_open);
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    const wpa2_y = ui.wifi_security_menu_rect.y + 4.0 + 1.0 * 32.0 + 16.0;
+    _ = ui.pointerButton(ui.wifi_security_menu_rect.x + 20, wpa2_y, true, status, &hw);
+    try testing.expectEqual(Action.consumed, ui.pointerButton(ui.wifi_security_menu_rect.x + 20, wpa2_y, false, status, &hw));
+    try testing.expectEqual(WifiSecurity.wpa2_personal, ui.wifi_security);
+    try testing.expectEqual(@as(@TypeOf(ui.focused_field), .wifi_password), ui.focused_field);
+    status.power_connected = true;
+    ui.updateLayout(win_w, win_h, status, &hw);
+    for (0..7) |_| try testing.expect(ui.handleKey(30)); // 'a'
+    try testing.expect(!isValidWifiPassword(ui.wifiPassword()));
+    try testing.expect(ui.handleKey(57)); // space
+    try testing.expectEqualStrings("aaaaaaa ", ui.wifiPassword());
+    try testing.expect(isValidWifiPassword(ui.wifiPassword()));
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testing.expect(ui.handleKey(28)); // Enter
+    try testing.expectEqual(@as(@TypeOf(ui.focused_field), .none), ui.focused_field);
+    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    status.power_connected = false;
+    ui.updateLayout(win_w, win_h, status, &hw);
+
+    // 8. Clicking outside the sheet (just below it, near the bottom of the window) closes the sheet
+    const below_sheet = ui.sheet_rect.y + ui.sheet_rect.h + 2.0;
+    try testing.expect(below_sheet < @as(f32, @floatFromInt(win_h)));
+    _ = ui.pointerButton(640, below_sheet, true, status, &hw);
+    _ = ui.pointerButton(640, below_sheet, false, status, &hw);
     try testing.expect(!ui.sheet_open);
 
     // 9. Verify board outline stops at the edge of overhanging connectors (e.g. HDMI on B+)
@@ -6469,6 +6726,8 @@ test "BoardUi persistent images and settings.json with custom and default card n
         ui.setHexField(&ui.serial_hex, &ui.serial_len, "00000000cafebabe", false);
         ui.setHexField(&ui.mac_hex, &ui.mac_len, "B827EB112233", true);
         ui.setHexField(&ui.wifi_mac_hex, &ui.wifi_mac_len, "B827EB445566", true);
+        ui.wifi_security = .wpa2_personal;
+        ui.setWifiPassword("say \"friend\" \\ enter");
         status.dhcp_enabled = false;
         status.sd_connected = true;
         status.hdmi_connected = false;
@@ -6490,6 +6749,8 @@ test "BoardUi persistent images and settings.json with custom and default card n
         try testing.expectEqual(@as(u64, 0x00000000CAFEBABE), status2.serial_u64);
         try testing.expectEqualSlices(u8, &.{ 0xB8, 0x27, 0xEB, 0x11, 0x22, 0x33 }, &status2.mac_address);
         try testing.expectEqualSlices(u8, &.{ 0xB8, 0x27, 0xEB, 0x44, 0x55, 0x66 }, &status2.wifi_mac_address);
+        try testing.expectEqual(WifiSecurity.wpa2_personal, ui2.wifi_security);
+        try testing.expectEqualStrings("say \"friend\" \\ enter", ui2.wifiPassword());
         try testing.expect(!status2.dhcp_enabled);
         try testing.expect(status2.sd_connected);
         try testing.expect(!status2.hdmi_connected);
