@@ -16,6 +16,8 @@
 
 const std = @import("std");
 const net_mod = @import("../usb/net.zig");
+const host_posix = @import("../host/posix.zig");
+const wpa2 = @import("wpa2.zig");
 
 pub const Chip = enum {
     cyw43430,
@@ -247,8 +249,21 @@ pub const Cyw43430 = struct {
     /// SSID of the open access point scans find (none while empty)
     ap_ssid: [32]u8 = @splat(0),
     ap_ssid_len: u8 = 0,
+    /// WPA2-Personal passphrase of the access point (an open network while empty)
+    ap_passphrase: [63]u8 = @splat(0),
+    ap_passphrase_len: u8 = 0,
+    /// Security the host set for joining: `wsec` (AES_ENABLED 4 for CCMP), `wpa_auth`
+    /// (WPA2_AUTH_PSK 0x80), `auth` (open system 0) and `mfp`
+    wsec: u32 = 0,
+    wpa_auth: u32 = 0,
+    auth_type: u32 = 0,
+    mfp: u32 = 0,
     /// The access point radio the host joined
     joined: ?AccessPoint = null,
+    /// Whether the access point passes the station's data: at once on an open network, after
+    /// the 4-way handshake on a WPA2 one
+    authorized: bool = false,
+    authenticator: ?wpa2.Authenticator = null,
     /// The network behind the access point: user-mode NAT on 10.0.3.0/24
     net: net_mod.VirtualNetwork = .{ .subnet = 3 },
     /// Last transmit sequence number the host may use, as last advertised in a received frame
@@ -269,10 +284,32 @@ pub const Cyw43430 = struct {
         const chip = self.chip;
         const ap_ssid = self.ap_ssid;
         const ap_ssid_len = self.ap_ssid_len;
+        const ap_passphrase = self.ap_passphrase;
+        const ap_passphrase_len = self.ap_passphrase_len;
         const dhcp_enabled = self.net.dhcp_enabled;
         self.net.deinit();
-        self.* = .{ .chip = chip, .mac_address = mac, .ap_ssid = ap_ssid, .ap_ssid_len = ap_ssid_len };
+        self.* = .{
+            .chip = chip,
+            .mac_address = mac,
+            .ap_ssid = ap_ssid,
+            .ap_ssid_len = ap_ssid_len,
+            .ap_passphrase = ap_passphrase,
+            .ap_passphrase_len = ap_passphrase_len,
+        };
         self.net.dhcp_enabled = dhcp_enabled;
+    }
+
+    /// Secures the access point with WPA2-Personal and `passphrase` (8..63 characters), or
+    /// leaves it open for an empty one
+    pub fn setAccessPointPassphrase(self: *Cyw43430, passphrase: []const u8) void {
+        const n = @min(passphrase.len, self.ap_passphrase.len);
+        @memset(&self.ap_passphrase, 0);
+        @memcpy(self.ap_passphrase[0..n], passphrase[0..n]);
+        self.ap_passphrase_len = @intCast(n);
+    }
+
+    fn secured(self: *const Cyw43430) bool {
+        return self.ap_passphrase_len != 0;
     }
 
     pub fn deinit(self: *Cyw43430) void {
@@ -282,14 +319,14 @@ pub const Cyw43430 = struct {
     /// Services the network behind the access point (host sockets), passing what it has
     /// for the guest to the host as received frames
     pub fn pollNetwork(self: *Cyw43430) void {
-        if (self.joined == null) return;
+        if (!self.authorized) return;
         self.net.poll();
         self.deliverNetworkFrames();
     }
 
     /// True while the network behind the access point has frames the guest has not taken
     pub fn hasPendingRx(self: *const Cyw43430) bool {
-        return self.joined != null and (self.net.hasRxFrame() or self.rx_count != 0);
+        return self.authorized and (self.net.hasRxFrame() or self.rx_count != 0);
     }
 
     /// Names the open access point scans find (up to 32 bytes of `ssid`)
@@ -904,7 +941,7 @@ pub const Cyw43430 = struct {
             self.rx_frame_offset = 0;
             self.rx_head = (self.rx_head + 1) % MAX_RX_FRAMES;
             self.rx_count -= 1;
-            if (self.joined != null) self.deliverNetworkFrames();
+            if (self.authorized) self.deliverNetworkFrames();
             if (self.rx_count == 0) {
                 self.sdio_intstatus &= ~I_HMB_FRAME_IND;
             } else {
@@ -938,8 +975,13 @@ pub const Cyw43430 = struct {
         if (payload.len < 4) return;
         const start = 4 + @as(usize, payload[3]) * 4;
         if (self.joined != null and start + 14 <= payload.len) {
-            self.net.handleTxFrame(payload[start..]);
-            self.deliverNetworkFrames();
+            const frame = payload[start..];
+            if (std.mem.readInt(u16, frame[12..14], .big) == 0x888e) {
+                self.handleEapol(frame[14..]);
+            } else if (self.authorized) {
+                self.net.handleTxFrame(frame);
+                self.deliverNetworkFrames();
+            }
         }
         // No reply to carry a new transmit window: send it in an empty frame
         if (self.rx_count == 0 and (self.tx_window_end -% self.host_tx_seq) < 8) {
@@ -1055,6 +1097,8 @@ pub const Cyw43430 = struct {
                     } else if (std.mem.eql(u8, var_name, "event_msgs")) {
                         const n = @min(dst.len, self.event_msgs.len);
                         @memcpy(dst[0..n], self.event_msgs[0..n]);
+                    } else if (self.securityVar(var_name)) |v| {
+                        if (dst.len >= 4) std.mem.writeInt(u32, dst[0..4], v.*, .little);
                     } else if (std.mem.eql(u8, var_name, "assoc_info")) {
                         // struct brcmf_cfg80211_assoc_ielen_le { req_len, resp_len }: no IEs kept
                     } else if (std.mem.eql(u8, var_name, "sta_info") and self.joined != null) {
@@ -1067,7 +1111,9 @@ pub const Cyw43430 = struct {
                     }
                 } else {
                     // SET_VAR
-                    if (std.mem.eql(u8, var_name, "cur_etheraddr")) {
+                    if (self.securityVar(var_name)) |v| {
+                        if (arg.len >= 4) v.* = std.mem.readInt(u32, arg[0..4], .little);
+                    } else if (std.mem.eql(u8, var_name, "cur_etheraddr")) {
                         if (arg.len >= 6) @memcpy(&self.mac_address, arg[0..6]);
                     } else if (std.mem.eql(u8, var_name, "event_msgs")) {
                         const n = @min(arg.len, self.event_msgs.len);
@@ -1141,7 +1187,7 @@ pub const Cyw43430 = struct {
                 if (self.joined) |ap| {
                     switch (cmd) {
                         // A length word, then struct brcmf_bss_info_le
-                        BRCMF_C_GET_BSS_INFO => if (dst.len >= 4 + BSS_INFO_SIZE + 64) {
+                        BRCMF_C_GET_BSS_INFO => if (dst.len >= 4 + BSS_INFO_SIZE + 96) {
                             const n = self.writeBssInfo(ap, dst[4..]);
                             std.mem.writeInt(u32, dst[0..4], n, .little);
                         },
@@ -1374,6 +1420,52 @@ pub const Cyw43430 = struct {
         }
     };
 
+    /// The security setting iovar `name` names (`wsec`, `wpa_auth`, `auth`, `mfp`)
+    fn securityVar(self: *Cyw43430, name: []const u8) ?*u32 {
+        if (std.mem.eql(u8, name, "wsec")) return &self.wsec;
+        if (std.mem.eql(u8, name, "wpa_auth")) return &self.wpa_auth;
+        if (std.mem.eql(u8, name, "auth")) return &self.auth_type;
+        if (std.mem.eql(u8, name, "mfp")) return &self.mfp;
+        return null;
+    }
+
+    const WPA2_AUTH_PSK: u32 = 0x80;
+    const AES_ENABLED: u32 = 0x04;
+    const BRCMF_E_DEAUTH_IND: u32 = 6;
+    const BRCMF_E_STATUS_FAIL: u32 = 1;
+    const WLAN_REASON_4WAY_HANDSHAKE_TIMEOUT: u32 = 15;
+
+    /// The station's EAPOL frame (802.1X header onwards): the 4-way handshake. A MIC that
+    /// does not verify means another passphrase, and the access point deauthenticates.
+    fn handleEapol(self: *Cyw43430, frame: []const u8) void {
+        if (self.authenticator) |*auth| {
+            var out: [wpa2.MAX_FRAME]u8 = undefined;
+            switch (auth.receive(frame, &out)) {
+                .ignore => {},
+                .send => |m| self.sendEapol(m),
+                .done => self.authorized = true,
+                .failed => {
+                    const ap = self.joined.?;
+                    self.joined = null;
+                    self.authenticator = null;
+                    self.queueEventFrom(BRCMF_E_DEAUTH_IND, BRCMF_E_STATUS_SUCCESS, WLAN_REASON_4WAY_HANDSHAKE_TIMEOUT, 0, ap.bssid, &.{});
+                },
+            }
+        }
+    }
+
+    /// Sends an EAPOL frame from the access point to the station
+    fn sendEapol(self: *Cyw43430, eapol: []const u8) void {
+        const ap = self.joined orelse return;
+        var buf: [4 + 14 + wpa2.MAX_FRAME]u8 = undefined;
+        buf[0..4].* = .{ 0x20, 0, 0, 0 }; // BCDC data header
+        @memcpy(buf[4..10], &self.mac_address);
+        @memcpy(buf[10..16], &ap.bssid);
+        std.mem.writeInt(u16, buf[16..18], 0x888e, .big);
+        @memcpy(buf[18..][0..eapol.len], eapol);
+        self.queueRxFrame(SDPCM_DATA_CHANNEL, buf[0 .. 18 + eapol.len]);
+    }
+
     /// Joins the access point radio the request picks (the strongest, given a choice). The
     /// network is open, so the firmware authenticates and associates by itself: it reports
     /// BRCMF_E_AUTH, BRCMF_E_ASSOC, link up and BRCMF_E_SET_SSID, or BRCMF_E_SET_SSID failing
@@ -1396,26 +1488,54 @@ pub const Cyw43430 = struct {
             }
         }
         if (self.joined) |old| self.queueLinkEvent(BRCMF_E_LINK, 0, 0, old.bssid);
-        self.joined = best;
+        self.joined = null;
+        self.authorized = false;
+        self.authenticator = null;
         const ap = best orelse {
             self.queueLinkEvent(BRCMF_E_SET_SSID, BRCMF_E_STATUS_NO_NETWORKS, 0, @splat(0));
             return;
         };
+        // A WPA2 network only admits stations joining with WPA2-PSK and CCMP
+        if (self.secured() and ((self.wpa_auth & WPA2_AUTH_PSK) == 0 or (self.wsec & AES_ENABLED) == 0)) {
+            self.queueLinkEvent(BRCMF_E_SET_SSID, BRCMF_E_STATUS_FAIL, 0, ap.bssid);
+            return;
+        }
+        self.joined = ap;
         self.queueLinkEvent(BRCMF_E_AUTH, BRCMF_E_STATUS_SUCCESS, 0, ap.bssid);
         self.queueLinkEvent(BRCMF_E_ASSOC, BRCMF_E_STATUS_SUCCESS, 0, ap.bssid);
         self.queueLinkEvent(BRCMF_E_LINK, BRCMF_E_STATUS_SUCCESS, BRCMF_EVENT_MSG_LINK, ap.bssid);
         self.queueLinkEvent(BRCMF_E_SET_SSID, BRCMF_E_STATUS_SUCCESS, 0, ap.bssid);
+        if (!self.secured()) {
+            self.authorized = true;
+            return;
+        }
+        // Start the 4-way handshake: message 1, with a fresh ANonce (and group key for message 3)
+        var anonce: [32]u8 = undefined;
+        var gtk: [16]u8 = undefined;
+        host_posix.getRandomBytes(&anonce);
+        host_posix.getRandomBytes(&gtk);
+        self.authenticator = .{
+            .pmk = wpa2.pmkFromPassphrase(self.ap_passphrase[0..self.ap_passphrase_len], self.ap_ssid[0..self.ap_ssid_len]),
+            .aa = ap.bssid,
+            .spa = self.mac_address,
+            .anonce = anonce,
+            .gtk = gtk,
+        };
+        var m1: [wpa2.MAX_FRAME]u8 = undefined;
+        self.sendEapol(self.authenticator.?.message1(&m1));
     }
 
     /// Disassociates (BRCMF_C_DISASSOC): the link goes down
     fn leaveNetwork(self: *Cyw43430) void {
         const ap = self.joined orelse return;
         self.joined = null;
+        self.authorized = false;
+        self.authenticator = null;
         self.queueLinkEvent(BRCMF_E_LINK, BRCMF_E_STATUS_SUCCESS, 0, ap.bssid);
     }
 
     fn queueLinkEvent(self: *Cyw43430, event_type: u32, status: u32, flags: u16, addr: [6]u8) void {
-        self.queueEventFrom(event_type, status, flags, addr, &.{});
+        self.queueEventFrom(event_type, status, 0, flags, addr, &.{});
     }
 
     /// The access point as a station seen from this one (struct brcmf_sta_info_le version 3):
@@ -1426,7 +1546,7 @@ pub const Cyw43430 = struct {
         @memset(dst[0..STA_INFO_SIZE], 0);
         std.mem.writeInt(u16, dst[0..2], 3, .little); // ver
         std.mem.writeInt(u16, dst[2..4], STA_INFO_SIZE, .little); // len
-        std.mem.writeInt(u16, dst[4..6], if (ap.band_5g) 0x0001 else 0x0401, .little); // cap
+        std.mem.writeInt(u16, dst[4..6], self.capability(ap), .little); // cap
         // flags: BRCMF_STA_AUTHE | BRCMF_STA_ASSOC | BRCMF_STA_AUTHO
         std.mem.writeInt(u32, dst[8..12], 0x08 | 0x10 | 0x20, .little);
         @memcpy(dst[16..22], &ap.bssid); // ea
@@ -1441,7 +1561,7 @@ pub const Cyw43430 = struct {
     }
 
     fn queueEscanResult(self: *Cyw43430, sync_id: u16, ap: AccessPoint) void {
-        var buf: [ESCAN_RESULT_FIXED + BSS_INFO_SIZE + 64]u8 = @splat(0);
+        var buf: [ESCAN_RESULT_FIXED + BSS_INFO_SIZE + 96]u8 = @splat(0);
         const bi_len = self.writeBssInfo(ap, buf[ESCAN_RESULT_FIXED..]);
 
         // struct brcmf_escan_result_le: buflen, version, sync_id, bss_count, bss_info_le
@@ -1451,6 +1571,12 @@ pub const Cyw43430 = struct {
         std.mem.writeInt(u16, buf[8..10], sync_id, .little);
         std.mem.writeInt(u16, buf[10..12], 1, .little);
         self.queueEvent(BRCMF_E_ESCAN_RESULT, BRCMF_E_STATUS_PARTIAL, buf[0..buflen]);
+    }
+
+    /// Capability information: ESS, short slot time at 2.4 GHz, and privacy for WPA2
+    fn capability(self: *const Cyw43430, ap: AccessPoint) u16 {
+        const base: u16 = if (ap.band_5g) 0x0001 else 0x0401;
+        return if (self.secured()) base | 0x0010 else base;
     }
 
     /// Writes `ap`'s struct brcmf_bss_info_le, with its IEs, to the zeroed `bi`; returns its length
@@ -1464,7 +1590,7 @@ pub const Cyw43430 = struct {
             &.{ 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c };
 
         // Information elements: SSID, Supported Rates (8 at most), DS Parameter Set (the
-        // channel), Extended Supported Rates
+        // channel), RSN (WPA2) and Extended Supported Rates
         var ies = bi[BSS_INFO_SIZE..];
         var n: usize = 0;
         ies[n] = 0;
@@ -1480,6 +1606,10 @@ pub const Cyw43430 = struct {
         ies[n + 1] = 1;
         ies[n + 2] = ap.channel;
         n += 3;
+        if (self.secured()) {
+            @memcpy(ies[n..][0..wpa2.rsn_ie.len], &wpa2.rsn_ie);
+            n += wpa2.rsn_ie.len;
+        }
         if (rates.len > basic) {
             ies[n] = 50;
             ies[n + 1] = @intCast(rates.len - basic);
@@ -1494,8 +1624,7 @@ pub const Cyw43430 = struct {
         std.mem.writeInt(u32, bi[4..8], bi_len, .little);
         @memcpy(bi[8..14], &ap.bssid);
         std.mem.writeInt(u16, bi[14..16], 100, .little); // beacon_period (TU)
-        // capability: ESS, plus short slot time at 2.4 GHz; no privacy (an open network)
-        std.mem.writeInt(u16, bi[16..18], if (ap.band_5g) 0x0001 else 0x0401, .little);
+        std.mem.writeInt(u16, bi[16..18], self.capability(ap), .little);
         bi[18] = @intCast(ssid.len);
         @memcpy(bi[19..][0..ssid.len], ssid);
         std.mem.writeInt(u32, bi[52..56], @intCast(rates.len), .little); // rateset.count
@@ -1515,11 +1644,11 @@ pub const Cyw43430 = struct {
     /// Queues a firmware event (BCDC header, ethernet header, struct brcm_ethhdr, then
     /// struct brcmf_event_msg_be followed by `data`) on the SDPCM event channel
     fn queueEvent(self: *Cyw43430, event_type: u32, status: u32, data: []const u8) void {
-        self.queueEventFrom(event_type, status, 0, self.mac_address, data);
+        self.queueEventFrom(event_type, status, 0, 0, self.mac_address, data);
     }
 
     /// Queues a firmware event about `addr` (the peer, or this station)
-    fn queueEventFrom(self: *Cyw43430, event_type: u32, status: u32, flags: u16, addr: [6]u8, data: []const u8) void {
+    fn queueEventFrom(self: *Cyw43430, event_type: u32, status: u32, reason: u32, flags: u16, addr: [6]u8, data: []const u8) void {
         var evt: [76 + 512]u8 = @splat(0);
         if (data.len > evt.len - 76) return;
 
@@ -1548,7 +1677,7 @@ pub const Cyw43430 = struct {
         std.mem.writeInt(u16, evt[30..32], flags, .big);
         std.mem.writeInt(u32, evt[32..36], event_type, .big);
         std.mem.writeInt(u32, evt[36..40], status, .big);
-        std.mem.writeInt(u32, evt[40..44], 0, .big); // reason = 0
+        std.mem.writeInt(u32, evt[40..44], reason, .big);
         std.mem.writeInt(u32, evt[44..48], 0, .big); // auth_type = 0
         std.mem.writeInt(u32, evt[48..52], @intCast(data.len), .big); // datalen
         @memcpy(evt[52..58], &addr);
@@ -2006,4 +2135,115 @@ test "Cyw43455 joins the access point's 5 GHz radio when asked for its channel" 
     }
     const r = testDcmd(&chip, 127, false, &.{}, &reply); // BRCMF_C_GET_RSSI
     try std.testing.expectEqual(@as(i32, ap_5g.rssi), std.mem.readInt(i32, r[0..4], .little));
+}
+
+/// Sets integer iovar `name` to `val` with SET_VAR
+fn testSetInt(chip: *Cyw43430, name: []const u8, val: u32, reply: *[2048]u8) void {
+    var body: [32]u8 = undefined;
+    @memcpy(body[0..name.len], name);
+    body[name.len] = 0;
+    std.mem.writeInt(u32, body[name.len + 1 ..][0..4], val, .little);
+    _ = testDcmd(chip, 263, true, body[0 .. name.len + 5], reply);
+}
+
+/// Reads the next data-channel frame and returns its 802.3 frame
+fn testReadData(chip: *Cyw43430, frame: *[2048]u8) ![]const u8 {
+    chip.readExtended(2, 0, true, frame);
+    try std.testing.expectEqual(@as(u8, 2), frame[5] & 0x0f); // SDPCM_DATA_CHANNEL
+    const len = std.mem.readInt(u16, frame[0..2], .little);
+    return frame[12 + 4 .. len];
+}
+
+/// Sends 802.3 frame `eth` on the data channel
+fn testSendData(chip: *Cyw43430, eth: []const u8) void {
+    var tx: [512]u8 = @splat(0);
+    const total: u16 = @intCast(12 + 4 + eth.len);
+    std.mem.writeInt(u16, tx[0..2], total, .little);
+    std.mem.writeInt(u16, tx[2..4], ~total, .little);
+    tx[5] = 2; // SDPCM_DATA_CHANNEL
+    tx[7] = 12;
+    tx[12] = 0x20; // BCDC data header
+    @memcpy(tx[16..][0..eth.len], eth);
+    chip.writeExtended(2, 0, true, tx[0..total]);
+}
+
+/// Answers an EAPOL-Key message from the access point as the station's supplicant would
+fn testStationKey(chip: *Cyw43430, ap: Cyw43430.AccessPoint, msg: []const u8, info: u16, snonce: [32]u8, key_data: []const u8, kck: [16]u8) void {
+    var eapol: [wpa2.MAX_FRAME]u8 = undefined;
+    const replay = std.mem.readInt(u64, msg[wpa2.REPLAY..][0..8], .big);
+    const m = wpa2.buildKey(&eapol, info, replay, snonce, key_data, kck);
+    var eth: [14 + wpa2.MAX_FRAME]u8 = undefined;
+    @memcpy(eth[0..6], &ap.bssid);
+    @memcpy(eth[6..12], &chip.mac_address);
+    std.mem.writeInt(u16, eth[12..14], 0x888e, .big);
+    @memcpy(eth[14..][0..m.len], m);
+    testSendData(chip, eth[0 .. 14 + m.len]);
+}
+
+test "Cyw43430 WPA2 access point runs the 4-way handshake before passing data" {
+    for ([_][]const u8{ "correct horse", "wrong horse!" }) |passphrase| {
+        var chip = Cyw43430{ .mac_address = .{ 0xb8, 0x27, 0xeb, 0x01, 0x02, 0x03 } };
+        defer chip.deinit();
+        chip.writeByte(0, 0x04, 0x07);
+        chip.setAccessPointName("tokamak");
+        chip.setAccessPointPassphrase("correct horse");
+        var reply: [2048]u8 = undefined;
+        var aps: [2]Cyw43430.AccessPoint = undefined;
+        const ap = chip.accessPoints(&aps)[0];
+
+        // Scans show privacy and the RSN IE
+        var bss: [4][256]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try testEscan(&chip, "", &.{}, &bss));
+        try std.testing.expect(std.mem.readInt(u16, bss[0][16..18], .little) & 0x0010 != 0);
+        const ie_len = std.mem.readInt(u32, bss[0][120..124], .little);
+        try std.testing.expect(std.mem.indexOf(u8, bss[0][128..][0..ie_len], &wpa2.rsn_ie) != null);
+
+        // Joining without WPA2-PSK is refused
+        var body: [80]u8 = @splat(0);
+        @memcpy(body[0..5], "join\x00");
+        body[5..75].* = testJoinParams("tokamak", 0);
+        _ = testDcmd(&chip, 263, true, body[0..75], &reply);
+        var e = try testReadEvent(&chip);
+        try std.testing.expectEqual(@as(u32, 0), e.event_type); // BRCMF_E_SET_SSID
+        try std.testing.expectEqual(@as(u32, 1), e.status); // BRCMF_E_STATUS_FAIL
+
+        // With WPA2-PSK and CCMP: associated, then message 1 from the access point
+        testSetInt(&chip, "wpa_auth", 0x80, &reply);
+        testSetInt(&chip, "wsec", 4, &reply);
+        var r = testDcmd(&chip, 262, false, "wpa_auth\x00", &reply);
+        try std.testing.expectEqual(@as(u32, 0x80), std.mem.readInt(u32, r[0..4], .little));
+        _ = testDcmd(&chip, 263, true, body[0..75], &reply);
+        for ([_]u32{ 3, 7, 16, 0 }) |want| {
+            e = try testReadEvent(&chip);
+            try std.testing.expectEqual(want, e.event_type);
+            try std.testing.expectEqual(@as(u32, 0), e.status);
+        }
+        var frame: [2048]u8 = undefined;
+        var eth = try testReadData(&chip, &frame);
+        try std.testing.expectEqualSlices(u8, &chip.mac_address, eth[0..6]);
+        try std.testing.expectEqualSlices(u8, &ap.bssid, eth[6..12]);
+        try std.testing.expectEqual(@as(u16, 0x888e), std.mem.readInt(u16, eth[12..14], .big));
+        var m1: [wpa2.MAX_FRAME]u8 = undefined;
+        @memcpy(m1[0 .. eth.len - 14], eth[14..]);
+        try std.testing.expect(!chip.authorized);
+
+        // Message 2 with the station's passphrase
+        const snonce: [32]u8 = @splat(0x5a);
+        const ptk = wpa2.derivePtk(wpa2.pmkFromPassphrase(passphrase, "tokamak"), ap.bssid, chip.mac_address, m1[wpa2.NONCE..][0..32].*, snonce);
+        testStationKey(&chip, ap, &m1, wpa2.KI_VERSION_2 | wpa2.KI_PAIRWISE | wpa2.KI_MIC, snonce, &wpa2.rsn_ie, ptk.kck);
+        if (!std.mem.eql(u8, passphrase, "correct horse")) {
+            // Another passphrase: deauthenticated
+            e = try testReadEvent(&chip);
+            try std.testing.expectEqual(@as(u32, 6), e.event_type); // BRCMF_E_DEAUTH_IND
+            try std.testing.expectEqualSlices(u8, &ap.bssid, &e.addr);
+            try std.testing.expect(chip.joined == null);
+            continue;
+        }
+        eth = try testReadData(&chip, &frame);
+        try std.testing.expectEqual(@as(u16, 0x888e), std.mem.readInt(u16, eth[12..14], .big));
+        var m3: [wpa2.MAX_FRAME]u8 = undefined;
+        @memcpy(m3[0 .. eth.len - 14], eth[14..]);
+        testStationKey(&chip, ap, &m3, wpa2.KI_VERSION_2 | wpa2.KI_PAIRWISE | wpa2.KI_MIC | wpa2.KI_SECURE, @splat(0), &.{}, ptk.kck);
+        try std.testing.expect(chip.authorized);
+    }
 }

@@ -26,6 +26,7 @@ pub const dma = @import("soc/dma.zig");
 pub const qcow2 = @import("soc/qcow2.zig");
 pub const sdhost = @import("soc/sdhost.zig");
 pub const cyw43430 = @import("soc/cyw43430.zig");
+pub const wpa2 = @import("soc/wpa2.zig");
 pub const bluetooth = @import("soc/bluetooth.zig");
 pub const mphi = @import("soc/mphi.zig");
 pub const i2c = @import("soc/i2c.zig");
@@ -73,6 +74,8 @@ const CliOptions = struct {
     sequential_cores: bool = false,
     strict: bool = false,
     clock: ClockMode = .realtime,
+    /// WPA2 passphrase of the emulated Wi-Fi access point (open while null)
+    wifi_password: ?[]const u8 = null,
 };
 
 /// Longest a parallel slice runs with `--clock realtime` (see `Smp.slice_deadline_ns`). A guest timer
@@ -178,6 +181,8 @@ fn printUsage(sandboxed: bool) void {
         \\  --power             Start with the 5V power supply connected
         \\  --model <model>     Board to emulate: zero, zero-w, zero-2-w, 1a+, 1b+, 3a+, 3b+ (default)
         \\  --hdmi-size <WxH>   HDMI output size in pixels (default: 1280x720)
+        \\  --wifi-password <p> Secure the emulated Wi-Fi network with WPA2 and passphrase <p> (8-63
+        \\                      characters); without it the network is open
         \\
     );
     if (!sandboxed) host_posix.writeStdout(
@@ -193,6 +198,12 @@ fn printUsage(sandboxed: bool) void {
         \\  --help              Show this help message
         \\
     );
+}
+
+/// A WPA2 passphrase is 8 to 63 characters of printable ASCII (32..126)
+fn isPrintableAscii(s: []const u8) bool {
+    for (s) |c| if (c < 32 or c > 126) return false;
+    return true;
 }
 
 pub fn main(init: std.process.Init.Minimal) u8 {
@@ -255,6 +266,16 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             };
             opts.width = sz.width;
             opts.height = sz.height;
+        } else if (std.mem.eql(u8, arg, "--wifi-password")) {
+            const p = args.next() orelse {
+                printUsage(sandboxed);
+                return 1;
+            };
+            if (p.len < 8 or p.len > 63 or !isPrintableAscii(p)) {
+                std.debug.print("Invalid --wifi-password (expected 8 to 63 printable ASCII characters)\n", .{});
+                return 1;
+            }
+            opts.wifi_password = p;
         } else if (std.mem.eql(u8, arg, "--headless")) {
             opts.headless = true;
         } else if (std.mem.eql(u8, arg, "--max-steps")) {
@@ -337,6 +358,7 @@ fn loadGuestBoot(
     var host_name_buf: [64]u8 = undefined;
     const host_name = host_posix.hostName(&host_name_buf);
     soc.sdhci.wifi.setAccessPointName(if (host_name.len != 0) host_name else "FauxPi");
+    soc.sdhci.wifi.setAccessPointPassphrase(opts.wifi_password orelse "");
     soc.bt.enabled = board_model.hasWireless();
     soc.bt.chip = switch (board_model) {
         .pi_3_a_plus, .pi_3_b_plus => .bcm4345c0,
