@@ -74,7 +74,9 @@ const CliOptions = struct {
     sequential_cores: bool = false,
     strict: bool = false,
     clock: ClockMode = .realtime,
-    /// WPA2 passphrase of the emulated Wi-Fi access point (open while null)
+    /// Security of the emulated Wi-Fi access point, and its WPA2 passphrase (the board settings'
+    /// while null)
+    wifi_security: ?ui_board_sheet.WifiSecurity = null,
     wifi_password: ?[]const u8 = null,
 };
 
@@ -181,6 +183,8 @@ fn printUsage(sandboxed: bool) void {
         \\  --power             Start with the 5V power supply connected
         \\  --model <model>     Board to emulate: zero, zero-w, zero-2-w, 1a+, 1b+, 3a+, 3b+ (default)
         \\  --hdmi-size <WxH>   HDMI output size in pixels (default: 1280x720)
+        \\  --wifi-security <s> Security of the emulated Wi-Fi network: wpa2 (default) or open,
+        \\                      overriding the board settings
         \\  --wifi-password <p> WPA2 passphrase <p> (8-63 characters) of the emulated Wi-Fi network,
         \\                      overriding the board settings (default: raspberry)
         \\
@@ -266,6 +270,19 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             };
             opts.width = sz.width;
             opts.height = sz.height;
+        } else if (std.mem.eql(u8, arg, "--wifi-security")) {
+            const v = args.next() orelse {
+                printUsage(sandboxed);
+                return 1;
+            };
+            opts.wifi_security = if (std.mem.eql(u8, v, "wpa2"))
+                .wpa2_personal
+            else if (std.mem.eql(u8, v, "open"))
+                .open
+            else {
+                std.debug.print("Unknown --wifi-security '{s}' (expected wpa2 or open)\n", .{v});
+                return 1;
+            };
         } else if (std.mem.eql(u8, arg, "--wifi-password")) {
             const p = args.next() orelse {
                 printUsage(sandboxed);
@@ -309,6 +326,10 @@ pub fn main(init: std.process.Init.Minimal) u8 {
 
     if (opts.headless and opts.sd_path == null) {
         printUsage(sandboxed);
+        return 1;
+    }
+    if (opts.wifi_security == .open and opts.wifi_password != null) {
+        std.debug.print("--wifi-password needs WPA2, not --wifi-security open\n", .{});
         return 1;
     }
 
@@ -437,16 +458,19 @@ fn noteRealtimeIdle(since_ns: *?u64, timer_wait_us: u64, cpus: *[4]Cpu) void {
     }
 }
 
-/// The emulated Wi-Fi access point's security: `--wifi-password` if given, else the board
-/// settings, else (headless) WPA2-Personal with the default password
+/// The emulated Wi-Fi access point's security and password: `--wifi-security` and
+/// `--wifi-password` where given (a password alone means WPA2), else the board settings, else
+/// (headless) WPA2-Personal with the default password
 fn syncWifiSecurity(soc: *Bcm2835, w: ?*const window.Window, opts: CliOptions) void {
-    if (opts.wifi_password) |p| return soc.sdhci.wifi.setAccessPointSecurity(.wpa2_personal, p);
-    const ui = &(w orelse return soc.sdhci.wifi.setAccessPointSecurity(.wpa2_personal, ui_board_sheet.default_wifi_password)).ui;
-    const security: cyw43430.Cyw43430.Security = switch (ui.wifi_security) {
+    const ui: ?*const ui_board_sheet.BoardUi = if (w) |win| &win.ui else null;
+    const security = opts.wifi_security orelse
+        (if (opts.wifi_password != null) .wpa2_personal else if (ui) |u| u.wifi_security else .wpa2_personal);
+    const password = opts.wifi_password orelse
+        (if (ui) |u| u.wifiPassword() else ui_board_sheet.default_wifi_password);
+    soc.sdhci.wifi.setAccessPointSecurity(switch (security) {
         .open => .open,
         .wpa2_personal => .wpa2_personal,
-    };
-    soc.sdhci.wifi.setAccessPointSecurity(security, ui.wifiPassword());
+    }, password);
 }
 
 fn syncWindowPeripheralsToSoc(w: *const window.Window, soc: *Bcm2835) void {
