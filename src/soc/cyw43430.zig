@@ -578,6 +578,7 @@ pub const Cyw43430 = struct {
                         // When ARM CM3 core (idx 3) is released from reset (val == 0),
                         // firmware is ready and signals HMB_DATA_FWREADY
                         if (idx == 3 and val == 0) {
+                            self.publishShared();
                             self.sdio_tohostmailboxdata = 0x00040008;
                             self.sdio_intstatus |= I_HMB_HOST_INT;
                         }
@@ -590,6 +591,41 @@ pub const Cyw43430 = struct {
     }
 
     const I_HMB_SW_MASK_ACK: u32 = I_HMB_HOST_INT;
+
+    const SDPCM_SHARED_VERSION: u32 = 3;
+    const SDPCM_SHARED_SIZE: u32 = 76; // struct sdpcm_shared
+    const RTE_CONSOLE_SIZE: u32 = 156; // struct rte_console
+    const CONSOLE_BUF_SIZE: u32 = 1024;
+
+    /// What the firmware does as it starts: it lays out its `sdpcm_shared` structure, with an
+    /// (empty) console log, and overwrites the last word of RAM, which held the NVRAM length
+    /// token, with its address. `brcmfmac` reads it to find the console and trap information.
+    fn publishShared(self: *Cyw43430) void {
+        const ram_size: u32 = RAM_SIZE;
+        // The NVRAM, ending in its length token (~words << 16 | words), sits at the top of RAM
+        const token = std.mem.readInt(u32, self.chip_ram[ram_size - 4 ..][0..4], .little);
+        const words = token & 0xffff;
+        const nvram_len: u32 = if ((token >> 16) == (~words & 0xffff)) words * 4 + 4 else 4;
+        if (nvram_len + SDPCM_SHARED_SIZE + RTE_CONSOLE_SIZE + CONSOLE_BUF_SIZE + 48 > ram_size) return;
+        const console_buf = (ram_size - nvram_len - CONSOLE_BUF_SIZE) & ~@as(u32, 15);
+        const console = (console_buf - RTE_CONSOLE_SIZE) & ~@as(u32, 15);
+        const shared = (console - SDPCM_SHARED_SIZE) & ~@as(u32, 15);
+
+        @memset(self.chip_ram[shared .. ram_size - nvram_len], 0);
+        // struct rte_console: vcons_in, vcons_out, then rte_log_le { buf, buf_size, idx, buf }
+        self.writeRam32(console + 8, console_buf);
+        self.writeRam32(console + 12, CONSOLE_BUF_SIZE);
+        self.writeRam32(console + 20, console_buf);
+        // struct sdpcm_shared: flags, trap_addr, assert_exp_addr, assert_file_addr, assert_line,
+        // console_addr, msgtrace_addr, tag[32], brpt_addr
+        self.writeRam32(shared, SDPCM_SHARED_VERSION);
+        self.writeRam32(shared + 20, console);
+        self.writeRam32(ram_size - 4, shared);
+    }
+
+    fn writeRam32(self: *Cyw43430, addr: u32, val: u32) void {
+        std.mem.writeInt(u32, self.chip_ram[addr..][0..4], val, .little);
+    }
 
     fn eromCoreEntry(comptime core_id: u16, comptime rev: u8, comptime base: u32, comptime wrap: u32) [4]u32 {
         return .{
@@ -971,4 +1007,25 @@ test "Cyw43430 CIS tuples, backplane ChipCommon/EROM, and BCDC cur_etheraddr" {
     var rx_pkt: [64]u8 = undefined;
     chip.readExtended(2, 0, true, &rx_pkt);
     try std.testing.expectEqualSlices(u8, &.{ 0xb8, 0x27, 0xeb, 0xaa, 0xbb, 0xcc }, rx_pkt[28..34]);
+}
+
+test "Cyw43430 firmware start replaces the NVRAM token with its sdpcm_shared address" {
+    var chip = Cyw43430{};
+    // brcmfmac downloads 0x2a0 bytes of NVRAM to the top of RAM, ending in its length token
+    const words: u32 = 0x2a0 / 4;
+    chip.writeBackplane32(Cyw43430.RAM_SIZE - 4, (~words << 16) | words);
+    chip.writeBackplane32(Cyw43430.RAM_SIZE - 0x2a4, 0x3d6e6f6d); // NVRAM text
+
+    chip.writeBackplane32(0x18103800, 0); // release the ARM CM3 from reset
+
+    const shared = chip.readBackplane32(Cyw43430.RAM_SIZE - 4);
+    try std.testing.expect(shared != 0 and ((~shared >> 16) & 0xffff) != (shared & 0xffff));
+    try std.testing.expect(shared < Cyw43430.RAM_SIZE - 0x2a4);
+    try std.testing.expectEqual(@as(u32, 0x3d6e6f6d), chip.readBackplane32(Cyw43430.RAM_SIZE - 0x2a4));
+    try std.testing.expectEqual(@as(u32, 3), chip.readBackplane32(shared) & 0xff); // version
+    const console = chip.readBackplane32(shared + 20);
+    const buf = chip.readBackplane32(console + 8);
+    try std.testing.expectEqual(@as(u32, 1024), chip.readBackplane32(console + 12)); // buf_size
+    try std.testing.expectEqual(@as(u32, 0), chip.readBackplane32(console + 16)); // idx
+    try std.testing.expect(buf > console and buf + 1024 <= Cyw43430.RAM_SIZE - 0x2a4);
 }
