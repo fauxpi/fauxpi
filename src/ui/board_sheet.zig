@@ -164,6 +164,15 @@ pub const WifiSecurity = enum {
     }
 };
 
+/// The Wi-Fi password until one is set
+pub const default_wifi_password = "raspberry";
+
+fn defaultWifiPasswordBuf() [63]u8 {
+    var buf: [63]u8 = @splat(0);
+    @memcpy(buf[0..default_wifi_password.len], default_wifi_password);
+    return buf;
+}
+
 /// A WPA2 passphrase is 8 to 63 characters of printable ASCII
 pub fn isValidWifiPassword(p: []const u8) bool {
     if (p.len < 8 or p.len > 63) return false;
@@ -361,8 +370,8 @@ pub const BoardUi = struct {
     wifi_mac_len: usize = 12,
     /// The emulated Wi-Fi access point's security, and its WPA2 passphrase
     wifi_security: WifiSecurity = .open,
-    wifi_password_buf: [63]u8 = @splat(0),
-    wifi_password_len: usize = 0,
+    wifi_password_buf: [63]u8 = defaultWifiPasswordBuf(),
+    wifi_password_len: usize = default_wifi_password.len,
 
     /// Persistent storage paths under `$XDG_DATA_HOME/fauxpi`.
     data_dir_buf: [512]u8 = @splat(0),
@@ -6564,9 +6573,11 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     status.dhcp_enabled = false;
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
 
-    // Wi-Fi security: choosing WPA2-Personal focuses the empty password, which takes printable
+    // Wi-Fi security: WPA2-Personal starts with the default password, which takes printable
     // characters and stays editable while the board is powered
     try testing.expectEqual(WifiSecurity.open, ui.wifi_security);
+    try testing.expectEqualStrings("raspberry", ui.wifiPassword());
+    try testing.expect(isValidWifiPassword(default_wifi_password));
     const sec_r = ui.wifi_security_btn_rect;
     _ = ui.pointerButton(sec_r.x + 10, sec_r.y + 10, true, status, &hw);
     _ = ui.pointerButton(sec_r.x + 10, sec_r.y + 10, false, status, &hw);
@@ -6576,9 +6587,15 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     _ = ui.pointerButton(ui.wifi_security_menu_rect.x + 20, wpa2_y, true, status, &hw);
     try testing.expectEqual(Action.consumed, ui.pointerButton(ui.wifi_security_menu_rect.x + 20, wpa2_y, false, status, &hw));
     try testing.expectEqual(WifiSecurity.wpa2_personal, ui.wifi_security);
-    try testing.expectEqual(@as(@TypeOf(ui.focused_field), .wifi_password), ui.focused_field);
+    try testing.expectEqual(@as(@TypeOf(ui.focused_field), .none), ui.focused_field);
     status.power_connected = true;
     ui.updateLayout(win_w, win_h, status, &hw);
+    const pw_r = ui.wifi_password_field_rect;
+    _ = ui.pointerButton(pw_r.x + 10, pw_r.y + 10, true, status, &hw);
+    _ = ui.pointerButton(pw_r.x + 10, pw_r.y + 10, false, status, &hw);
+    try testing.expectEqual(@as(@TypeOf(ui.focused_field), .wifi_password), ui.focused_field);
+    for (0..default_wifi_password.len) |_| try testing.expect(ui.handleKey(14)); // Backspace
+    try testing.expectEqualStrings("", ui.wifiPassword());
     for (0..7) |_| try testing.expect(ui.handleKey(30)); // 'a'
     try testing.expect(!isValidWifiPassword(ui.wifiPassword()));
     try testing.expect(ui.handleKey(57)); // space
