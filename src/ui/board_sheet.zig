@@ -369,7 +369,7 @@ pub const BoardUi = struct {
     wifi_mac_hex: [12]u8 = "B827EB654321".*,
     wifi_mac_len: usize = 12,
     /// The emulated Wi-Fi access point's security, and its WPA2 passphrase
-    wifi_security: WifiSecurity = .open,
+    wifi_security: WifiSecurity = .wpa2_personal,
     wifi_password_buf: [63]u8 = defaultWifiPasswordBuf(),
     wifi_password_len: usize = default_wifi_password.len,
 
@@ -6573,12 +6573,19 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     status.dhcp_enabled = false;
     ui.paint(pixels, win_w, win_h, 1, status, &hw);
 
-    // Wi-Fi security: WPA2-Personal starts with the default password, which takes printable
-    // characters and stays editable while the board is powered
-    try testing.expectEqual(WifiSecurity.open, ui.wifi_security);
+    // Wi-Fi security: WPA2-Personal with the default password at first. Choosing Open from the
+    // menu, then WPA2-Personal again; the password takes printable characters and stays
+    // editable while the board is powered
+    try testing.expectEqual(WifiSecurity.wpa2_personal, ui.wifi_security);
     try testing.expectEqualStrings("raspberry", ui.wifiPassword());
     try testing.expect(isValidWifiPassword(default_wifi_password));
     const sec_r = ui.wifi_security_btn_rect;
+    _ = ui.pointerButton(sec_r.x + 10, sec_r.y + 10, true, status, &hw);
+    _ = ui.pointerButton(sec_r.x + 10, sec_r.y + 10, false, status, &hw);
+    const open_y = ui.wifi_security_menu_rect.y + 4.0 + 16.0;
+    _ = ui.pointerButton(ui.wifi_security_menu_rect.x + 20, open_y, true, status, &hw);
+    _ = ui.pointerButton(ui.wifi_security_menu_rect.x + 20, open_y, false, status, &hw);
+    try testing.expectEqual(WifiSecurity.open, ui.wifi_security);
     _ = ui.pointerButton(sec_r.x + 10, sec_r.y + 10, true, status, &hw);
     _ = ui.pointerButton(sec_r.x + 10, sec_r.y + 10, false, status, &hw);
     try testing.expect(ui.wifi_security_menu_open);

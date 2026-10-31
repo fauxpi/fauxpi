@@ -181,8 +181,8 @@ fn printUsage(sandboxed: bool) void {
         \\  --power             Start with the 5V power supply connected
         \\  --model <model>     Board to emulate: zero, zero-w, zero-2-w, 1a+, 1b+, 3a+, 3b+ (default)
         \\  --hdmi-size <WxH>   HDMI output size in pixels (default: 1280x720)
-        \\  --wifi-password <p> Secure the emulated Wi-Fi network with WPA2 and passphrase <p> (8-63
-        \\                      characters), overriding the board settings
+        \\  --wifi-password <p> WPA2 passphrase <p> (8-63 characters) of the emulated Wi-Fi network,
+        \\                      overriding the board settings (default: raspberry)
         \\
     );
     if (!sandboxed) host_posix.writeStdout(
@@ -437,10 +437,11 @@ fn noteRealtimeIdle(since_ns: *?u64, timer_wait_us: u64, cpus: *[4]Cpu) void {
     }
 }
 
-/// The emulated Wi-Fi access point's security: `--wifi-password` if given, else the board settings
+/// The emulated Wi-Fi access point's security: `--wifi-password` if given, else the board
+/// settings, else (headless) WPA2-Personal with the default password
 fn syncWifiSecurity(soc: *Bcm2835, w: ?*const window.Window, opts: CliOptions) void {
     if (opts.wifi_password) |p| return soc.sdhci.wifi.setAccessPointSecurity(.wpa2_personal, p);
-    const ui = &(w orelse return soc.sdhci.wifi.setAccessPointSecurity(.open, "")).ui;
+    const ui = &(w orelse return soc.sdhci.wifi.setAccessPointSecurity(.wpa2_personal, ui_board_sheet.default_wifi_password)).ui;
     const security: cyw43430.Cyw43430.Security = switch (ui.wifi_security) {
         .open => .open,
         .wpa2_personal => .wpa2_personal,
