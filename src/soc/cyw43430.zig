@@ -243,6 +243,9 @@ pub const Cyw43430 = struct {
     country_ccode: [4]u8 = .{ '0', '0', 0, 0 },
     /// `bw_cap` the host set for the 5 GHz and 2.4 GHz bands, if any (`null` = all supported)
     bw_cap: [2]?u32 = .{ null, null },
+    /// SSID of the open access point scans find (none while empty)
+    ap_ssid: [32]u8 = @splat(0),
+    ap_ssid_len: u8 = 0,
 
     rx_frames: [MAX_RX_FRAMES][MAX_FRAME_LEN]u8 = undefined,
     rx_frame_lens: [MAX_RX_FRAMES]usize = @splat(0),
@@ -257,7 +260,17 @@ pub const Cyw43430 = struct {
     pub fn reset(self: *Cyw43430) void {
         const mac = self.mac_address;
         const chip = self.chip;
-        self.* = .{ .chip = chip, .mac_address = mac };
+        const ap_ssid = self.ap_ssid;
+        const ap_ssid_len = self.ap_ssid_len;
+        self.* = .{ .chip = chip, .mac_address = mac, .ap_ssid = ap_ssid, .ap_ssid_len = ap_ssid_len };
+    }
+
+    /// Names the open access point scans find (up to 32 bytes of `ssid`)
+    pub fn setAccessPointName(self: *Cyw43430, ssid: []const u8) void {
+        const n = @min(ssid.len, self.ap_ssid.len);
+        @memset(&self.ap_ssid, 0);
+        @memcpy(self.ap_ssid[0..n], ssid[0..n]);
+        self.ap_ssid_len = @intCast(n);
     }
 
     /// Offset into `chip_ram` of the `len` bytes at backplane address `addr`, if they are RAM
@@ -902,7 +915,7 @@ pub const Cyw43430 = struct {
 
         var status: i32 = 0;
         var out_body_len: usize = max_body;
-        var trigger_escan = false;
+        var escan_params: ?[]const u8 = null;
 
         switch (cmd) {
             BRCMF_C_GET_VAR, BRCMF_C_SET_VAR => {
@@ -1015,7 +1028,7 @@ pub const Cyw43430 = struct {
                             }
                         }
                     } else if (std.mem.eql(u8, var_name, "escan")) {
-                        trigger_escan = true;
+                        escan_params = arg;
                     } else if (std.mem.eql(u8, var_name, "bus:rxglom") or
                         std.mem.eql(u8, var_name, "ulp_sdioctrl") or
                         std.mem.eql(u8, var_name, "pfn") or
@@ -1086,9 +1099,7 @@ pub const Cyw43430 = struct {
 
         self.queueRxFrame(SDPCM_CONTROL_CHANNEL, resp_buf[0 .. 16 + out_body_len]);
 
-        if (trigger_escan) {
-            self.queueEscanCompleteEvent();
-        }
+        if (escan_params) |params| self.runEscan(params);
     }
 
     /// The channel widths enabled in `band`: what the host set with `bw_cap`, or all supported
@@ -1155,10 +1166,156 @@ pub const Cyw43430 = struct {
         return out[0..n];
     }
 
-    fn queueEscanCompleteEvent(self: *Cyw43430) void {
-        // BCDC header (4 bytes) + struct brcmf_event (14 + 10 + 48 = 72 bytes) = 76 bytes
-        // Total SDPCM frame = 12 + 76 = 88 bytes (> BRCMF_FIRSTREAD = 64 bytes)
-        var evt: [76]u8 = @splat(0);
+    const BRCMF_E_ESCAN_RESULT: u32 = 69;
+    const BRCMF_E_STATUS_SUCCESS: u32 = 0;
+    const BRCMF_E_STATUS_PARTIAL: u32 = 8;
+    const BSS_INFO_SIZE: usize = 128; // struct brcmf_bss_info_le, before its IEs
+    const ESCAN_RESULT_FIXED: usize = 12; // struct brcmf_escan_result_le, before bss_info_le
+
+    /// One radio of the emulated access point: an open, legacy (802.11a/g) BSS
+    const AccessPoint = struct {
+        bssid: [6]u8,
+        channel: u8,
+        band_5g: bool,
+        rssi: i16,
+    };
+
+    /// The access point's radios this chip can hear: 2.4 GHz channel 6 and, on dual-band chips,
+    /// 5 GHz channel 36, each with a locally administered BSSID derived from the SSID
+    fn accessPoints(self: *const Cyw43430, out: *[2]AccessPoint) []const AccessPoint {
+        if (self.ap_ssid_len == 0) return out[0..0];
+        var h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (self.ap_ssid[0..self.ap_ssid_len]) |c| h = (h ^ c) *% 0x0000_0100_0000_01b3;
+        var bssid: [6]u8 = undefined;
+        for (&bssid, 0..) |*b, i| b.* = @truncate(h >> @intCast(i * 8));
+        bssid[0] = (bssid[0] & 0xfc) | 0x02; // locally administered, unicast
+        bssid[5] &= 0xfe;
+        out[0] = .{ .bssid = bssid, .channel = 6, .band_5g = false, .rssi = -45 };
+        if (!self.chip.dualBand()) return out[0..1];
+        bssid[5] |= 1;
+        out[1] = .{ .bssid = bssid, .channel = 36, .band_5g = true, .rssi = -52 };
+        return out[0..2];
+    }
+
+    /// Handles `escan` (struct brcmf_escan_params_le: version, action, sync_id, then
+    /// struct brcmf_scan_params_le): reports each access point radio on a requested channel
+    /// whose SSID was asked for, as a BRCMF_E_ESCAN_RESULT partial result, then completes.
+    fn runEscan(self: *Cyw43430, params: []const u8) void {
+        const sync_id: u16 = if (params.len >= 8) std.mem.readInt(u16, params[6..8], .little) else 0;
+        // scan_params_le: ssid_le at 8, ..., channel_num at 68 (channels low 16 bits, SSIDs high),
+        // then the channel chanspecs and, 32-bit aligned, the SSIDs (struct brcmf_ssid_le)
+        const channel_num: u32 = if (params.len >= 72) std.mem.readInt(u32, params[68..72], .little) else 0;
+        const n_channels: usize = channel_num & 0xffff;
+        const n_ssids: usize = channel_num >> 16;
+        const ssids_at = std.mem.alignForward(usize, 72 + n_channels * 2, 4);
+
+        var aps: [2]AccessPoint = undefined;
+        for (self.accessPoints(&aps)) |ap| {
+            if (n_channels != 0) {
+                var listed = false;
+                for (0..n_channels) |i| {
+                    if (72 + i * 2 + 2 > params.len) break;
+                    const chanspec = std.mem.readInt(u16, params[72 + i * 2 ..][0..2], .little);
+                    if ((chanspec & 0xff) == ap.channel) listed = true;
+                }
+                if (!listed) continue;
+            }
+            if (n_ssids != 0) {
+                var wanted = false;
+                for (0..n_ssids) |i| {
+                    const at = ssids_at + i * 36;
+                    if (at + 36 > params.len) break;
+                    if (self.ssidMatches(params[at..][0..36])) wanted = true;
+                }
+                if (!wanted) continue;
+            } else if (params.len >= 44 and !self.ssidMatches(params[8..44])) {
+                continue;
+            }
+            self.queueEscanResult(sync_id, ap);
+        }
+        self.queueEvent(BRCMF_E_ESCAN_RESULT, BRCMF_E_STATUS_SUCCESS, &.{});
+    }
+
+    /// Whether the access point answers to `ssid_le` (struct brcmf_ssid_le: length, SSID);
+    /// an empty SSID is a wildcard
+    fn ssidMatches(self: *const Cyw43430, ssid_le: *const [36]u8) bool {
+        const len = std.mem.readInt(u32, ssid_le[0..4], .little);
+        if (len == 0) return true;
+        return len == self.ap_ssid_len and std.mem.eql(u8, ssid_le[4..][0..len], self.ap_ssid[0..len]);
+    }
+
+    fn queueEscanResult(self: *Cyw43430, sync_id: u16, ap: AccessPoint) void {
+        var buf: [ESCAN_RESULT_FIXED + BSS_INFO_SIZE + 64]u8 = @splat(0);
+        const bi = buf[ESCAN_RESULT_FIXED..];
+        const ssid = self.ap_ssid[0..self.ap_ssid_len];
+        // Rates in 500 kb/s units, 0x80 marking the basic rates: 1, 2, 5.5, 11 Mb/s (basic) and
+        // 6..54 Mb/s at 2.4 GHz; 6, 12, 24 Mb/s (basic) and 9..54 Mb/s at 5 GHz
+        const rates: []const u8 = if (ap.band_5g)
+            &.{ 0x8c, 0x12, 0x98, 0x24, 0xb0, 0x48, 0x60, 0x6c }
+        else
+            &.{ 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24, 0x30, 0x48, 0x60, 0x6c };
+
+        // Information elements: SSID, Supported Rates (8 at most), DS Parameter Set (the
+        // channel), Extended Supported Rates
+        var ies = bi[BSS_INFO_SIZE..];
+        var n: usize = 0;
+        ies[n] = 0;
+        ies[n + 1] = @intCast(ssid.len);
+        @memcpy(ies[n + 2 ..][0..ssid.len], ssid);
+        n += 2 + ssid.len;
+        const basic = @min(rates.len, 8);
+        ies[n] = 1;
+        ies[n + 1] = @intCast(basic);
+        @memcpy(ies[n + 2 ..][0..basic], rates[0..basic]);
+        n += 2 + basic;
+        ies[n] = 3;
+        ies[n + 1] = 1;
+        ies[n + 2] = ap.channel;
+        n += 3;
+        if (rates.len > basic) {
+            ies[n] = 50;
+            ies[n + 1] = @intCast(rates.len - basic);
+            @memcpy(ies[n + 2 ..][0 .. rates.len - basic], rates[basic..]);
+            n += 2 + rates.len - basic;
+        }
+        n = std.mem.alignForward(usize, n, 4);
+
+        // struct brcmf_bss_info_le
+        const bi_len: u32 = @intCast(BSS_INFO_SIZE + n);
+        std.mem.writeInt(u32, bi[0..4], 109, .little); // BRCMF_BSS_INFO_VERSION
+        std.mem.writeInt(u32, bi[4..8], bi_len, .little);
+        @memcpy(bi[8..14], &ap.bssid);
+        std.mem.writeInt(u16, bi[14..16], 100, .little); // beacon_period (TU)
+        // capability: ESS, plus short slot time at 2.4 GHz; no privacy (an open network)
+        std.mem.writeInt(u16, bi[16..18], if (ap.band_5g) 0x0001 else 0x0401, .little);
+        bi[18] = @intCast(ssid.len);
+        @memcpy(bi[19..][0..ssid.len], ssid);
+        std.mem.writeInt(u32, bi[52..56], @intCast(rates.len), .little); // rateset.count
+        @memcpy(bi[56..][0..rates.len], rates);
+        const band: u16 = if (ap.band_5g) 0xc000 else 0x0000;
+        std.mem.writeInt(u16, bi[72..74], band | 0x1000 | ap.channel, .little); // 20 MHz chanspec
+        bi[76] = 1; // dtim_period
+        std.mem.writeInt(i16, bi[78..80], ap.rssi, .little);
+        bi[80] = @bitCast(@as(i8, -92)); // phy_noise
+        bi[88] = ap.channel; // ctl_ch
+        std.mem.writeInt(u16, bi[116..118], BSS_INFO_SIZE, .little); // ie_offset
+        std.mem.writeInt(u32, bi[120..124], @intCast(n), .little); // ie_length
+        std.mem.writeInt(u16, bi[124..126], @intCast(ap.rssi + 92), .little); // SNR
+
+        // struct brcmf_escan_result_le: buflen, version, sync_id, bss_count, bss_info_le
+        const buflen: u32 = @intCast(ESCAN_RESULT_FIXED + bi_len);
+        std.mem.writeInt(u32, buf[0..4], buflen, .little);
+        std.mem.writeInt(u32, buf[4..8], 109, .little);
+        std.mem.writeInt(u16, buf[8..10], sync_id, .little);
+        std.mem.writeInt(u16, buf[10..12], 1, .little);
+        self.queueEvent(BRCMF_E_ESCAN_RESULT, BRCMF_E_STATUS_PARTIAL, buf[0..buflen]);
+    }
+
+    /// Queues a firmware event (BCDC header, ethernet header, struct brcm_ethhdr, then
+    /// struct brcmf_event_msg_be followed by `data`) on the SDPCM event channel
+    fn queueEvent(self: *Cyw43430, event_type: u32, status: u32, data: []const u8) void {
+        var evt: [76 + 512]u8 = @splat(0);
+        if (data.len > evt.len - 76) return;
 
         // 1. struct brcmf_proto_bcdc_header (4 bytes)
         evt[0] = 0x20; // BCDC_PROTO_VER (2) << BCDC_FLAG_VER_SHIFT (4)
@@ -1173,7 +1330,7 @@ pub const Cyw43430 = struct {
 
         // 3. struct brcm_ethhdr (10 bytes at evt[18..28])
         std.mem.writeInt(u16, evt[18..20], 32769, .big); // BCMILCP_SUBTYPE_VENDOR_LONG
-        std.mem.writeInt(u16, evt[20..22], 54, .big); // length
+        std.mem.writeInt(u16, evt[20..22], @intCast(54 + data.len), .big); // length
         evt[22] = 0; // version
         evt[23] = 0x00; // BRCM_OUI
         evt[24] = 0x10;
@@ -1183,17 +1340,18 @@ pub const Cyw43430 = struct {
         // 4. struct brcmf_event_msg_be (48 bytes at evt[28..76])
         std.mem.writeInt(u16, evt[28..30], 2, .big); // version = 2
         std.mem.writeInt(u16, evt[30..32], 0, .big); // flags = 0
-        std.mem.writeInt(u32, evt[32..36], 69, .big); // event_type = BRCMF_E_ESCAN_RESULT (69)
-        std.mem.writeInt(u32, evt[36..40], 0, .big); // status = BRCMF_E_STATUS_SUCCESS (0)
+        std.mem.writeInt(u32, evt[32..36], event_type, .big);
+        std.mem.writeInt(u32, evt[36..40], status, .big);
         std.mem.writeInt(u32, evt[40..44], 0, .big); // reason = 0
         std.mem.writeInt(u32, evt[44..48], 0, .big); // auth_type = 0
-        std.mem.writeInt(u32, evt[48..52], 0, .big); // datalen = 0
+        std.mem.writeInt(u32, evt[48..52], @intCast(data.len), .big); // datalen
         @memcpy(evt[52..58], &self.mac_address); // addr
         @memcpy(evt[58..63], "wlan0"); // ifname
         evt[74] = 0; // ifidx
         evt[75] = 0; // bsscfgidx
+        @memcpy(evt[76..][0..data.len], data);
 
-        self.queueRxFrame(SDPCM_EVENT_CHANNEL, &evt);
+        self.queueRxFrame(SDPCM_EVENT_CHANNEL, evt[0 .. 76 + data.len]);
     }
 };
 
@@ -1417,4 +1575,92 @@ test "Cyw43430 reports 20 MHz channels at 2.4 GHz only" {
     try std.testing.expect(std.mem.readInt(u32, reply[12 + 8 ..][0..4], .little) & 1 != 0); // BCDC_DCMD_ERROR
     r = testGetVar(&chip, "bw_cap", &le(@as(u32, 2)), &reply);
     try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, r[0..4], .little));
+}
+
+/// Starts an escan (SET_VAR "escan") for `ssid` ("" = any) on `chanspecs` (none = all channels),
+/// skips the control reply and returns the BSS infos of the partial results in `out`
+fn testEscan(chip: *Cyw43430, ssid: []const u8, chanspecs: []const u16, out: *[4][256]u8) !usize {
+    var params: [256]u8 = @splat(0);
+    std.mem.writeInt(u32, params[0..4], 1, .little); // version
+    std.mem.writeInt(u16, params[4..6], 1, .little); // action: start
+    std.mem.writeInt(u16, params[6..8], 0x1234, .little); // sync_id
+    std.mem.writeInt(u32, params[8..12], @intCast(ssid.len), .little);
+    @memcpy(params[12..][0..ssid.len], ssid);
+    std.mem.writeInt(u32, params[68..72], @intCast(chanspecs.len), .little);
+    for (chanspecs, 0..) |cs, i| std.mem.writeInt(u16, params[72 + i * 2 ..][0..2], cs, .little);
+    const params_len = 72 + chanspecs.len * 2;
+
+    var tx: [512]u8 = @splat(0);
+    const total: u16 = @intCast(12 + 16 + 6 + params_len);
+    std.mem.writeInt(u16, tx[0..2], total, .little);
+    std.mem.writeInt(u16, tx[2..4], ~total, .little);
+    tx[7] = 12;
+    std.mem.writeInt(u32, tx[12..16], 263, .little); // BRCMF_C_SET_VAR
+    std.mem.writeInt(u32, tx[16..20], @intCast(6 + params_len), .little);
+    std.mem.writeInt(u32, tx[20..24], 0x0001_0002, .little);
+    @memcpy(tx[28..34], "escan\x00");
+    @memcpy(tx[34..][0..params_len], params[0..params_len]);
+    chip.writeExtended(2, 0, true, tx[0..total]);
+
+    var frame: [2048]u8 = undefined;
+    chip.readExtended(2, 0, true, &frame); // control reply
+    try std.testing.expectEqual(@as(u8, 0), frame[5] & 0x0f);
+    var n: usize = 0;
+    while (true) {
+        chip.readExtended(2, 0, true, &frame);
+        try std.testing.expectEqual(@as(u8, 1), frame[5] & 0x0f); // SDPCM_EVENT_CHANNEL
+        const evt = frame[12 + 4 ..]; // after the SDPCM and BCDC headers
+        try std.testing.expectEqual(@as(u32, 69), std.mem.readInt(u32, evt[28..32], .big)); // ESCAN_RESULT
+        const status = std.mem.readInt(u32, evt[32..36], .big);
+        if (status == 0) return n; // BRCMF_E_STATUS_SUCCESS: scan complete
+        try std.testing.expectEqual(@as(u32, 8), status); // BRCMF_E_STATUS_PARTIAL
+        const datalen = std.mem.readInt(u32, evt[44..48], .big);
+        const result = evt[72..][0..datalen];
+        // The checks brcmf_cfg80211_escan_handler makes
+        const buflen = std.mem.readInt(u32, result[0..4], .little);
+        try std.testing.expectEqual(datalen, buflen);
+        try std.testing.expectEqual(@as(u16, 0x1234), std.mem.readInt(u16, result[8..10], .little));
+        try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, result[10..12], .little));
+        const bi = result[12..];
+        try std.testing.expectEqual(@as(u32, 109), std.mem.readInt(u32, bi[0..4], .little));
+        try std.testing.expectEqual(buflen - 12, std.mem.readInt(u32, bi[4..8], .little));
+        @memcpy(out[n][0..bi.len], bi);
+        n += 1;
+    }
+}
+
+test "Cyw43455 scans find the access point at 2.4 and 5 GHz, open" {
+    var chip = Cyw43430{ .chip = .cyw43455 };
+    chip.writeByte(0, 0x04, 0x07);
+    chip.setAccessPointName("tokamak");
+    var bss: [4][256]u8 = undefined;
+
+    try std.testing.expectEqual(@as(usize, 2), try testEscan(&chip, "", &.{}, &bss));
+    for (bss[0..2], [_]u8{ 6, 36 }, [_]u16{ 0x1006, 0xd024 }) |bi, ch, chanspec| {
+        try std.testing.expectEqualStrings("tokamak", bi[19..][0..bi[18]]);
+        try std.testing.expectEqual(chanspec, std.mem.readInt(u16, bi[72..74], .little));
+        try std.testing.expectEqual(ch, bi[88]);
+        try std.testing.expect(std.mem.readInt(u16, bi[16..18], .little) & 0x0010 == 0); // no privacy
+        try std.testing.expect(bi[8] & 0x03 == 0x02); // locally administered BSSID
+        // The IEs start with the SSID
+        const ies = bi[std.mem.readInt(u16, bi[116..118], .little)..];
+        try std.testing.expectEqual(@as(u8, 0), ies[0]);
+        try std.testing.expectEqualStrings("tokamak", ies[2..][0..ies[1]]);
+    }
+    try std.testing.expect(!std.mem.eql(u8, bss[0][8..14], bss[1][8..14])); // one BSSID per radio
+
+    // A scan of 5 GHz channel 36 only, or for another SSID
+    try std.testing.expectEqual(@as(usize, 1), try testEscan(&chip, "", &.{0xd024}, &bss));
+    try std.testing.expectEqual(@as(u8, 36), bss[0][88]);
+    try std.testing.expectEqual(@as(usize, 2), try testEscan(&chip, "tokamak", &.{}, &bss));
+    try std.testing.expectEqual(@as(usize, 0), try testEscan(&chip, "other", &.{}, &bss));
+}
+
+test "Cyw43430 scans find only the access point's 2.4 GHz radio" {
+    var chip = Cyw43430{};
+    chip.writeByte(0, 0x04, 0x07);
+    chip.setAccessPointName("tokamak");
+    var bss: [4][256]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try testEscan(&chip, "", &.{}, &bss));
+    try std.testing.expectEqual(@as(u8, 6), bss[0][88]);
 }

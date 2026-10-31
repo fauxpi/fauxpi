@@ -332,6 +332,10 @@ fn loadGuestBoot(
         .pi_3_a_plus, .pi_3_b_plus => .cyw43455,
         else => .cyw43430,
     };
+    // Wi-Fi scans find one open access point, named after this machine
+    var host_name_buf: [64]u8 = undefined;
+    const host_name = host_posix.hostName(&host_name_buf);
+    soc.sdhci.wifi.setAccessPointName(if (host_name.len != 0) host_name else "FauxPi");
     soc.bt.enabled = board_model.hasWireless();
     soc.bt.chip = switch (board_model) {
         .pi_3_a_plus, .pi_3_b_plus => .bcm4345c0,

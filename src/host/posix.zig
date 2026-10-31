@@ -116,6 +116,7 @@ extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) i32;
 extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) i32;
 extern "kernel32" fn GetSystemTimeAsFileTime(lpSystemTimeAsFileTime: *u64) void;
 extern "kernel32" fn GetEnvironmentVariableA(lpName: [*:0]const u8, lpBuffer: [*]u8, nSize: u32) u32;
+extern "kernel32" fn GetComputerNameA(lpBuffer: [*]u8, nSize: *u32) i32;
 extern "kernel32" fn FindFirstFileA(lpFileName: [*:0]const u8, lpFindFileData: *WIN32_FIND_DATAA) isize;
 extern "kernel32" fn FindNextFileA(hFindFile: isize, lpFindFileData: *WIN32_FIND_DATAA) i32;
 extern "kernel32" fn FindClose(hFindFile: isize) i32;
@@ -732,6 +733,26 @@ pub fn waitpidBlocking(pid: pid_t) void {
 }
 
 var qpc_freq: u64 = 0;
+
+/// The host machine's name, without any domain (`"build-box"` for `build-box.local`), or ""
+pub fn hostName(buf: []u8) []const u8 {
+    var name: []const u8 = "";
+    if (is_linux) {
+        var uts: std.os.linux.utsname = undefined;
+        if (std.os.linux.uname(&uts) == 0) {
+            const node = std.mem.sliceTo(&uts.nodename, 0);
+            const n = @min(node.len, buf.len);
+            @memcpy(buf[0..n], node[0..n]);
+            name = buf[0..n];
+        }
+    } else if (is_windows) {
+        var size: u32 = @intCast(buf.len);
+        if (GetComputerNameA(buf.ptr, &size) != 0) name = buf[0..@min(size, buf.len)];
+    } else if (buf.len > 0 and std.c.gethostname(buf.ptr, buf.len) == 0) {
+        name = std.mem.sliceTo(buf, 0);
+    }
+    return name[0 .. std.mem.indexOfScalar(u8, name, '.') orelse name.len];
+}
 
 pub fn monotonicNs() u64 {
     if (is_linux) {
