@@ -477,6 +477,12 @@ pub const WaylandWindow = struct {
                 eff_timeout_ms = rep_ms;
             }
         }
+        // A host connect being made has no socket to wait on yet: look again soon
+        const hid_connecting = if (self.hid) |h| h.isEthernetLinkUp() and h.net.isConnecting() else false;
+        const wifi_connecting = if (self.wifi_net) |n| n.isConnecting() else false;
+        if (hid_connecting or wifi_connecting) {
+            if (eff_timeout_ms < 0 or eff_timeout_ms > 2) eff_timeout_ms = 2;
+        }
         const rc = linux.poll(&fds, @intCast(nfds), eff_timeout_ms);
         if (linux.errno(rc) == .SUCCESS and rc > 0) {
             try self.display.pollAndDispatch();

@@ -647,16 +647,13 @@ pub const WindowsWindow = struct {
         }
         if (self.hid) |h| {
             if (h.isEthernetLinkUp()) {
-                var net_fds: [32]host_posix.pollfd = undefined;
-                const n = h.net.fillPollFds(&net_fds);
-                if (n > 0) {
+                if (h.net.hasHostSockets()) {
                     eff_timeout_ms = @min(eff_timeout_ms, 2);
                 }
             }
         }
         if (self.wifi_net) |wn| {
-            var net_fds: [32]host_posix.pollfd = undefined;
-            if (wn.fillPollFds(&net_fds) > 0) eff_timeout_ms = @min(eff_timeout_ms, 2);
+            if (wn.hasHostSockets()) eff_timeout_ms = @min(eff_timeout_ms, 2);
         }
 
         if (eff_timeout_ms > 0) {

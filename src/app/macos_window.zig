@@ -662,16 +662,13 @@ pub const MacosWindow = struct {
         }
         if (self.hid) |h| {
             if (h.isEthernetLinkUp()) {
-                var net_fds: [32]host_posix.pollfd = undefined;
-                const n = h.net.fillPollFds(&net_fds);
-                if (n > 0) {
+                if (h.net.hasHostSockets()) {
                     eff_timeout_us = @min(eff_timeout_us, 2_000);
                 }
             }
         }
         if (self.wifi_net) |wn| {
-            var net_fds: [32]host_posix.pollfd = undefined;
-            if (wn.fillPollFds(&net_fds) > 0) eff_timeout_us = @min(eff_timeout_us, 2_000);
+            if (wn.hasHostSockets()) eff_timeout_us = @min(eff_timeout_us, 2_000);
         }
 
         if (eff_timeout_us > 0) {

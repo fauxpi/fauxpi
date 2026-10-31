@@ -1,5 +1,10 @@
 const std = @import("std");
 const host_posix = @import("../host/posix.zig");
+const Io = std.Io;
+const host_net = std.Io.net;
+
+/// Socket operations are tried without waiting: what is not ready is tried again at the next poll
+const no_wait: Io.Timeout = .{ .duration = .{ .raw = .zero, .clock = .awake } };
 
 /// User-mode NAT / SLIRP virtual network stack for the emulated Ethernet and Wi-Fi.
 /// Provides virtual gateway `10.0.2.2` (`52:55:0a:00:02:02`), DHCP server (`10.0.2.15/24`),
@@ -21,7 +26,7 @@ pub const VirtualNetwork = struct {
 
     pub const UdpSession = struct {
         active: bool = false,
-        fd: host_posix.fd_t = -1,
+        socket: ?host_net.Socket = null,
         guest_mac: [6]u8 = DEFAULT_GUEST_MAC,
         guest_ip: [4]u8 = DEFAULT_GUEST_IP,
         guest_port: u16 = 0,
@@ -32,13 +37,21 @@ pub const VirtualNetwork = struct {
 
     pub const TcpState = enum(u8) {
         unused,
+        /// The host connect is being made: the guest's SYN is answered when it is
+        connecting,
         established,
         fin_sent,
     };
 
     pub const TcpConn = struct {
         state: TcpState = .unused,
-        fd: host_posix.fd_t = -1,
+        /// The host connection, once made (connecting until then)
+        stream: ?host_net.Stream = null,
+        /// Tells this connection's host connect from those of earlier connections in its slot
+        generation: u32 = 0,
+        /// The guest has finished sending: the host connection is shut for sending once
+        /// what the guest sent before is written
+        guest_fin: bool = false,
         guest_mac: [6]u8 = DEFAULT_GUEST_MAC,
         guest_ip: [4]u8 = DEFAULT_GUEST_IP,
         guest_port: u16 = 0,
@@ -70,6 +83,30 @@ pub const VirtualNetwork = struct {
     udp_sessions: [MAX_UDP_SESSIONS]UdpSession = @splat(.{}),
     tcp_conns: [MAX_TCP_CONNS]TcpConn = @splat(.{}),
 
+    /// What the host sockets are made and used through: without it (in tests) the network
+    /// only answers what it serves itself
+    io: ?Io = null,
+    /// The host connects still being made, which finish here; made with the first one, and
+    /// not to be moved while it has some
+    connects: ?Io.Select(ConnectDone) = null,
+    connects_buf: [MAX_TCP_CONNS]ConnectDone = undefined,
+    /// How many of `connects` have not been taken from it
+    connects_pending: usize = 0,
+
+    pub const ConnectDone = union(enum) {
+        done: Connected,
+    };
+
+    pub const Connected = struct {
+        conn: u8,
+        generation: u32,
+        result: host_net.IpAddress.ConnectError!host_net.Stream,
+    };
+
+    fn connectHost(io: Io, address: host_net.IpAddress, conn: u8, generation: u32) Connected {
+        return .{ .conn = conn, .generation = generation, .result = address.connect(io, .{ .mode = .stream }) };
+    }
+
     /// The network's addresses: gateway 10.0.<subnet>.2, guest 10.0.<subnet>.15
     pub fn gatewayIp(self: *const VirtualNetwork) [4]u8 {
         return .{ 10, 0, self.subnet, 2 };
@@ -88,18 +125,35 @@ pub const VirtualNetwork = struct {
     }
 
     pub fn deinit(self: *VirtualNetwork) void {
-        for (&self.udp_sessions) |*s| {
-            if (s.active and s.fd >= 0) {
-                host_posix.close(s.fd);
+        for (0..MAX_UDP_SESSIONS) |i| self.closeUdpSession(i);
+        for (0..MAX_TCP_CONNS) |i| self.closeTcpConn(i);
+        if (self.connects) |*connects| {
+            const io = self.io.?;
+            while (connects.cancel()) |done| {
+                if (done.done.result) |stream| stream.close(io) else |_| {}
             }
-            s.* = .{};
+            self.connects = null;
+            self.connects_pending = 0;
         }
-        for (&self.tcp_conns) |*c| {
-            if (c.state != .unused and c.fd >= 0) {
-                host_posix.close(c.fd);
-            }
-            c.* = .{};
-        }
+    }
+
+    /// Whether host sockets are open, or being connected, for the guest
+    pub fn hasHostSockets(self: *const VirtualNetwork) bool {
+        if (self.connects_pending > 0) return true;
+        for (&self.udp_sessions) |*s| if (s.socket != null) return true;
+        for (&self.tcp_conns) |*c| if (c.stream != null) return true;
+        return false;
+    }
+
+    /// Whether host connects are being made, which finish without a socket to wait on
+    pub fn isConnecting(self: *const VirtualNetwork) bool {
+        return self.connects_pending > 0;
+    }
+
+    fn closeUdpSession(self: *VirtualNetwork, idx: usize) void {
+        const s = &self.udp_sessions[idx];
+        if (s.socket) |*socket| socket.close(self.io.?);
+        s.* = .{};
     }
 
     pub fn hasRxFrame(self: *const VirtualNetwork) bool {
@@ -372,9 +426,12 @@ pub const VirtualNetwork = struct {
         rep[3] = 0xec; // Precision (-20)
         @memcpy(rep[12..16], "LOCL");
 
-        const ts = host_posix.realtimeSecNsec();
-        const ntp_sec: u32 = @truncate(ts.sec + 2_208_988_800);
-        const ntp_frac: u32 = @truncate((ts.nsec << 32) / 1_000_000_000);
+        const io = self.io orelse return;
+        const now_ns: u96 = @intCast(@max(0, Io.Clock.real.now(io).nanoseconds));
+        const sec: u64 = @intCast(now_ns / std.time.ns_per_s);
+        const nsec: u64 = @intCast(now_ns % std.time.ns_per_s);
+        const ntp_sec: u32 = @truncate(sec + 2_208_988_800);
+        const ntp_frac: u32 = @truncate((nsec << 32) / 1_000_000_000);
 
         // Reference Timestamp (16..24)
         std.mem.writeInt(u32, rep[16..20], ntp_sec, .big);
@@ -396,14 +453,10 @@ pub const VirtualNetwork = struct {
         if (self.dns_resolved) return self.host_dns_ip;
         self.dns_resolved = true;
 
-        const fd = host_posix.openRead("/etc/resolv.conf") catch return self.host_dns_ip;
-        defer host_posix.close(fd);
+        var buf: [4096]u8 = undefined;
+        const conf = Io.Dir.cwd().readFile(self.io.?, "/etc/resolv.conf", &buf) catch return self.host_dns_ip;
 
-        var buf: [2048]u8 = undefined;
-        const n_rc = host_posix.read(fd, &buf) catch return self.host_dns_ip;
-        if (n_rc == 0) return self.host_dns_ip;
-
-        var lines = std.mem.splitScalar(u8, buf[0..n_rc], '\n');
+        var lines = std.mem.splitScalar(u8, conf, '\n');
         while (lines.next()) |line| {
             const trimmed = std.mem.trim(u8, line, " \t\r");
             if (std.mem.startsWith(u8, trimmed, "nameserver")) {
@@ -428,6 +481,7 @@ pub const VirtualNetwork = struct {
     }
 
     fn forwardUdp(self: *VirtualNetwork, src_ip: [4]u8, src_port: u16, dst_ip: [4]u8, dst_port: u16, data: []const u8) void {
+        const io = self.io orelse return;
         var session_idx: ?usize = null;
         var oldest_idx: usize = 0;
         var oldest_tick: u64 = std.math.maxInt(u64);
@@ -449,14 +503,12 @@ pub const VirtualNetwork = struct {
         }
 
         if (session_idx == null) {
-            const s = &self.udp_sessions[oldest_idx];
-            if (s.active and s.fd >= 0) {
-                host_posix.close(s.fd);
-            }
-            const sock_fd = host_posix.socketNonBlock(false) catch return;
-            s.* = .{
+            self.closeUdpSession(oldest_idx);
+            const any: host_net.IpAddress = .{ .ip4 = .unspecified(0) };
+            const socket = any.bind(io, .{ .mode = .dgram }) catch return;
+            self.udp_sessions[oldest_idx] = .{
                 .active = true,
-                .fd = sock_fd,
+                .socket = socket,
                 .guest_mac = self.guest_mac,
                 .guest_ip = src_ip,
                 .guest_port = src_port,
@@ -472,8 +524,14 @@ pub const VirtualNetwork = struct {
         s.guest_ip = src_ip;
         s.guest_mac = self.guest_mac;
 
-        const real_ip = self.mapTargetIp(dst_ip, dst_port);
-        _ = host_posix.sendtoIpv4NonBlock(s.fd, data, real_ip, dst_port);
+        const dest: host_net.IpAddress = .{ .ip4 = .{ .bytes = self.mapTargetIp(dst_ip, dst_port), .port = dst_port } };
+        var message: host_net.OutgoingMessage = .{ .address = &dest, .data_ptr = data.ptr, .data_len = data.len };
+        // A datagram that can't be sent now is dropped, as a busy link would
+        _ = io.operateTimeout(.{ .net_send = .{
+            .socket_handle = s.socket.?.handle,
+            .messages = (&message)[0..1],
+            .flags = .{},
+        } }, no_wait) catch {};
     }
 
     fn handleTcp(self: *VirtualNetwork, src_ip: [4]u8, dst_ip: [4]u8, payload: []const u8) void {
@@ -507,24 +565,27 @@ pub const VirtualNetwork = struct {
         }
 
         if (flag_syn and !((flags & 0x10) != 0)) {
+            // The guest sending its SYN again while the host connect is still being made
+            if (conn_idx) |idx| {
+                const c = &self.tcp_conns[idx];
+                if (c.state == .connecting and c.guest_seq == seq +% 1) return;
+            }
             const idx = conn_idx orelse self.allocTcpConn();
             self.closeTcpConn(idx);
 
-            const fd = host_posix.socketNonBlock(true) catch {
-                self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, 0, seq +% 1, 0x14, &.{}); // RST|ACK
-                return;
-            };
-            const real_ip = self.mapTargetIp(dst_ip, dst_port);
-            if (host_posix.connectIpv4NonBlock(fd, real_ip, dst_port) == .failed) {
-                host_posix.close(fd);
+            // The host connect is made concurrently, and the guest's SYN answered once it is
+            // made (SYN|ACK) or has failed (RST|ACK), as the host's peer answered
+            const generation = self.tcp_conns[idx].generation;
+            const address: host_net.IpAddress = .{ .ip4 = .{ .bytes = self.mapTargetIp(dst_ip, dst_port), .port = dst_port } };
+            if (!self.startConnect(address, idx, generation)) {
                 self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, 0, seq +% 1, 0x14, &.{}); // RST|ACK
                 return;
             }
 
             const init_seq: u32 = 0x1000_0000 +% (@as(u32, @truncate(self.tick_count)) *% 65537);
             self.tcp_conns[idx] = .{
-                .state = .established,
-                .fd = fd,
+                .state = .connecting,
+                .generation = generation,
                 .guest_mac = self.guest_mac,
                 .guest_ip = src_ip,
                 .guest_port = src_port,
@@ -535,9 +596,6 @@ pub const VirtualNetwork = struct {
                 .tx_len = 0,
                 .last_tick = self.tick_count,
             };
-
-            // Send SYN|ACK
-            self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, init_seq, seq +% 1, 0x12, &.{});
             return;
         }
 
@@ -567,10 +625,8 @@ pub const VirtualNetwork = struct {
             if (seq +% @as(u32, @intCast(tcp_data.len)) == c.guest_seq) {
                 c.guest_seq +%= 1;
             }
+            c.guest_fin = true;
             self.flushTcpTx(idx);
-            if (c.fd >= 0) {
-                host_posix.shutdownWrite(c.fd);
-            }
             self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, c.my_seq, c.guest_seq, 0x10, &.{});
         }
     }
@@ -588,94 +644,146 @@ pub const VirtualNetwork = struct {
         return oldest_idx;
     }
 
-    fn closeTcpConn(self: *VirtualNetwork, idx: usize) void {
-        const c = &self.tcp_conns[idx];
-        if (c.state != .unused and c.fd >= 0) {
-            host_posix.close(c.fd);
-        }
-        c.* = .{};
+    /// Starts connecting to `address` on the host for connection `idx`
+    fn startConnect(self: *VirtualNetwork, address: host_net.IpAddress, idx: usize, generation: u32) bool {
+        const io = self.io orelse return false;
+        // Every connect must have room in `connects_buf` to finish, or canceling them would wait forever
+        if (self.connects_pending == self.connects_buf.len) return false;
+        if (self.connects == null) self.connects = .init(io, &self.connects_buf);
+        self.connects.?.concurrent(.done, connectHost, .{ io, address, @as(u8, @intCast(idx)), generation }) catch return false;
+        self.connects_pending += 1;
+        return true;
     }
 
+    fn closeTcpConn(self: *VirtualNetwork, idx: usize) void {
+        const c = &self.tcp_conns[idx];
+        if (c.stream) |*stream| stream.close(self.io.?);
+        // A connect still being made for it is closed when it finishes
+        c.* = .{ .generation = c.generation +% 1 };
+    }
+
+    /// Writes what the guest sent that the host connection will take now, and once all of
+    /// it is written after the guest finished, shuts the host connection for sending
     fn flushTcpTx(self: *VirtualNetwork, idx: usize) void {
         const c = &self.tcp_conns[idx];
-        if (c.state == .unused or c.fd < 0 or c.tx_len == 0) return;
-        const sent = host_posix.sendtoIpv4NonBlock(c.fd, c.tx_buf[0..c.tx_len], null, 0);
-        if (sent > 0) {
+        const stream = c.stream orelse return;
+        const io = self.io.?;
+        if (c.tx_len > 0) {
+            const data = [_][]const u8{c.tx_buf[0..c.tx_len]};
+            const result = io.operateTimeout(.{ .net_write = .{
+                .socket_handle = stream.socket.handle,
+                .data = &data,
+            } }, no_wait) catch return;
+            const sent = result.net_write catch return;
             if (sent < c.tx_len) {
                 std.mem.copyForwards(u8, &c.tx_buf, c.tx_buf[sent..c.tx_len]);
             }
             c.tx_len -= sent;
         }
+        if (c.tx_len == 0 and c.guest_fin) {
+            stream.shutdown(io, .send) catch {};
+            c.guest_fin = false;
+        }
     }
 
+    /// The host sockets to wait on for the guest (connects being made have none: see `isConnecting`)
     pub fn fillPollFds(self: *const VirtualNetwork, out: []host_posix.pollfd) usize {
         var n: usize = 0;
         for (&self.udp_sessions) |*s| {
-            if (s.active and s.fd >= 0 and n < out.len) {
-                out[n] = .{ .fd = s.fd, .events = host_posix.POLL.IN, .revents = 0 };
-                n += 1;
-            }
+            const socket = s.socket orelse continue;
+            if (n == out.len) break;
+            out[n] = .{ .fd = socket.handle, .events = host_posix.POLL.IN, .revents = 0 };
+            n += 1;
         }
         for (&self.tcp_conns) |*c| {
-            if (c.state != .unused and c.fd >= 0 and n < out.len) {
-                const ev: i16 = if (c.tx_len > 0) (host_posix.POLL.IN | host_posix.POLL.OUT) else host_posix.POLL.IN;
-                out[n] = .{ .fd = c.fd, .events = ev, .revents = 0 };
-                n += 1;
-            }
+            const stream = c.stream orelse continue;
+            if (n == out.len) break;
+            const ev: i16 = if (c.tx_len > 0) (host_posix.POLL.IN | host_posix.POLL.OUT) else host_posix.POLL.IN;
+            out[n] = .{ .fd = stream.socket.handle, .events = ev, .revents = 0 };
+            n += 1;
         }
         return n;
     }
 
-    /// Polls non-blocking host UDP and TCP sockets and enqueues any incoming Ethernet frames.
+    /// Takes the host connects that have finished
+    fn takeConnects(self: *VirtualNetwork) void {
+        if (self.connects_pending == 0) return;
+        const io = self.io.?;
+        var done: [MAX_TCP_CONNS]ConnectDone = undefined;
+        const n = self.connects.?.awaitMany(&done, 0) catch return;
+        self.connects_pending -= n;
+        for (done[0..n]) |d| {
+            const r = d.done;
+            const c = &self.tcp_conns[r.conn];
+            const stream = r.result catch {
+                // Refused or unreachable: refuse the guest's connection, if it still has it
+                if (c.state != .unused and c.generation == r.generation) {
+                    self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, 0, c.guest_seq, 0x14, &.{}); // RST|ACK
+                    self.closeTcpConn(r.conn);
+                }
+                continue;
+            };
+            if (c.state == .unused or c.generation != r.generation) {
+                stream.close(io);
+                continue;
+            }
+            c.stream = stream;
+            c.state = .established;
+            self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.my_seq -% 1, c.guest_seq, 0x12, &.{}); // SYN|ACK
+        }
+    }
+
+    /// Takes what the host sockets have for the guest, without waiting, and enqueues it as
+    /// Ethernet frames
     pub fn poll(self: *VirtualNetwork) void {
         self.tick_count +%= 1;
+        const io = self.io orelse return;
+        self.takeConnects();
 
-        // Poll UDP NAT sockets
+        // UDP NAT sockets
         for (&self.udp_sessions) |*s| {
-            if (!s.active or s.fd < 0) continue;
+            const socket = s.socket orelse continue;
             if (self.rx_count >= RX_QUEUE_CAP - 2) break;
 
             var buf: [1472]u8 = undefined;
-            switch (host_posix.recvNonBlock(s.fd, &buf)) {
-                .data => |rc| {
-                    s.last_tick = self.tick_count;
-                    self.sendUdpPacket(s.dst_ip, s.dst_port, s.guest_ip, s.guest_port, buf[0..rc]);
-                },
-                else => {},
-            }
+            const message = socket.receiveTimeout(io, &buf, no_wait) catch continue;
+            s.last_tick = self.tick_count;
+            self.sendUdpPacket(s.dst_ip, s.dst_port, s.guest_ip, s.guest_port, message.data);
         }
 
-        // Poll TCP NAT connections
+        // TCP NAT connections
         for (0..MAX_TCP_CONNS) |idx| {
             const c = &self.tcp_conns[idx];
-            if (c.state == .unused or c.fd < 0) continue;
+            const stream = c.stream orelse continue;
             if (self.rx_count >= RX_QUEUE_CAP - 2) break;
 
-            if (c.tx_len > 0) {
+            if (c.tx_len > 0 or c.guest_fin) {
                 self.flushTcpTx(idx);
             }
 
             var buf: [1400]u8 = undefined;
-            switch (host_posix.recvNonBlock(c.fd, &buf)) {
-                .data => |rc| {
+            var data = [_][]u8{&buf};
+            const result = io.operateTimeout(.{ .net_read = .{
+                .socket_handle = stream.socket.handle,
+                .data = &data,
+            } }, no_wait) catch continue;
+            if (result.net_read) |read| {
+                if (read.data_len > 0) {
                     c.last_tick = self.tick_count;
                     const seq = c.my_seq;
-                    c.my_seq +%= @intCast(rc);
-                    self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, seq, c.guest_seq, 0x18, buf[0..rc]); // PSH|ACK
-                },
-                .eof => {
-                    // EOF from remote host -> send FIN|ACK and close
+                    c.my_seq +%= @intCast(read.data_len);
+                    self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, seq, c.guest_seq, 0x18, buf[0..read.data_len]); // PSH|ACK
+                } else {
+                    // The host closed the connection: FIN|ACK to the guest
                     const seq = c.my_seq;
                     c.my_seq +%= 1;
                     self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, seq, c.guest_seq, 0x11, &.{}); // FIN|ACK
                     self.closeTcpConn(idx);
-                },
-                .again => {},
-                .err => {
-                    // Connection refused / reset
-                    self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.my_seq, c.guest_seq, 0x14, &.{}); // RST|ACK
-                    self.closeTcpConn(idx);
-                },
+                }
+            } else |_| {
+                // Reset by the host
+                self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.my_seq, c.guest_seq, 0x14, &.{}); // RST|ACK
+                self.closeTcpConn(idx);
             }
         }
     }
@@ -814,7 +922,7 @@ pub const VirtualNetwork = struct {
 };
 
 test "VirtualNetwork ARP, DHCP, ICMP Echo, and SNTP" {
-    var net = VirtualNetwork{};
+    var net = VirtualNetwork{ .io = std.testing.io };
     defer net.deinit();
 
     // 1. Test ARP request for 10.0.2.2
@@ -888,4 +996,114 @@ test "VirtualNetwork ARP, DHCP, ICMP Echo, and SNTP" {
     const sntp_len = net.popRxFrame(&rx_buf).?;
     try std.testing.expectEqual(@as(usize, 34 + 8 + 48), sntp_len);
     try std.testing.expectEqual(@as(u8, 0x24), rx_buf[42]); // VN=4, Mode=4 (Server)
+}
+
+/// Fills `frame` as an IPv4 packet from the guest to the gateway, of `proto` with `l4_len`
+/// bytes after the IP header
+fn testGuestIpv4(frame: []u8, proto: u8, l4_len: usize) void {
+    @memcpy(frame[0..6], &VirtualNetwork.GATEWAY_MAC);
+    @memcpy(frame[6..12], &VirtualNetwork.DEFAULT_GUEST_MAC);
+    std.mem.writeInt(u16, frame[12..14], 0x0800, .big);
+    frame[14] = 0x45;
+    std.mem.writeInt(u16, frame[16..18], @intCast(20 + l4_len), .big);
+    frame[22] = 64;
+    frame[23] = proto;
+    @memcpy(frame[26..30], &VirtualNetwork.DEFAULT_GUEST_IP);
+    @memcpy(frame[30..34], &VirtualNetwork.GATEWAY_IP);
+}
+
+/// Polls `net` until it has a frame for the guest, for up to two seconds
+fn testPollForRx(net: *VirtualNetwork) !void {
+    for (0..400) |_| {
+        net.poll();
+        if (net.hasRxFrame()) return;
+        try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return error.Timeout;
+}
+
+test "VirtualNetwork forwards UDP and TCP through host sockets" {
+    const io = std.testing.io;
+    var net = VirtualNetwork{ .io = io };
+    defer net.deinit();
+    var rx_buf: [VirtualNetwork.MAX_FRAME_LEN]u8 = undefined;
+    const loopback: host_net.IpAddress = .{ .ip4 = .loopback(0) };
+
+    // UDP to the gateway reaches the host's loopback, and the reply comes back from it
+    const server = try loopback.bind(io, .{ .mode = .dgram });
+    defer server.close(io);
+    const udp_port = server.address.getPort();
+    var udp: [34 + 8 + 4]u8 = @splat(0);
+    testGuestIpv4(&udp, 17, 8 + 4);
+    std.mem.writeInt(u16, udp[34..36], 40000, .big);
+    std.mem.writeInt(u16, udp[36..38], udp_port, .big);
+    std.mem.writeInt(u16, udp[38..40], 8 + 4, .big);
+    @memcpy(udp[42..46], "ping");
+    net.handleTxFrame(&udp);
+
+    var buf: [16]u8 = undefined;
+    const got = try server.receiveTimeout(io, &buf, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
+    try std.testing.expectEqualStrings("ping", got.data);
+    try server.send(io, &got.from, "pong");
+    try testPollForRx(&net);
+    _ = net.popRxFrame(&rx_buf).?;
+    try std.testing.expectEqual(udp_port, std.mem.readInt(u16, rx_buf[34..36], .big));
+    try std.testing.expectEqualStrings("pong", rx_buf[42..46]);
+
+    // A guest SYN is answered once the host connect is made
+    var listener = try loopback.listen(io, .{});
+    defer listener.deinit(io);
+    const tcp_port = listener.socket.address.getPort();
+    var syn: [34 + 20]u8 = @splat(0);
+    testGuestIpv4(&syn, 6, 20);
+    std.mem.writeInt(u16, syn[34..36], 40001, .big);
+    std.mem.writeInt(u16, syn[36..38], tcp_port, .big);
+    std.mem.writeInt(u32, syn[38..42], 1000, .big);
+    syn[46] = 5 << 4;
+    syn[47] = 0x02; // SYN
+    net.handleTxFrame(&syn);
+    try std.testing.expect(!net.hasRxFrame());
+    try testPollForRx(&net);
+    _ = net.popRxFrame(&rx_buf).?;
+    try std.testing.expectEqual(@as(u8, 0x12), rx_buf[47]); // SYN|ACK
+    try std.testing.expectEqual(@as(u32, 1001), std.mem.readInt(u32, rx_buf[42..46], .big));
+
+    // What the host sends once connected reaches the guest
+    const accepted = try listener.accept(io);
+    defer accepted.close(io);
+    var write_buf: [16]u8 = undefined;
+    var writer = accepted.writer(io, &write_buf);
+    try writer.interface.writeAll("hello");
+    try writer.interface.flush();
+    try testPollForRx(&net);
+    _ = net.popRxFrame(&rx_buf).?;
+    try std.testing.expectEqual(@as(u8, 0x18), rx_buf[47]); // PSH|ACK
+    try std.testing.expectEqualStrings("hello", rx_buf[54..59]);
+}
+
+test "VirtualNetwork refuses a guest connection the host refuses" {
+    const io = std.testing.io;
+    var net = VirtualNetwork{ .io = io };
+    defer net.deinit();
+    var rx_buf: [VirtualNetwork.MAX_FRAME_LEN]u8 = undefined;
+
+    // A port that was listened on and closed again, so nothing is
+    const loopback: host_net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try loopback.listen(io, .{});
+    const port = listener.socket.address.getPort();
+    listener.deinit(io);
+
+    var syn: [34 + 20]u8 = @splat(0);
+    testGuestIpv4(&syn, 6, 20);
+    std.mem.writeInt(u16, syn[34..36], 40002, .big);
+    std.mem.writeInt(u16, syn[36..38], port, .big);
+    std.mem.writeInt(u32, syn[38..42], 1000, .big);
+    syn[46] = 5 << 4;
+    syn[47] = 0x02; // SYN
+    net.handleTxFrame(&syn);
+    try testPollForRx(&net);
+    _ = net.popRxFrame(&rx_buf).?;
+    try std.testing.expectEqual(@as(u8, 0x14), rx_buf[47]); // RST|ACK
+    try std.testing.expectEqual(@as(u32, 1001), std.mem.readInt(u32, rx_buf[42..46], .big));
+    try std.testing.expect(!net.hasHostSockets());
 }

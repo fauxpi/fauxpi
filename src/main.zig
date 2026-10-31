@@ -354,10 +354,13 @@ fn loadGuestBoot(
 ) !loader.BootResult {
     const saved_hdr_ext_mask = soc.gpio.ext_mask & gpio.Gpio.HEADER_PIN_MASK;
     const saved_hdr_ext_level = soc.gpio.ext_level & gpio.Gpio.HEADER_PIN_MASK;
+    const net_io = soc.usb.hid.net.io;
     soc.usb.hid.net.deinit();
     soc.sdhci.wifi.deinit();
     @memset(ram[0..@min(board_model.ramBytes(), ram.len)], 0);
     soc.initInPlace(ram, opts.width, opts.height);
+    soc.usb.hid.net.io = net_io;
+    soc.sdhci.wifi.net.io = net_io;
     soc.mailbox.fb_allocated = true;
     soc.gpio.ext_mask = (soc.gpio.ext_mask & ~gpio.Gpio.HEADER_PIN_MASK) | saved_hdr_ext_mask;
     soc.gpio.ext_level = (soc.gpio.ext_level & ~gpio.Gpio.HEADER_PIN_MASK) | saved_hdr_ext_level;
@@ -511,9 +514,15 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         }
     }
 
+    // The host sockets behind the emulated network are made and used through it
+    var threaded: std.Io.Threaded = .init(gpa, .{ .environ = environ });
+    defer threaded.deinit();
+
     const soc = try gpa.create(Bcm2835);
     defer gpa.destroy(soc);
     soc.initInPlace(ram, opts.width, opts.height);
+    soc.usb.hid.net.io = threaded.io();
+    soc.sdhci.wifi.net.io = threaded.io();
     defer soc.usb.hid.net.deinit();
     defer soc.sdhci.wifi.deinit();
     const cpus = try gpa.create([4]Cpu);

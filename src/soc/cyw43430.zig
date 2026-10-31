@@ -289,6 +289,7 @@ pub const Cyw43430 = struct {
         const ap_passphrase = self.ap_passphrase;
         const ap_passphrase_len = self.ap_passphrase_len;
         const dhcp_enabled = self.net.dhcp_enabled;
+        const io = self.net.io;
         self.net.deinit();
         self.* = .{
             .chip = chip,
@@ -300,6 +301,7 @@ pub const Cyw43430 = struct {
             .ap_passphrase_len = ap_passphrase_len,
         };
         self.net.dhcp_enabled = dhcp_enabled;
+        self.net.io = io;
     }
 
     pub const Security = enum { open, wpa2_personal };
