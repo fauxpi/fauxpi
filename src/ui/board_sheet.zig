@@ -544,6 +544,25 @@ pub const BoardUi = struct {
         };
     }
 
+    /// What the pointer shows over what it is over (as of the last
+    /// `pointerMotion`): an I-beam over a text field, a hand over what can
+    /// be pressed, or else the arrow.
+    pub const HoverCursor = enum { default, pointer, text };
+
+    pub fn hoverCursor(self: *const BoardUi) HoverCursor {
+        const h = self.snapshotHoverState();
+        var cursor: HoverCursor = .default;
+        inline for (@typeInfo(HoverStateSnapshot).@"struct".field_names) |name| {
+            const v = @field(h, name);
+            const on = if (@typeInfo(@TypeOf(v)) == .optional) v != null else v;
+            if (on) {
+                if (comptime std.mem.endsWith(u8, name, "_field_hovered")) return .text;
+                cursor = .pointer;
+            }
+        }
+        return cursor;
+    }
+
     pub fn takeHoverDirty(self: *BoardUi) bool {
         const d = self.hover_dirty;
         self.hover_dirty = false;
@@ -5969,6 +5988,14 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expect(ui.sheet_open);
     try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     try testing.expect(ui.sheet_rect.h > 150);
+
+    // The pointer is a hand over the board button, and the arrow over the
+    // rest of the title bar
+    const board_btn = ui.boardBtnRect(win_w);
+    _ = ui.pointerMotion(board_btn.x + board_btn.w / 2, board_btn.y + board_btn.h / 2, status, &hw);
+    try testing.expect(ui.hoverCursor() == .pointer);
+    _ = ui.pointerMotion(200, 22, status, &hw);
+    try testing.expect(ui.hoverCursor() == .default);
 
     // Dragging the left side of the title bar returns .start_drag
     try testing.expectEqual(Action.start_drag, ui.pointerButton(200, 22, true, status, &hw));

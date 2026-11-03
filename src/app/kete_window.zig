@@ -302,7 +302,12 @@ const Surface = struct {
 
     pub fn cursor(self: *const Surface, _: *kete.WidgetNode, pos: kete.Point) ?kete.PointerCursor {
         // A cross over the display: the guest draws its own pointer.
-        return if (self.win.ui.isPointInUi(pos[0], pos[1], self.win.status)) .default else .crosshair;
+        if (!self.win.ui.isPointInUi(pos[0], pos[1], self.win.status)) return .crosshair;
+        return switch (self.win.ui.hoverCursor()) {
+            .default => .default,
+            .pointer => .pointer,
+            .text => .text,
+        };
     }
 
     pub fn event(self: *const Surface, n: *kete.WidgetNode, e: kete.Event) bool {
