@@ -94,6 +94,9 @@ parts:
         amd64) cpu=x86_64_v2 ;;
         *) cpu=baseline ;;
       esac
+      # Temporary: show the resolv.conf that Zig's resolver fails to parse (ResolvConfParseFailed)
+      ls -l /etc/resolv.conf
+      cat -A /etc/resolv.conf
       ./scripts/zig build -Doptimize=ReleaseFast -Dcpu=$cpu --prefix "$CRAFT_PART_INSTALL/usr"
       install -Dm644 data/io.github.fauxpi.Fauxpi.desktop \
         "$CRAFT_PART_INSTALL/usr/share/applications/io.github.fauxpi.Fauxpi.desktop"
