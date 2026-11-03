@@ -1,9 +1,11 @@
-//! Client-side Wayland window TitleBar (`44px` tall) and the drop-down
+//! The window's title bar (`44px` tall, with kete's window buttons over its
+//! right end) and the drop-down
 //! Interactive Board Sheet (`BoardSheet`), where each connector and peripheral
 //! (Micro-SD card, Mini HDMI, Power, 3-port USB Hub with Ethernet, USB Keyboard,
 //! USB Mouse, and Ethernet) is rendered visually and acts as a toggle button.
 
 const std = @import("std");
+const kete = @import("kete");
 const host_posix = @import("../host/posix.zig");
 const canvas_mod = @import("canvas.zig");
 const board = @import("board.zig");
@@ -19,7 +21,6 @@ pub const Point = canvas_mod.Point;
 pub const Icon = canvas_mod.Icon;
 pub const Theme = canvas_mod.Theme;
 pub const Font = canvas_mod.Font;
-pub const GlyphCache = canvas_mod.GlyphCache;
 pub const Gpio = soc_gpio.Gpio;
 pub const SdCardSize = qcow2_mod.SdCardSize;
 pub const Qcow2Disk = qcow2_mod.Qcow2Disk;
@@ -324,9 +325,8 @@ pub const BoardUi = struct {
     };
 
     gpa: std.mem.Allocator,
+    /// The font text is measured in (kete draws it in the same).
     font: Font,
-    icon_font: Font,
-    cache: GlyphCache,
     theme: Theme = Theme.dark,
 
     title: []const u8 = "Raspberry Pi Zero",
@@ -406,6 +406,10 @@ pub const BoardUi = struct {
     xkb_altgr: bool = false,
     has_xkb_modifiers: bool = false,
     keymap: XkbKeymap = XkbKeymap.defaultUs(),
+    /// What the key being handled types, by the system's keymap, while
+    /// `typed_char_known`.
+    typed_char: ?u21 = null,
+    typed_char_known: bool = false,
     new_card_size: SdCardSize = .gb_4,
     hovered_sd_size_idx: ?usize = null,
     hovered_sd_card_row_idx: ?usize = null,
@@ -476,12 +480,6 @@ pub const BoardUi = struct {
     hovered_gpio_input_idx: ?usize = null,
 
     /// Cached rasterized pixel buffers for TitleBar, Board diagram, and GPIO panel.
-    title_cache: []u32 = &.{},
-    title_cache_key: TitleCacheKey = .{},
-    board_cache: []u32 = &.{},
-    board_cache_key: BoardCacheKey = .{},
-    gpio_cache: []u32 = &.{},
-    gpio_cache_key: GpioCacheKey = .{},
     hover_dirty: bool = false,
 
     const HoverStateSnapshot = struct {
@@ -595,13 +593,9 @@ pub const BoardUi = struct {
     };
 
     pub fn init(gpa: std.mem.Allocator) !BoardUi {
-        const font = try Font.init(canvas_mod.fira_ttf);
-        const icon_font = try Font.init(canvas_mod.icons_ttf);
         var ui: BoardUi = .{
             .gpa = gpa,
-            .font = font,
-            .icon_font = icon_font,
-            .cache = GlyphCache.init(gpa),
+            .font = try Font.init(canvas_mod.fira_ttf),
         };
         ui.randomizeIdentity();
         ui.resetDefaultNewCardName();
@@ -619,10 +613,6 @@ pub const BoardUi = struct {
             card.deinit();
         }
         self.sd_cards.deinit(self.gpa);
-        if (self.title_cache.len > 0) self.gpa.free(self.title_cache);
-        if (self.board_cache.len > 0) self.gpa.free(self.board_cache);
-        if (self.gpio_cache.len > 0) self.gpa.free(self.gpio_cache);
-        self.cache.deinit();
     }
 
     pub fn dataDir(self: *const BoardUi) []const u8 {
@@ -1517,7 +1507,7 @@ pub const BoardUi = struct {
     fn boardBtnRect(self: *const BoardUi, win_w: u32) Rect {
         if (self.sheet_docked_above) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         const w_f: f32 = @floatFromInt(win_w);
-        const title_w = @import("../font/text.zig").measure(.{ .font = &self.font, .size = 22.0 }, self.title);
+        const title_w = kete.font.measure(.{ .font = &self.font, .size = 22.0 }, self.title);
         const title_x = @round((w_f - title_w) * 0.5);
         return .{
             .x = @round(title_x + title_w + 8.0),
@@ -1527,14 +1517,14 @@ pub const BoardUi = struct {
         };
     }
 
-    fn closeBtnRect(win_w: u32) Rect {
-        const w: f32 = @floatFromInt(win_w);
-        return .{ .x = w - 8.0 - bar_btn_size, .y = (44.0 - bar_btn_size) * 0.5, .w = bar_btn_size, .h = bar_btn_size };
+    /// The window's close and maximize buttons are kete's (over the title
+    /// bar's right end), not the sheet's: these take no room.
+    fn closeBtnRect(_: u32) Rect {
+        return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     }
 
-    fn maxBtnRect(win_w: u32) Rect {
-        const w: f32 = @floatFromInt(win_w);
-        return .{ .x = w - 8.0 - bar_btn_size - 4.0 - bar_btn_size, .y = (44.0 - bar_btn_size) * 0.5, .w = bar_btn_size, .h = bar_btn_size };
+    fn maxBtnRect(_: u32) Rect {
+        return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     }
 
     pub fn boardBoundsWithPeripherals(drawing: *const board.Board) board.Rect {
@@ -1848,8 +1838,13 @@ pub const BoardUi = struct {
         self.keymap = XkbKeymap.parse(text);
     }
 
-    /// Translates an evdev keycode using the active XKB keymap and modifier state.
+    /// Translates an evdev keycode: as the system's keymap did (`typed_char`,
+    /// when it is known), or else using the active XKB keymap and modifier state.
     pub fn lookupKeyChar(self: *const BoardUi, evdev_key: u32) ?u8 {
+        if (self.typed_char_known) {
+            const ch = self.typed_char orelse return null;
+            return if (ch < 0x80) @intCast(ch) else null;
+        }
         const shift = (self.shift_mask != 0) or self.xkb_shift or self.shift_held;
         const altgr = self.altgr_held or self.xkb_altgr;
         return self.keymap.lookup(evdev_key, shift, self.caps_lock, altgr);
@@ -2317,7 +2312,7 @@ pub const BoardUi = struct {
         self.has_display_border = (w_f > req_disp_w) or (content_h > req_disp_h);
 
         if (self.snackbar_len > 0) {
-            const msg_w = @import("../font/text.zig").measure(
+            const msg_w = kete.font.measure(
                 .{ .font = &self.font, .size = self.theme.body_size },
                 self.snackbarMessage(),
             );
@@ -3121,65 +3116,37 @@ pub const BoardUi = struct {
 
     /// Renders the client-side TitleBar (`y = 0..44` logical), the GPIO box below the display when
     /// connected, and, when open, the drop-down Board Sheet over `pixels` at `scale` (e.g. 1x or 2x).
+    /// Draws the title bar, the display's surround (or its "no signal"
+    /// screen), the GPIO box and the sheet with `p` (the painter of a widget
+    /// filling the window). The HDMI output is drawn under it, by the window.
     pub fn paint(
         self: *BoardUi,
-        pixels: []u32,
+        p: *kete.Painter,
         win_w: u32,
         win_h: u32,
-        scale: u32,
         status: SystemStatus,
         gpio_hw: *const Gpio,
     ) void {
-        self.paintWithBackdrop(pixels, win_w, win_h, scale, status, gpio_hw, false);
-    }
-
-    /// Renders `BoardUi` over `pixels`, skipping redundant full-screen HDMI backdrop dimming and
-    /// outer sheet border rasterization when `backdrop_already_dimmed` is true for the same `sheet_rect`.
-    pub fn paintWithBackdrop(
-        self: *BoardUi,
-        pixels: []u32,
-        win_w: u32,
-        win_h: u32,
-        scale: u32,
-        status: SystemStatus,
-        gpio_hw: *const Gpio,
-        backdrop_already_dimmed: bool,
-    ) void {
-        const sc = @max(scale, 1);
         self.updateLayout(win_w, win_h, status, gpio_hw);
-
-        const buf_w = win_w * sc;
-        const buf_h = win_h * sc;
-        var c: Canvas = .{
-            .pixels = pixels,
-            .width = buf_w,
-            .height = buf_h,
-            .stride = buf_w,
-            .scale = @floatFromInt(sc),
-            .font = &self.font,
-            .icon_font = &self.icon_font,
-            .cache = &self.cache,
-        };
+        var c: Canvas = .{ .painter = p, .font = &self.font };
 
         const disp_bottom_h: u32 = if (status.gpio_connected and win_h > gpio_panel_height)
             win_h - gpio_panel_height
         else
             win_h;
 
-        if (!backdrop_already_dimmed) {
-            if (!status.hdmi_connected or !status.hdmi_active) {
-                self.paintNoSignal(&c, status.hdmi_connected);
-            }
-            if (self.has_display_border) {
-                self.paintDisplayBorder(&c, win_w, disp_bottom_h);
-            }
+        if (!status.hdmi_connected or !status.hdmi_active) {
+            self.paintNoSignal(&c, status.hdmi_connected);
+        }
+        if (self.has_display_border) {
+            self.paintDisplayBorder(&c, win_w, disp_bottom_h);
         }
         if (status.gpio_connected and win_h > gpio_panel_height) {
-            self.paintGpioBox(&c, win_w, status, gpio_hw);
+            self.paintGpioBox(&c, status, gpio_hw);
         }
-        self.paintTitleBar(&c, win_w, status.board_model);
+        self.paintTitleBar(&c, win_w);
         if (self.sheet_open) {
-            self.paintSheet(&c, win_w, disp_bottom_h, status, backdrop_already_dimmed);
+            self.paintSheet(&c, win_w, disp_bottom_h, status);
         }
         if (self.hasSnackbar()) {
             self.paintSnackbar(&c);
@@ -3224,35 +3191,20 @@ pub const BoardUi = struct {
     }
 
     fn paintDisplayBorder(self: *const BoardUi, c: *Canvas, win_w: u32, disp_bottom_h: u32) void {
-        const sc_f = @max(c.scale, 1.0);
-        const sc: u32 = @intFromFloat(sc_f);
-        const top_py: u32 = title_bar_height * sc;
-        const bot_py: u32 = @min(c.height, disp_bottom_h * sc);
-        if (bot_py <= top_py) return;
-
+        const top: f32 = @floatFromInt(title_bar_height);
+        const bottom: f32 = @floatFromInt(disp_bottom_h);
+        if (bottom <= top) return;
+        const w: f32 = @floatFromInt(win_w);
         const dr = self.display_rect;
-        const dx0: u32 = @min(c.width, @as(u32, @intFromFloat(@max(0.0, @round(dr.x * sc_f)))));
-        const dy0: u32 = @min(bot_py, @max(top_py, @as(u32, @intFromFloat(@max(0.0, @round(dr.y * sc_f))))));
-        const dx1: u32 = @min(c.width, @as(u32, @intFromFloat(@max(0.0, @round((dr.x + dr.w) * sc_f)))));
-        const dy1: u32 = @min(bot_py, @max(dy0, @as(u32, @intFromFloat(@max(0.0, @round((dr.y + dr.h) * sc_f))))));
+        const dy0 = std.math.clamp(dr.y, top, bottom);
+        const dy1 = std.math.clamp(dr.y + dr.h, dy0, bottom);
+        const bg = self.theme.surface;
 
-        const bg_argb = self.theme.surface.toArgb();
-        const full_w = @min(c.width, win_w * sc);
-
-        // Top surround strip (between TitleBar and top of display_rect)
-        for (top_py..dy0) |py| {
-            @memset(c.pixels[py * c.stride ..][0..full_w], bg_argb);
-        }
-        // Left & right surround strips beside display_rect
-        for (dy0..dy1) |py| {
-            const row = c.pixels[py * c.stride ..][0..full_w];
-            if (dx0 > 0) @memset(row[0..dx0], bg_argb);
-            if (dx1 < full_w) @memset(row[dx1..full_w], bg_argb);
-        }
-        // Bottom surround strip (between bottom of display_rect and disp_bottom_h)
-        for (dy1..bot_py) |py| {
-            @memset(c.pixels[py * c.stride ..][0..full_w], bg_argb);
-        }
+        // The surround: above, beside and below the display.
+        c.fillRect(.{ .x = 0, .y = top, .w = w, .h = dy0 - top }, bg);
+        c.fillRect(.{ .x = 0, .y = dy0, .w = @max(dr.x, 0), .h = dy1 - dy0 }, bg);
+        c.fillRect(.{ .x = dr.x + dr.w, .y = dy0, .w = @max(w - (dr.x + dr.w), 0), .h = dy1 - dy0 }, bg);
+        c.fillRect(.{ .x = 0, .y = dy1, .w = w, .h = bottom - dy1 }, bg);
 
         // Crisp 1px border frame around the display
         c.strokeRect(dr.outset(1.0), 1.0, self.theme.outline_variant);
@@ -3324,38 +3276,12 @@ pub const BoardUi = struct {
         );
     }
 
-    fn paintTitleBar(self: *BoardUi, c: *Canvas, win_w: u32, board_model: BoardModel) void {
-        const sc: u32 = @intFromFloat(@max(c.scale, 1.0));
-        const bar_px_w = win_w * sc;
-        const bar_px_h = title_bar_height * sc;
-        const total_px = @as(usize, bar_px_w) * @as(usize, bar_px_h);
-        if (total_px == 0 or c.pixels.len < total_px) return;
-
-        const key: TitleCacheKey = .{
-            .win_w = win_w,
-            .scale = sc,
-            .board_model = board_model,
-            .maximized = self.maximized,
-            .sheet_open = self.sheet_open,
-            .sheet_docked_above = self.sheet_docked_above,
-            .board_btn_hovered = self.board_btn_hovered,
-            .board_btn_pressed = self.board_btn_pressed,
-            .max_btn_hovered = self.max_btn_hovered,
-            .max_btn_pressed = self.max_btn_pressed,
-            .close_btn_hovered = self.close_btn_hovered,
-            .close_btn_pressed = self.close_btn_pressed,
-        };
-
-        if (self.title_cache.len == total_px and std.meta.eql(self.title_cache_key, key)) {
-            @memcpy(c.pixels[0..total_px], self.title_cache);
-            return;
-        }
-
+    fn paintTitleBar(self: *BoardUi, c: *Canvas, win_w: u32) void {
         const t = &self.theme;
         const w_f: f32 = @floatFromInt(win_w);
         const h_f: f32 = @floatFromInt(title_bar_height);
 
-        @memset(c.pixels[0..total_px], t.surface_container.toArgb());
+        c.fillRect(.{ .x = 0, .y = 0, .w = w_f, .h = h_f }, t.surface_container);
 
         // Centered window title (22px)
         const title_w = c.measureText(22.0, self.title);
@@ -3376,37 +3302,7 @@ pub const BoardUi = struct {
                 self.sheet_open,
             );
         }
-
-        // Right buttons: Maximize/Restore and Close (omitted on macOS where native traffic lights are on the left)
-        if (!host_posix.is_macos) {
-            paintBarButton(
-                c,
-                t,
-                maxBtnRect(win_w),
-                if (self.maximized) .filter_none else .crop_square,
-                self.max_btn_hovered,
-                self.max_btn_pressed,
-                false,
-            );
-            paintBarButton(
-                c,
-                t,
-                closeBtnRect(win_w),
-                .close,
-                self.close_btn_hovered,
-                self.close_btn_pressed,
-                false,
-            );
-        }
-
-        if (self.title_cache.len != total_px) {
-            if (self.title_cache.len > 0) self.gpa.free(self.title_cache);
-            self.title_cache = self.gpa.alloc(u32, total_px) catch &.{};
-        }
-        if (self.title_cache.len == total_px) {
-            @memcpy(self.title_cache, c.pixels[0..total_px]);
-            self.title_cache_key = key;
-        }
+        // The window's own buttons (maximize, close) are kete's, over the right end.
     }
 
     fn paintBoardToggleButton(
@@ -3621,137 +3517,26 @@ pub const BoardUi = struct {
     fn paintSheet(
         self: *BoardUi,
         c: *Canvas,
-        _: u32,
+        win_w: u32,
         disp_bottom_h: u32,
         status: SystemStatus,
-        backdrop_already_dimmed: bool,
     ) void {
         const t = &self.theme;
-        const sc_f = @max(c.scale, 1.0);
-        const sc: u32 = @intFromFloat(sc_f);
         const h_f: f32 = @floatFromInt(disp_bottom_h);
         const top_y: f32 = @floatFromInt(title_bar_height);
-
         const sr = self.sheet_rect;
-        // Cache the interior board diagram region (padded by 16px inside sheet_rect)
-        const pad_in: f32 = 16.0;
-        const cache_box_x = @max(@round(sr.x + 8.0), @round(self.board_rect.x - pad_in));
-        const cache_box_y = @max(@round(sr.y + 4.0), @round(self.board_rect.y - pad_in));
-        const cache_box_x1 = @min(@round(sr.x + sr.w - 8.0), @round(self.board_rect.x + self.board_rect.w + pad_in));
-        const cache_box_y1 = @min(@round(sr.y + sr.h - 16.0), @round(self.board_rect.y + self.board_rect.h + pad_in));
 
-        if (!backdrop_already_dimmed) {
-            // Dim the HDMI display behind the drop-down sheet using SWAR when overlaying the display
-            if (!self.sheet_docked_above and h_f > top_y) {
-                const py_start: u32 = title_bar_height * sc;
-                const py_end: u32 = @min(c.height, disp_bottom_h * sc);
-                const sr_x0: u32 = @intFromFloat(@max(0.0, @ceil((sr.x + 2.0) * sc_f)));
-                const sr_x1: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(c.width)), @floor((sr.x + sr.w - 2.0) * sc_f)));
-                const sr_opaque_y1: u32 = @intFromFloat(@max(@as(f32, @floatFromInt(py_start)), @floor((sr.y + sr.h - 17.0) * sc_f)));
-
-                for (py_start..py_end) |py| {
-                    const row = c.pixels[py * c.stride ..][0..c.width];
-                    if (py < sr_opaque_y1 and sr_x0 < sr_x1) {
-                        dimSpanSwar(row[0..sr_x0]);
-                        dimSpanSwar(row[sr_x1..c.width]);
-                    } else {
-                        dimSpanSwar(row);
-                    }
-                }
-            }
-
-            // Drop-down sheet container (anchored to the bottom of the TitleBar)
-            const sheet_radii: Radii = .{ .tl = 0, .tr = 0, .br = 16, .bl = 16 };
-            c.fillRoundedRect(sr, sheet_radii, t.surface);
-            c.strokeRoundedRect(sr, sheet_radii, 1.0, t.outline_variant);
-        } else {
-            // Dimmed HDMI backdrop and outer rounded border of `sr` are already in `c.pixels` at identical `sr` geometry;
-            // clear only the lower interior below `cache_box_y1` (since `board_cache` overwrites `cache_box` directly).
-            if (sr.y + sr.h - 16.0 > cache_box_y1) {
-                c.fillRect(.{
-                    .x = sr.x + 2.0,
-                    .y = cache_box_y1,
-                    .w = sr.w - 4.0,
-                    .h = (sr.y + sr.h - 16.0) - cache_box_y1,
-                }, t.surface);
-            }
-            c.fillRect(.{
-                .x = sr.x + 16.0,
-                .y = sr.y + sr.h - 16.0,
-                .w = sr.w - 32.0,
-                .h = 14.0,
-            }, t.surface);
+        // Dim the HDMI display behind the drop-down sheet when overlaying the display
+        if (!self.sheet_docked_above and h_f > top_y) {
+            const w_f: f32 = @floatFromInt(win_w);
+            c.fillRect(.{ .x = 0, .y = top_y, .w = w_f, .h = h_f - top_y }, Color.rgb(0x000000).withAlpha(dim_alpha));
         }
 
-        if (cache_box_x1 > cache_box_x and cache_box_y1 > cache_box_y) {
-            const box_x_px: u32 = @intFromFloat(cache_box_x * sc_f);
-            const box_y_px: u32 = @intFromFloat(cache_box_y * sc_f);
-            const box_w_px: u32 = @intFromFloat((cache_box_x1 - cache_box_x) * sc_f);
-            const box_h_px: u32 = @intFromFloat((cache_box_y1 - cache_box_y) * sc_f);
-            const total_board_px = @as(usize, box_w_px) * @as(usize, box_h_px);
+        // Drop-down sheet container (anchored to the bottom of the TitleBar)
+        const sheet_radii: Radii = .{ .tl = 0, .tr = 0, .br = 16, .bl = 16 };
+        c.fillRoundedRect(sr, sheet_radii, t.surface);
+        c.strokeRoundedRect(sr, sheet_radii, 1.0, t.outline_variant);
 
-            const bkey: BoardCacheKey = .{
-                .w_px = box_w_px,
-                .h_px = box_h_px,
-                .scale = sc,
-                .board_model = status.board_model,
-                .hovered_target = self.hovered_target,
-                .sd_card_name_hash = std.hash.Wyhash.hash(0, self.activeSdCardName()),
-                .sd_connected = status.sd_connected,
-                .hdmi_connected = status.hdmi_connected,
-                .audio_connected = status.audio_connected,
-                .power_connected = status.power_connected,
-                .usb_hub_connected = status.usb_hub_connected,
-                .usb_keyboard_connected = status.usb_keyboard_connected,
-                .usb_mouse_connected = status.usb_mouse_connected,
-                .ethernet_connected = status.ethernet_connected,
-                .gpio_connected = status.gpio_connected,
-                .act_led_on = status.act_led_on,
-                .pwr_led_on = status.pwr_led_on,
-                .cpu_temperature_c = self.effectiveCpuTemperature(status),
-                .cpu_temp_popup_open = self.cpu_temp_popup_open,
-            };
-
-            if (self.board_cache.len != total_board_px or !std.meta.eql(self.board_cache_key, bkey)) {
-                if (self.board_cache.len != total_board_px) {
-                    if (self.board_cache.len > 0) self.gpa.free(self.board_cache);
-                    self.board_cache = self.gpa.alloc(u32, total_board_px) catch &.{};
-                }
-                if (self.board_cache.len == total_board_px) {
-                    @memset(self.board_cache, t.surface.toArgb());
-                    var sub_c: Canvas = .{
-                        .pixels = self.board_cache,
-                        .width = box_w_px,
-                        .height = box_h_px,
-                        .stride = box_w_px,
-                        .scale = sc_f,
-                        .origin = .{ -cache_box_x, -cache_box_y },
-                        .font = &self.font,
-                        .icon_font = &self.icon_font,
-                        .cache = &self.cache,
-                    };
-                    const drawing = status.board_model.drawing();
-                    self.paintBoardDrawing(&sub_c, drawing, self.board_rect, status);
-                    self.board_cache_key = bkey;
-                }
-            }
-
-            if (self.board_cache.len == total_board_px and box_x_px + box_w_px <= c.width and box_y_px + box_h_px <= c.height) {
-                for (0..box_h_px) |ry| {
-                    const dst_row = c.pixels[(box_y_px + ry) * c.stride + box_x_px ..][0..box_w_px];
-                    const src_row = self.board_cache[ry * box_w_px ..][0..box_w_px];
-                    @memcpy(dst_row, src_row);
-                }
-                self.paintSettingsSection(c, status);
-                self.paintSdPopups(c);
-                self.paintCpuTempPopup(c, status);
-                return;
-            }
-        }
-
-        if (backdrop_already_dimmed) {
-            c.fillRect(.{ .x = sr.x + 2.0, .y = sr.y + 2.0, .w = sr.w - 4.0, .h = sr.h - 18.0 }, t.surface);
-        }
         const drawing = status.board_model.drawing();
         self.paintBoardDrawing(c, drawing, self.board_rect, status);
         self.paintSettingsSection(c, status);
@@ -3759,65 +3544,20 @@ pub const BoardUi = struct {
         self.paintCpuTempPopup(c, status);
     }
 
+    /// How dark the display is under the sheet: as if 45% of it shows.
+    const dim_alpha: f32 = 0.55;
+
     /// Renders the GPIO box below the display when the GPIO ribbon cable is connected.
     /// First section: LEDs for outputs ordered from low to high pin numbers.
     /// Second section: interactive switches for inputs ordered from low to high pin numbers.
     fn paintGpioBox(
         self: *BoardUi,
         c: *Canvas,
-        win_w: u32,
-        status: SystemStatus,
+        _: SystemStatus,
         gpio_hw: *const Gpio,
     ) void {
         const gb = self.gpio_box_rect;
         if (gb.w <= 0 or gb.h <= 0) return;
-
-        const sc_f = @max(c.scale, 1.0);
-        const sc: u32 = @intFromFloat(sc_f);
-        const box_y_px: u32 = @intFromFloat(@round(gb.y * sc_f));
-        const box_w_px: u32 = win_w * sc;
-        const box_h_px: u32 = gpio_panel_height * sc;
-        if (box_y_px + box_h_px > c.height or box_w_px > c.width) return;
-
-        const hdr_mask = headerGpioMask();
-        var out_mask: u32 = 0;
-        var in_mask: u32 = 0;
-        var level_mask: u32 = 0;
-        for (0..28) |pin_usize| {
-            const pin: u6 = @intCast(pin_usize);
-            const bit: u32 = @as(u32, 1) << @intCast(pin);
-            if ((hdr_mask & bit) == 0) continue;
-            switch (gpio_hw.getPinFunction(pin)) {
-                .output => out_mask |= bit,
-                .input => in_mask |= bit,
-                else => {},
-            }
-            if (gpio_hw.getPinLevel(pin)) level_mask |= bit;
-        }
-
-        const total_px = @as(usize, box_w_px) * @as(usize, box_h_px);
-        const gkey: GpioCacheKey = .{
-            .win_w = win_w,
-            .scale = sc,
-            .board_model = status.board_model,
-            .output_mask = out_mask,
-            .input_mask = in_mask,
-            .level_mask = level_mask,
-            .hovered_input_idx = self.hovered_gpio_input_idx,
-        };
-
-        if (self.gpio_cache.len == total_px and std.meta.eql(self.gpio_cache_key, gkey)) {
-            if (box_w_px == c.stride) {
-                @memcpy(c.pixels[@as(usize, box_y_px) * c.stride ..][0..total_px], self.gpio_cache[0..total_px]);
-            } else {
-                for (0..box_h_px) |ry| {
-                    const dst_row = c.pixels[(box_y_px + ry) * c.stride ..][0..box_w_px];
-                    const src_row = self.gpio_cache[ry * box_w_px ..][0..box_w_px];
-                    @memcpy(dst_row, src_row);
-                }
-            }
-            return;
-        }
 
         const t = &self.theme;
         c.fillRect(gb, t.surface_container);
@@ -3923,23 +3663,6 @@ pub const BoardUi = struct {
                     if (high or hovered) t.on_surface else t.on_surface_variant,
                 );
             }
-        }
-
-        if (self.gpio_cache.len != total_px) {
-            if (self.gpio_cache.len > 0) self.gpa.free(self.gpio_cache);
-            self.gpio_cache = self.gpa.alloc(u32, total_px) catch &.{};
-        }
-        if (self.gpio_cache.len == total_px) {
-            if (box_w_px == c.stride) {
-                @memcpy(self.gpio_cache[0..total_px], c.pixels[@as(usize, box_y_px) * c.stride ..][0..total_px]);
-            } else {
-                for (0..box_h_px) |ry| {
-                    const src_row = c.pixels[(box_y_px + ry) * c.stride ..][0..box_w_px];
-                    const dst_row = self.gpio_cache[ry * box_w_px ..][0..box_w_px];
-                    @memcpy(dst_row, src_row);
-                }
-            }
-            self.gpio_cache_key = gkey;
         }
     }
 
@@ -6192,6 +5915,33 @@ pub fn fileExistsLinux(path: []const u8) bool {
 
 const testing = std.testing;
 
+/// Paints `ui` into `pixels` (`win_w` by `win_h` logical pixels, `scale`
+/// pixels each) as the window does, with kete's software renderer, over what
+/// is there (the HDMI output, say).
+fn testPaint(ui: *BoardUi, pixels: []u32, win_w: u32, win_h: u32, scale: u32, status: SystemStatus, hw: *const Gpio) !void {
+    const Sheet = struct {
+        ui: *BoardUi,
+        w: u32,
+        h: u32,
+        status: SystemStatus,
+        hw: *const Gpio,
+
+        pub fn layout(self: *const @This(), _: *kete.WidgetNode, c: kete.Constraints) kete.Size {
+            return c.constrain(.{ .w = @floatFromInt(self.w), .h = @floatFromInt(self.h) });
+        }
+
+        pub fn paint(self: *const @This(), _: *kete.WidgetNode, p: *kete.Painter) void {
+            self.ui.paint(p, self.w, self.h, self.status, self.hw);
+        }
+    };
+    const u = try kete.ui.WindowUi.createDefault(testing.allocator, testing.io);
+    defer u.destroy();
+    u.attachRenderer(u.shared.software_renderer.renderer(), false);
+    u.scale = scale;
+    u.frame(win_w, win_h, 0, Sheet{ .ui = ui, .w = win_w, .h = win_h, .status = status, .hw = hw });
+    try u.preview(.{ .pixels = pixels, .width = win_w * scale, .height = win_h * scale });
+}
+
 test "TitleBar and BoardSheet toggle connectors and peripherals on the board diagram" {
     var ui = try BoardUi.init(testing.allocator);
     defer ui.deinit();
@@ -6217,7 +5967,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
 
     // 1. Starts with the hardware overlay open by default
     try testing.expect(ui.sheet_open);
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     try testing.expect(ui.sheet_rect.h > 150);
 
     // Dragging the left side of the title bar returns .start_drag
@@ -6236,12 +5986,12 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expect(ui.sheet_open);
 
     // Paint with the drop-down sheet open at 1x and 2x HiDPI scale
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     const pixels_2x = try testing.allocator.alloc(u32, (win_w * 2) * (win_h * 2));
     defer testing.allocator.free(pixels_2x);
     @memset(pixels_2x, 0xff000000);
-    ui.paint(pixels_2x, win_w, win_h, 2, status, &hw);
+    try testPaint(&ui, pixels_2x, win_w, win_h, 2, status, &hw);
     try testing.expectEqual(Theme.dark.surface_container.toArgb(), pixels_2x[80 * (win_w * 2) + 200]);
 
     const tr = BoardUi.boardTransform(&board.pi_zero, ui.board_rect);
@@ -6266,7 +6016,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expect(ui.sd_manage_open);
 
     // Paint the Manage SD Cards popup and verify Browse button triggers .select_sd_image
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     _ = ui.pointerButton(ui.sd_browse_btn_rect.x + 10, ui.sd_browse_btn_rect.y + 10, true, status, &hw);
     try testing.expectEqual(Action.select_sd_image, ui.pointerButton(ui.sd_browse_btn_rect.x + 10, ui.sd_browse_btn_rect.y + 10, false, status, &hw));
 
@@ -6276,7 +6026,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(SdCardSize.mb_256, ui.new_card_size);
     ui.setPendingSdImageFile("/tmp/oversized.img", 300 * 1024 * 1024);
     try testing.expect(ui.hasImageTooLargeError());
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // Selecting a valid small image and clicking "+ Create & Add Card" adds a sparse QCOW2 card and selects it
     var valid_img: [512]u8 = @splat(0);
@@ -6284,7 +6034,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     valid_img[511] = 0xAA;
     ui.setPendingSdImageSlice("raspios-lite.img", &valid_img);
     try testing.expect(!ui.hasImageTooLargeError());
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     _ = ui.pointerButton(ui.sd_add_btn_rect.x + 10, ui.sd_add_btn_rect.y + 10, true, status, &hw);
     try testing.expectEqual(Action.select_sd_card, ui.pointerButton(ui.sd_add_btn_rect.x + 10, ui.sd_add_btn_rect.y + 10, false, status, &hw));
     try testing.expect(!ui.sd_manage_open);
@@ -6297,7 +6047,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.consumed, ui.pointerButton(sd_card_removed_x, sd_y, false, status, &hw));
     try testing.expect(ui.sd_card_menu_open);
     try testing.expect(!ui.sd_manage_open);
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // Click item 0 in the SD card menu to select the card
     const sd_menu_item0_y = ui.sd_card_menu_rect.y + 4.0 + 16.0;
@@ -6306,8 +6056,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expect(!ui.sd_card_menu_open);
 
     // Verify the active SD card name ("Card 1") is rendered rotated 90° beside the left edge of the unplugged SD card
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
-    try testing.expectEqual(std.hash.Wyhash.hash(0, "Card 1"), ui.board_cache_key.sd_card_name_hash);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     const surface_argb = Theme.dark.surface.toArgb();
     var unplugged_label_lit: usize = 0;
     const unp_x0: usize = @intFromFloat(@round(tr.x + (-19.8) * tr.scale));
@@ -6327,7 +6076,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     _ = ui.pointerButton(sd_conn_x, sd_y, true, status, &hw);
     try testing.expectEqual(Action.toggle_sd, ui.pointerButton(sd_conn_x, sd_y, false, status, &hw));
     status.sd_connected = true;
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // Verify the active SD card name ("Card 1") moves with the card and is rendered beside the protruding left edge when inserted
     var inserted_label_lit: usize = 0;
@@ -6379,13 +6128,13 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     status.sd_connected = false;
     status.power_connected = false;
     ui.pointerLeave();
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     try testing.expectEqual(@as(usize, 0), countRedPixelsInSdSocket(pixels, win_w, tr));
 
     // Hovering over the power cable while SD card is disconnected shows the red exclamation mark on the SD socket
     _ = ui.pointerMotion(pwr_x, pwr_cable_y, status, &hw);
     try testing.expectEqual(@as(?InteractiveTarget, .power), ui.hovered_target);
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     try testing.expect(countRedPixelsInSdSocket(pixels, win_w, tr) > 20);
 
     // Connecting power while SD card is disconnected keeps the red exclamation mark visible even when not hovering power
@@ -6393,12 +6142,12 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.toggle_power, ui.pointerButton(pwr_x, pwr_y, false, status, &hw));
     status.power_connected = true;
     ui.pointerLeave();
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     try testing.expect(countRedPixelsInSdSocket(pixels, win_w, tr) > 20);
 
     // Connecting the SD card hides the red exclamation mark
     status.sd_connected = true;
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     try testing.expectEqual(@as(usize, 0), countRedPixelsInSdSocket(pixels, win_w, tr));
 
     // 5. Clicking the USB Hub body does not toggle the hub (.consumed), while clicking the USB OTG socket/plug/cable returns .toggle_usb_hub
@@ -6432,7 +6181,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(Action.toggle_ethernet, ui.pointerButton(eth_x, eth_y, false, status, &hw));
     status.ethernet_connected = false;
 
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // 7. Clicking the bottom Settings button expands the sheet downward and exposes
     //    Serial Number, USB Ethernet MAC, and DHCP Server controls.
@@ -6472,7 +6221,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqualStrings("Raspberry Pi 1 Model A+", ui.title);
     try testing.expect(board.forModel(status.board_model) == &board.pi1_a_plus);
     try testing.expectEqual(@as(f32, 0.0), ui.wifi_mac_field_rect.w);
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // Select item 1 (Raspberry Pi 1 Model B+): B board has no external USB hub; USB & Ethernet ports are interactive directly
     _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
@@ -6492,9 +6241,9 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expectEqual(InteractiveTarget.audio, BoardUi.targetAt(&board.pi1_b_plus, .{ 53.5, 55.0 }, true).?);
     try testing.expect(status.audio_connected);
     status.audio_connected = false;
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     status.audio_connected = true;
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // Select item 2 (Raspberry Pi 3 Model A+): A+ board with wireless and external USB hub
     _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
@@ -6509,7 +6258,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expect(board.forModel(status.board_model) == &board.pi3_a_plus);
     try testing.expect(status.board_model.usesExternalUsbHub());
     try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // Select item 3 (Raspberry Pi 3 Model B+): B+ board with wireless and direct USB/Ethernet ports
     _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
@@ -6524,7 +6273,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expect(board.forModel(status.board_model) == &board.pi3_b_plus);
     try testing.expect(!status.board_model.usesExternalUsbHub());
     try testing.expect(ui.wifi_mac_field_rect.w > 0.0);
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // Select item 5 (Raspberry Pi Zero W) from the popup menu
     _ = ui.pointerButton(ui.board_menu_btn_rect.x + 10, ui.board_menu_btn_rect.y + 10, true, status, &hw);
@@ -6561,7 +6310,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     _ = ui.pointerButton(dhcp_r.x + 10, dhcp_r.y + 10, true, status, &hw);
     try testing.expectEqual(Action.toggle_dhcp, ui.pointerButton(dhcp_r.x + 10, dhcp_r.y + 10, false, status, &hw));
     status.dhcp_enabled = false;
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // Wi-Fi security: WPA2-Personal with the default password at first. Choosing Open from the
     // menu, then WPA2-Personal again; the password takes printable characters and stays
@@ -6579,7 +6328,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     _ = ui.pointerButton(sec_r.x + 10, sec_r.y + 10, true, status, &hw);
     _ = ui.pointerButton(sec_r.x + 10, sec_r.y + 10, false, status, &hw);
     try testing.expect(ui.wifi_security_menu_open);
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     const wpa2_y = ui.wifi_security_menu_rect.y + 4.0 + 1.0 * 32.0 + 16.0;
     _ = ui.pointerButton(ui.wifi_security_menu_rect.x + 20, wpa2_y, true, status, &hw);
     try testing.expectEqual(Action.consumed, ui.pointerButton(ui.wifi_security_menu_rect.x + 20, wpa2_y, false, status, &hw));
@@ -6598,10 +6347,10 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     try testing.expect(ui.handleKey(57)); // space
     try testing.expectEqualStrings("aaaaaaa ", ui.wifiPassword());
     try testing.expect(isValidWifiPassword(ui.wifiPassword()));
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     try testing.expect(ui.handleKey(28)); // Enter
     try testing.expectEqual(@as(@TypeOf(ui.focused_field), .none), ui.focused_field);
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     status.power_connected = false;
     ui.updateLayout(win_w, win_h, status, &hw);
 
@@ -6616,7 +6365,7 @@ test "TitleBar and BoardSheet toggle connectors and peripherals on the board dia
     ui.sheet_open = true;
     status.board_model = .pi_1_b_plus;
     ui.updateLayout(win_w, win_h, status, &hw);
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     const b_plus = &board.pi1_b_plus;
     const b_tr = BoardUi.boardTransform(b_plus, ui.board_rect);
@@ -6825,7 +6574,7 @@ test "GPIO ribbon cable connector and GPIO box outputs LEDs and input switches" 
     defer testing.allocator.free(pixels);
     @memset(pixels, 0xff000000);
 
-    ui.paint(pixels[0 .. win_w * win_h_disconnected], win_w, win_h_disconnected, 1, status, &hw);
+    try testPaint(&ui, pixels[0 .. win_w * win_h_disconnected], win_w, win_h_disconnected, 1, status, &hw);
     try testing.expectEqual(@as(f32, 0.0), ui.gpio_box_rect.h);
 
     // 2. Clicking the GPIO ribbon cable / header on the board diagram toggles .toggle_gpio
@@ -6839,7 +6588,7 @@ test "GPIO ribbon cable connector and GPIO box outputs LEDs and input switches" 
 
     // Connect the GPIO ribbon cable
     status.gpio_connected = true;
-    ui.paint(pixels, win_w, win_h_connected, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h_connected, 1, status, &hw);
     try testing.expectEqual(@as(f32, @floatFromInt(BoardUi.gpio_panel_height)), ui.gpio_box_rect.h);
     try testing.expectEqual(@as(f32, 764.0), ui.gpio_box_rect.y);
 
@@ -6897,7 +6646,7 @@ test "GPIO ribbon cable connector and GPIO box outputs LEDs and input switches" 
     hw.write32(0x1C, (1 << 5) | (1 << 21)); // GPSET0: set GPIO 5 and GPIO 21 high
     try testing.expect(hw.takeUiDirty());
 
-    ui.paint(pixels, win_w, win_h_connected, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h_connected, 1, status, &hw);
 
     // Outputs section has 3 pins ordered low-to-high by RPi header pin number: [12 (GPIO 18), 29 (GPIO 5), 40 (GPIO 21)]
     try testing.expectEqual(@as(usize, 3), ui.gpio_output_count);
@@ -6927,7 +6676,7 @@ test "GPIO ribbon cable connector and GPIO box outputs LEDs and input switches" 
     // Guest OS clears GPIO 21 (header pin 40) via GPCLR0 (0x28)
     hw.write32(0x28, 1 << 21);
     try testing.expect(!hw.getPinLevel(21));
-    ui.paint(pixels, win_w, win_h_connected, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h_connected, 1, status, &hw);
 }
 
 test "XkbKeymap parsing, modifiers, Caps Lock, AltGr, and non-US layout input" {
@@ -7029,7 +6778,7 @@ test "BoardUi threaded SD card image creation with progress spinner" {
     try testing.expect(ui.sd_manage_open);
 
     // Paint while task is active to exercise progress spinner rendering
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // Poll until background creation finishes
     var spins: usize = 0;
@@ -7072,7 +6821,7 @@ test "BoardUi snackbar displays boot errors and dismisses on close button click"
         ui.snackbarMessage(),
     );
 
-    ui.paint(pixels, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
     try testing.expect(ui.snackbar_rect.w >= 240.0);
     try testing.expectEqual(@as(f32, 48.0), ui.snackbar_rect.h);
     try testing.expect(ui.isPointInUi(ui.snackbar_rect.x + 10.0, ui.snackbar_rect.y + 10.0, status));
@@ -7114,40 +6863,6 @@ test "BoardUi.blitHdmiToBackbuffer SIMD pixel scaling for sc = 1, 2, 3, 4" {
             }
         }
     }
-}
-
-test "BoardUi.paintWithBackdrop reuses dimmed HDMI backdrop bit-identically on sheet hover" {
-    var ui = try BoardUi.init(testing.allocator);
-    defer ui.deinit();
-
-    var hw: Gpio = .{};
-    const status: SystemStatus = .{ .hdmi_connected = true, .hdmi_active = true };
-    const win_w: u32 = 800;
-    const win_h: u32 = 524;
-    const pixels_ref = try testing.allocator.alloc(u32, win_w * win_h);
-    defer testing.allocator.free(pixels_ref);
-    const pixels_fast = try testing.allocator.alloc(u32, win_w * win_h);
-    defer testing.allocator.free(pixels_fast);
-
-    @memset(pixels_ref, 0xFF336699);
-    @memset(pixels_fast, 0xFF336699);
-
-    ui.sheet_open = true;
-    // Initial paint dims the backdrop in pixels_fast
-    ui.paintWithBackdrop(pixels_fast, win_w, win_h, 1, status, &hw, false);
-
-    // Now change hover state and settings button hover
-    ui.hovered_target = .hdmi;
-    ui.settings_btn_hovered = true;
-
-    // Fast path: reuse already-dimmed backdrop without re-blitting or re-dimming HDMI
-    ui.paintWithBackdrop(pixels_fast, win_w, win_h, 1, status, &hw, true);
-
-    // Reference path: fresh HDMI blit + full paint
-    @memset(pixels_ref, 0xFF336699);
-    ui.paintWithBackdrop(pixels_ref, win_w, win_h, 1, status, &hw, false);
-
-    try testing.expectEqualSlices(u32, pixels_ref, pixels_fast);
 }
 
 test "BoardUi centers display with border when extra space is available and docks board sheet above display when it fits" {
@@ -7222,7 +6937,7 @@ test "BoardUi centers display with border when extra space is available and dock
     const disp_x: usize = @intFromFloat(ui.display_rect.x);
     const disp_y: usize = @intFromFloat(ui.display_rect.y);
     BoardUi.blitHdmiToBackbufferAt(pixels, win_w, disp_x, disp_y, hdmi_fb, 800, 480, 1);
-    ui.paintWithBackdrop(pixels, win_w, win_h, 1, status, &hw, false);
+    try testPaint(&ui, pixels, win_w, win_h, 1, status, &hw);
 
     // Pixel inside display_rect remains undimmed 0xFF2288EE
     try testing.expectEqual(@as(u32, 0xFF2288EE), pixels[(disp_y + 100) * win_w + (disp_x + 100)]);
@@ -7421,7 +7136,7 @@ test "BoardUi renders thermometer and temperature on CPU and opens temperature s
     const pixels_42 = try testing.allocator.alloc(u32, win_w * win_h);
     defer testing.allocator.free(pixels_42);
     @memset(pixels_42, 0xFF000000);
-    ui.paint(pixels_42, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels_42, win_w, win_h, 1, status, &hw);
 
     const surface_argb = ui.theme.surface.toArgb();
     var cpu_interior_lit: usize = 0;
@@ -7470,7 +7185,7 @@ test "BoardUi renders thermometer and temperature on CPU and opens temperature s
     const pixels_65 = try testing.allocator.alloc(u32, win_w * win_h);
     defer testing.allocator.free(pixels_65);
     @memset(pixels_65, 0xFF000000);
-    ui.paint(pixels_65, win_w, win_h, 1, status, &hw);
+    try testPaint(&ui, pixels_65, win_w, win_h, 1, status, &hw);
 
     var diff_count: usize = 0;
     for (iy0..iy1) |py| {

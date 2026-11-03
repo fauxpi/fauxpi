@@ -5,12 +5,16 @@ pub fn build(b: *std.Build) void {
     const explicit_optimize = b.option(std.builtin.OptimizeMode, "optimize", "Optimization mode (default: ReleaseFast)");
     const optimize: std.builtin.OptimizeMode = explicit_optimize orelse .ReleaseFast;
 
+    // The UI toolkit the window is drawn with.
+    const kete = b.dependency("kete", .{ .target = target, .optimize = optimize }).module("kete");
+
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    root_mod.addImport("kete", kete);
 
     // Debug builds use LLVM too: Zig's self-hosted x86-64 backend crashes compiling the
     // 128-bit `cmpxchg` that emulates `STXP` (src/cpu/atomic_ram.zig).
@@ -39,6 +43,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
         .link_libc = true,
     });
+    test_mod.addImport("kete", b.dependency("kete", .{ .target = target, .optimize = .Debug }).module("kete"));
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

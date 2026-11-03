@@ -1,45 +1,19 @@
-//! Common desktop window state, compositing, input routing, and platform dispatch
-//! shared across `WaylandWindow`, `MacosWindow`, and `WindowsWindow`.
+//! The desktop window's state and input routing: what the window (`KeteWindow`)
+//! does with the pointer and keyboard, for the Board & GPIO sheet and the guest.
 
 const std = @import("std");
-const builtin = @import("builtin");
-const host_posix = @import("../host/posix.zig");
 const UsbHidComposite = @import("../usb/hid.zig").UsbHidComposite;
 const Gpio = @import("../soc/gpio.zig").Gpio;
 const board_sheet = @import("../ui/board_sheet.zig");
 
-pub const wayland_window = @import("wayland_window.zig");
-pub const macos_window = @import("macos_window.zig");
-pub const windows_window = @import("windows_window.zig");
+pub const kete_window = @import("kete_window.zig");
 
-/// Platform-native desktop window backend (`WindowsWindow` on Windows, `MacosWindow` on macOS, `WaylandWindow` on Linux).
-pub const Window = switch (builtin.os.tag) {
-    .macos => macos_window.MacosWindow,
-    .windows => windows_window.WindowsWindow,
-    else => wayland_window.WaylandWindow,
-};
-
-pub const cursor_logical_dim: u32 = 24;
-pub const crosshair_logical_hot: i32 = 12;
-
-pub const CursorMode = enum {
-    unknown,
-    ui_arrow,
-    hdmi_crosshair,
-};
+/// The desktop window, made with kete.
+pub const Window = kete_window.KeteWindow;
 
 pub const KeyRepeat = struct {
     key: u32,
     next_ns: u64,
-};
-
-pub const BufferState = struct {
-    hdmi_gen: u64 = 0,
-    had_sheet: bool = false,
-    hdmi_state: u2 = 0,
-    sheet_rect: board_sheet.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    display_rect: board_sheet.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    sheet_docked: bool = false,
 };
 
 pub const CommonResources = struct {
@@ -101,85 +75,6 @@ pub fn initCommonResources(
     };
 }
 
-pub fn paintFaintCrosshairCursor(pixels: []u32, sc: u32) void {
-    const dim: usize = @as(usize, cursor_logical_dim) * @as(usize, sc);
-    @memset(pixels, 0x00000000);
-
-    const c: i32 = @intCast(crosshair_logical_hot);
-    // Premultiplied ARGB8888: faint ~22% white core with subtle ~11% dark halo
-    // so the crosshair is subtly visible on both dark and light HDMI frames without
-    // doubling up with the guest OS cursor.
-    const core_px: u32 = 0x38383838;
-    const halo_px: u32 = 0x1C000000;
-
-    var d: i32 = -5;
-    while (d <= 5) : (d += 1) {
-        if (d >= -1 and d <= 1) continue; // 3x3 gap around center tip
-        // Horizontal arm (y = c, x = c + d) + 1px halo above/below
-        fillScaledCursorPixel(pixels, dim, sc, c + d, c - 1, halo_px);
-        fillScaledCursorPixel(pixels, dim, sc, c + d, c, core_px);
-        fillScaledCursorPixel(pixels, dim, sc, c + d, c + 1, halo_px);
-        // Vertical arm (x = c, y = c + d) + 1px halo left/right
-        fillScaledCursorPixel(pixels, dim, sc, c - 1, c + d, halo_px);
-        fillScaledCursorPixel(pixels, dim, sc, c, c + d, core_px);
-        fillScaledCursorPixel(pixels, dim, sc, c + 1, c + d, halo_px);
-    }
-    // Subtle center dot
-    fillScaledCursorPixel(pixels, dim, sc, c, c, core_px);
-}
-
-pub fn paintArrowCursor(pixels: []u32, sc: u32) void {
-    const dim: usize = @as(usize, cursor_logical_dim) * @as(usize, sc);
-    @memset(pixels, 0x00000000);
-    const arrow_rows = [_][]const u8{
-        "X",
-        "XX",
-        "X.X",
-        "X..X",
-        "X...X",
-        "X....X",
-        "X.....X",
-        "X......X",
-        "X.......X",
-        "X........X",
-        "X.....XXXXX",
-        "X..X..X",
-        "X.X X..X",
-        "XX  X..X",
-        "X    X..X",
-        "     X..X",
-        "      XX",
-    };
-    for (arrow_rows, 0..) |row, ly| {
-        for (row, 0..) |ch, lx| {
-            const color: u32 = switch (ch) {
-                'X' => 0xFF000000,
-                '.' => 0xFFFFFFFF,
-                else => continue,
-            };
-            fillScaledCursorPixel(pixels, dim, sc, @intCast(lx + 1), @intCast(ly + 1), color);
-        }
-    }
-}
-
-fn fillScaledCursorPixel(pixels: []u32, dim: usize, sc: u32, lx: i32, ly: i32, color: u32) void {
-    if (lx < 0 or ly < 0) return;
-    const x0: usize = @as(usize, @intCast(lx)) * @as(usize, sc);
-    const y0: usize = @as(usize, @intCast(ly)) * @as(usize, sc);
-    const s: usize = sc;
-    var dy: usize = 0;
-    while (dy < s) : (dy += 1) {
-        const py = y0 + dy;
-        if (py >= dim) break;
-        var dx: usize = 0;
-        while (dx < s) : (dx += 1) {
-            const px = x0 + dx;
-            if (px >= dim) break;
-            pixels[py * dim + px] = color;
-        }
-    }
-}
-
 pub fn notifyHdmiUpdated(win: anytype) void {
     win.hdmi_gen +%= 1;
     if (win.hdmi_gen == 0) win.hdmi_gen = 1;
@@ -196,164 +91,6 @@ pub fn setChosenSdPath(win: anytype, path: []const u8) void {
     const fsize = board_sheet.Qcow2Disk.getFileSizeLinux(path) catch 0;
     win.ui.setPendingSdImageFile(path, fsize);
     win.ui_dirty = true;
-}
-
-/// Non-blocking child process pipe reader used by the macOS (`osascript`) file chooser dialog.
-pub const PosixFilePicker = struct {
-    fd: host_posix.fd_t = -1,
-    pid: host_posix.pid_t = -1,
-    buf: [std.fs.max_path_bytes]u8 = undefined,
-    len: usize = 0,
-
-    pub fn close(self: *PosixFilePicker) void {
-        if (self.fd >= 0) {
-            host_posix.close(self.fd);
-            self.fd = -1;
-        }
-        self.pid = -1;
-        self.len = 0;
-    }
-
-    pub fn spawn(self: *PosixFilePicker, comptime childFn: fn () noreturn) void {
-        if (self.fd >= 0) return;
-
-        var fds: [2]host_posix.fd_t = undefined;
-        if (!host_posix.pipeNonBlockCloexec(&fds)) return;
-
-        const pid = host_posix.forkProcess() orelse {
-            host_posix.close(fds[0]);
-            host_posix.close(fds[1]);
-            return;
-        };
-
-        if (pid == 0) {
-            host_posix.dup2Stdout(fds[1]);
-            host_posix.close(fds[0]);
-            host_posix.close(fds[1]);
-            childFn();
-        }
-
-        host_posix.close(fds[1]);
-        self.fd = fds[0];
-        self.pid = pid;
-        self.len = 0;
-    }
-
-    pub fn poll(self: *PosixFilePicker, win: anytype) void {
-        if (self.fd < 0) return;
-
-        while (self.len < self.buf.len) {
-            switch (host_posix.readNonBlock(self.fd, self.buf[self.len..])) {
-                .again => return,
-                .err => break,
-                .bytes => |rc| {
-                    if (rc == 0) {
-                        host_posix.waitpidBlocking(self.pid);
-                        host_posix.close(self.fd);
-                        self.fd = -1;
-                        self.pid = -1;
-
-                        const trimmed = std.mem.trim(u8, self.buf[0..self.len], " \t\r\n");
-                        setChosenSdPath(win, trimmed);
-                        self.len = 0;
-                        win.ui_dirty = true;
-                        return;
-                    }
-                    self.len += rc;
-                },
-            }
-        }
-    }
-};
-
-/// Composites `win.hdmi_fb` and `win.ui` into `full` backbuffer, tracking incremental backdrop state
-/// in `buf_state` and returning whether the HDMI display region was damaged.
-pub fn compositeToBuffer(win: anytype, full: []u32, buf_state: *BufferState) bool {
-    const sc = @max(win.scale, 1);
-    const buf_w: usize = @as(usize, win.width) * @as(usize, sc);
-    const dw: usize = win.display_width;
-    const dh: usize = win.display_height;
-
-    win.ui.updateLayout(win.width, win.height, win.status, win.gpio);
-    const disp_x: u32 = @intFromFloat(@max(0.0, @floor(win.ui.display_rect.x)));
-    const disp_y: u32 = @intFromFloat(@max(0.0, @floor(win.ui.display_rect.y)));
-    const left_phys_cols: usize = @as(usize, disp_x) * @as(usize, sc);
-    const top_phys_rows: usize = @as(usize, disp_y) * @as(usize, sc);
-
-    const has_overlay = win.ui.sheet_open or win.ui.hasSnackbar();
-    const has_popup = win.ui.sd_manage_open or win.ui.sd_card_menu_open or win.ui.board_menu_open or win.ui.cpu_temp_popup_open;
-    const can_reuse_sheet_backdrop = win.ui.sheet_open and !win.ui.hasSnackbar() and !has_popup;
-    const hdmi_state: u2 = (@as(u2, @intFromBool(win.status.hdmi_connected)) |
-        (@as(u2, @intFromBool(win.status.hdmi_active)) << 1));
-    const same_display_layout = std.meta.eql(buf_state.display_rect, win.ui.display_rect) and
-        (buf_state.sheet_docked == win.ui.sheet_docked_above);
-    const same_sheet_backdrop = can_reuse_sheet_backdrop and
-        buf_state.had_sheet and
-        buf_state.hdmi_state == hdmi_state and
-        same_display_layout and
-        std.meta.eql(buf_state.sheet_rect, win.ui.sheet_rect);
-
-    var reuse_dimmed_backdrop = false;
-    var damaged_hdmi = false;
-    if (win.status.hdmi_connected and win.status.hdmi_active) {
-        if (same_sheet_backdrop and buf_state.hdmi_gen == win.hdmi_gen) {
-            reuse_dimmed_backdrop = true;
-            damaged_hdmi = false;
-        } else {
-            const need_hdmi_blit = (buf_state.hdmi_gen != win.hdmi_gen) or
-                !same_display_layout or
-                has_overlay or
-                buf_state.had_sheet or
-                (buf_state.hdmi_state != hdmi_state);
-            if (need_hdmi_blit) {
-                board_sheet.BoardUi.blitHdmiToBackbufferAt(full, buf_w, left_phys_cols, top_phys_rows, win.hdmi_fb, dw, dh, sc);
-                buf_state.hdmi_gen = win.hdmi_gen;
-                damaged_hdmi = true;
-            } else {
-                damaged_hdmi = false;
-            }
-        }
-    } else {
-        buf_state.hdmi_gen = 0;
-        if (same_sheet_backdrop) {
-            reuse_dimmed_backdrop = true;
-            damaged_hdmi = false;
-        } else {
-            damaged_hdmi = (buf_state.hdmi_state != hdmi_state) or
-                !same_display_layout or
-                has_overlay or
-                buf_state.had_sheet;
-        }
-    }
-    buf_state.had_sheet = has_overlay;
-    buf_state.hdmi_state = hdmi_state;
-    buf_state.display_rect = win.ui.display_rect;
-    buf_state.sheet_docked = win.ui.sheet_docked_above;
-    buf_state.sheet_rect = if (can_reuse_sheet_backdrop)
-        win.ui.sheet_rect
-    else
-        .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-
-    win.ui.paintWithBackdrop(full, win.width, win.height, sc, win.status, win.gpio, reuse_dimmed_backdrop);
-    return damaged_hdmi;
-}
-
-pub fn reallocSingleBackbuffer(win: anytype) !void {
-    freeSingleBackbuffer(win);
-    const sc = @max(win.scale, 1);
-    const count = @as(usize, win.width * sc) * @as(usize, win.height * sc);
-    win.backbuffer = try win.gpa.alloc(u32, count);
-    @memset(win.backbuffer, 0xFF101418);
-    win.buf_state = .{};
-    win.cursor_mode = .unknown;
-    win.ui_dirty = true;
-}
-
-pub fn freeSingleBackbuffer(win: anytype) void {
-    if (win.backbuffer.len > 0) {
-        win.gpa.free(win.backbuffer);
-        win.backbuffer = &.{};
-    }
 }
 
 pub fn pollAsyncSdCreation(win: anytype, now_ns: u64) void {
@@ -400,7 +137,6 @@ pub fn handlePointerMotion(win: anytype, sx: f64, sy: f64) void {
 pub fn handlePointerLeave(win: anytype) void {
     win.last_mouse_x = null;
     win.last_mouse_y = null;
-    win.cursor_mode = .unknown;
     win.ui.pointerLeave();
     if (win.ui.takeHoverDirty()) {
         win.ui_dirty = true;
@@ -579,44 +315,6 @@ pub fn isModifierKey(evdev_key: u32) bool {
     };
 }
 
-pub fn repeatTimeoutMs(win: anytype, now_ns: u64) ?i32 {
-    const rep = win.repeat orelse return null;
-    if (win.repeat_rate == 0 or !win.ui.sheet_open) return null;
-    if (now_ns >= rep.next_ns) return 0;
-    const rem_ms = std.math.divCeil(u64, rep.next_ns - now_ns, std.time.ns_per_ms) catch 0;
-    return @intCast(@min(rem_ms, @as(u64, std.math.maxInt(i32))));
-}
-
-pub fn serviceRepeat(win: anytype, now_ns: u64) void {
-    const rep = &(win.repeat orelse return);
-    if (win.repeat_rate == 0) {
-        win.repeat = null;
-        return;
-    }
-    if (now_ns < rep.next_ns) return;
-    const step = std.time.ns_per_s / @as(u64, win.repeat_rate);
-    rep.next_ns = if (now_ns - rep.next_ns < step) rep.next_ns + step else now_ns + step;
-    if (win.ui.sheet_open) {
-        win.dispatchKey(rep.key, true, true);
-    }
-}
-
-pub fn recordKeyEvent(win: anytype, key: u32, pressed: bool, is_repeat: bool, now_ns: u64) void {
-    if (key < 256) {
-        if (pressed) win.keys_down.set(key) else win.keys_down.unset(key);
-    }
-    if (pressed) {
-        if (!isModifierKey(key) and win.repeat_rate > 0 and !is_repeat) {
-            const delay_ns = @as(u64, win.repeat_delay_ms) * std.time.ns_per_ms;
-            win.repeat = .{ .key = key, .next_ns = now_ns + delay_ns };
-        }
-    } else {
-        if (win.repeat) |rep| {
-            if (rep.key == key) win.repeat = null;
-        }
-    }
-}
-
 pub fn releaseAllHeldKeys(win: anytype) void {
     win.repeat = null;
     win.keys_down = .empty;
@@ -671,7 +369,5 @@ pub fn dispatchKey(win: anytype, key: u32, pressed: bool, is_repeat: bool) void 
 }
 
 test {
-    _ = wayland_window;
-    _ = macos_window;
-    _ = windows_window;
+    _ = kete_window;
 }

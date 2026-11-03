@@ -9,7 +9,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const linux = std.os.linux;
 const host_posix = @import("../host/posix.zig");
-const window = @import("../app/window.zig");
+const window = @import("window.zig");
 
 const is_linux = (builtin.os.tag == .linux);
 

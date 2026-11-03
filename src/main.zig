@@ -50,14 +50,12 @@ pub const vc4_hvs = @import("vc4/hvs.zig");
 pub const vc4_pv = @import("vc4/pixelvalve.zig");
 pub const vc4_hdmi = @import("vc4/hdmi.zig");
 
-pub const wl_protocol = if (builtin.os.tag == .linux) @import("wayland/protocol.zig") else struct {};
-pub const wl_client = if (builtin.os.tag == .linux) @import("wayland/client.zig") else struct {};
-pub const font = @import("font/font.zig");
 pub const ui_board = @import("ui/board.zig");
 pub const ui_gpio_model = @import("ui/gpio_model.zig");
 pub const ui_canvas = @import("ui/canvas.zig");
 pub const ui_board_sheet = @import("ui/board_sheet.zig");
 pub const window = @import("app/window.zig");
+pub const portal = @import("app/portal.zig");
 pub const app_audio = @import("app/audio.zig");
 
 const Bcm2835 = bcm2835.Bcm2835;
@@ -543,7 +541,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     defer if (wl_win) |w| w.destroy();
 
     if (!opts.headless) {
-        wl_win = try window.Window.create(gpa, environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
+        wl_win = try window.Window.create(gpa, threaded.io(), environ, opts.width, opts.height, &soc.usb.hid, &soc.gpio);
         wl_win.?.wifi_net = &soc.sdhci.wifi.net;
         wl_win.?.status.power_connected = opts.power;
         if (opts.sd_path) |sd_path| {

@@ -1,15 +1,15 @@
-//! Software 2D anti-aliased canvas for FauxPi's window decorations and
-//! Board & GPIO drop-down sheet.
+//! The 2D canvas FauxPi's title bar and Board & GPIO sheet draw with: kete's,
+//! through the painter of the widget being painted. Coordinates are logical
+//! pixels from the window's top left.
 
 const std = @import("std");
-const text_mod = @import("../font/text.zig");
+const kete = @import("kete");
 
-pub const Font = text_mod.Font;
-pub const GlyphCache = text_mod.GlyphCache;
-pub const Style = text_mod.Style;
+pub const Font = kete.font.Font;
+pub const Style = kete.font.Style;
 
-pub const fira_ttf = @embedFile("../fonts/FiraSans-Regular.ttf");
-pub const icons_ttf = @embedFile("../fonts/MaterialIcons-Regular.ttf");
+/// The text font, the same as kete draws text in.
+pub const fira_ttf = kete.font.default_font_data;
 
 pub const Point = [2]f32;
 
@@ -42,6 +42,10 @@ pub const Color = struct {
         const b: u32 = @intFromFloat(@round(std.math.clamp(c.b, 0, 1) * 255.0));
         return (a << 24) | (r << 16) | (g << 8) | b;
     }
+
+    fn toKete(c: Color) kete.Color {
+        return .{ .r = c.r, .g = c.g, .b = c.b, .a = c.a };
+    }
 };
 
 pub const Rect = struct {
@@ -66,6 +70,10 @@ pub const Rect = struct {
     pub fn outset(r: Rect, d: f32) Rect {
         return .{ .x = r.x - d, .y = r.y - d, .w = r.w + 2 * d, .h = r.h + 2 * d };
     }
+
+    fn toKete(r: Rect) kete.Rect {
+        return .{ .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+    }
 };
 
 /// Corner radii: top left, top right, bottom right, bottom left.
@@ -82,32 +90,37 @@ pub const Radii = struct {
     pub fn max(r: Radii) f32 {
         return @max(@max(r.tl, r.tr), @max(r.br, r.bl));
     }
+
+    fn toKete(r: Radii) kete.CornerRadii {
+        return .{ .tl = r.tl, .tr = r.tr, .br = r.br, .bl = r.bl };
+    }
 };
 
-/// Material Icons codepoints in `MaterialIcons-Regular.ttf`.
-pub const Icon = enum(u21) {
-    bolt = 0xea0b,
-    check = 0xe5ca,
-    close = 0xe5cd,
-    crop_square = 0xe3c6,
-    delete = 0xe872,
-    developer_board = 0xe30d,
-    edit = 0xe3c9,
-    expand_less = 0xe5ce,
-    expand_more = 0xe5cf,
-    filter_none = 0xe3e0,
-    headphones = 0xf01f,
-    keyboard = 0xe312,
-    lan = 0xeb2f,
-    monitor = 0xef5b,
-    mouse = 0xe323,
-    priority_high = 0xe645,
-    thermostat = 0xe1ff,
-    usb = 0xe1e0,
+/// Material Icons, by kete's names for them.
+pub const Icon = enum {
+    bolt,
+    check,
+    close,
+    crop_square,
+    delete,
+    developer_board,
+    edit,
+    expand_less,
+    expand_more,
+    filter_none,
+    headphones,
+    keyboard,
+    lan,
+    monitor,
+    mouse,
+    priority_high,
+    thermostat,
+    usb,
 
-    pub fn text(icon: Icon, buf: *[4]u8) []const u8 {
-        const len = std.unicode.utf8Encode(@backingInt(icon), buf) catch return "";
-        return buf[0..len];
+    fn toKete(icon: Icon) kete.IconName {
+        return switch (icon) {
+            inline else => |i| @field(kete.IconName, @tagName(i)),
+        };
     }
 };
 
@@ -141,377 +154,70 @@ pub const Theme = struct {
     };
 };
 
-const fill_stroke: f32 = 1e6;
-
-inline fn shapeCoverage(d: f32, sx: f32, sy: f32, inset: f32) f32 {
-    const by_distance = std.math.clamp(0.5 - (d + inset), 0.0, 1.0);
-    const cx = std.math.clamp(0.5 - (sx + inset), 0.0, 1.0);
-    const cy = std.math.clamp(0.5 - (sy + inset), 0.0, 1.0);
-    return @min(by_distance, cx * cy);
-}
-
-inline fn shapeCoverageVec4(v_d: @Vector(4, f32), v_sx: @Vector(4, f32), cy_clamped: f32, inset: f32) @Vector(4, f32) {
-    const v_zero: @Vector(4, f32) = @splat(0.0);
-    const v_one: @Vector(4, f32) = @splat(1.0);
-    const v_half_minus_inset: @Vector(4, f32) = @splat(0.5 - inset);
-    const by_distance = @min(@max(v_half_minus_inset - v_d, v_zero), v_one);
-    const cx = @min(@max(v_half_minus_inset - v_sx, v_zero), v_one);
-    return @min(by_distance, cx * @as(@Vector(4, f32), @splat(cy_clamped)));
-}
-
 pub const Canvas = struct {
-    pixels: []u32,
-    width: u32,
-    height: u32,
-    stride: u32,
-    scale: f32 = 1.0,
-    clip: ?Rect = null,
-    origin: Point = .{ 0, 0 },
+    /// The painter of the widget drawn in, whose top left is the window's.
+    painter: *kete.Painter,
+    /// The font text is measured in (the one kete draws it in).
     font: *const Font,
-    icon_font: *const Font,
-    cache: *GlyphCache,
 
-    pub fn clipTo(c: *Canvas, r: Rect) ?Rect {
-        const old = c.clip;
-        const moved: Rect = .{ .x = r.x + c.origin[0], .y = r.y + c.origin[1], .w = r.w, .h = r.h };
-        c.clip = if (old) |o| (o.intersect(moved) orelse .{ .x = 0, .y = 0, .w = 0, .h = 0 }) else moved;
-        return old;
+    /// Limits drawing to `r` until `restoreClip` with what this returns.
+    pub fn clipTo(c: *Canvas, r: Rect) ?kete.Rect {
+        return c.painter.clipTo(r.toKete());
     }
 
-    pub fn restoreClip(c: *Canvas, old: ?Rect) void {
-        c.clip = old;
+    pub fn restoreClip(c: *Canvas, old: ?kete.Rect) void {
+        c.painter.restoreClip(old);
     }
 
     pub fn fillRect(c: *Canvas, r: Rect, color: Color) void {
-        c.roundedRect(r, .{}, fill_stroke, color);
+        c.painter.canvas().fillRect(r.toKete(), color.toKete());
     }
 
     pub fn strokeRect(c: *Canvas, r: Rect, width: f32, color: Color) void {
-        c.roundedRect(r, .{}, width, color);
+        c.painter.canvas().strokeRect(r.toKete(), width, color.toKete());
     }
 
-    /// Strokes the inside edge of `r` as dashes `dash` long, with gaps as long, from each corner.
+    /// Strokes the inside edge of `r` as dashes `dash` long, with gaps as long.
     pub fn strokeDashedRect(c: *Canvas, r: Rect, width: f32, dash: f32, color: Color) void {
         if (dash <= 0) return c.strokeRect(r, width, color);
-        var x = r.x;
-        while (x < r.x + r.w) : (x += 2 * dash) {
-            const len = @min(dash, r.x + r.w - x);
-            c.fillRect(.{ .x = x, .y = r.y, .w = len, .h = width }, color);
-            c.fillRect(.{ .x = x, .y = r.y + r.h - width, .w = len, .h = width }, color);
-        }
-        var y = r.y;
-        while (y < r.y + r.h) : (y += 2 * dash) {
-            const len = @min(dash, r.y + r.h - y);
-            c.fillRect(.{ .x = r.x, .y = y, .w = width, .h = len }, color);
-            c.fillRect(.{ .x = r.x + r.w - width, .y = y, .w = width, .h = len }, color);
-        }
+        const pattern = [2]f32{ dash, dash };
+        // Kete strokes centred on the edge: inset by half the width.
+        const inner = r.outset(-width / 2);
+        c.painter.canvas().strokeDashedRect(inner.toKete(), width, .{ .pattern = &pattern }, color.toKete());
     }
 
     pub fn fillRoundedRect(c: *Canvas, r: Rect, radii: Radii, color: Color) void {
-        c.roundedRect(r, radii, fill_stroke, color);
+        c.painter.canvas().fillRoundedRect(r.toKete(), radii.toKete(), color.toKete());
     }
 
     pub fn strokeRoundedRect(c: *Canvas, r: Rect, radii: Radii, width: f32, color: Color) void {
-        c.roundedRect(r, radii, width, color);
+        c.painter.canvas().strokeRoundedRect(r.toKete(), radii.toKete(), width, color.toKete());
     }
 
     pub fn fillCircle(c: *Canvas, center: Point, radius: f32, color: Color) void {
-        c.roundedRect(
-            .{ .x = center[0] - radius, .y = center[1] - radius, .w = 2 * radius, .h = 2 * radius },
-            .all(radius),
-            fill_stroke,
-            color,
-        );
+        c.painter.canvas().fillCircle(center, radius, color.toKete());
     }
 
     pub fn strokeCircle(c: *Canvas, center: Point, radius: f32, width: f32, color: Color) void {
-        c.roundedRect(
-            .{ .x = center[0] - radius, .y = center[1] - radius, .w = 2 * radius, .h = 2 * radius },
-            .all(radius),
-            width,
-            color,
-        );
+        c.painter.canvas().strokeCircle(center, radius, width, color.toKete());
     }
 
     pub fn measureText(c: *const Canvas, size: f32, str: []const u8) f32 {
-        return c.cache.runs.measure(.{ .font = c.font, .size = size }, str);
+        return kete.font.measure(.{ .font = c.font, .size = size }, str);
     }
 
+    /// Draws `str` with its baseline at `baseline`; the pen position after it.
     pub fn drawText(c: *Canvas, size: f32, x: f32, baseline: f32, str: []const u8, color: Color) f32 {
-        return c.drawTextWithFont(c.font, size, x, baseline, str, color);
+        return c.painter.text(size, x, baseline, str, color.toKete());
     }
 
+    /// Draws `str` turned a quarter counter-clockwise, running up from `y`
+    /// with its baseline at `baseline_x`; where it ends.
     pub fn drawTextRotated90(c: *Canvas, size: f32, baseline_x: f32, y: f32, str: []const u8, color: Color) f32 {
-        return c.drawTextRotated90WithFont(c.font, size, baseline_x, y, str, color);
+        return c.painter.textRunning(size, .{ baseline_x, y }, .up, str, color.toKete())[1];
     }
 
     pub fn drawIcon(c: *Canvas, icon: Icon, x: f32, y: f32, size: f32, color: Color) void {
-        var buf: [4]u8 = undefined;
-        _ = c.drawTextWithFont(c.icon_font, size, x, y + size, icon.text(&buf), color);
-    }
-
-    fn drawTextWithFont(c: *Canvas, f: *const Font, size: f32, x: f32, baseline: f32, str: []const u8, color: Color) f32 {
-        if (str.len == 0) return x;
-        const sc = @max(c.scale, 1.0);
-        const argb = color.toArgb();
-        if (color.a <= 0) {
-            return x + c.cache.runs.measure(.{ .font = f, .size = size, .color = argb }, str);
-        }
-
-        const phys_style: Style = .{
-            .font = f,
-            .size = size * sc,
-            .color = argb,
-        };
-        const ox = (x + c.origin[0]) * sc;
-        const oy = (baseline + c.origin[1]) * sc;
-
-        const tc: text_mod.Canvas = .{
-            .pixels = c.pixels,
-            .width = c.width,
-            .height = c.height,
-            .stride = c.stride,
-        };
-        const end_phys = text_mod.draw(tc, c.cache, phys_style, ox, oy, str) catch
-            (ox + c.cache.runs.measure(.{ .font = f, .size = size, .color = argb }, str) * sc);
-        return (end_phys / sc) - c.origin[0];
-    }
-
-    fn drawTextRotated90WithFont(c: *Canvas, f: *const Font, size: f32, baseline_x: f32, y: f32, str: []const u8, color: Color) f32 {
-        if (str.len == 0) return y;
-        const sc = @max(c.scale, 1.0);
-        const argb = color.toArgb();
-        if (color.a <= 0) {
-            return y - c.cache.runs.measure(.{ .font = f, .size = size, .color = argb }, str);
-        }
-
-        const phys_style: Style = .{
-            .font = f,
-            .size = size * sc,
-            .color = argb,
-        };
-        const ox = (baseline_x + c.origin[0]) * sc;
-        const oy = (y + c.origin[1]) * sc;
-
-        const tc: text_mod.Canvas = .{
-            .pixels = c.pixels,
-            .width = c.width,
-            .height = c.height,
-            .stride = c.stride,
-        };
-        const end_phys = text_mod.drawRotated90Ccw(tc, c.cache, phys_style, ox, oy, str) catch
-            (oy - c.cache.runs.measure(.{ .font = f, .size = size, .color = argb }, str) * sc);
-        return (end_phys / sc) - c.origin[1];
-    }
-
-    fn roundedRect(c: *Canvas, r_in: Rect, radii_in: Radii, stroke_in: f32, color: Color) void {
-        const sc = @max(c.scale, 1.0);
-        const r: Rect = .{
-            .x = (r_in.x + c.origin[0]) * sc,
-            .y = (r_in.y + c.origin[1]) * sc,
-            .w = r_in.w * sc,
-            .h = r_in.h * sc,
-        };
-        if (r.w <= 0 or r.h <= 0 or color.a <= 0 or stroke_in <= 0) return;
-
-        const screen_rect: Rect = .{
-            .x = 0,
-            .y = 0,
-            .w = @floatFromInt(c.width),
-            .h = @floatFromInt(c.height),
-        };
-        const active_clip = if (c.clip) |cl| blk: {
-            const scaled_clip: Rect = .{
-                .x = cl.x * sc,
-                .y = cl.y * sc,
-                .w = cl.w * sc,
-                .h = cl.h * sc,
-            };
-            break :blk screen_rect.intersect(scaled_clip) orelse return;
-        } else screen_rect;
-        const box = r.outset(1.0).intersect(active_clip) orelse return;
-
-        const x0: u32 = @intFromFloat(@max(0.0, @floor(box.x)));
-        const y0: u32 = @intFromFloat(@max(0.0, @floor(box.y)));
-        const x1: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(c.width)), @ceil(box.x + box.w)));
-        const y1: u32 = @intFromFloat(@min(@as(f32, @floatFromInt(c.height)), @ceil(box.y + box.h)));
-        if (x0 >= x1 or y0 >= y1) return;
-
-        const hw = r.w * 0.5;
-        const hh = r.h * 0.5;
-        const cx = r.x + hw;
-        const cy = r.y + hh;
-        const limit = @min(hw, hh);
-        const radii: Radii = .{
-            .tl = std.math.clamp(radii_in.tl * sc, 0.0, limit),
-            .tr = std.math.clamp(radii_in.tr * sc, 0.0, limit),
-            .br = std.math.clamp(radii_in.br * sc, 0.0, limit),
-            .bl = std.math.clamp(radii_in.bl * sc, 0.0, limit),
-        };
-        const max_r = radii.max();
-        const filled = stroke_in >= fill_stroke;
-        const stroke = if (filled) fill_stroke else stroke_in * sc;
-        const argb = color.toArgb();
-        const argb_opaque: u32 = argb | 0xff000000;
-        const v_src_rb: @Vector(4, u32) = @splat(argb & 0x00ff00ff);
-        const v_src_g: @Vector(4, u32) = @splat(argb & 0x0000ff00);
-        const base_alpha: f32 = color.a * 255.0;
-
-        // Horizontal span `inner_x0..inner_x1` where `ax <= hw - inner_margin` (`mx == 0` and `cx == 1.0`)
-        const inner_margin = @max(max_r, if (filled) 0.0 else stroke) + 1.0;
-        const has_inner_x = hw > inner_margin;
-        const inner_x0: u32 = if (has_inner_x) @intFromFloat(@max(@as(f32, @floatFromInt(x0)), @ceil(cx - (hw - inner_margin)))) else x1;
-        const inner_x1: u32 = if (has_inner_x) @intFromFloat(@min(@as(f32, @floatFromInt(x1)), @floor(cx + (hw - inner_margin)))) else x0;
-        const has_mid_span = has_inner_x and (inner_x0 < inner_x1);
-        const full_a_u32: u32 = @intFromFloat(@round(base_alpha));
-
-        const FVec4 = @Vector(4, f32);
-        const v_zero: FVec4 = @splat(0.0);
-        const v_hw: FVec4 = @splat(hw);
-        const v_base_alpha: FVec4 = @splat(base_alpha);
-        const v_lane_step = FVec4{ 0.0, 1.0, 2.0, 3.0 };
-
-        for (y0..y1) |py| {
-            const fy = @as(f32, @floatFromInt(py)) + 0.5 - cy;
-            const ay = @abs(fy);
-            const sy = ay - hh;
-            const cy_0 = std.math.clamp(0.5 - sy, 0.0, 1.0);
-            if (cy_0 <= 0.0) continue;
-            const cy_stroke = if (filled) 0.0 else std.math.clamp(0.5 - (sy + stroke), 0.0, 1.0);
-            const rad_left = if (fy < 0.0) radii.tl else radii.bl;
-            const rad_right = if (fy < 0.0) radii.tr else radii.br;
-            const v_rad_left: FVec4 = @splat(rad_left);
-            const v_rad_right: FVec4 = @splat(rad_right);
-            const v_sy: FVec4 = @splat(sy);
-
-            const row = c.pixels[py * c.stride ..];
-            const in_inner_y = (hh > inner_margin) and (ay <= hh - inner_margin);
-
-            var px: u32 = x0;
-            while (px < x1) {
-                if (has_mid_span and px == inner_x0) {
-                    if (in_inner_y) {
-                        if (filled) {
-                            text_mod.blendSpan(row[inner_x0..inner_x1], argb, full_a_u32);
-                        }
-                    } else {
-                        const span_cov = cy_0 - cy_stroke;
-                        if (span_cov > 0.0) {
-                            const span_a: u32 = @intFromFloat(@round(base_alpha * span_cov));
-                            text_mod.blendSpan(row[inner_x0..inner_x1], argb, span_a);
-                        }
-                    }
-                    px = inner_x1;
-                    continue;
-                }
-
-                const limit_x = if (has_mid_span and px < inner_x0) inner_x0 else x1;
-                while (px + 4 <= limit_x) : (px += 4) {
-                    const v_fx: FVec4 = @as(FVec4, @splat(@as(f32, @floatFromInt(px)) + 0.5 - cx)) + v_lane_step;
-                    const v_ax = @abs(v_fx);
-                    const v_rad = @select(f32, v_fx < v_zero, v_rad_left, v_rad_right);
-                    const v_qx = v_ax - (v_hw - v_rad);
-                    const v_qy = v_sy + v_rad;
-                    const v_mx = @max(v_qx, v_zero);
-                    const v_my = @max(v_qy, v_zero);
-                    const v_d = @sqrt(v_mx * v_mx + v_my * v_my) + @min(@max(v_qx, v_qy), v_zero) - v_rad;
-                    const v_sx = v_ax - v_hw;
-
-                    const v_cov0 = shapeCoverageVec4(v_d, v_sx, cy_0, 0.0);
-                    const v_cov = if (filled)
-                        v_cov0
-                    else
-                        @max(v_cov0 - shapeCoverageVec4(v_d, v_sx, cy_stroke, stroke), v_zero);
-
-                    const v_a_u8: @Vector(4, u8) = @intFromFloat(@round(v_base_alpha * v_cov));
-                    text_mod.blendCov4(row[px..][0..4], @bitCast(v_a_u8), argb_opaque, 255, v_src_rb, v_src_g);
-                }
-
-                while (px < limit_x) : (px += 1) {
-                    const fx = @as(f32, @floatFromInt(px)) + 0.5 - cx;
-                    const ax = @abs(fx);
-                    const rad = if (fx < 0.0) rad_left else rad_right;
-
-                    const qx = ax - (hw - rad);
-                    const qy = ay - (hh - rad);
-                    const mx = @max(qx, 0.0);
-                    const my = @max(qy, 0.0);
-                    const d = @sqrt(mx * mx + my * my) + @min(@max(qx, qy), 0.0) - rad;
-                    const sx = ax - hw;
-
-                    const cov = shapeCoverage(d, sx, sy, 0.0) - (if (filled) 0.0 else shapeCoverage(d, sx, sy, stroke));
-                    if (cov > 0.0) {
-                        const a_u32: u32 = @intFromFloat(@round(base_alpha * cov));
-                        if (a_u32 > 0) {
-                            row[px] = text_mod.blend(row[px], argb, a_u32);
-                        }
-                    }
-                }
-            }
-        }
+        c.painter.icon(icon.toKete(), x, y, size, color.toKete());
     }
 };
-
-const testing = std.testing;
-
-test "canvas shapes and icons draw anti-aliased pixels at 1x and 2x scale" {
-    const f = try Font.init(fira_ttf);
-    const ic = try Font.init(icons_ttf);
-    var cache = GlyphCache.init(testing.allocator);
-    defer cache.deinit();
-
-    var pixels: [100 * 60]u32 = @splat(0xff141218);
-    var c: Canvas = .{
-        .pixels = &pixels,
-        .width = 100,
-        .height = 60,
-        .stride = 100,
-        .font = &f,
-        .icon_font = &ic,
-        .cache = &cache,
-    };
-
-    c.fillRoundedRect(.{ .x = 10, .y = 10, .w = 40, .h = 20 }, .all(6), Theme.dark.primary);
-    try testing.expectEqual(Theme.dark.primary.toArgb(), pixels[20 * 100 + 30]);
-
-    c.strokeCircle(.{ 75, 30 }, 12, 2, Theme.dark.on_surface);
-    try testing.expectEqual(@as(u32, 0xff141218), pixels[30 * 100 + 75]);
-
-    try testing.expect(ic.glyphIndex(@backingInt(Icon.bolt)) != 0);
-    try testing.expect(ic.glyphIndex(@backingInt(Icon.check)) != 0);
-    try testing.expect(ic.glyphIndex(@backingInt(Icon.edit)) != 0);
-    try testing.expect(ic.glyphIndex(@backingInt(Icon.monitor)) != 0);
-    try testing.expect(ic.glyphIndex(@backingInt(Icon.thermostat)) != 0);
-
-    c.drawIcon(.developer_board, 10, 34, 20, Theme.dark.on_surface);
-    var icon_lit: usize = 0;
-    for (34..54) |y| {
-        for (10..30) |x| {
-            if (pixels[y * 100 + x] != 0xff141218) icon_lit += 1;
-        }
-    }
-    try testing.expect(icon_lit > 40);
-
-    // 2x HiDPI scale: logical 100x60 into physical 200x120 buffer
-    var pixels_2x: [200 * 120]u32 = @splat(0xff141218);
-    var c2: Canvas = .{
-        .pixels = &pixels_2x,
-        .width = 200,
-        .height = 120,
-        .stride = 200,
-        .scale = 2.0,
-        .font = &f,
-        .icon_font = &ic,
-        .cache = &cache,
-    };
-    c2.fillRoundedRect(.{ .x = 10, .y = 10, .w = 40, .h = 20 }, .all(6), Theme.dark.primary);
-    // Logical center (30, 20) -> physical center (60, 40)
-    try testing.expectEqual(Theme.dark.primary.toArgb(), pixels_2x[40 * 200 + 60]);
-
-    // Translucent fillRoundedRect uses SIMD blendSpan and matches scalar text_mod.blend
-    const translucent = Theme.dark.primary.withAlpha(0.5);
-    c2.fillRoundedRect(.{ .x = 55, .y = 10, .w = 40, .h = 20 }, .all(6), translucent);
-    const expected_blend = text_mod.blend(0xff141218, translucent.toArgb(), @intFromFloat(@round(0.5 * 255.0)));
-    try testing.expectEqual(expected_blend, pixels_2x[40 * 200 + 150]);
-    try testing.expectEqual(expected_blend, pixels_2x[22 * 200 + 150]);
-}
