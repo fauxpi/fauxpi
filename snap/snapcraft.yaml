@@ -94,10 +94,14 @@ parts:
         amd64) cpu=x86_64_v2 ;;
         *) cpu=baseline ;;
       esac
-      # Temporary: show the resolv.conf that Zig's resolver fails to parse (ResolvConfParseFailed)
-      ls -l /etc/resolv.conf
-      cat -A /etc/resolv.conf
-      ./scripts/zig build -Doptimize=ReleaseFast -Dcpu=$cpu --prefix "$CRAFT_PART_INSTALL/usr"
+      # Zig can't fetch kete here: it fails on the container's scoped IPv6 nameserver in
+      # resolv.conf (https://codeberg.org/ziglang/zig/issues/36186). So download the commit
+      # build.zig.zon names with curl and build against that.
+      kete=$(sed -n 's|.*"git+https://github.com/\(.*/kete\)#\([0-9a-f]*\)".*|\1/archive/\2.tar.gz|p' build.zig.zon)
+      rm -rf kete-src
+      mkdir kete-src
+      curl -fsSL "https://github.com/$kete" | tar -xz -C kete-src --strip-components=1
+      ./scripts/zig build -Doptimize=ReleaseFast -Dcpu=$cpu --fork="$PWD/kete-src" --prefix "$CRAFT_PART_INSTALL/usr"
       install -Dm644 data/io.github.fauxpi.Fauxpi.desktop \
         "$CRAFT_PART_INSTALL/usr/share/applications/io.github.fauxpi.Fauxpi.desktop"
       install -Dm644 data/io.github.fauxpi.Fauxpi.svg \
