@@ -256,6 +256,7 @@ pub fn handlePointerButton(win: anytype, button_bit: u8, pressed: bool, sx_f64: 
                 if (!win.status.gpio_connected) {
                     win.gpio.clearHeaderExternalPins();
                 }
+                win.fitGpioPanel();
                 win.ui.saveSettings(win.status) catch {};
                 return;
             },

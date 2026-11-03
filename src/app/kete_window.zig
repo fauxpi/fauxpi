@@ -192,6 +192,16 @@ pub const KeteWindow = struct {
         if (self.kwin.ui.win) |w| w.startMove();
     }
 
+    /// The GPIO panel was connected (or disconnected): the window grows
+    /// (or shrinks) by its height, so that the display keeps its size,
+    /// unless it is maximized.
+    pub fn fitGpioPanel(self: *KeteWindow) void {
+        if (self.kwin.isMaximized()) return;
+        const panel = board_sheet.BoardUi.gpio_panel_height;
+        const h = if (self.status.gpio_connected) self.height + panel else self.height -| panel;
+        self.kwin.setSize(self.width, @max(h, board_sheet.BoardUi.title_bar_height + 120));
+    }
+
     pub fn toggleMaximized(self: *KeteWindow) void {
         self.ui.maximized = !self.kwin.isMaximized();
         self.kwin.setMaximized(self.ui.maximized);
