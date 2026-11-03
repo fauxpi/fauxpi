@@ -37,6 +37,9 @@ pub const KeteWindow = struct {
     /// 1x simulated HDMI framebuffer (`display_width * display_height`)
     hdmi_fb: []u32,
     hdmi_gen: u64 = 1,
+    /// `hdmi_fb` as kete draws it (scaled on the GPU), if it is no bigger
+    /// than kete's images can be; or else it is scaled on the CPU.
+    hdmi_image: ?kete.gfx.Image = null,
 
     closed: bool = false,
     ui_dirty: bool = true,
@@ -101,6 +104,11 @@ pub const KeteWindow = struct {
             .ui = common.ui,
             .status = common.status,
         };
+        if (display_width <= kete.gfx.Image.max_size and display_height <= kete.gfx.Image.max_size) {
+            win.hdmi_image = .init(win.hdmi_fb, display_width, display_height);
+            // Each of the guest's pixels a sharp square, as a monitor shows it.
+            win.hdmi_image.?.nearest = true;
+        }
         win.kwin = try app.openWindow(.{
             .title = win.ui.title,
             .root = .of(&win.root),
@@ -143,6 +151,7 @@ pub const KeteWindow = struct {
 
     pub fn notifyHdmiUpdated(self: *KeteWindow) void {
         window.notifyHdmiUpdated(self);
+        if (self.hdmi_image) |*img| img.changed();
     }
 
     /// Has the window drawn again (by `present`, or the next wait).
@@ -272,7 +281,16 @@ const Surface = struct {
         win.ui.updateLayout(win.width, win.height, win.status, win.gpio);
         if (win.status.hdmi_connected and win.status.hdmi_active) {
             const dr = win.ui.display_rect;
-            p.gpuWith(.{ .bounds = .{ .x = dr.x, .y = dr.y, .w = dr.w, .h = dr.h }, .key = win.hdmi_gen, .fills = true }, win, drawHdmi);
+            const r: kete.Rect = .{ .x = dr.x, .y = dr.y, .w = dr.w, .h = dr.h };
+            if (win.hdmi_image) |*img| {
+                // HDMI has no transparency: whatever alpha the pixels have,
+                // they are over black.
+                const c = p.canvas();
+                c.fillRect(r, .{ .r = 0, .g = 0, .b = 0 });
+                c.drawImage(img, r, 1);
+            } else {
+                p.gpuWith(.{ .bounds = r, .key = win.hdmi_gen, .fills = true }, win, drawHdmi);
+            }
         }
         win.ui.paint(p, win.width, win.height, win.status, win.gpio);
     }
