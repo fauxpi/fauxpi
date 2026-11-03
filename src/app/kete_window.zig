@@ -267,12 +267,23 @@ const Surface = struct {
         win.ui.paint(p, win.width, win.height, win.status, win.gpio);
     }
 
-    /// Scales the HDMI framebuffer into `area` (nearest pixel, so it stays sharp).
+    /// Scales the HDMI framebuffer into the display's rectangle in `area`
+    /// (the whole widget's: the bounds only say where it draws), nearest
+    /// pixel, so it stays sharp.
     fn drawHdmi(win: *const KeteWindow, target: *kete.gfx.software.Image, area: kete.gfx.GpuArea) anyerror!void {
-        const vp = area.viewport;
+        const box = area.viewport;
+        if (box.width == 0 or box.height == 0 or win.width == 0) return;
+        const s = @as(f32, @floatFromInt(box.width)) / @as(f32, @floatFromInt(win.width));
+        const dr = win.ui.display_rect;
+        const vp: kete.gfx.Viewport = .{
+            .x = box.x + @as(i32, @intFromFloat(@round(dr.x * s))),
+            .y = box.y + @as(i32, @intFromFloat(@round(dr.y * s))),
+            .width = @intFromFloat(@max(@round(dr.w * s), 0)),
+            .height = @intFromFloat(@max(@round(dr.h * s), 0)),
+        };
         if (vp.width == 0 or vp.height == 0) return;
         const full: kete.gfx.Viewport = .{ .width = target.width, .height = target.height };
-        const sc = full.intersect(if (area.scissor) |s| vp.intersect(s) orelse return else vp) orelse return;
+        const sc = full.intersect(if (area.scissor) |cut| vp.intersect(cut) orelse return else vp) orelse return;
         const dw: usize = win.display_width;
         const dh: usize = win.display_height;
         const stride = target.rowStride();
