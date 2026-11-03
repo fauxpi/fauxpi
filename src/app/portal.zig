@@ -1,7 +1,7 @@
 //! Pure-Zig XDG Desktop Portal (`org.freedesktop.portal.FileChooser`) client over the
 //! D-Bus session bus wire protocol.
 //!
-//! Used by `WaylandWindow` so file selection works seamlessly under strict Snap and
+//! Used by the window (`Window`) so file selection works seamlessly under strict Snap and
 //! Flatpak confinement (via `xdg-desktop-portal` and `xdg-document-portal`) without
 //! spawning external helper binaries such as `zenity` or `kdialog`.
 
@@ -97,7 +97,7 @@ pub const PortalFilePicker = struct {
         self.in_len = 0;
     }
 
-    pub fn poll(self: *PortalFilePicker, win: anytype) void {
+    pub fn poll(self: *PortalFilePicker, win: *window.Window) void {
         if (!is_linux) return;
         if (self.fd < 0) return;
 
@@ -189,7 +189,7 @@ pub const PortalFilePicker = struct {
         }
 
         if (selected_path) |p| {
-            window.setChosenSdPath(win, p);
+            win.setChosenSdPath(p);
         }
 
         if (should_close) {

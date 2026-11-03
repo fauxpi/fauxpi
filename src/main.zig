@@ -698,8 +698,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     (idle_rendered_booted != guest_booted);
                 const needs_redraw = w.ui_dirty or
                     soc.gpio.takeUiDirty() or
-                    state_changed or
-                    (w.pending_scale != w.scale);
+                    state_changed;
 
                 if (needs_redraw) {
                     const now_ns = monotonicNs();
@@ -904,7 +903,6 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     soc.gpio.ui_dirty_latch or
                     soc.mailbox.exp_act_latch or
                     w.ui_dirty or
-                    (w.pending_scale != w.scale) or
                     soc.usb.pending_csplit_sof or
                     (soc.usb.sof_wakeup_frames > 0) or
                     soc.usb.hid.hasPendingInterruptIn() or
@@ -1091,8 +1089,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 const need_present = hdmi_changed or
                     leds_changed or
                     gpio_ui_dirty or
-                    w.ui_dirty or
-                    (w.pending_scale != w.scale);
+                    w.ui_dirty;
                 if (need_present) {
                     w.compositeUi();
                     try w.present();
