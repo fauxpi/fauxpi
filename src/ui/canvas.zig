@@ -1,6 +1,6 @@
-//! The 2D canvas FauxPi's title bar and Board & GPIO sheet draw with: kete's,
-//! through the painter of the widget being painted. Coordinates are logical
-//! pixels from the window's top left.
+//! The 2D canvas FauxPi's own drawings (the board, the GPIO panel and the
+//! display's surround) draw with: kete's, through the painter of the widget
+//! being painted. Coordinates are logical pixels from the widget's top left.
 
 const std = @import("std");
 const kete = @import("kete");
@@ -44,6 +44,10 @@ pub const Color = struct {
     }
 
     fn toKete(c: Color) kete.Color {
+        return .{ .r = c.r, .g = c.g, .b = c.b, .a = c.a };
+    }
+
+    pub fn fromKete(c: kete.Color) Color {
         return .{ .r = c.r, .g = c.g, .b = c.b, .a = c.a };
     }
 };
@@ -124,7 +128,7 @@ pub const Icon = enum {
     }
 };
 
-/// Material 3 dark colour scheme.
+/// The colours FauxPi's drawings use: kete's theme's (`fromKete`).
 pub const Theme = struct {
     primary: Color,
     on_primary: Color,
@@ -152,6 +156,15 @@ pub const Theme = struct {
         .outline_variant = .rgb(0x49454f),
         .@"error" = .rgb(0xf2b8b5),
     };
+
+    /// The colours of kete's `t`, so the drawings match kete's widgets.
+    pub fn fromKete(t: *const kete.Theme) Theme {
+        var out: Theme = undefined;
+        inline for (@typeInfo(Theme).@"struct".field_names) |name| {
+            @field(out, name) = if (comptime std.mem.eql(u8, name, "body_size")) t.body_size else Color.fromKete(@field(t, name));
+        }
+        return out;
+    }
 };
 
 pub const Canvas = struct {

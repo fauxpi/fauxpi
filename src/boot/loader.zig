@@ -10,7 +10,7 @@ const std = @import("std");
 const fat32 = @import("fat32.zig");
 const fdt = @import("fdt.zig");
 const bluetooth = @import("../soc/bluetooth.zig");
-const BoardModel = @import("../ui/board_sheet.zig").BoardModel;
+const BoardModel = @import("../ui/board.zig").BoardModel;
 
 pub const kernel_load_addr: u32 = 0x0000_8000;
 pub const kernel64_load_addr: u32 = 0x0020_0000;

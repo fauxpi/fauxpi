@@ -55,7 +55,9 @@ pub const vc4_hdmi = @import("vc4/hdmi.zig");
 pub const ui_board = @import("ui/board.zig");
 pub const ui_gpio_model = @import("ui/gpio_model.zig");
 pub const ui_canvas = @import("ui/canvas.zig");
-pub const ui_board_sheet = @import("ui/board_sheet.zig");
+pub const ui_board_state = @import("ui/board_state.zig");
+pub const ui_board_drawing = @import("ui/board_drawing.zig");
+pub const ui_window_ui = @import("ui/window_ui.zig");
 pub const window = @import("app/window.zig");
 pub const portal = @import("app/portal.zig");
 pub const app_audio = @import("app/audio.zig");
@@ -65,7 +67,7 @@ const Cpu = arm1176.Arm1176(Bcm2835);
 
 const CliOptions = struct {
     sd_path: ?[]const u8 = null,
-    board_model: ?ui_board_sheet.BoardModel = null,
+    board_model: ?ui_board_state.BoardModel = null,
     width: u16 = 1280,
     height: u16 = 720,
     power: bool = false,
@@ -76,7 +78,7 @@ const CliOptions = struct {
     clock: ClockMode = .realtime,
     /// Security of the emulated Wi-Fi access point, and its WPA2 passphrase (the board settings'
     /// while null)
-    wifi_security: ?ui_board_sheet.WifiSecurity = null,
+    wifi_security: ?ui_board_state.WifiSecurity = null,
     wifi_password: ?[]const u8 = null,
 };
 
@@ -347,7 +349,7 @@ fn loadGuestBoot(
     soc: *Bcm2835,
     sd_qcow2: ?*qcow2.Qcow2Disk,
     sd_image_buf: ?[]u8,
-    board_model: ui_board_sheet.BoardModel,
+    board_model: ui_board_state.BoardModel,
     board_serial: u64,
     mac_address: [6]u8,
     wifi_mac_address: [6]u8,
@@ -419,7 +421,7 @@ fn loadGuestBoot(
 fn resetCpusForBoard(
     cpus: *[4]Cpu,
     num_cores: *usize,
-    board_model: ui_board_sheet.BoardModel,
+    board_model: ui_board_state.BoardModel,
     boot_res: loader.BootResult,
 ) void {
     const is_a53 = board_model.isBcm2837() or boot_res.is_aarch64;
@@ -465,11 +467,11 @@ fn noteRealtimeIdle(since_ns: *?u64, timer_wait_us: u64, cpus: *[4]Cpu) void {
 /// `--wifi-password` where given (a password alone means WPA2), else the board settings, else
 /// (headless) WPA2-Personal with the default password
 fn syncWifiSecurity(soc: *Bcm2835, w: ?*const window.Window, opts: CliOptions) void {
-    const ui: ?*const ui_board_sheet.BoardUi = if (w) |win| &win.ui else null;
+    const ui: ?*const ui_board_state.BoardState = if (w) |win| &win.board else null;
     const security = opts.wifi_security orelse
         (if (opts.wifi_password != null) .wpa2_personal else if (ui) |u| u.wifi_security else .wpa2_personal);
     const password = opts.wifi_password orelse
-        (if (ui) |u| u.wifiPassword() else ui_board_sheet.default_wifi_password);
+        (if (ui) |u| u.wifiPassword() else ui_board_state.default_wifi_password);
     soc.sdhci.wifi.setAccessPointSecurity(switch (security) {
         .open => .open,
         .wpa2_personal => .wpa2_personal,
@@ -504,7 +506,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 headless_qcow2 = disk;
             } else |_| {
                 const fsize = try qcow2.Qcow2Disk.getFileSizeLinux(sd_path);
-                const card_sz = ui_board_sheet.SdCardSize.smallestFitting(@max(fsize, 256 * 1024 * 1024)) orelse .gb_32;
+                const card_sz = ui_board_state.SdCardSize.smallestFitting(@max(fsize, 256 * 1024 * 1024)) orelse .gb_32;
                 if (qcow2.Qcow2Disk.createFromImageFile(gpa, card_sz.bytes(), sd_path)) |disk| {
                     headless_qcow2 = disk;
                 } else |_| {
@@ -548,15 +550,15 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         wl_win.?.status.power_connected = opts.power;
         if (opts.sd_path) |sd_path| {
             if (qcow2.Qcow2Disk.getFileSizeLinux(sd_path)) |fsize| {
-                const card_sz = ui_board_sheet.SdCardSize.smallestFitting(@max(fsize, 256 * 1024 * 1024)) orelse .gb_32;
-                if (wl_win.?.ui.addSdCardFromFile(sd_path, card_sz)) |_| {
+                const card_sz = ui_board_state.SdCardSize.smallestFitting(@max(fsize, 256 * 1024 * 1024)) orelse .gb_32;
+                if (wl_win.?.board.addSdCardFromFile(sd_path, card_sz)) |_| {
                     wl_win.?.status.sd_connected = true;
-                    wl_win.?.ui.saveSettings(wl_win.?.status) catch {};
+                    wl_win.?.board.saveSettings(wl_win.?.status) catch {};
                 } else |err| {
-                    wl_win.?.ui.showBootErrorSnackbar(err);
+                    wl_win.?.board.showBootErrorSnackbar(err);
                 }
             } else |err| {
-                wl_win.?.ui.showBootErrorSnackbar(err);
+                wl_win.?.board.showBootErrorSnackbar(err);
             }
         }
         if (opts.board_model) |bm| {
@@ -565,7 +567,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     }
 
     const initial_sd = if (wl_win) |w|
-        (w.status.sd_connected and (w.ui.activeSdCard() != null or sd_image_buf != null or headless_qcow2 != null))
+        (w.status.sd_connected and (w.board.activeSdCard() != null or sd_image_buf != null or headless_qcow2 != null))
     else
         (sd_image_buf != null or headless_qcow2 != null);
 
@@ -575,7 +577,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         const mac = if (wl_win) |w| w.status.mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x12, 0x34, 0x56 };
         const wifi_mac = if (wl_win) |w| w.status.wifi_mac_address else [6]u8{ 0xb8, 0x27, 0xeb, 0x47, 0x61, 0x03 };
         const active_qcow2: ?*qcow2.Qcow2Disk = if (wl_win) |w|
-            (if (initial_sd and w.ui.activeSdCard() != null) &w.ui.activeSdCard().?.disk else if (initial_sd and headless_qcow2 != null) &(headless_qcow2.?) else null)
+            (if (initial_sd and w.board.activeSdCard() != null) &w.board.activeSdCard().?.disk else if (initial_sd and headless_qcow2 != null) &(headless_qcow2.?) else null)
         else if (initial_sd and headless_qcow2 != null)
             &(headless_qcow2.?)
         else
@@ -588,7 +590,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
         } else |err| {
             if (wl_win) |w| {
                 std.debug.print("fauxpi: failed to boot SD image: {s}\n", .{@errorName(err)});
-                w.ui.showBootErrorSnackbar(err);
+                w.board.showBootErrorSnackbar(err);
                 boot_failed = true;
             } else {
                 return err;
@@ -637,7 +639,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             if (w.sd_reconnected) {
                 w.sd_reconnected = false;
                 boot_failed = false;
-                if (w.ui.activeSdCard()) |card| {
+                if (w.board.activeSdCard()) |card| {
                     soc.sdhost.attachQcow2(&card.disk);
                 } else if (sd_image_buf) |img| {
                     soc.sdhost.attachMutableSlice(img);
@@ -647,21 +649,21 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             if (w.sd_image_chosen) {
                 w.sd_image_chosen = false;
                 boot_failed = false;
-                if (w.ui.activeSdCard()) |card| {
+                if (w.board.activeSdCard()) |card| {
                     if (w.status.sd_connected) {
                         soc.sdhost.attachQcow2(&card.disk);
                     }
                 }
             }
 
-            const has_sd_media = (w.ui.activeSdCard() != null) or (sd_image_buf != null);
+            const has_sd_media = (w.board.activeSdCard() != null) or (sd_image_buf != null);
             const has_boot_media = w.status.sd_connected and has_sd_media;
             if (!w.status.power_connected) {
                 guest_booted = false;
                 boot_failed = false;
             } else if (w.power_reconnected or (!guest_booted and !boot_failed and has_boot_media)) {
                 w.power_reconnected = false;
-                const active_qcow2: ?*qcow2.Qcow2Disk = if (w.status.sd_connected and w.ui.activeSdCard() != null) &w.ui.activeSdCard().?.disk else null;
+                const active_qcow2: ?*qcow2.Qcow2Disk = if (w.status.sd_connected and w.board.activeSdCard() != null) &w.board.activeSdCard().?.disk else null;
                 const active_sd = if (w.status.sd_connected) sd_image_buf else null;
                 if (active_qcow2 != null or active_sd != null) {
                     if (host_audio) |ha| ha.setPaused(true);
@@ -670,7 +672,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                         resetCpusForBoard(cpus, &num_cores, w.status.board_model, reboot_res);
                         guest_booted = true;
                         boot_failed = false;
-                        w.ui.dismissSnackbar();
+                        w.board.dismissSnackbar();
                         last_guest_vblank_us = 0;
                         active_us_accum = 0;
                         rt_clock = RealtimeClock.start(monotonicNs());
@@ -678,7 +680,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                         if (host_audio) |ha| ha.setPaused(false);
                     } else |err| {
                         std.debug.print("fauxpi: failed to boot SD image: {s}\n", .{@errorName(err)});
-                        w.ui.showBootErrorSnackbar(err);
+                        w.board.showBootErrorSnackbar(err);
                         w.ui_dirty = true;
                         guest_booted = false;
                         boot_failed = true;
@@ -1070,7 +1072,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                 const leds = soc.sampleBoardLeds(w.status.power_connected);
                 w.status.act_led_on = leds.act_on;
                 w.status.pwr_led_on = leds.pwr_on;
-                const leds_changed = w.ui.sheet_open and ((leds.act_on != prev_act) or (leds.pwr_on != prev_pwr));
+                const leds_changed = w.boardShown() and ((leds.act_on != prev_act) or (leds.pwr_on != prev_pwr));
 
                 const prev_hdmi_active = w.status.hdmi_active;
                 const disp_pixels = w.displayPixels();
