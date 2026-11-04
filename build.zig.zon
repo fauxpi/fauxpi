@@ -1,7 +1,7 @@
 .{
     .name = .fauxpi,
-    // The release (26.10, 26.10.1, 27.04) as a semantic version: 26.10.0, 26.10.1, 27.4.0
-    .version = "26.10.0",
+    // Not FauxPi's version, which build.zig takes from the commit built: Zig only needs one here
+    .version = "0.0.0",
     .dependencies = .{
         .kete = .{
             .url = "git+https://github.com/robert-ancell/kete#7292acb7b8c9963cdd9e24ec5f08753532893a9a",

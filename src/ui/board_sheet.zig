@@ -6,6 +6,7 @@
 
 const std = @import("std");
 const kete = @import("kete");
+const build_info = @import("build_info");
 const host_posix = @import("../host/posix.zig");
 const canvas_mod = @import("canvas.zig");
 const board = @import("board.zig");
@@ -263,6 +264,9 @@ pub const HubLayout = struct {
         };
     }
 };
+
+/// The settings panel's last line, which says which FauxPi this is.
+const version_line_h: f32 = 12.0;
 
 pub const BoardUi = struct {
     pub const title_bar_height: u32 = 44;
@@ -2105,7 +2109,8 @@ pub const BoardUi = struct {
         const panel_x: f32 = @round(sheet_x + pad);
         const panel_w: f32 = @round(sheet_w - 2.0 * pad);
         const panel_y: f32 = @round(btn_y + btn_h + 12.0);
-        const panel_h: f32 = if (has_wifi) 322.0 else 230.0;
+        // The rows, then the version line.
+        const panel_h: f32 = @as(f32, if (has_wifi) 322.0 else 230.0) + version_line_h;
         self.settings_panel_rect = .{
             .x = panel_x,
             .y = panel_y,
@@ -3822,6 +3827,12 @@ pub const BoardUi = struct {
         const state_txt = if (status.dhcp_enabled) "Enabled" else "Disabled";
         const st_w = c.measureText(13.0, state_txt);
         _ = c.drawText(13.0, sw.x - 10.0 - st_w, row3_y + 19.0, state_txt, if (status.dhcp_enabled) t.primary else t.on_surface_variant);
+
+        // Which FauxPi this is, small, at the bottom
+        var version_buf: [64]u8 = undefined;
+        const version = std.fmt.bufPrint(&version_buf, "FauxPi {s} \u{00b7} {s}", .{ build_info.version, build_info.commit }) catch "FauxPi";
+        const version_w = c.measureText(11.0, version);
+        _ = c.drawText(11.0, @round(pr.x + (pr.w - version_w) * 0.5), pr.y + pr.h - 9.0, version, t.on_surface_variant.withAlpha(0.7));
 
         self.paintWifiSecurityMenu(c);
 

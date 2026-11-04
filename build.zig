@@ -8,6 +8,12 @@ pub fn build(b: *std.Build) void {
     // The UI toolkit the window is drawn with.
     const kete = b.dependency("kete", .{ .target = target, .optimize = optimize }).module("kete");
 
+    // The version is the date of the commit built (2026.11.5), so it goes up by itself; and the
+    // commit, to say exactly which build it is.
+    const build_info = b.addOptions();
+    build_info.addOption([]const u8, "version", gitVersion(b));
+    build_info.addOption([]const u8, "commit", gitOutput(b, &.{ "rev-parse", "--short", "HEAD" }) orelse "unknown");
+
     const root_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -15,6 +21,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     root_mod.addImport("kete", kete);
+    root_mod.addOptions("build_info", build_info);
 
     // Debug builds use LLVM too: Zig's self-hosted x86-64 backend crashes compiling the
     // 128-bit `cmpxchg` that emulates `STXP` (src/cpu/atomic_ram.zig).
@@ -44,6 +51,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     test_mod.addImport("kete", b.dependency("kete", .{ .target = target, .optimize = .Debug }).module("kete"));
+    test_mod.addOptions("build_info", build_info);
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
@@ -54,4 +62,25 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+}
+
+/// What `git <args>` prints in the source tree, trimmed; null without git or its history.
+fn gitOutput(b: *std.Build, args: []const []const u8) ?[]const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.append(b.allocator, "git") catch return null;
+    argv.appendSlice(b.allocator, args) catch return null;
+    var code: u8 = 0;
+    const out = b.runAllowFail(argv.items, &code, .ignore) catch return null;
+    const trimmed = std.mem.trim(u8, out, " \t\r\n");
+    return if (trimmed.len == 0) null else trimmed;
+}
+
+/// The date of the commit built as a version: 2026-11-05 is 2026.11.5.
+fn gitVersion(b: *std.Build) []const u8 {
+    const date = gitOutput(b, &.{ "log", "-1", "--format=%cs" }) orelse return "unknown";
+    var parts = std.mem.splitScalar(u8, date, '-');
+    const year = std.fmt.parseInt(u16, parts.next() orelse "", 10) catch return "unknown";
+    const month = std.fmt.parseInt(u8, parts.next() orelse "", 10) catch return "unknown";
+    const day = std.fmt.parseInt(u8, parts.next() orelse "", 10) catch return "unknown";
+    return b.fmt("{d}.{d}.{d}", .{ year, month, day });
 }

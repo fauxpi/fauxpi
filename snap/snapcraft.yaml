@@ -1,7 +1,7 @@
 name: fauxpi
 title: FauxPi
 base: core24
-# The version is the latest <release> in the AppStream metadata
+# The version is the date of the commit built (2026.11.5), as FauxPi shows it in its settings
 adopt-info: fauxpi
 summary: Raspberry Pi hardware simulator
 description: |
@@ -73,13 +73,16 @@ parts:
     # The committed tree, not the folder: build caches there run to gigabytes
     source: .
     source-type: git
-    parse-info: [usr/share/metainfo/io.github.fauxpi.Fauxpi.metainfo.xml]
+    override-pull: |
+      craftctl default
+      craftctl set version="$(git log -1 --format=%cs | awk -F- '{ printf "%d.%d.%d", $1, $2, $3 }')"
     # Zig from the Zig snap: ziglang.org downloads take minutes. If the channel moves past the
     # version scripts/zig pins, the script downloads that version instead.
     build-snaps:
       - zig/latest/beta
     build-packages:
       - ca-certificates
+      - git
       - curl
       - python3
       - tar

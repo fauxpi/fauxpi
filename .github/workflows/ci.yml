@@ -3,7 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ['*'] # a release, e.g. 26.10 or 26.10.1
+    tags: ['*'] # a release to the stable channel
   pull_request:
 
 jobs:
