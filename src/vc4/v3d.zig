@@ -5,6 +5,8 @@ const qpu_sim = @import("qpu_sim.zig");
 const format_mod = @import("format.zig");
 const texture = @import("texture.zig");
 const GlRenderer = @import("gl_renderer.zig").GlRenderer;
+const metal_renderer = @import("metal_renderer.zig");
+const qpu_to_msl = @import("qpu_to_msl.zig");
 
 /// VideoCore IV 3D Engine (`brcm,bcm2835-v3d`) at `0x20c00000` (size `0x1000`).
 pub const V3d = struct {
@@ -278,6 +280,8 @@ pub const V3d = struct {
 
     gl: GlRenderer = .{},
     gl_initialized: bool = false,
+    metal: ?*MetalState = null,
+    metal_tried: bool = false,
     frame_dirty: bool = false,
 
     pub fn resetInPlace(self: *V3d) void {
@@ -1235,228 +1239,345 @@ pub const V3d = struct {
         }
     }
 
+    /// Reads an RCL's tile jobs in order: each a tile's store, with how the tile was loaded or
+    /// cleared and whether it was drawn into.
+    const RclReader = struct {
+        pc: u32,
+        end: u32,
+        fb_addr: u32 = 0,
+        fb_width: u32 = 0,
+        fb_height: u32 = 0,
+        fb_flags: u16 = 0,
+        clear_color0: u32 = 0,
+        clear_zs: f32 = 1.0,
+        cur_tile_x: u32 = 0,
+        cur_tile_y: u32 = 0,
+        has_tile_coords: bool = false,
+        pending_load: ?PendingTileLoad = null,
+        cur_lazy_load: ?LazyTileLoad = null,
+        cur_has_render: bool = false,
+        tile_loaded: bool = false,
+
+        fn init(ram: []const u8, start_bus: u32, end_bus: u32) RclReader {
+            const end = end_bus & vc_bus.ramMask(ram.len);
+            return .{ .pc = start_bus & vc_bus.ramMask(ram.len), .end = if (end > ram.len) 0 else end };
+        }
+
+        fn job(it: *const RclReader, dst_addr: u32, tiling: u2, ls_format: u2) TileJob {
+            return .{
+                .tile_x = it.cur_tile_x,
+                .tile_y = it.cur_tile_y,
+                .clear_color0 = it.clear_color0,
+                .clear_zs = it.clear_zs,
+                .lazy_load = it.cur_lazy_load,
+                .has_render = it.cur_has_render,
+                .dst_addr = dst_addr,
+                .fb_w = it.fb_width,
+                .fb_h = it.fb_height,
+                .tiling = tiling,
+                .ls_format = ls_format,
+            };
+        }
+
+        /// The tile is done with: what comes next is for another.
+        fn endTile(it: *RclReader) void {
+            it.tile_loaded = false;
+            it.has_tile_coords = false;
+            it.pending_load = null;
+            it.cur_lazy_load = null;
+            it.cur_has_render = false;
+        }
+
+        fn startTile(it: *RclReader) void {
+            if (!it.tile_loaded) {
+                it.cur_lazy_load = null;
+                it.tile_loaded = true;
+            }
+        }
+
+        fn next(it: *RclReader, ram: []const u8) ?TileJob {
+            while (it.pc < it.end) {
+                const pc = it.pc;
+                const end = it.end;
+                const op = ram[pc];
+                switch (op) {
+                    0 => break, // HALT
+                    1, 4, 5, 8, 18 => it.pc += 1,
+                    16 => { // BRANCH
+                        if (pc + 5 > end) break;
+                        it.pc = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+                    },
+                    17 => { // BRANCH_TO_SUB_LIST (executes binned primitives for the current tile)
+                        if (pc + 5 > end) break;
+                        it.startTile();
+                        it.cur_has_render = true;
+                        it.pc += 5;
+                    },
+                    24, 25 => { // STORE_MS_TILE_BUFFER / STORE_MS_TILE_BUFFER_AND_EOF (1 byte)
+                        it.startTile();
+                        const r_format: u2 = @truncate((it.fb_flags >> 2) & 3);
+                        const r_tiling: u2 = @truncate((it.fb_flags >> 6) & 3);
+                        const ls_format: u2 = if (r_format == 1) 0 else 2;
+                        const j = it.job(it.fb_addr, r_tiling, ls_format);
+                        it.endTile();
+                        it.pc += 1;
+                        return j;
+                    },
+                    28 => { // STORE_TILE_BUFFER_GENERAL (7 bytes)
+                        if (pc + 7 > end) break;
+                        const bits = std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little);
+                        const addr_word = std.mem.readInt(u32, ram[pc + 3 ..][0..4], .little);
+                        const buf_kind = bits & 7;
+                        var j: ?TileJob = null;
+                        if (buf_kind == 1) { // Color buffer store
+                            it.startTile();
+                            const ls_tiling: u2 = @truncate((bits >> 4) & 3);
+                            const ls_format: u2 = @truncate((bits >> 8) & 3);
+                            const dst_addr = if ((addr_word & ~@as(u32, 0xf)) != 0) (addr_word & ~@as(u32, 0xf)) else it.fb_addr;
+                            j = it.job(dst_addr, ls_tiling, ls_format);
+                        }
+                        // Last store for tile
+                        if ((bits & (1 << 15)) == 0) it.endTile();
+                        it.pc += 7;
+                        if (j) |stored| return stored;
+                    },
+                    29 => { // LOAD_TILE_BUFFER_GENERAL (7 bytes)
+                        if (pc + 7 > end) break;
+                        const bits = std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little);
+                        const addr_word = std.mem.readInt(u32, ram[pc + 3 ..][0..4], .little);
+                        const buf_kind = bits & 7;
+                        if (buf_kind == 1) { // Load color buffer from memory into tile buffer
+                            const ls_tiling: u2 = @truncate((bits >> 4) & 3);
+                            const ls_format: u2 = @truncate((bits >> 8) & 3);
+                            const load_addr = addr_word & ~@as(u32, 0xf);
+                            if (it.has_tile_coords) {
+                                it.cur_lazy_load = .{
+                                    .addr = load_addr,
+                                    .fb_w = it.fb_width,
+                                    .fb_h = it.fb_height,
+                                    .tile_x = it.cur_tile_x,
+                                    .tile_y = it.cur_tile_y,
+                                    .tile_size = 64,
+                                    .tiling = ls_tiling,
+                                    .format = ls_format,
+                                };
+                                it.cur_has_render = false;
+                                it.tile_loaded = true;
+                            } else {
+                                it.pending_load = .{
+                                    .addr = load_addr,
+                                    .tiling = ls_tiling,
+                                    .format = ls_format,
+                                };
+                            }
+                        }
+                        it.pc += 7;
+                    },
+                    113 => { // TILE_RENDERING_MODE_CONFIG (11 bytes)
+                        if (pc + 11 > end) break;
+                        it.fb_addr = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
+                        it.fb_width = std.mem.readInt(u16, ram[pc + 5 ..][0..2], .little);
+                        it.fb_height = std.mem.readInt(u16, ram[pc + 7 ..][0..2], .little);
+                        it.fb_flags = std.mem.readInt(u16, ram[pc + 9 ..][0..2], .little);
+                        it.pc += 11;
+                    },
+                    114 => { // CLEAR_COLORS (14 bytes)
+                        if (pc + 14 > end) break;
+                        const raw_c0 = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
+                        const zs_word = std.mem.readInt(u32, ram[pc + 9 ..][0..4], .little) & 0x00FFFFFF;
+                        it.clear_zs = @as(f32, @floatFromInt(zs_word)) / 16777215.0;
+                        // Note: for RGB565 render targets, kernel/userspace packs TWO RGB565 pixels in clear_color0
+                        const r_format: u2 = @truncate((it.fb_flags >> 2) & 3);
+                        if (r_format == 0 or r_format == 2) {
+                            it.clear_color0 = format_mod.fromRgb565(@truncate(raw_c0));
+                        } else {
+                            it.clear_color0 = raw_c0;
+                        }
+                        it.pc += 14;
+                    },
+                    115 => { // TILE_COORDINATES (3 bytes)
+                        if (pc + 3 > end) break;
+                        it.cur_tile_x = ram[pc + 1];
+                        it.cur_tile_y = ram[pc + 2];
+                        it.has_tile_coords = true;
+                        it.cur_has_render = false;
+                        if (it.pending_load) |pl| {
+                            it.cur_lazy_load = .{
+                                .addr = pl.addr,
+                                .fb_w = it.fb_width,
+                                .fb_h = it.fb_height,
+                                .tile_x = it.cur_tile_x,
+                                .tile_y = it.cur_tile_y,
+                                .tile_size = 64,
+                                .tiling = pl.tiling,
+                                .format = pl.format,
+                            };
+                            it.tile_loaded = true;
+                            it.pending_load = null;
+                        } else if (!it.tile_loaded) {
+                            it.cur_lazy_load = null;
+                            it.tile_loaded = true;
+                        }
+                        it.pc += 3;
+                    },
+                    else => break,
+                }
+            }
+            it.pc = it.end;
+            return null;
+        }
+    };
+
     fn executeRcl(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) void {
-        var pc = start_bus & vc_bus.ramMask(ram.len);
-        const end = end_bus & vc_bus.ramMask(ram.len);
-        if (end > ram.len) return;
+        if ((end_bus & vc_bus.ramMask(ram.len)) > ram.len) return;
 
         self.prepareDrawsForFrame(ram);
-
-        var fb_addr: u32 = 0;
-        var fb_width: u32 = 0;
-        var fb_height: u32 = 0;
-        var fb_flags: u16 = 0;
-        var clear_color0: u32 = 0;
-        var clear_zs: f32 = 1.0;
-
-        var cur_tile_x: u32 = 0;
-        var cur_tile_y: u32 = 0;
-        var has_tile_coords: bool = false;
-        var pending_load: ?PendingTileLoad = null;
-        var cur_lazy_load: ?LazyTileLoad = null;
-        var cur_has_render: bool = false;
-        var tile_loaded: bool = false;
+        if (metal_renderer.supported and self.renderWithMetal(ram, start_bus, end_bus)) return;
 
         var tile_jobs: [1024]TileJob = undefined;
         var tile_jobs_len: usize = 0;
         var queued_tile_mask: [32]u32 = @splat(0);
 
-        const queueOrRunJob = struct {
-            fn f(
-                v3d_self: *V3d,
-                mem: []u8,
-                jobs: *[1024]TileJob,
-                jobs_len: *usize,
-                q_mask: *[32]u32,
-                job: TileJob,
-            ) void {
-                if (job.tile_x < 32 and job.tile_y < 32) {
-                    const bit = @as(u32, 1) << @intCast(job.tile_x);
-                    if ((q_mask[job.tile_y] & bit) != 0 or jobs_len.* >= jobs.len) {
-                        v3d_self.flushTileJobs(mem, jobs[0..jobs_len.*]);
-                        jobs_len.* = 0;
-                        q_mask.* = @splat(0);
-                    }
-                    q_mask[job.tile_y] |= bit;
-                    jobs[jobs_len.*] = job;
-                    jobs_len.* += 1;
-                } else {
-                    v3d_self.flushTileJobs(mem, jobs[0..jobs_len.*]);
-                    jobs_len.* = 0;
-                    q_mask.* = @splat(0);
-                    const single = [1]TileJob{job};
-                    v3d_self.flushTileJobs(mem, &single);
+        var reader: RclReader = .init(ram, start_bus, end_bus);
+        while (reader.next(ram)) |job| {
+            if (job.tile_x < 32 and job.tile_y < 32) {
+                const bit = @as(u32, 1) << @intCast(job.tile_x);
+                if ((queued_tile_mask[job.tile_y] & bit) != 0 or tile_jobs_len >= tile_jobs.len) {
+                    self.flushTileJobs(ram, tile_jobs[0..tile_jobs_len]);
+                    tile_jobs_len = 0;
+                    queued_tile_mask = @splat(0);
                 }
-            }
-        }.f;
-
-        while (pc < end) {
-            const op = ram[pc];
-            switch (op) {
-                0 => break, // HALT
-                1, 4, 5, 8, 18 => pc += 1,
-                16 => { // BRANCH
-                    if (pc + 5 > end) break;
-                    pc = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-                },
-                17 => { // BRANCH_TO_SUB_LIST (executes binned primitives for the current tile)
-                    if (pc + 5 > end) break;
-                    if (!tile_loaded) {
-                        cur_lazy_load = null;
-                        tile_loaded = true;
-                    }
-                    cur_has_render = true;
-                    pc += 5;
-                },
-                24, 25 => { // STORE_MS_TILE_BUFFER / STORE_MS_TILE_BUFFER_AND_EOF (1 byte)
-                    if (!tile_loaded) {
-                        cur_lazy_load = null;
-                        tile_loaded = true;
-                    }
-                    const r_format: u2 = @truncate((fb_flags >> 2) & 3);
-                    const r_tiling: u2 = @truncate((fb_flags >> 6) & 3);
-                    const ls_format: u2 = if (r_format == 1) 0 else 2;
-                    queueOrRunJob(self, ram, &tile_jobs, &tile_jobs_len, &queued_tile_mask, .{
-                        .tile_x = cur_tile_x,
-                        .tile_y = cur_tile_y,
-                        .clear_color0 = clear_color0,
-                        .clear_zs = clear_zs,
-                        .lazy_load = cur_lazy_load,
-                        .has_render = cur_has_render,
-                        .dst_addr = fb_addr,
-                        .fb_w = fb_width,
-                        .fb_h = fb_height,
-                        .tiling = r_tiling,
-                        .ls_format = ls_format,
-                    });
-                    tile_loaded = false;
-                    has_tile_coords = false;
-                    pending_load = null;
-                    cur_lazy_load = null;
-                    cur_has_render = false;
-                    pc += 1;
-                },
-                28 => { // STORE_TILE_BUFFER_GENERAL (7 bytes)
-                    if (pc + 7 > end) break;
-                    const bits = std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little);
-                    const addr_word = std.mem.readInt(u32, ram[pc + 3 ..][0..4], .little);
-                    const buf_kind = bits & 7;
-                    if (buf_kind == 1) { // Color buffer store
-                        if (!tile_loaded) {
-                            cur_lazy_load = null;
-                            tile_loaded = true;
-                        }
-                        const ls_tiling: u2 = @truncate((bits >> 4) & 3);
-                        const ls_format: u2 = @truncate((bits >> 8) & 3);
-                        const dst_addr = if ((addr_word & ~@as(u32, 0xf)) != 0) (addr_word & ~@as(u32, 0xf)) else fb_addr;
-                        queueOrRunJob(self, ram, &tile_jobs, &tile_jobs_len, &queued_tile_mask, .{
-                            .tile_x = cur_tile_x,
-                            .tile_y = cur_tile_y,
-                            .clear_color0 = clear_color0,
-                            .clear_zs = clear_zs,
-                            .lazy_load = cur_lazy_load,
-                            .has_render = cur_has_render,
-                            .dst_addr = dst_addr,
-                            .fb_w = fb_width,
-                            .fb_h = fb_height,
-                            .tiling = ls_tiling,
-                            .ls_format = ls_format,
-                        });
-                    }
-                    if ((bits & (1 << 15)) == 0) {
-                        // Last store for tile
-                        tile_loaded = false;
-                        has_tile_coords = false;
-                        pending_load = null;
-                        cur_lazy_load = null;
-                        cur_has_render = false;
-                    }
-                    pc += 7;
-                },
-                29 => { // LOAD_TILE_BUFFER_GENERAL (7 bytes)
-                    if (pc + 7 > end) break;
-                    const bits = std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little);
-                    const addr_word = std.mem.readInt(u32, ram[pc + 3 ..][0..4], .little);
-                    const buf_kind = bits & 7;
-                    if (buf_kind == 1) { // Load color buffer from memory into tile buffer
-                        const ls_tiling: u2 = @truncate((bits >> 4) & 3);
-                        const ls_format: u2 = @truncate((bits >> 8) & 3);
-                        const load_addr = addr_word & ~@as(u32, 0xf);
-                        if (has_tile_coords) {
-                            cur_lazy_load = .{
-                                .addr = load_addr,
-                                .fb_w = fb_width,
-                                .fb_h = fb_height,
-                                .tile_x = cur_tile_x,
-                                .tile_y = cur_tile_y,
-                                .tile_size = 64,
-                                .tiling = ls_tiling,
-                                .format = ls_format,
-                            };
-                            cur_has_render = false;
-                            tile_loaded = true;
-                        } else {
-                            pending_load = .{
-                                .addr = load_addr,
-                                .tiling = ls_tiling,
-                                .format = ls_format,
-                            };
-                        }
-                    }
-                    pc += 7;
-                },
-                113 => { // TILE_RENDERING_MODE_CONFIG (11 bytes)
-                    if (pc + 11 > end) break;
-                    fb_addr = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
-                    fb_width = std.mem.readInt(u16, ram[pc + 5 ..][0..2], .little);
-                    fb_height = std.mem.readInt(u16, ram[pc + 7 ..][0..2], .little);
-                    fb_flags = std.mem.readInt(u16, ram[pc + 9 ..][0..2], .little);
-                    pc += 11;
-                },
-                114 => { // CLEAR_COLORS (14 bytes)
-                    if (pc + 14 > end) break;
-                    const raw_c0 = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
-                    const zs_word = std.mem.readInt(u32, ram[pc + 9 ..][0..4], .little) & 0x00FFFFFF;
-                    clear_zs = @as(f32, @floatFromInt(zs_word)) / 16777215.0;
-                    // Note: for RGB565 render targets, kernel/userspace packs TWO RGB565 pixels in clear_color0
-                    const r_format: u2 = @truncate((fb_flags >> 2) & 3);
-                    if (r_format == 0 or r_format == 2) {
-                        clear_color0 = format_mod.fromRgb565(@truncate(raw_c0));
-                    } else {
-                        clear_color0 = raw_c0;
-                    }
-                    pc += 14;
-                },
-                115 => { // TILE_COORDINATES (3 bytes)
-                    if (pc + 3 > end) break;
-                    cur_tile_x = ram[pc + 1];
-                    cur_tile_y = ram[pc + 2];
-                    has_tile_coords = true;
-                    cur_has_render = false;
-                    if (pending_load) |pl| {
-                        cur_lazy_load = .{
-                            .addr = pl.addr,
-                            .fb_w = fb_width,
-                            .fb_h = fb_height,
-                            .tile_x = cur_tile_x,
-                            .tile_y = cur_tile_y,
-                            .tile_size = 64,
-                            .tiling = pl.tiling,
-                            .format = pl.format,
-                        };
-                        tile_loaded = true;
-                        pending_load = null;
-                    } else if (!tile_loaded) {
-                        cur_lazy_load = null;
-                        tile_loaded = true;
-                    }
-                    pc += 3;
-                },
-                else => break,
+                queued_tile_mask[job.tile_y] |= bit;
+                tile_jobs[tile_jobs_len] = job;
+                tile_jobs_len += 1;
+            } else {
+                self.flushTileJobs(ram, tile_jobs[0..tile_jobs_len]);
+                tile_jobs_len = 0;
+                queued_tile_mask = @splat(0);
+                const single = [1]TileJob{job};
+                self.flushTileJobs(ram, &single);
             }
         }
 
         self.flushTileJobs(ram, tile_jobs[0..tile_jobs_len]);
+    }
+
+    /// What drawing frames with Metal needs (on macOS), made with the first frame.
+    const MetalState = struct {
+        renderer: metal_renderer.Renderer,
+        vertices: [MAX_PREBINNED_TRIS * 3]metal_renderer.Vertex = undefined,
+        draws: [256]metal_renderer.Draw = undefined,
+        uniforms: [256][qpu_to_msl.max_uniforms]u32 = undefined,
+        code: [256][512]qpu.Inst = undefined,
+    };
+
+    /// Draws the frame with Metal, if it is one Metal can draw the same as the CPU: each tile once,
+    /// all loaded (or cleared) and stored alike, and every shader one Metal runs.
+    fn renderWithMetal(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
+        if (!self.metal_tried) {
+            self.metal_tried = true;
+            var renderer = metal_renderer.Renderer.init() catch |err| {
+                if (err != error.Unsupported) std.debug.print("fauxpi: V3D on Metal: {s}\n", .{@errorName(err)});
+                return false;
+            };
+            const state = std.heap.page_allocator.create(MetalState) catch {
+                renderer.deinit();
+                return false;
+            };
+            state.renderer = renderer;
+            self.metal = state;
+        }
+        const m = self.metal orelse return false;
+        const renderer = &m.renderer;
+        if (self.overflow_draw_start < self.draws_len) return false;
+
+        var reader: RclReader = .init(ram, start_bus, end_bus);
+        const first = reader.next(ram) orelse return false;
+        if (first.fb_w == 0 or first.fb_h == 0 or first.fb_w > 2048 or first.fb_h > 2048) return false;
+        var frame: metal_renderer.Frame = .{
+            .width = first.fb_w,
+            .height = first.fb_h,
+            .clear_color = first.clear_color0,
+            .clear_z = first.clear_zs,
+            .load = if (first.lazy_load) |l| .{
+                .base = l.addr & vc_bus.ramMask(ram.len),
+                .tiling = l.tiling,
+                .cpp = if (l.format == 1 or l.format == 2) 2 else 4,
+            } else null,
+            .store = .{
+                .base = first.dst_addr & vc_bus.ramMask(ram.len),
+                .tiling = first.tiling,
+                .cpp = if (first.ls_format == 1 or first.ls_format == 2) 2 else 4,
+            },
+            .tiles = @splat(0),
+        };
+        var job: ?TileJob = first;
+        while (job) |j| : (job = reader.next(ram)) {
+            if (j.tile_x >= 32 or j.tile_y >= 32) return false;
+            const bit = @as(u32, 1) << @intCast(j.tile_x);
+            if ((frame.tiles[j.tile_y] & bit) != 0) return false;
+            frame.tiles[j.tile_y] |= bit;
+            if (j.fb_w != first.fb_w or j.fb_h != first.fb_h or j.clear_color0 != first.clear_color0 or
+                j.clear_zs != first.clear_zs or j.has_render != first.has_render or j.dst_addr != first.dst_addr or
+                j.tiling != first.tiling or j.ls_format != first.ls_format)
+            {
+                return false;
+            }
+            if ((j.lazy_load == null) != (first.lazy_load == null)) return false;
+            if (j.lazy_load) |l| {
+                const f = first.lazy_load.?;
+                if (l.addr != f.addr or l.tiling != f.tiling or l.format != f.format) return false;
+            }
+        }
+
+        // The triangles, in a run for each draw.
+        var n_vertices: usize = 0;
+        var n_draws: usize = 0;
+        if (first.has_render) {
+            var last_draw: ?u16 = null;
+            for (self.shaded_tris[0..self.shaded_tris_len]) |*tri| {
+                const prep = self.prep_draws[tri.draw_idx];
+                if (!prep.valid) continue;
+                if (last_draw != tri.draw_idx) {
+                    if (n_draws == m.draws.len) return false;
+                    if (prep.fs_unif_len != qpu_to_msl.max_uniforms or prep.fs_code_len > m.code[0].len) return false;
+                    const draw = self.draws[tri.draw_idx];
+                    const code = m.code[n_draws][0..prep.fs_code_len];
+                    for (code, 0..) |*inst, i| inst.* = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
+                    for (&m.uniforms[n_draws], 0..) |*u, i| u.* = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
+                    m.draws[n_draws] = .{
+                        .first_vertex = @intCast(n_vertices),
+                        .vertex_count = 0,
+                        .code = code,
+                        .uniforms = &m.uniforms[n_draws],
+                        .num_varyings = prep.fs_num_varyings,
+                        .depth_func = @truncate((draw.config_b1 >> 4) & 7),
+                        .depth_write = (draw.config_b1 & 0x80) != 0,
+                        .clip_x = draw.clip_x,
+                        .clip_y = draw.clip_y,
+                        .clip_w = draw.clip_w,
+                        .clip_h = draw.clip_h,
+                    };
+                    n_draws += 1;
+                    last_draw = tri.draw_idx;
+                }
+                for (tri.v) |v| {
+                    m.vertices[n_vertices] = .{
+                        .x = v.x,
+                        .y = v.y,
+                        .z = v.z,
+                        .inv_w = v.inv_w,
+                        .unit_w = @intFromBool(tri.all_unit_w),
+                        .varyings = v.persp_varyings,
+                    };
+                    n_vertices += 1;
+                }
+                m.draws[n_draws - 1].vertex_count += 3;
+            }
+        }
+
+        renderer.render(ram, &frame, m.vertices[0..n_vertices], m.draws[0..n_draws]) catch return false;
+        return true;
     }
 
     fn loadTileFromRam(
