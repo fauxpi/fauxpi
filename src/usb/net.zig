@@ -23,6 +23,17 @@ pub const VirtualNetwork = struct {
     pub const RX_QUEUE_CAP = 32;
     pub const MAX_UDP_SESSIONS = 16;
     pub const MAX_TCP_CONNS = 16;
+    /// The most sent to the guest on one connection that it has not acknowledged
+    pub const TCP_RX_BUF_LEN = 16 * 1024;
+    /// The most data in one segment to the guest
+    pub const TCP_MSS = 1400;
+    /// How long a segment waits for the guest's acknowledgement before it is sent
+    /// again, at first and at most (doubling each time)
+    pub const TCP_RTO_MIN_NS: i96 = 250 * std.time.ns_per_ms;
+    pub const TCP_RTO_MAX_NS: i96 = 4 * std.time.ns_per_s;
+    /// How many times something is sent again with no acknowledgement before the guest
+    /// is taken to be gone and the connection reset
+    pub const TCP_MAX_RETRIES = 12;
 
     pub const UdpSession = struct {
         active: bool = false,
@@ -57,11 +68,42 @@ pub const VirtualNetwork = struct {
         guest_port: u16 = 0,
         dst_ip: [4]u8 = .{ 0, 0, 0, 0 },
         dst_port: u16 = 0,
-        my_seq: u32 = 0,
+        /// The oldest sequence number sent to the guest that it has not acknowledged
+        snd_una: u32 = 0,
+        /// The next sequence number to send to the guest (back at `snd_una` to send again)
+        snd_nxt: u32 = 0,
         guest_seq: u32 = 0,
+        /// How much more the guest said it will take, from `snd_una`
+        guest_window: u32 = 0,
         tx_buf: [4096]u8 = undefined,
         tx_len: usize = 0,
+        /// What the host sent for the guest, from `snd_una`: kept until the guest
+        /// acknowledges it, to be sent again if it is lost
+        rx_buf: [TCP_RX_BUF_LEN]u8 = undefined,
+        rx_len: usize = 0,
+        /// The host has finished sending: a FIN follows the data
+        host_eof: bool = false,
+        /// The FIN has been sent (at the sequence number after the data)
+        fin_out: bool = false,
+        /// The guest acknowledging the same thing again, what it does as it gets data
+        /// after a segment that was lost
+        dup_acks: u8 = 0,
+        /// When what is unacknowledged is sent again if it still is, and how long that waits
+        rto_deadline_ns: i96 = 0,
+        rto_ns: i96 = TCP_RTO_MIN_NS,
+        /// How many times in a row it has been sent again with no acknowledgement
+        retries: u8 = 0,
         last_tick: u64 = 0,
+
+        /// The sequence number after the data the host has sent
+        fn dataEnd(c: *const TcpConn) u32 {
+            return c.snd_una +% @as(u32, @intCast(c.rx_len));
+        }
+
+        /// Whether something sent to the guest has not been acknowledged
+        fn hasUnacked(c: *const TcpConn) bool {
+            return c.snd_nxt != c.snd_una or c.fin_out;
+        }
     };
 
     /// Third octet of the network's 10.0.x.0/24 addresses (`GATEWAY_IP` etc. are for 2)
@@ -591,8 +633,10 @@ pub const VirtualNetwork = struct {
                 .guest_port = src_port,
                 .dst_ip = dst_ip,
                 .dst_port = dst_port,
-                .my_seq = init_seq +% 1,
+                .snd_una = init_seq +% 1,
+                .snd_nxt = init_seq +% 1,
                 .guest_seq = seq +% 1,
+                .guest_window = std.mem.readInt(u16, payload[14..16], .big),
                 .tx_len = 0,
                 .last_tick = self.tick_count,
             };
@@ -606,6 +650,12 @@ pub const VirtualNetwork = struct {
         const c = &self.tcp_conns[idx];
         c.last_tick = self.tick_count;
 
+        if ((flags & 0x10) != 0 and c.state != .connecting) {
+            const ack = std.mem.readInt(u32, payload[8..12], .big);
+            const window = std.mem.readInt(u16, payload[14..16], .big);
+            if (self.handleTcpAck(idx, ack, window, tcp_data.len == 0 and !flag_fin)) return;
+        }
+
         if (tcp_data.len > 0) {
             if (seq == c.guest_seq) {
                 const space = c.tx_buf.len - c.tx_len;
@@ -618,7 +668,7 @@ pub const VirtualNetwork = struct {
                 self.flushTcpTx(idx);
             }
             // Acknowledge current expected guest_seq
-            self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, c.my_seq, c.guest_seq, 0x10, &.{});
+            self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, c.snd_nxt, c.guest_seq, 0x10, &.{});
         }
 
         if (flag_fin) {
@@ -627,7 +677,7 @@ pub const VirtualNetwork = struct {
             }
             c.guest_fin = true;
             self.flushTcpTx(idx);
-            self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, c.my_seq, c.guest_seq, 0x10, &.{});
+            self.sendTcpSegment(dst_ip, dst_port, src_ip, src_port, c.snd_nxt, c.guest_seq, 0x10, &.{});
         }
     }
 
@@ -698,7 +748,8 @@ pub const VirtualNetwork = struct {
         for (&self.tcp_conns) |*c| {
             const stream = c.stream orelse continue;
             if (n == out.len) break;
-            const ev: i16 = if (c.tx_len > 0) (host_posix.POLL.IN | host_posix.POLL.OUT) else host_posix.POLL.IN;
+            const want_in = !c.host_eof and c.rx_len < c.rx_buf.len;
+            const ev: i16 = (if (want_in) host_posix.POLL.IN else 0) | (if (c.tx_len > 0) host_posix.POLL.OUT else 0);
             out[n] = .{ .fd = stream.socket.handle, .events = ev, .revents = 0 };
             n += 1;
         }
@@ -729,7 +780,7 @@ pub const VirtualNetwork = struct {
             }
             c.stream = stream;
             c.state = .established;
-            self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.my_seq -% 1, c.guest_seq, 0x12, &.{}); // SYN|ACK
+            self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.snd_una -% 1, c.guest_seq, 0x12, &.{}); // SYN|ACK
         }
     }
 
@@ -752,6 +803,7 @@ pub const VirtualNetwork = struct {
         }
 
         // TCP NAT connections
+        const now = self.nowNs();
         for (0..MAX_TCP_CONNS) |idx| {
             const c = &self.tcp_conns[idx];
             const stream = c.stream orelse continue;
@@ -761,31 +813,116 @@ pub const VirtualNetwork = struct {
                 self.flushTcpTx(idx);
             }
 
-            var buf: [1400]u8 = undefined;
-            var data = [_][]u8{&buf};
-            const result = io.operateTimeout(.{ .net_read = .{
-                .socket_handle = stream.socket.handle,
-                .data = &data,
-            } }, no_wait) catch continue;
-            if (result.net_read) |read| {
-                if (read.data_len > 0) {
-                    c.last_tick = self.tick_count;
-                    const seq = c.my_seq;
-                    c.my_seq +%= @intCast(read.data_len);
-                    self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, seq, c.guest_seq, 0x18, buf[0..read.data_len]); // PSH|ACK
-                } else {
-                    // The host closed the connection: FIN|ACK to the guest
-                    const seq = c.my_seq;
-                    c.my_seq +%= 1;
-                    self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, seq, c.guest_seq, 0x11, &.{}); // FIN|ACK
+            // Not acknowledged in time: lost, so sent again from the first of it
+            if (c.hasUnacked() and now >= c.rto_deadline_ns) {
+                if (c.retries == TCP_MAX_RETRIES) {
+                    self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.snd_nxt, c.guest_seq, 0x14, &.{}); // RST|ACK
                     self.closeTcpConn(idx);
+                    continue;
                 }
-            } else |_| {
-                // Reset by the host
-                self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.my_seq, c.guest_seq, 0x14, &.{}); // RST|ACK
-                self.closeTcpConn(idx);
+                c.retries += 1;
+                c.snd_nxt = c.snd_una;
+                c.fin_out = false;
+                c.dup_acks = 0;
+                c.rto_ns = @min(c.rto_ns * 2, TCP_RTO_MAX_NS);
+            }
+
+            // Only as much from the host as can be kept until the guest has it
+            if (!c.host_eof and c.rx_len < c.rx_buf.len) {
+                var data = [_][]u8{c.rx_buf[c.rx_len..]};
+                const result = io.operateTimeout(.{ .net_read = .{
+                    .socket_handle = stream.socket.handle,
+                    .data = &data,
+                } }, no_wait);
+                if (result) |r| {
+                    if (r.net_read) |read| {
+                        c.last_tick = self.tick_count;
+                        if (read.data_len > 0) c.rx_len += read.data_len else c.host_eof = true;
+                    } else |_| {
+                        // Reset by the host
+                        self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.snd_nxt, c.guest_seq, 0x14, &.{}); // RST|ACK
+                        self.closeTcpConn(idx);
+                        continue;
+                    }
+                } else |_| {}
+            }
+
+            self.sendTcpData(idx, now);
+        }
+    }
+
+    /// Takes the guest's acknowledgement `ack` and `window` on connection `idx`, sending
+    /// what that lets be sent; true if the connection is finished and closed. `pure` is
+    /// for a segment with nothing else in it, which may be a duplicate acknowledgement.
+    fn handleTcpAck(self: *VirtualNetwork, idx: usize, ack: u32, window: u16, pure: bool) bool {
+        const c = &self.tcp_conns[idx];
+        const fin_seq = c.dataEnd();
+        const sent_end = if (c.fin_out) fin_seq +% 1 else c.snd_nxt;
+        // Something not sent yet (or from an earlier connection): ignored
+        if (seqBefore(sent_end, ack) or seqBefore(ack, c.snd_una)) return false;
+        const now = self.nowNs();
+        if (c.fin_out and ack == fin_seq +% 1) {
+            // The guest has everything, the FIN too
+            c.rx_len = 0;
+            c.snd_una = fin_seq;
+            c.snd_nxt = fin_seq;
+            c.fin_out = false;
+            self.closeTcpConn(idx);
+            return true;
+        }
+        const acked: usize = ack -% c.snd_una;
+        if (acked > 0) {
+            std.mem.copyForwards(u8, c.rx_buf[0 .. c.rx_len - acked], c.rx_buf[acked..c.rx_len]);
+            c.rx_len -= acked;
+            c.snd_una = ack;
+            if (seqBefore(c.snd_nxt, ack)) c.snd_nxt = ack;
+            c.dup_acks = 0;
+            c.retries = 0;
+            c.rto_ns = TCP_RTO_MIN_NS;
+            c.rto_deadline_ns = now + c.rto_ns;
+        } else if (pure and c.hasUnacked() and window == c.guest_window) {
+            // The same acknowledgement three more times: what follows it was lost
+            c.dup_acks +|= 1;
+            if (c.dup_acks == 3) {
+                c.snd_nxt = c.snd_una;
+                c.fin_out = false;
             }
         }
+        c.guest_window = window;
+        self.sendTcpData(idx, now);
+        return false;
+    }
+
+    /// Sends the guest what it has room for of what the host sent, then the FIN once the
+    /// host has finished and all of it is sent
+    fn sendTcpData(self: *VirtualNetwork, idx: usize, now: i96) void {
+        const c = &self.tcp_conns[idx];
+        if (c.state != .established) return;
+        const end = c.dataEnd();
+        const window_end = c.snd_una +% c.guest_window;
+        while (self.rx_count < RX_QUEUE_CAP - 2) {
+            const in_flight: u32 = c.snd_nxt -% c.snd_una;
+            const unsent: u32 = end -% c.snd_nxt;
+            if (unsent > 0) {
+                const room: u32 = if (seqBefore(c.snd_nxt, window_end)) window_end -% c.snd_nxt else 0;
+                const n: u32 = @min(unsent, room, TCP_MSS);
+                if (n == 0) break;
+                if (!c.hasUnacked()) c.rto_deadline_ns = now + c.rto_ns;
+                const off: usize = in_flight;
+                self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.snd_nxt, c.guest_seq, 0x18, c.rx_buf[off .. off + n]); // PSH|ACK
+                c.snd_nxt +%= n;
+            } else if (c.host_eof and !c.fin_out) {
+                if (!c.hasUnacked()) c.rto_deadline_ns = now + c.rto_ns;
+                self.sendTcpSegment(c.dst_ip, c.dst_port, c.guest_ip, c.guest_port, c.snd_nxt, c.guest_seq, 0x11, &.{}); // FIN|ACK
+                c.fin_out = true;
+                break;
+            } else break;
+        }
+    }
+
+    fn nowNs(self: *const VirtualNetwork) i96 {
+        const io = self.io orelse return 0;
+        return Io.Clock.awake.now(io).nanoseconds;
     }
 
     pub fn sendUdpPacket(self: *VirtualNetwork, src_ip: [4]u8, src_port: u16, dst_ip: [4]u8, dst_port: u16, data: []const u8) void {
@@ -870,6 +1007,11 @@ pub const VirtualNetwork = struct {
             @memset(frame[raw_len..wire_len], 0);
         }
         self.enqueueRxFrame(frame[0..wire_len]);
+    }
+
+    /// Whether sequence number `a` comes before `b` (with them wrapping around)
+    fn seqBefore(a: u32, b: u32) bool {
+        return @as(i32, @bitCast(a -% b)) < 0;
     }
 
     pub fn parseIpv4(s: []const u8) ?[4]u8 {
@@ -1061,6 +1203,7 @@ test "VirtualNetwork forwards UDP and TCP through host sockets" {
     std.mem.writeInt(u32, syn[38..42], 1000, .big);
     syn[46] = 5 << 4;
     syn[47] = 0x02; // SYN
+    std.mem.writeInt(u16, syn[48..50], 65535, .big); // Window
     net.handleTxFrame(&syn);
     try std.testing.expect(!net.hasRxFrame());
     try testPollForRx(&net);
@@ -1106,4 +1249,159 @@ test "VirtualNetwork refuses a guest connection the host refuses" {
     try std.testing.expectEqual(@as(u8, 0x14), rx_buf[47]); // RST|ACK
     try std.testing.expectEqual(@as(u32, 1001), std.mem.readInt(u32, rx_buf[42..46], .big));
     try std.testing.expect(!net.hasHostSockets());
+}
+
+/// Sends `net` a TCP segment from the guest's port 40003 to the gateway's `port`
+fn testGuestTcp(net: *VirtualNetwork, port: u16, seq: u32, ack: u32, flags: u8, window: u16, data: []const u8) void {
+    var frame: [34 + 20 + 64]u8 = @splat(0);
+    testGuestIpv4(&frame, 6, 20 + data.len);
+    std.mem.writeInt(u16, frame[34..36], 40003, .big);
+    std.mem.writeInt(u16, frame[36..38], port, .big);
+    std.mem.writeInt(u32, frame[38..42], seq, .big);
+    std.mem.writeInt(u32, frame[42..46], ack, .big);
+    frame[46] = 5 << 4;
+    frame[47] = flags;
+    std.mem.writeInt(u16, frame[48..50], window, .big);
+    @memcpy(frame[54 .. 54 + data.len], data);
+    net.handleTxFrame(frame[0 .. 54 + data.len]);
+}
+
+const TestSegment = struct { seq: u32, flags: u8, len: usize, first: u8 };
+
+/// Takes the frames `net` has for the guest
+fn testTakeSegments(net: *VirtualNetwork, out: []TestSegment) usize {
+    var rx_buf: [VirtualNetwork.MAX_FRAME_LEN]u8 = undefined;
+    var n: usize = 0;
+    while (net.popRxFrame(&rx_buf)) |len| {
+        const ip_len = std.mem.readInt(u16, rx_buf[16..18], .big);
+        const data_len = ip_len - 40;
+        out[n] = .{ .seq = std.mem.readInt(u32, rx_buf[38..42], .big), .flags = rx_buf[47], .len = data_len, .first = if (data_len > 0) rx_buf[54] else 0 };
+        n += 1;
+        _ = len;
+    }
+    return n;
+}
+
+/// Polls `net` until it has sent the guest up to `seq` (the sequence number after its data)
+fn testPollUntilSent(net: *VirtualNetwork, seq: u32) !void {
+    for (0..400) |_| {
+        net.poll();
+        const c = &net.tcp_conns[0];
+        if (c.state == .established and c.snd_nxt == seq) return;
+        try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return error.Timeout;
+}
+
+test "VirtualNetwork sends the guest no more than its window, again what it lost, then the FIN" {
+    const io = std.testing.io;
+    var net = VirtualNetwork{ .io = io };
+    defer net.deinit();
+    var segs: [VirtualNetwork.RX_QUEUE_CAP]TestSegment = undefined;
+
+    const loopback: host_net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try loopback.listen(io, .{});
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    testGuestTcp(&net, port, 1000, 0, 0x02, 3000, &.{}); // SYN
+    try testPollForRx(&net);
+    try std.testing.expectEqual(@as(usize, 1), testTakeSegments(&net, &segs));
+    try std.testing.expectEqual(@as(u8, 0x12), segs[0].flags); // SYN|ACK
+    const isn = segs[0].seq +% 1;
+    testGuestTcp(&net, port, 1001, isn, 0x10, 3000, &.{});
+
+    // The host sends 6000 bytes (each 1400 the next letter) and closes
+    const accepted = try listener.accept(io);
+    var body: [6000]u8 = undefined;
+    for (&body, 0..) |*b, i| b.* = 'a' + @as(u8, @intCast(i / 1400));
+    var write_buf: [64]u8 = undefined;
+    var writer = accepted.writer(io, &write_buf);
+    try writer.interface.writeAll(&body);
+    try writer.interface.flush();
+    accepted.close(io);
+
+    // Only the 3000 bytes of the window
+    try testPollUntilSent(&net, isn +% 3000);
+    var n = testTakeSegments(&net, &segs);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqual(@as(usize, 1400), segs[0].len);
+    try std.testing.expectEqual(@as(usize, 200), segs[2].len);
+    try std.testing.expectEqual(isn +% 2800, segs[2].seq);
+
+    // The second segment is lost: the guest acknowledges the first, then the same again
+    // for each that follows, and the second is sent again
+    testGuestTcp(&net, port, 1001, isn +% 1400, 0x10, 3000, &.{});
+    n = testTakeSegments(&net, &segs);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(isn +% 3000, segs[0].seq);
+    try std.testing.expectEqual(@as(usize, 1400), segs[0].len);
+    for (0..3) |_| testGuestTcp(&net, port, 1001, isn +% 1400, 0x10, 3000, &.{});
+    n = testTakeSegments(&net, &segs);
+    try std.testing.expect(n >= 1);
+    try std.testing.expectEqual(isn +% 1400, segs[0].seq);
+    try std.testing.expectEqual(@as(u8, 'b'), segs[0].first);
+
+    // All the data acknowledged: the FIN follows it, and once that is acknowledged too
+    // the connection is finished
+    _ = testTakeSegments(&net, &segs);
+    testGuestTcp(&net, port, 1001, isn +% 4400, 0x10, 8000, &.{});
+    n = testTakeSegments(&net, &segs);
+    try std.testing.expectEqual(isn +% 4400, segs[0].seq);
+    try std.testing.expectEqual(@as(usize, 1600), segs[0].len + segs[1].len);
+    testGuestTcp(&net, port, 1001, isn +% 6000, 0x10, 8000, &.{});
+    try testPollUntilFin(&net, &segs, isn +% 6000);
+    testGuestTcp(&net, port, 1001, isn +% 6001, 0x10, 8000, &.{});
+    try std.testing.expect(!net.hasHostSockets());
+}
+
+/// Polls `net` until it sends the guest a FIN at `seq`
+fn testPollUntilFin(net: *VirtualNetwork, segs: []TestSegment, seq: u32) !void {
+    for (0..400) |_| {
+        net.poll();
+        const n = testTakeSegments(net, segs);
+        for (segs[0..n]) |s| if (s.flags & 0x01 != 0) {
+            try std.testing.expectEqual(seq, s.seq);
+            return;
+        };
+        try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    return error.Timeout;
+}
+
+test "VirtualNetwork sends again what the guest does not acknowledge in time" {
+    const io = std.testing.io;
+    var net = VirtualNetwork{ .io = io };
+    defer net.deinit();
+    var segs: [VirtualNetwork.RX_QUEUE_CAP]TestSegment = undefined;
+
+    const loopback: host_net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try loopback.listen(io, .{});
+    defer listener.deinit(io);
+    const port = listener.socket.address.getPort();
+
+    testGuestTcp(&net, port, 1000, 0, 0x02, 65535, &.{}); // SYN
+    try testPollForRx(&net);
+    _ = testTakeSegments(&net, &segs);
+    const isn = net.tcp_conns[0].snd_una;
+    testGuestTcp(&net, port, 1001, isn, 0x10, 65535, &.{});
+
+    const accepted = try listener.accept(io);
+    defer accepted.close(io);
+    var write_buf: [16]u8 = undefined;
+    var writer = accepted.writer(io, &write_buf);
+    try writer.interface.writeAll("hello");
+    try writer.interface.flush();
+    try testPollUntilSent(&net, isn +% 5);
+    try std.testing.expectEqual(@as(usize, 1), testTakeSegments(&net, &segs));
+
+    // Lost: sent again once it has waited long enough
+    for (0..200) |_| {
+        net.poll();
+        if (net.hasRxFrame()) break;
+        try std.testing.io.sleep(.fromMilliseconds(5), .awake);
+    }
+    try std.testing.expectEqual(@as(usize, 1), testTakeSegments(&net, &segs));
+    try std.testing.expectEqual(isn, segs[0].seq);
+    try std.testing.expectEqual(@as(u8, 'h'), segs[0].first);
 }
