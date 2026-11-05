@@ -4,9 +4,11 @@ const qpu = @import("qpu.zig");
 const qpu_sim = @import("qpu_sim.zig");
 const format_mod = @import("format.zig");
 const texture = @import("texture.zig");
-const GlRenderer = @import("gl_renderer.zig").GlRenderer;
+const builtin = @import("builtin");
 const metal_renderer = @import("metal_renderer.zig");
-const qpu_to_msl = @import("qpu_to_msl.zig");
+const gl_renderer = @import("gl_renderer.zig");
+const gpu_draw = @import("gpu_draw.zig");
+const qpu_to_shader = @import("qpu_to_shader.zig");
 
 /// VideoCore IV 3D Engine (`brcm,bcm2835-v3d`) at `0x20c00000` (size `0x1000`).
 pub const V3d = struct {
@@ -283,10 +285,9 @@ pub const V3d = struct {
     tile_tri_start: [32 * 32 + 1]u32 = @splat(0),
     tile_tris: std.ArrayList(u32) = .empty,
 
-    gl: GlRenderer = .{},
-    gl_initialized: bool = false,
-    metal: ?*MetalState = null,
-    metal_tried: bool = false,
+    /// What frames are drawn with on the host's GPU (made with the first frame), if they can be.
+    gpu: ?*GpuState = null,
+    gpu_tried: bool = false,
     frame_dirty: bool = false,
 
     pub fn resetInPlace(self: *V3d) void {
@@ -342,8 +343,6 @@ pub const V3d = struct {
         self.shaded_tris.clearRetainingCapacity();
         self.overflow_draw_start = 0;
         self.tile_tri_start = @splat(0);
-        self.gl = .{};
-        self.gl_initialized = false;
         self.frame_dirty = false;
     }
 
@@ -396,11 +395,6 @@ pub const V3d = struct {
     }
 
     pub fn write32(self: *V3d, offset: u32, val: u32, ram: []u8) void {
-        if (!self.gl_initialized) {
-            self.gl = GlRenderer.init();
-            self.gl_initialized = true;
-        }
-
         switch (offset) {
             0x010 => self.scratch = val,
             0x020 => self.l2cactl = val,
@@ -546,7 +540,6 @@ pub const V3d = struct {
                     const n_attr: u4 = @intCast(if ((word & 7) == 0) 8 else (word & 7));
                     self.cur_num_attrs = n_attr;
                     self.cur_shader_rec = word & ~@as(u32, 0xf);
-                    self.warmShaderCache(ram, self.cur_shader_rec);
                     pc += 5;
                 },
                 96 => { // CONFIGURATION_BITS (4 bytes)
@@ -583,20 +576,6 @@ pub const V3d = struct {
                 },
                 else => break,
             }
-        }
-    }
-
-    fn warmShaderCache(self: *V3d, ram: []const u8, shader_rec_bus: u32) void {
-        const rec_phys = shader_rec_bus & vc_bus.ramMask(ram.len);
-        if (rec_phys + 36 > ram.len) return;
-        const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-        const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-        var vs_buf: [512]qpu.Inst = undefined;
-        var fs_buf: [512]qpu.Inst = undefined;
-        const vs_code = extractQpuProgram(ram, vs_code_phys, &vs_buf);
-        const fs_code = extractQpuProgram(ram, fs_code_phys, &fs_buf);
-        if (vs_code.len > 0 and fs_code.len > 0) {
-            _ = self.gl.getOrTranslateProgram(vs_code, fs_code);
         }
     }
 
@@ -1455,7 +1434,7 @@ pub const V3d = struct {
         if ((end_bus & vc_bus.ramMask(ram.len)) > ram.len) return;
 
         self.prepareDrawsForFrame(ram);
-        if (metal_renderer.supported and self.renderWithMetal(ram, start_bus, end_bus)) return;
+        if (gpu_supported and self.renderWithGpu(ram, start_bus, end_bus)) return;
 
         var tile_jobs: [1024]TileJob = undefined;
         var tile_jobs_len: usize = 0;
@@ -1485,61 +1464,51 @@ pub const V3d = struct {
         self.flushTileJobs(ram, tile_jobs[0..tile_jobs_len]);
     }
 
-    /// What drawing frames with Metal needs (on macOS), made with the first frame.
-    const MetalState = struct {
-        renderer: metal_renderer.Renderer,
-        vertices: [metal_renderer.max_vertices]metal_renderer.Vertex = undefined,
-        draws: [256]metal_renderer.Draw = undefined,
-        uniforms: [256][qpu_to_msl.max_uniforms]u32 = undefined,
-        code: [256][512]qpu.Inst = undefined,
+    /// Whether frames can be drawn on the host's GPU: with Metal on macOS, OpenGL on Linux.
+    const gpu_supported = metal_renderer.supported or builtin.os.tag == .linux;
+    const GpuRenderer = if (metal_renderer.supported) metal_renderer.Renderer else gl_renderer.Renderer;
+
+    /// What drawing frames on the GPU needs, made with the first frame.
+    const GpuState = struct {
+        renderer: GpuRenderer,
+        vertices: [gpu_draw.max_vertices]gpu_draw.Vertex = undefined,
+        draws: [gpu_draw.max_draws]gpu_draw.Draw = undefined,
+        uniforms: [gpu_draw.max_draws][qpu_to_shader.max_uniforms]u32 = undefined,
+        code: [gpu_draw.max_draws][512]qpu.Inst = undefined,
+        /// OpenGL: the tile buffer, as big as the framebuffer.
+        color: std.ArrayList(u32) = .empty,
     };
 
-    /// Draws the frame with Metal, if it is one Metal can draw the same as the CPU: each tile once,
-    /// all loaded (or cleared) and stored alike, and every shader one Metal runs.
-    fn renderWithMetal(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
-        if (!self.metal_tried) {
-            self.metal_tried = true;
-            var renderer = metal_renderer.Renderer.init() catch |err| {
-                if (err != error.Unsupported) std.debug.print("fauxpi: V3D on Metal: {s}\n", .{@errorName(err)});
+    /// Draws the frame on the GPU, if it is one the GPU can draw the same as the CPU: each tile
+    /// once, all loaded (or cleared) and stored alike, and every shader one the GPU runs.
+    fn renderWithGpu(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
+        if (!self.gpu_tried) {
+            self.gpu_tried = true;
+            const api = if (metal_renderer.supported) "Metal" else "OpenGL";
+            var renderer = GpuRenderer.init() catch |err| {
+                if (err != error.Unsupported) std.debug.print("fauxpi: V3D on {s}: {s}\n", .{ api, @errorName(err) });
                 return false;
             };
-            const state = std.heap.page_allocator.create(MetalState) catch {
-                renderer.deinit();
+            const state = std.heap.page_allocator.create(GpuState) catch {
+                if (metal_renderer.supported) renderer.deinit();
                 return false;
             };
-            state.renderer = renderer;
-            self.metal = state;
+            state.* = .{ .renderer = renderer };
+            self.gpu = state;
         }
-        const m = self.metal orelse return false;
-        const renderer = &m.renderer;
+        const g = self.gpu orelse return false;
         if (self.overflow_draw_start < self.draws_len) return false;
 
         var reader: RclReader = .init(ram, start_bus, end_bus);
         const first = reader.next(ram) orelse return false;
         if (first.fb_w == 0 or first.fb_h == 0 or first.fb_w > 2048 or first.fb_h > 2048) return false;
-        var frame: metal_renderer.Frame = .{
-            .width = first.fb_w,
-            .height = first.fb_h,
-            .clear_color = first.clear_color0,
-            .clear_z = first.clear_zs,
-            .load = if (first.lazy_load) |l| .{
-                .base = l.addr & vc_bus.ramMask(ram.len),
-                .tiling = l.tiling,
-                .cpp = if (l.format == 1 or l.format == 2) 2 else 4,
-            } else null,
-            .store = .{
-                .base = first.dst_addr & vc_bus.ramMask(ram.len),
-                .tiling = first.tiling,
-                .cpp = if (first.ls_format == 1 or first.ls_format == 2) 2 else 4,
-            },
-            .tiles = @splat(0),
-        };
+        var tiles: [32]u32 = @splat(0);
         var job: ?TileJob = first;
         while (job) |j| : (job = reader.next(ram)) {
             if (j.tile_x >= 32 or j.tile_y >= 32) return false;
             const bit = @as(u32, 1) << @intCast(j.tile_x);
-            if ((frame.tiles[j.tile_y] & bit) != 0) return false;
-            frame.tiles[j.tile_y] |= bit;
+            if ((tiles[j.tile_y] & bit) != 0) return false;
+            tiles[j.tile_y] |= bit;
             if (j.fb_w != first.fb_w or j.fb_h != first.fb_h or j.clear_color0 != first.clear_color0 or
                 j.clear_zs != first.clear_zs or j.has_render != first.has_render or j.dst_addr != first.dst_addr or
                 j.tiling != first.tiling or j.ls_format != first.ls_format)
@@ -1549,7 +1518,11 @@ pub const V3d = struct {
             if ((j.lazy_load == null) != (first.lazy_load == null)) return false;
             if (j.lazy_load) |l| {
                 const f = first.lazy_load.?;
-                if (l.addr != f.addr or l.tiling != f.tiling or l.format != f.format) return false;
+                if (l.addr != f.addr or l.tiling != f.tiling or l.format != f.format or
+                    l.fb_w != f.fb_w or l.fb_h != f.fb_h or l.tile_size != 64 or l.tile_x != j.tile_x or l.tile_y != j.tile_y)
+                {
+                    return false;
+                }
             }
         }
 
@@ -1562,17 +1535,17 @@ pub const V3d = struct {
                 const prep = self.prep_draws[tri.draw_idx];
                 if (!prep.valid) continue;
                 if (last_draw != tri.draw_idx) {
-                    if (n_draws == m.draws.len) return false;
-                    if (prep.fs_unif_len != qpu_to_msl.max_uniforms or prep.fs_code_len > m.code[0].len) return false;
+                    if (n_draws == g.draws.len) return false;
+                    if (prep.fs_unif_len != qpu_to_shader.max_uniforms or prep.fs_code_len > g.code[0].len) return false;
                     const draw = self.draws[tri.draw_idx];
-                    const code = m.code[n_draws][0..prep.fs_code_len];
+                    const code = g.code[n_draws][0..prep.fs_code_len];
                     for (code, 0..) |*inst, i| inst.* = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
-                    for (&m.uniforms[n_draws], 0..) |*u, i| u.* = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
-                    m.draws[n_draws] = .{
+                    for (&g.uniforms[n_draws], 0..) |*u, i| u.* = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
+                    g.draws[n_draws] = .{
                         .first_vertex = @intCast(n_vertices),
                         .vertex_count = 0,
                         .code = code,
-                        .uniforms = &m.uniforms[n_draws],
+                        .uniforms = &g.uniforms[n_draws],
                         .num_varyings = prep.fs_num_varyings,
                         .depth_func = @truncate((draw.config_b1 >> 4) & 7),
                         .depth_write = (draw.config_b1 & 0x80) != 0,
@@ -1585,7 +1558,7 @@ pub const V3d = struct {
                     last_draw = tri.draw_idx;
                 }
                 for (tri.v) |v| {
-                    m.vertices[n_vertices] = .{
+                    g.vertices[n_vertices] = .{
                         .x = v.x,
                         .y = v.y,
                         .z = v.z,
@@ -1595,11 +1568,83 @@ pub const V3d = struct {
                     };
                     n_vertices += 1;
                 }
-                m.draws[n_draws - 1].vertex_count += 3;
+                g.draws[n_draws - 1].vertex_count += 3;
             }
         }
 
-        renderer.render(ram, &frame, m.vertices[0..n_vertices], m.draws[0..n_draws]) catch return false;
+        if (metal_renderer.supported) {
+            var frame: metal_renderer.Frame = .{
+                .width = first.fb_w,
+                .height = first.fb_h,
+                .clear_color = first.clear_color0,
+                .clear_z = first.clear_zs,
+                .load = if (first.lazy_load) |l| .{
+                    .base = l.addr & vc_bus.ramMask(ram.len),
+                    .tiling = l.tiling,
+                    .cpp = if (l.format == 1 or l.format == 2) 2 else 4,
+                } else null,
+                .store = .{
+                    .base = first.dst_addr & vc_bus.ramMask(ram.len),
+                    .tiling = first.tiling,
+                    .cpp = if (first.ls_format == 1 or first.ls_format == 2) 2 else 4,
+                },
+                .tiles = tiles,
+            };
+            g.renderer.render(ram, &frame, g.vertices[0..n_vertices], g.draws[0..n_draws]) catch return false;
+            return true;
+        }
+        // Only drawing is faster on the GPU: the CPU loads and stores tiles on its own as fast.
+        if (n_draws == 0) return false;
+        return self.renderWithGl(g, ram, first, &tiles, n_vertices, n_draws);
+    }
+
+    /// Draws the frame with OpenGL: the tiles listed loaded (or cleared) on the CPU into a buffer
+    /// as big as the framebuffer, drawn into, and stored from it.
+    fn renderWithGl(self: *V3d, g: *GpuState, ram: []u8, first: TileJob, tiles: *const [32]u32, n_vertices: usize, n_draws: usize) bool {
+        _ = self;
+        const w = first.fb_w;
+        const h = first.fb_h;
+        g.color.resize(std.heap.page_allocator, @as(usize, w) * h) catch return false;
+        const color = g.color.items;
+        var tile_color: [64 * 64]u32 = undefined;
+        var tile_depth: [64 * 64]f32 = undefined;
+        var tb: TileBuffer = .{ .color = &tile_color, .depth = &tile_depth };
+        const tiles_w = (w + 63) / 64;
+        const tiles_h = (h + 63) / 64;
+        for (0..@min(tiles_h, 32)) |ty| {
+            for (0..@min(tiles_w, 32)) |tx| {
+                if (tiles[ty] & (@as(u32, 1) << @intCast(tx)) == 0) continue;
+                const x0: u32 = @intCast(tx * 64);
+                const y0: u32 = @intCast(ty * 64);
+                const vw = @min(64, w - x0);
+                const vh = @min(64, h - y0);
+                if (first.lazy_load) |ll| {
+                    @memset(&tile_color, 0);
+                    loadTileIntoBuf(&tb, ram, ll.addr, ll.fb_w, ll.fb_h, @intCast(tx), @intCast(ty), 64, ll.tiling, ll.format);
+                    for (0..vh) |y| @memcpy(color[(y0 + y) * w + x0 ..][0..vw], tile_color[y * 64 ..][0..vw]);
+                } else {
+                    for (0..vh) |y| @memset(color[(y0 + y) * w + x0 ..][0..vw], first.clear_color0);
+                }
+            }
+        }
+
+        g.renderer.render(ram, w, h, color, first.clear_zs, g.vertices[0..n_vertices], g.draws[0..n_draws]) catch |err| {
+            if (err != error.Unsupported) std.debug.print("fauxpi: V3D on OpenGL: {s}\n", .{@errorName(err)});
+            return false;
+        };
+
+        for (0..@min(tiles_h, 32)) |ty| {
+            for (0..@min(tiles_w, 32)) |tx| {
+                if (tiles[ty] & (@as(u32, 1) << @intCast(tx)) == 0) continue;
+                const x0: u32 = @intCast(tx * 64);
+                const y0: u32 = @intCast(ty * 64);
+                const vw = @min(64, w - x0);
+                const vh = @min(64, h - y0);
+                for (0..vh) |y| @memcpy(tile_color[y * 64 ..][0..vw], color[(y0 + y) * w + x0 ..][0..vw]);
+                tb.color_solid = null;
+                storeTileFromBuf(&tb, ram, first.dst_addr, w, h, @intCast(tx), @intCast(ty), 64, first.tiling, first.ls_format);
+            }
+        }
         return true;
     }
 

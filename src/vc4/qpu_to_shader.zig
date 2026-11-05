@@ -1,8 +1,8 @@
-//! Translates VideoCore IV QPU fragment shaders into the Metal Shading Language, for drawing V3D
-//! jobs with Metal (`metal_renderer.zig`). A fragment runs the program as one lane of the QPU, in the
-//! order `qpu_sim` runs it, so both draw the same pixels: what `qpu_sim` follows at run time (which
-//! uniform is read next, the TMU FIFOs, which varying) is followed here while translating, as the
-//! programs have no branches that `qpu_sim` takes.
+//! Translates VideoCore IV QPU fragment shaders into the Metal Shading Language (for drawing V3D
+//! jobs with Metal, `metal_renderer.zig`) or GLSL (with OpenGL, `gl_renderer.zig`). A fragment runs
+//! the program as one lane of the QPU, in the order `qpu_sim` runs it, so both draw the same pixels:
+//! what `qpu_sim` follows at run time (which uniform is read next, the TMU FIFOs, which varying) is
+//! followed here while translating, as the programs have no branches that `qpu_sim` takes.
 
 const std = @import("std");
 const qpu = @import("qpu.zig");
@@ -13,16 +13,30 @@ pub const max_uniforms = 128;
 /// The varyings a fragment is given.
 pub const max_varyings = 16;
 
+pub const Language = enum { msl, glsl };
+
+/// The textures a GLSL shader samples, each its own (`tex[k]`).
+pub const max_samples = 8;
+
 /// What a translated shader needs.
 pub const Shader = struct {
-    /// Reads the tile buffer's colour (`color_load`), with framebuffer fetch.
+    /// Reads the tile buffer's colour (`color_load`): with framebuffer fetch (Metal), or from the
+    /// framebuffer as a texture (OpenGL).
     reads_color: bool = false,
+    /// GLSL: what each texture sampled is, as the uniforms holding its parameters (for `tex[k]`).
+    samples: [max_samples]Sample = undefined,
+    sample_count: usize = 0,
+    /// GLSL: it samples more textures than it has units for, so it can't be drawn.
+    too_many_samples: bool = false,
 };
+
+/// A texture sampled: the uniforms with its TMU parameters 0 and 1.
+pub const Sample = struct { p0: usize, p1: usize };
 
 /// MSL shared by the shaders: the vertex a triangle's corner is drawn from, what a fragment is
 /// given, and the helpers the fragment shaders and kernels use. `Vertex` and `DrawInfo` are laid out
 /// as the structs of the same names in `metal_renderer.zig`.
-pub const common =
+pub const msl_common =
     \\#include <metal_stdlib>
     \\using namespace metal;
     \\
@@ -278,9 +292,9 @@ pub const common =
 ;
 
 /// MSL of the vertex shader all draws share, and the kernels that load the tile buffer from RAM and
-/// store it back (`ls_load`, `ls_store`); compiled after `common`. `LoadStore` is laid out as the
+/// store it back (`ls_load`, `ls_store`); compiled after `msl_common`. `LoadStore` is laid out as the
 /// struct of the same name in `metal_renderer.zig`.
-pub const shared_functions =
+pub const msl_shared_functions =
     \\vertex VOut vertex_main(uint vid [[vertex_id]], device const Vertex* verts [[buffer(0)]],
     \\    constant float2& fb [[buffer(1)]]) {
     \\  Vertex v = verts[vid];
@@ -336,45 +350,248 @@ pub const shared_functions =
     \\
 ;
 
+/// GLSL shared by the fragment shaders: what a fragment is given (the varyings, the draw's uniforms,
+/// the textures it samples, decoded, and the tile buffer it reads), and the helpers the shaders use,
+/// as `msl_common`'s do. Each texture sampled is decoded as the TMU reads it (`qpu_sim`), 32 bits a
+/// texel, so sampling it only wraps and filters.
+pub const glsl_common =
+    \\#version 330 core
+    \\noperspective in float v_inv_w;
+    \\flat in uint v_unit_w;
+    \\noperspective in vec4 v_v0;
+    \\noperspective in vec4 v_v1;
+    \\noperspective in vec4 v_v2;
+    \\noperspective in vec4 v_v3;
+    \\uniform uint unif[128];
+    \\uniform uint n_var;
+    \\uniform usampler2D tex[8];
+    \\uniform uint tex_ok[8];
+    \\uniform usampler2D tlb_tex;
+    \\layout(location = 0) out uint o_color;
+    \\
+    \\float f(uint x) { return uintBitsToFloat(x); }
+    \\uint u(float x) { return floatBitsToUint(x); }
+    \\float fmin(float a, float b) { return min(a, b); }
+    \\float fmax(float a, float b) { return max(a, b); }
+    \\float fabs(float a) { return abs(a); }
+    \\uint clz(uint x) {
+    \\  if (x == 0u) return 32u;
+    \\  uint n = 0u;
+    \\  if ((x & 0xffff0000u) == 0u) { n += 16u; x <<= 16; }
+    \\  if ((x & 0xff000000u) == 0u) { n += 8u; x <<= 8; }
+    \\  if ((x & 0xf0000000u) == 0u) { n += 4u; x <<= 4; }
+    \\  if ((x & 0xc0000000u) == 0u) { n += 2u; x <<= 2; }
+    \\  if ((x & 0x80000000u) == 0u) n += 1u;
+    \\  return n;
+    \\}
+    \\
+    \\uint unorm8(uint v) {
+    \\  float x = f(v);
+    \\  if (isnan(x)) x = 0.0;
+    \\  x = min(max(x, 0.0), 1.0);
+    \\  return uint(floor(x * 255.0 + 0.5));
+    \\}
+    \\
+    \\uint ftoi(uint v) {
+    \\  float x = f(v);
+    \\  if (isnan(x)) x = 0.0;
+    \\  x = min(max(x, -2147483648.0), 2147483520.0);
+    \\  return uint(int(x));
+    \\}
+    \\
+    \\uint unpack(uint v, uint mode, bool flt) {
+    \\  if (mode == 1u) { int s = int(v << 16) >> 16; return flt ? u(float(s)) : uint(s); }
+    \\  if (mode == 2u) { int s = int(v) >> 16; return flt ? u(float(s)) : uint(s); }
+    \\  if (mode == 3u) return (v >> 24) * 0x01010101u;
+    \\  if (mode >= 4u && mode <= 7u) {
+    \\    uint b = (v >> ((mode - 4u) * 8u)) & 0xffu;
+    \\    return flt ? u(float(b) * (1.0 / 255.0)) : b;
+    \\  }
+    \\  return v;
+    \\}
+    \\
+    \\uint ror(uint a, uint b) {
+    \\  uint s = b & 31u;
+    \\  return (a >> s) | (a << ((32u - s) & 31u));
+    \\}
+    \\uvec4 bytes(uint a) { return uvec4(a & 0xffu, (a >> 8) & 0xffu, (a >> 16) & 0xffu, a >> 24); }
+    \\uint pack4(uvec4 b) { return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }
+    \\uint v8adds(uint a, uint b) { return pack4(min(bytes(a) + bytes(b), uvec4(255u))); }
+    \\uint v8subs(uint a, uint b) { return pack4(uvec4(max(ivec4(bytes(a)) - ivec4(bytes(b)), ivec4(0)))); }
+    \\uint v8min(uint a, uint b) { return pack4(min(bytes(a), bytes(b))); }
+    \\uint v8max(uint a, uint b) { return pack4(max(bytes(a), bytes(b))); }
+    \\uint v8muld(uint a, uint b) {
+    \\  uvec4 p = bytes(a) * bytes(b) + 127u;
+    \\  return pack4(((p + 1u + (p >> 8)) >> 8) & 0xffu);
+    \\}
+    \\
+    \\// The TMU's wrapping (qpu_sim's wrap): repeat, or clamp to the edge.
+    \\uint tex_wrap(float c, uint size, uint mode) {
+    \\  int n = int(max(size, 1u));
+    \\  int i = isnan(c) ? 0 : int(clamp(c, -1e9, 1e9));
+    \\  if (mode == 0u) return uint(i >= 0 ? i % n : (n - 1) - ((-i - 1) % n));
+    \\  return uint(clamp(i, 0, n - 1));
+    \\}
+    \\
+    \\uint texel(usampler2D t, uint x, uint y) { return texelFetch(t, ivec2(x, y), 0).r; }
+    \\
+    \\// The TMU sampling texture `t` (decoded from RAM; `ok` if it could be), as qpu_sim does.
+    \\uint tmu_sample(usampler2D t, uint ok, uint p0, uint p1, float s, float tc) {
+    \\  if (ok == 0u) return 0xff000000u;
+    \\  uint w = (p1 >> 8) & 2047u;
+    \\  uint h = (p1 >> 20) & 2047u;
+    \\  uint width = w == 0u ? 2048u : w;
+    \\  uint height = h == 0u ? 2048u : h;
+    \\  float fw = float(width);
+    \\  float fh = float(height);
+    \\  uint wrap_s = p1 & 3u;
+    \\  uint wrap_t = (p1 >> 2) & 3u;
+    \\  if (((p1 >> 7) & 1u) != 0u) {
+    \\    float fx = floor(s * fw);
+    \\    float fy = floor(tc * fh);
+    \\    uint wx = (fx >= 0.0 && fx < fw) ? uint(fx) : tex_wrap(fx, width, wrap_s);
+    \\    uint wy = (fy >= 0.0 && fy < fh) ? uint(fy) : tex_wrap(fy, height, wrap_t);
+    \\    return texel(t, wx, wy);
+    \\  }
+    \\  float fx = s * fw - 0.5;
+    \\  float fy = tc * fh - 0.5;
+    \\  float x0 = floor(fx);
+    \\  float y0 = floor(fy);
+    \\  uint wx0, wx1, wy0, wy1;
+    \\  if (x0 >= 0.0 && x0 + 1.0 < fw) {
+    \\    wx0 = uint(x0);
+    \\    wx1 = wx0 + 1u;
+    \\  } else {
+    \\    wx0 = tex_wrap(x0, width, wrap_s);
+    \\    wx1 = tex_wrap(x0 + 1.0, width, wrap_s);
+    \\  }
+    \\  if (y0 >= 0.0 && y0 + 1.0 < fh) {
+    \\    wy0 = uint(y0);
+    \\    wy1 = wy0 + 1u;
+    \\  } else {
+    \\    wy0 = tex_wrap(y0, height, wrap_t);
+    \\    wy1 = tex_wrap(y0 + 1.0, height, wrap_t);
+    \\  }
+    \\  uint fxf = uint(floor((fx - x0) * 256.0 + 0.5));
+    \\  uint fyf = uint(floor((fy - y0) * 256.0 + 0.5));
+    \\  uint c00 = texel(t, wx0, wy0);
+    \\  if (fxf == 0u && fyf == 0u) return c00;
+    \\  uint c10 = texel(t, wx1, wy0);
+    \\  uint c01 = texel(t, wx0, wy1);
+    \\  uint c11 = texel(t, wx1, wy1);
+    \\  if (c00 == c10 && c00 == c01 && c00 == c11) return c00;
+    \\  uint ix = 256u - fxf;
+    \\  uint iy = 256u - fyf;
+    \\  uint w00 = (ix * iy + 128u) >> 8;
+    \\  uint w10 = (fxf * iy + 128u) >> 8;
+    \\  uint w01 = (ix * fyf + 128u) >> 8;
+    \\  uint ws = w00 + w10 + w01;
+    \\  uint w11 = ws >= 256u ? 0u : 256u - ws;
+    \\  uvec4 sum = bytes(c00) * w00 + bytes(c10) * w10 + bytes(c01) * w01 + bytes(c11) * w11 + 128u;
+    \\  return pack4((sum >> 8) & 0xffu);
+    \\}
+    \\
+;
+
+/// The start of a GLSL fragment shader's `main`: its inputs, as `translate` reads them.
+const glsl_prologue =
+    \\void main() {
+    \\  float W = v_unit_w != 0u ? 1.0 : (abs(v_inv_w) > 1e-12 ? 1.0 / v_inv_w : 1.0);
+    \\  float V[16] = float[16](
+    \\    v_v0.x * W, v_v0.y * W, v_v0.z * W, v_v0.w * W,
+    \\    v_v1.x * W, v_v1.y * W, v_v1.z * W, v_v1.w * W,
+    \\    v_v2.x * W, v_v2.y * W, v_v2.z * W, v_v2.w * W,
+    \\    v_v3.x * W, v_v3.y * W, v_v3.z * W, v_v3.w * W);
+    \\  uint ra[32];
+    \\  uint rb[32];
+    \\  for (int i = 0; i < 32; ++i) {
+    \\    ra[i] = 0u;
+    \\    rb[i] = 0u;
+    \\  }
+    \\  ra[15] = u(W);
+    \\  rb[15] = u(gl_FragCoord.z);
+    \\  uint px = uint(gl_FragCoord.x), py = uint(gl_FragCoord.y);
+    \\
+;
+
+/// The GLSL vertex shader all draws share: a corner (`gl_renderer.Vertex`) where it is in the
+/// framebuffer (`fb` pixels big; its rows up from the bottom of the GL framebuffer, as in RAM), and
+/// what the fragments get.
+pub const glsl_vertex =
+    \\#version 330 core
+    \\layout(location = 0) in vec4 a_pos;
+    \\layout(location = 1) in uint a_unit_w;
+    \\layout(location = 2) in vec4 a_v0;
+    \\layout(location = 3) in vec4 a_v1;
+    \\layout(location = 4) in vec4 a_v2;
+    \\layout(location = 5) in vec4 a_v3;
+    \\uniform vec2 fb;
+    \\noperspective out float v_inv_w;
+    \\flat out uint v_unit_w;
+    \\noperspective out vec4 v_v0;
+    \\noperspective out vec4 v_v1;
+    \\noperspective out vec4 v_v2;
+    \\noperspective out vec4 v_v3;
+    \\void main() {
+    \\  gl_Position = vec4(a_pos.x / fb.x * 2.0 - 1.0, a_pos.y / fb.y * 2.0 - 1.0, a_pos.z * 2.0 - 1.0, 1.0);
+    \\  v_inv_w = a_pos.w;
+    \\  v_unit_w = a_unit_w;
+    \\  v_v0 = a_v0;
+    \\  v_v1 = a_v1;
+    \\  v_v2 = a_v2;
+    \\  v_v3 = a_v3;
+    \\}
+    \\
+;
+
 /// The varying interpolation `qpu_sim` stands for: `fmul acc, vary, frag_w` then `fadd dst, acc, r5`
 /// gives back the varying, with `r5` the constant it reads as.
 const varying_c = "0.25f";
 
-/// Writes `fragment_main` for the fragment shader `decoded` (`qpu_sim.decodeProgram`'s, so that the
-/// varying interpolation pairs it fuses are fused here too).
-pub fn translate(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst) std.Io.Writer.Error!Shader {
-    var t: Translator = .{ .w = w };
+/// Writes the fragment shader `decoded` (`qpu_sim.decodeProgram`'s, so that the varying
+/// interpolation pairs it fuses are fused here too) in `lang`: MSL's `fragment_main` (after
+/// `msl_common`), or GLSL's `main` (after `glsl_common`).
+pub fn translate(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, lang: Language) std.Io.Writer.Error!Shader {
+    var t: Translator = .{ .w = w, .lang = lang };
     // The tile's colour is an input only if the program reads it.
     for (decoded) |d| {
         if (d.sig == .color_load or d.sig == .color_load_end) t.shader.reads_color = true;
     }
 
+    if (lang == .glsl) {
+        try w.writeAll(glsl_prologue);
+        if (t.shader.reads_color) try w.writeAll("  uint tlb_in = texelFetch(tlb_tex, ivec2(gl_FragCoord.xy), 0).r;\n");
+    } else {
+        try w.writeAll(
+            \\fragment FragOut fragment_main(VOut in [[stage_in]], constant uint* unif [[buffer(0)]],
+            \\    device const uchar* ram [[buffer(1)]], constant DrawInfo& di [[buffer(2)]]
+        );
+        if (t.shader.reads_color) try w.writeAll(",\n    uint tlb_in [[color(0)]]");
+        try w.writeAll(
+            \\) {
+            \\  float W = in.unit_w != 0u ? 1.0f : (fabs(in.inv_w) > 1e-12f ? 1.0f / in.inv_w : 1.0f);
+            \\  float V[16] = {
+            \\    in.v0.x * W, in.v0.y * W, in.v0.z * W, in.v0.w * W,
+            \\    in.v1.x * W, in.v1.y * W, in.v1.z * W, in.v1.w * W,
+            \\    in.v2.x * W, in.v2.y * W, in.v2.z * W, in.v2.w * W,
+            \\    in.v3.x * W, in.v3.y * W, in.v3.z * W, in.v3.w * W,
+            \\  };
+            \\  uint ra[32] = {};
+            \\  uint rb[32] = {};
+            \\  ra[15] = u(W);
+            \\  rb[15] = u(in.pos.z);
+            \\  uint px = uint(in.pos.x), py = uint(in.pos.y);
+            \\
+        );
+    }
     try w.writeAll(
-        \\fragment FragOut fragment_main(VOut in [[stage_in]], constant uint* unif [[buffer(0)]],
-        \\    device const uchar* ram [[buffer(1)]], constant DrawInfo& di [[buffer(2)]]
-    );
-    if (t.shader.reads_color) try w.writeAll(",\n    uint tlb_in [[color(0)]]");
-    try w.writeAll(
-        \\) {
-        \\  float W = in.unit_w != 0u ? 1.0f : (fabs(in.inv_w) > 1e-12f ? 1.0f / in.inv_w : 1.0f);
-        \\  float V[16] = {
-        \\    in.v0.x * W, in.v0.y * W, in.v0.z * W, in.v0.w * W,
-        \\    in.v1.x * W, in.v1.y * W, in.v1.z * W, in.v1.w * W,
-        \\    in.v2.x * W, in.v2.y * W, in.v2.z * W, in.v2.w * W,
-        \\    in.v3.x * W, in.v3.y * W, in.v3.z * W, in.v3.w * W,
-        \\  };
-        \\  uint ra[32] = {};
-        \\  uint rb[32] = {};
-        \\  ra[15] = u(W);
-        \\  rb[15] = u(in.pos.z);
-        \\  uint r0 = 0, r1 = 0, r2 = 0, r3 = 0, r4 = 0, r5 = 0, pa = 0, pb = 0;
+        \\  uint r0 = 0u, r1 = 0u, r2 = 0u, r3 = 0u, r4 = 0u, r5 = 0u, pa = 0u, pb = 0u;
         \\  bool flag_z = false, flag_n = false;
-        \\  uint px = uint(in.pos.x), py = uint(in.pos.y);
-        \\  uint tlb_c = 0;
+        \\  uint tlb_c = 0u;
         \\  bool tlb_w = false;
-        \\  uint tmu0_t = 0, tmu1_t = 0;
-        \\  uint tmu0_f0 = 0, tmu0_f1 = 0, tmu0_f2 = 0, tmu0_f3 = 0;
-        \\  uint tmu1_f0 = 0, tmu1_f1 = 0, tmu1_f2 = 0, tmu1_f3 = 0;
+        \\  uint tmu0_t = 0u, tmu1_t = 0u;
+        \\  uint tmu0_f0 = 0u, tmu0_f1 = 0u, tmu0_f2 = 0u, tmu0_f3 = 0u;
+        \\  uint tmu1_f0 = 0u, tmu1_f1 = 0u, tmu1_f2 = 0u, tmu1_f3 = 0u;
         \\
     );
 
@@ -389,7 +606,7 @@ pub fn translate(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst) std.Io
         if ((d.flags & qpu_sim.DecodedInst.FLAG_FUSED_LINTERP) != 0) {
             const k = t.varyings;
             t.varyings += 1;
-            try w.print("    uint val = {d}u < di.n_var ? u(V[{d}]) : 0u;\n", .{ k, @min(k, max_varyings - 1) });
+            try w.print("    uint val = {d}u < {s} ? u(V[{d}]) : 0u;\n", .{ k, t.nVar(), @min(k, max_varyings - 1) });
             try w.print("    r5 = u({s});\n", .{varying_c});
             if (d.waddr_add != d.waddr_mul) {
                 try w.print("    r{d} = u(f(val) - {s});\n", .{ d.waddr_mul - qpu.W.acc0, varying_c });
@@ -472,9 +689,14 @@ pub fn translate(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst) std.Io
     }
 
     // Without an end the program fails in qpu_sim, and draws nothing.
-    if (end_at == null) try w.writeAll("  discard_fragment();\n");
-    try w.writeAll(
-        \\  if (!tlb_w) discard_fragment();
+    const discard = if (lang == .glsl) "discard" else "discard_fragment()";
+    if (end_at == null) try w.print("  {s};\n", .{discard});
+    try w.print("  if (!tlb_w) {s};\n", .{discard});
+    try w.writeAll(if (lang == .glsl)
+        \\  o_color = tlb_c;
+        \\}
+        \\
+    else
         \\  FragOut o;
         \\  o.color = tlb_c;
         \\  return o;
@@ -486,6 +708,7 @@ pub fn translate(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst) std.Io
 
 const Translator = struct {
     w: *std.Io.Writer,
+    lang: Language,
     shader: Shader = .{},
     /// The next uniform and varying read.
     uniforms: usize = 0,
@@ -502,6 +725,11 @@ const Translator = struct {
         len: u3 = 0,
     };
 
+    /// How many varyings the draw gives.
+    fn nVar(t: *const Translator) []const u8 {
+        return if (t.lang == .glsl) "n_var" else "di.n_var";
+    }
+
     fn port(t: *Translator, raddr: u6, file: qpu_sim.File) !void {
         const w = t.w;
         if (raddr < 32) return w.print("{s}[{d}]", .{ if (file == .a) "ra" else "rb", raddr });
@@ -514,7 +742,7 @@ const Translator = struct {
             qpu.R.vary => {
                 const k = t.varyings;
                 t.varyings += 1;
-                try w.print("({d}u < di.n_var ? u((V[{d}] - {s}) / W) : 0u)", .{ k, @min(k, max_varyings - 1), varying_c });
+                try w.print("({d}u < {s} ? u((V[{d}] - {s}) / W) : 0u)", .{ k, t.nVar(), @min(k, max_varyings - 1), varying_c });
             },
             qpu.R.elem_qpu => try w.writeAll("(px & 15u)"),
             qpu.R.xy_pixel_coord => try w.writeAll(if (file == .a) "px" else "py"),
@@ -575,11 +803,29 @@ const Translator = struct {
                     return;
                 }
                 const slot = tmu.head +% @as(u2, @truncate(tmu.len));
-                try w.print("    tmu{d}_f{d} = tmu_sample(ram, di, unif[{d}], unif[{d}], f({s}), ", .{ unit, slot, tmu.params[0], tmu.params[1], val });
-                if (tmu.has_t) {
-                    try w.print("f(tmu{d}_t));\n", .{unit});
+                // Whether the sample is called for (not with no unit left for it).
+                var sampled = true;
+                if (t.lang == .glsl) {
+                    // Each texture sampled has a unit of its own.
+                    const k = t.shader.sample_count;
+                    if (k == max_samples) {
+                        t.shader.too_many_samples = true;
+                        sampled = false;
+                        try w.print("    tmu{d}_f{d} = 0xff000000u;\n", .{ unit, slot });
+                    } else {
+                        t.shader.samples[k] = .{ .p0 = tmu.params[0], .p1 = tmu.params[1] };
+                        t.shader.sample_count += 1;
+                        try w.print("    tmu{d}_f{d} = tmu_sample(tex[{d}], tex_ok[{d}], unif[{d}], unif[{d}], f({s}), ", .{ unit, slot, k, k, tmu.params[0], tmu.params[1], val });
+                    }
                 } else {
-                    try w.writeAll("0.0f);\n");
+                    try w.print("    tmu{d}_f{d} = tmu_sample(ram, di, unif[{d}], unif[{d}], f({s}), ", .{ unit, slot, tmu.params[0], tmu.params[1], val });
+                }
+                if (sampled) {
+                    if (tmu.has_t) {
+                        try w.print("f(tmu{d}_t));\n", .{unit});
+                    } else {
+                        try w.writeAll("0.0f);\n");
+                    }
                 }
                 tmu.len += 1;
                 tmu.param_count = 0;
@@ -676,7 +922,7 @@ fn pack(w: *std.Io.Writer, dst: []const u8, val: []const u8, a_pack: u4, mul_pac
 fn translateForTest(code: []const qpu.Inst, out: []u8) ![]const u8 {
     var decoded_buf: [64]qpu_sim.DecodedInst = undefined;
     var w: std.Io.Writer = .fixed(out);
-    _ = try translate(&w, qpu_sim.decodeProgram(code, &decoded_buf));
+    _ = try translate(&w, qpu_sim.decodeProgram(code, &decoded_buf), .msl);
     return w.buffered();
 }
 

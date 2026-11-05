@@ -1625,6 +1625,39 @@ pub fn sample(memory: []const u8, p0: u32, p1: u32, s: f32, t: f32) Error!u32 {
     return sampleConfig(memory, texture.decodeConfig(p0, p1), s, t);
 }
 
+/// The texture `p0`, `p1` (TMU parameters 0 and 1) as the TMU reads it, a texel a word, row by
+/// row: its size, and the bytes of RAM it is read from. Null if it is of a type the TMU doesn't
+/// read here (its samples are then 0xff000000), or runs past the end of RAM.
+pub const DecodedTexture = struct {
+    width: u32,
+    height: u32,
+    bytes: []const u8,
+
+    pub fn of(memory: []const u8, p0: u32, p1: u32) ?DecodedTexture {
+        const pt = PrecomputedTex.init(texture.decodeConfig(p0, p1), memory.len) catch return null;
+        const len: usize = if (pt.cfg.type == .rgba32r)
+            @as(usize, pt.cfg.width) * pt.cfg.height * 4
+        else if (pt.is_small_microtile)
+            @as(usize, pt.utiles_per_row) * ((pt.cfg.height + pt.uh_mask) >> pt.uh_shift) * 64
+        else
+            @as(usize, pt.tiles_per_row) * ((pt.cfg.height + (@as(u32, 1) << pt.tile_h_shift) - 1) >> pt.tile_h_shift) * 4096;
+        if (pt.base_off + len > memory.len) return null;
+        return .{ .width = pt.cfg.width, .height = pt.cfg.height, .bytes = memory[pt.base_off..][0..len] };
+    }
+
+    /// Decodes it into `out` (`width * height` words), as `sample` fetches each texel.
+    pub fn decode(memory: []const u8, p0: u32, p1: u32, out: []u32) bool {
+        const pt = PrecomputedTex.init(texture.decodeConfig(p0, p1), memory.len) catch return false;
+        const w = pt.cfg.width;
+        for (0..pt.cfg.height) |y| {
+            for (0..w) |x| {
+                out[y * w + x] = pt.fetchAt(memory, @intCast(x), @intCast(y)) catch return false;
+            }
+        }
+        return true;
+    }
+};
+
 fn sampleConfig(memory: []const u8, p: texture.Config, s: f32, t: f32) Error!u32 {
     const pt = try PrecomputedTex.init(p, memory.len);
     return pt.sample(memory, s, t);
@@ -1967,4 +2000,25 @@ test "QPU fused varying linterp and fast-path fragment shader compilation" {
     const res_tex_fast = try runFragmentFast(fast_tex, dec_tex, &env_tex);
     const res_tex_dec = try runFragmentDecoded(dec_tex, &env_tex);
     try std.testing.expectEqual(res_tex_dec.tlb_color.?[0], res_tex_fast.tlb_color.?[0]);
+}
+
+test "a texture decoded as the TMU reads it gives what it samples" {
+    // 32 by 32 RGBA, T-format, in RAM from 0x1000.
+    var ram: [0x1000 + 32 * 32 * 4]u8 = undefined;
+    for (&ram, 0..) |*b, i| b.* = @truncate(i *% 2654435761 >> 7);
+    const cfg: texture.Config = .{ .offset = 0x1000, .type = .rgba8888, .width = 32, .height = 32, .mag_filter = .nearest };
+    const p0 = texture.p0(cfg);
+    const p1 = texture.p1(cfg);
+    const dt = DecodedTexture.of(&ram, p0, p1).?;
+    try std.testing.expectEqual(@as(u32, 32), dt.width);
+    try std.testing.expectEqual(@as(usize, 32 * 32 * 4), dt.bytes.len);
+    var out: [32 * 32]u32 = undefined;
+    try std.testing.expect(DecodedTexture.decode(&ram, p0, p1, &out));
+    for (0..32) |y| for (0..32) |x| {
+        const s = (@as(f32, @floatFromInt(x)) + 0.5) / 32;
+        const t = (@as(f32, @floatFromInt(y)) + 0.5) / 32;
+        try std.testing.expectEqual(try sample(&ram, p0, p1, s, t), out[y * 32 + x]);
+    };
+    // Past the end of RAM: none.
+    try std.testing.expect(DecodedTexture.of(ram[0..0x1800], p0, p1) == null);
 }

@@ -1,5 +1,5 @@
 //! Draws V3D frames with Metal, on macOS. V3D shades the vertices and bins the triangles on the CPU
-//! as before; Metal rasterizes them and runs the fragment shaders (translated by `qpu_to_msl.zig`),
+//! as before; Metal rasterizes them and runs the fragment shaders (translated by `qpu_to_shader.zig`),
 //! into a copy of the tile buffer as big as the framebuffer, which kernels load from and store to
 //! the guest's RAM. The guest's RAM is a Metal buffer, not a copy, so the shaders read textures
 //! where the guest wrote them.
@@ -10,25 +10,16 @@ const kete = @import("kete");
 const objc = kete.gfx.objc;
 const qpu = @import("qpu.zig");
 const qpu_sim = @import("qpu_sim.zig");
-const msl = @import("qpu_to_msl.zig");
+const msl = @import("qpu_to_shader.zig");
+const gpu_draw = @import("gpu_draw.zig");
 
 const Id = objc.Id;
 const msg = objc.msg;
 
 pub const supported = builtin.os.tag == .macos;
 
-/// A triangle's corner (MSL `Vertex`): where it is in the framebuffer, in pixels; its depth and
-/// 1/W; and its varyings, already multiplied by 1/W.
-pub const Vertex = extern struct {
-    x: f32,
-    y: f32,
-    z: f32,
-    inv_w: f32,
-    /// Whether the triangle's corners all have a W of 1 (so 1 is used, exactly, as V3D's CPU path does).
-    unit_w: u32,
-    pad: [3]u32 = @splat(0),
-    varyings: [msl.max_varyings]f32,
-};
+pub const Vertex = gpu_draw.Vertex;
+pub const Draw = gpu_draw.Draw;
 
 /// What a draw's fragment shader is given besides its uniforms (MSL `DrawInfo`).
 const DrawInfo = extern struct {
@@ -73,28 +64,10 @@ pub const Frame = struct {
     tiles: [32]u32,
 };
 
-/// A run of triangles drawn with one fragment shader.
-pub const Draw = struct {
-    first_vertex: u32,
-    vertex_count: u32,
-    /// The fragment shader, and its uniforms.
-    code: []const qpu.Inst,
-    uniforms: *const [msl.max_uniforms]u32,
-    num_varyings: u32,
-    /// The V3D depth test (`MTLCompareFunction` has the same values) and whether depth is written.
-    depth_func: u3,
-    depth_write: bool,
-    clip_x: u32,
-    clip_y: u32,
-    clip_w: u32,
-    clip_h: u32,
-};
-
 pub const Error = error{ Unsupported, MetalFailed };
 
-const max_draws = 256;
-/// A frame's triangles' corners: as many as V3D bins (`V3d.MAX_PREBINNED_TRIS`).
-pub const max_vertices = 65536 * 3;
+const max_draws = gpu_draw.max_draws;
+pub const max_vertices = gpu_draw.max_vertices;
 const pixel_r32uint: u64 = 53;
 const pixel_depth32: u64 = 252;
 const primitive_triangle: u64 = 3;
@@ -152,7 +125,7 @@ pub const Renderer = struct {
         };
         errdefer r.deinit();
         r.queue = msg(Id, device, "newCommandQueue", .{}) orelse return error.MetalFailed;
-        r.shared_lib = try r.compile(msl.common ++ msl.shared_functions);
+        r.shared_lib = try r.compile(msl.msl_common ++ msl.msl_shared_functions);
         r.vertex_fn = msg(Id, r.shared_lib, "newFunctionWithName:", .{objc.nsString("vertex_main")}) orelse return error.MetalFailed;
         r.load_pipe = try r.computePipeline("ls_load");
         r.store_pipe = try r.computePipeline("ls_store");
@@ -265,8 +238,8 @@ pub const Renderer = struct {
         const decoded = qpu_sim.decodeProgram(code, &decoded_buf);
         var src: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer src.deinit();
-        src.writer.writeAll(msl.common) catch return null;
-        const shader = msl.translate(&src.writer, decoded) catch return null;
+        src.writer.writeAll(msl.msl_common) catch return null;
+        const shader = msl.translate(&src.writer, decoded, .msl) catch return null;
         if (shader.reads_color and !r.framebuffer_fetch) return null;
 
         const lib = r.compile(src.written()) catch return null;
