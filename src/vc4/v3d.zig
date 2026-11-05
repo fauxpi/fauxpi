@@ -42,7 +42,8 @@ pub const V3d = struct {
     };
 
     /// The most triangles a frame's draws are shaded and binned into tiles
-    /// with; the draws past them are shaded again for each tile.
+    /// with (those drawn: not culled, or off the framebuffer); the draws past
+    /// them are shaded again for each tile.
     pub const MAX_PREBINNED_TRIS = 65536;
     pub const MAX_PREP_FS_INSTS = 8192;
     pub const MAX_PREP_FS_UNIFS = 8192;
@@ -619,7 +620,7 @@ pub const V3d = struct {
         var vs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
         var vs_unif_buf: [128]u32 = undefined;
 
-        for (self.draws[0..self.draws_len], 0..) |draw, draw_idx| {
+        draws: for (self.draws[0..self.draws_len], 0..) |draw, draw_idx| {
             self.prep_draws[draw_idx] = .{};
             if (draw.count < 3) continue;
             const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
@@ -682,11 +683,14 @@ pub const V3d = struct {
                 else => 0,
             };
 
-            if (self.shaded_tris.items.len + num_tris > MAX_PREBINNED_TRIS) {
+            // Most of a draw's triangles may be culled, or off the
+            // framebuffer: only those kept count.
+            const draw_start = self.shaded_tris.items.len;
+            if (draw_start >= MAX_PREBINNED_TRIS) {
                 self.overflow_draw_start = draw_idx;
                 break;
             }
-            self.shaded_tris.ensureUnusedCapacity(tri_allocator, num_tris) catch {
+            self.shaded_tris.ensureUnusedCapacity(tri_allocator, @min(num_tris, MAX_PREBINNED_TRIS - draw_start)) catch {
                 self.overflow_draw_start = draw_idx;
                 break;
             };
@@ -834,6 +838,12 @@ pub const V3d = struct {
                     const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
                     if (min_fx >= max_fx or min_fy >= max_fy) continue;
 
+                    if (self.shaded_tris.items.len == MAX_PREBINNED_TRIS) {
+                        // This draw, and those after it, are drawn whole for each tile.
+                        self.shaded_tris.shrinkRetainingCapacity(draw_start);
+                        self.overflow_draw_start = draw_idx;
+                        break :draws;
+                    }
                     self.shaded_tris.appendAssumeCapacity(ShadedTriangle.init(
                         @intCast(draw_idx),
                         @intFromFloat(min_fx),
@@ -3049,6 +3059,145 @@ test "V3D BCL + RCL execution renders triangle into T-tiled framebuffer" {
     try std.testing.expect((v3d.read32(0x030) & V3d.INT_FRDONE) != 0);
 
     // Center pixel (32, 32) should be opaque red (0xffff0000)
+    const center_off = 0x10000 + (32 * 64 + 32) * 4;
+    try std.testing.expectEqual(@as(u32, 0xffff0000), std.mem.readInt(u32, ram[center_off..][0..4], .little));
+}
+
+test "V3D counts only the triangles drawn against the most it shades ahead" {
+    var v3d = V3d{};
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 256 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    // Build VS and FS programs in guest RAM at 0x1000 and 0x1400
+    var vs: qpu.Program(32) = .{};
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_write_setup, .value = 0x00001a00 }));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_read_setup, .value = 0x00501a00 }));
+    vs.emit(try qpu.mov(qpu.wr(0), qpu.vpm_read)); // x
+    vs.emit(try qpu.mov(qpu.wr(1), qpu.vpm_read)); // y
+    vs.emit(try qpu.mov(qpu.wa(0), qpu.vpm_read)); // r
+    vs.emit(try qpu.mov(qpu.wr(3), qpu.vpm_read)); // g
+    vs.emit(try qpu.mov(qpu.wa(2), qpu.vpm_read)); // b
+    vs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(0), .a = qpu.r(0), .b = qpu.unif } }));
+    vs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(1), .a = qpu.r(1), .b = qpu.unif } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .ftoi, .dst = qpu.wa(1), .a = qpu.r(0), .b = qpu.r(0) }, .pack = .{ .regfile_a = .@"16a" } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .ftoi, .dst = qpu.wa(1), .a = qpu.r(1), .b = qpu.r(1) }, .pack = .{ .regfile_a = .@"16b" } }));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.wr(2), .value = @bitCast(@as(f32, 0.5)) }));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(1)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(2)));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_write, .value = @bitCast(@as(f32, 1.0)) }));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(0)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(3)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(2)));
+    vs.end(.vertex);
+
+    var fs: qpu.Program(32) = .{};
+    for (0..3) |i| {
+        const acc: u3 = @intCast(i);
+        fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(acc), .a = qpu.vary, .b = qpu.frag_w } }));
+        fs.emit(try qpu.alu(.{ .add = .{ .op = .fadd, .dst = qpu.wr(acc), .a = qpu.r(acc), .b = qpu.r(5) } }));
+    }
+    const one = qpu.smallImmFloat(1.0);
+    fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(2), .b = one }, .pack = .{ .mul = .@"8a" } }));
+    fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(1), .b = one }, .pack = .{ .mul = .@"8b" } }));
+    fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(0), .b = one }, .pack = .{ .mul = .@"8c" } }));
+    fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = one, .b = one }, .pack = .{ .mul = .@"8d" } }));
+    fs.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(3)));
+    fs.end(.fragment);
+
+    @memcpy(ram[0x1000 .. 0x1000 + vs.code().len * 8], std.mem.sliceAsBytes(vs.code()));
+    @memcpy(ram[0x1400 .. 0x1400 + fs.code().len * 8], std.mem.sliceAsBytes(fs.code()));
+
+    // VS uniforms at 0x1800: x_scale = 32.0 * 16.0, y_scale = 32.0 * 16.0
+    std.mem.writeInt(u32, ram[0x1800..0x1804], @bitCast(@as(f32, 32.0 * 16.0)), .little);
+    std.mem.writeInt(u32, ram[0x1804..0x1808], @bitCast(@as(f32, 32.0 * 16.0)), .little);
+
+    // 3 vertices at 0x2000 (stride 20: x, y, r, g, b) covering the 64x64 tile in Pure Red (1, 0, 0)
+    const verts = [_]f32{
+        -1.0, -1.0, 1.0, 0.0, 0.0,
+        1.0,  -1.0, 1.0, 0.0, 0.0,
+        0.0,  1.0,  1.0, 0.0, 0.0,
+    };
+    @memcpy(ram[0x2000 .. 0x2000 + @sizeOf(@TypeOf(verts))], std.mem.sliceAsBytes(&verts));
+
+    // Shader record at 0x3000 (16-byte aligned)
+    ram[0x3003] = 3; // fs_num_varyings = 3
+    std.mem.writeInt(u32, ram[0x3004..0x3008], 0x1400, .little); // FS code
+    std.mem.writeInt(u32, ram[0x3008..0x300c], 0x1900, .little); // FS unifs
+    ram[0x300e] = 1; // vs_attr_mask = 1
+    std.mem.writeInt(u32, ram[0x3010..0x3014], 0x1000, .little); // VS code
+    std.mem.writeInt(u32, ram[0x3014..0x3018], 0x1800, .little); // VS unifs
+    // Attribute 0 at 0x3024: base=0x2000, size-1=19, stride=20
+    std.mem.writeInt(u32, ram[0x3024..0x3028], 0x2000, .little);
+    ram[0x3028] = 19;
+    ram[0x3029] = 20;
+    // The same at 0x3100, but every vertex the first (stride 0): triangles with no area.
+    @memcpy(ram[0x3100..0x3130], ram[0x3000..0x3030]);
+    ram[0x3129] = 0;
+
+    // Build BCL at 0x4000
+    var bcl: usize = 0x4000;
+    ram[bcl] = 6; // START_TILE_BINNING
+    bcl += 1;
+    ram[bcl] = 103; // VIEWPORT_OFFSET (32.0, 32.0)
+    std.mem.writeInt(u16, ram[bcl + 1 ..][0..2], 32 * 16, .little);
+    std.mem.writeInt(u16, ram[bcl + 3 ..][0..2], 32 * 16, .little);
+    bcl += 5;
+    // More triangles than are shaded ahead, none of them drawn.
+    ram[bcl] = 64; // GL_SHADER_STATE (0x3100 | 1 attr)
+    std.mem.writeInt(u32, ram[bcl + 1 ..][0..4], 0x3101, .little);
+    bcl += 5;
+    ram[bcl] = 33; // GL_ARRAY_PRIMITIVE (triangles=4)
+    ram[bcl + 1] = 4;
+    std.mem.writeInt(u32, ram[bcl + 2 ..][0..4], (V3d.MAX_PREBINNED_TRIS + 4000) * 3, .little);
+    std.mem.writeInt(u32, ram[bcl + 6 ..][0..4], 0, .little);
+    bcl += 10;
+    ram[bcl] = 64; // GL_SHADER_STATE (0x3000 | 1 attr)
+    std.mem.writeInt(u32, ram[bcl + 1 ..][0..4], 0x3001, .little);
+    bcl += 5;
+    ram[bcl] = 33; // GL_ARRAY_PRIMITIVE (triangles=4, count=3, first=0)
+    ram[bcl + 1] = 4;
+    std.mem.writeInt(u32, ram[bcl + 2 ..][0..4], 3, .little);
+    std.mem.writeInt(u32, ram[bcl + 6 ..][0..4], 0, .little);
+    bcl += 10;
+    ram[bcl] = 4; // FLUSH
+    bcl += 1;
+
+    v3d.write32(0x034, V3d.INT_FLDONE | V3d.INT_FRDONE, ram); // Enable interrupts
+    v3d.write32(0x110, 0x4000, ram); // CT0CA
+    v3d.write32(0x108, @intCast(bcl), ram); // CT0EA -> run BCL
+    try std.testing.expect((v3d.read32(0x030) & V3d.INT_FLDONE) != 0);
+
+    // Build RCL at 0x5000 rendering to Linear RGBA8888 framebuffer at 0x10000 (64x64)
+    var rcl: usize = 0x5000;
+    ram[rcl] = 113; // TILE_RENDERING_MODE_CONFIG
+    std.mem.writeInt(u32, ram[rcl + 1 ..][0..4], 0x10000, .little);
+    std.mem.writeInt(u16, ram[rcl + 5 ..][0..2], 64, .little);
+    std.mem.writeInt(u16, ram[rcl + 7 ..][0..2], 64, .little);
+    std.mem.writeInt(u16, ram[rcl + 9 ..][0..2], 1 << 2, .little); // format=1 (RGBA8888), tiling=0 (Linear)
+    rcl += 11;
+    ram[rcl] = 114; // CLEAR_COLORS (black 0xff000000)
+    std.mem.writeInt(u32, ram[rcl + 1 ..][0..4], 0xff000000, .little);
+    std.mem.writeInt(u32, ram[rcl + 9 ..][0..4], 0x00ffffff, .little);
+    rcl += 14;
+    ram[rcl] = 115; // TILE_COORDINATES (0, 0)
+    ram[rcl + 1] = 0;
+    ram[rcl + 2] = 0;
+    rcl += 3;
+    ram[rcl] = 17; // BRANCH_TO_SUB_LIST
+    std.mem.writeInt(u32, ram[rcl + 1 ..][0..4], 0, .little);
+    rcl += 5;
+    ram[rcl] = 25; // STORE_MS_TILE_BUFFER_AND_EOF
+    rcl += 1;
+
+    v3d.write32(0x114, 0x5000, ram); // CT1CA
+    v3d.write32(0x10c, @intCast(rcl), ram); // CT1EA -> run RCL
+    try std.testing.expect((v3d.read32(0x030) & V3d.INT_FRDONE) != 0);
+
+    // Both draws were shaded ahead, and the triangle drawn.
+    try std.testing.expectEqual(@as(usize, 2), v3d.draws_len);
+    try std.testing.expect(v3d.overflow_draw_start >= v3d.draws_len);
     const center_off = 0x10000 + (32 * 64 + 32) * 4;
     try std.testing.expectEqual(@as(u32, 0xffff0000), std.mem.readInt(u32, ram[center_off..][0..4], .little));
 }
