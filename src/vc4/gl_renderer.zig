@@ -433,7 +433,7 @@ pub const Renderer = struct {
         var src: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
         defer src.deinit();
         src.writer.writeAll(shader.glsl_vertex_common) catch return null;
-        const vs = shader.translateVertex(&src.writer, decoded) catch return null;
+        const vs = shader.translateVertex(&src.writer, decoded, .glsl) catch return null;
         if (vs.unsupported) return null;
 
         const sh = r.compileShader(GL_VERTEX_SHADER, src.written()) orelse return null;
@@ -986,4 +986,141 @@ test "vertex shaders shade on the GPU as qpu_sim shades them" {
             }
         }
     }
+}
+
+/// The kinds of random vertex shader the tests make: float arithmetic on floats, or integer
+/// arithmetic on integers (mixed, integers taken as floats are mostly denormals, which GPUs flush to
+/// 0 and qpu_sim doesn't).
+const RandomKind = enum { float, int };
+
+/// A random QPU instruction a vertex shader of `kind` might run: ALU operations (with conditions
+/// and flags, and for integers packing and unpacking) on registers, uniforms, VPM reads and
+/// immediates, writing registers, accumulators, the VPM and (for floats) the reciprocal.
+fn randomVertexInst(r: std.Random, kind: RandomKind) u64 {
+    const raddrs = [_]u6{ 0, 1, 2, 3, 4, 5, 15, 15, 32, 32, 48, 48, 48 };
+    const waddrs = [_]u6{ 0, 1, 2, 3, 15, 32, 33, 34, 35, 37, 39, 48, 48, 52 };
+    const float_add = [_]u5{ 0, 1, 2, 3, 4, 5, 6, 21 };
+    const float_mul = [_]u3{ 0, 1 };
+    const int_add = [_]u5{ 0, 7, 8, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 30, 31 };
+    const int_mul = [_]u3{ 0, 2, 3, 4, 5, 6, 7 };
+    const sigs = [_]u4{ 1, 1, 1, 1, 13, 13, 14 };
+    const sig = sigs[r.uintLessThan(usize, sigs.len)];
+    var i: u64 = @as(u64, sig) << 60;
+    if (kind == .int) {
+        i |= @as(u64, r.int(u3)) << 57; // unpack
+        i |= @as(u64, @intFromBool(r.uintLessThan(u8, 3) == 0)) << 56; // pm
+        i |= @as(u64, if (r.boolean()) 0 else r.int(u4)) << 52; // pack
+    }
+    i |= @as(u64, if (r.uintLessThan(u8, 3) == 0) r.int(u3) else 1) << 49; // cond add
+    i |= @as(u64, if (r.uintLessThan(u8, 3) == 0) r.int(u3) else 1) << 46; // cond mul
+    i |= @as(u64, @intFromBool(r.uintLessThan(u8, 4) == 0)) << 45; // sf
+    i |= @as(u64, @intFromBool(r.boolean())) << 44; // ws
+    for ([_]u6{ 38, 32 }) |shift| {
+        var waddr = waddrs[r.uintLessThan(usize, waddrs.len)];
+        if (kind == .int and waddr == 52) waddr = 48;
+        i |= @as(u64, waddr) << shift;
+    }
+    if (sig == 14) {
+        const imm: u32 = if (kind == .float) @bitCast(r.float(f32) * 4.0 - 2.0) else r.int(u32);
+        return i | imm;
+    }
+    const mul: u3 = if (kind == .float) float_mul[r.uintLessThan(usize, float_mul.len)] else int_mul[r.uintLessThan(usize, int_mul.len)];
+    const add: u5 = if (kind == .float) float_add[r.uintLessThan(usize, float_add.len)] else int_add[r.uintLessThan(usize, int_add.len)];
+    i |= @as(u64, mul) << 29;
+    i |= @as(u64, add) << 24;
+    i |= @as(u64, raddrs[r.uintLessThan(usize, raddrs.len)]) << 18;
+    // Small immediates: integers, or (for floats) the powers of two.
+    const small: u6 = if (kind == .float) 32 + r.uintLessThan(u6, 16) else r.uintLessThan(u6, 32);
+    i |= @as(u64, if (sig == 13) small else raddrs[r.uintLessThan(usize, raddrs.len)]) << 12;
+    i |= r.int(u12);
+    return i;
+}
+
+test "random vertex shaders shade on the GPU as qpu_sim shades them" {
+    var r = Renderer.init() catch return error.SkipZigTest;
+    var prng = std.Random.DefaultPrng.init(4321);
+    const rand = prng.random();
+    var differ: usize = 0;
+    var checked: usize = 0;
+    for (0..200) |pi| {
+        const kind: RandomKind = if (pi % 2 == 0) .float else .int;
+        var code: [48]qpu.Inst = undefined;
+        const n = 6 + rand.uintLessThan(usize, 30);
+        for (code[0..n]) |*c| c.* = randomVertexInst(rand, kind);
+        // At least a position's three words, then the end.
+        const writes = 3 + rand.uintLessThan(usize, 6);
+        for (0..writes) |k| code[n + k] = try qpu.mov(qpu.vpm_write, qpu.r(rand.uintLessThan(u3, 4)));
+        code[n + writes] = qpu.nop(.prog_end);
+        code[n + writes + 1] = qpu.nop(.none);
+        code[n + writes + 2] = qpu.nop(.none);
+        const prog = code[0 .. n + writes + 3];
+
+        const number = struct {
+            fn of(rnd: std.Random, k: RandomKind) u32 {
+                return if (k == .int) rnd.int(u32) else if (rnd.uintLessThan(u8, 4) == 0) @bitCast(@as(f32, 1.0)) else @bitCast(rnd.float(f32) * 4.0 - 2.0);
+            }
+        };
+        var unifs: [shader.max_uniforms]u32 = undefined;
+        for (&unifs) |*x| x.* = number.of(rand, kind);
+        const vpm_words = rand.uintLessThan(u32, 13);
+        const n_var = rand.uintLessThan(u32, 17);
+        const stride = @max((vpm_words + 3) / 4 * 4, 4);
+        var inputs: [16 * 16]u32 = @splat(0);
+        var vpm_in: [32]qpu_sim.Vec = undefined;
+        for (0..vpm_words) |k| {
+            for (0..16) |lane| {
+                const v = number.of(rand, kind);
+                inputs[lane * stride + k] = v;
+                vpm_in[k][lane] = v;
+            }
+        }
+        var decoded_buf: [48]qpu_sim.DecodedInst = undefined;
+        const decoded = qpu_sim.decodeProgram(prog, &decoded_buf);
+        const res = qpu_sim.runDecoded(decoded, .{ .uniforms = &unifs, .vpm_in = vpm_in[0..vpm_words] }) catch continue;
+        var gpu: [16]Vertex = undefined;
+        const vp = [2]f32{ rand.float(f32) * 100, rand.float(f32) * 100 };
+        try r.shadeForTest(prog, &unifs, vpm_words, &inputs, 16, n_var, vp, &gpu);
+        const valid_vars = @min(n_var, res.vpm_out_len - 3);
+        lanes: for (0..16) |lane| {
+            // Only vertices of ordinary numbers: a float program's integers (say, its position's
+            // words) are denormals, and its infinities and NaNs come out as the GPU's do.
+            for (res.vpm_out[1 .. 3 + valid_vars]) |word| {
+                const x: f32 = @bitCast(word[lane]);
+                if (x != 0 and !std.math.isNormal(x)) continue :lanes;
+            }
+            const xy = res.vpm_out[0][lane];
+            const xs: i16 = @bitCast(@as(u16, @truncate(xy)));
+            const ys: i16 = @bitCast(@as(u16, @truncate(xy >> 16)));
+            const raw_inv_w: f32 = @bitCast(res.vpm_out[2][lane]);
+            const inv_w: f32 = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
+            var want: [24]u32 = @splat(0);
+            want[0] = @bitCast(@as(f32, @floatFromInt(xs)) * (1.0 / 16.0) + vp[0]);
+            want[1] = @bitCast(@as(f32, @floatFromInt(ys)) * (1.0 / 16.0) + vp[1]);
+            want[2] = res.vpm_out[1][lane];
+            want[3] = @bitCast(inv_w);
+            want[4] = @intFromBool(inv_w == 1.0);
+            for (0..valid_vars) |k| want[8 + k] = @bitCast(@as(f32, @bitCast(res.vpm_out[3 + k][lane])) * inv_w);
+            const got: [24]u32 = @bitCast(std.mem.toBytes(gpu[lane]));
+            for (want, got, 0..) |want_word, gv, word| {
+                checked += 1;
+                // A denormal the vertex's arithmetic makes (1/W times an integer's bits) is 0 on
+                // the GPU.
+                const float = word < 4 or word >= 8;
+                const wv = if (float and want_word & 0x7f800000 == 0) want_word & 0x80000000 else want_word;
+                // Which zero fmin and fmax give for +0 and -0 is qpu_sim's compiler's choice
+                // (Zig's @min), and the GPU's.
+                const zeros = float and (wv | gv) & 0x7fffffff == 0;
+                if (wv != gv and !zeros) {
+                    if (differ < 10) std.debug.print("program {d} ({s}) lane {d} word {d}: expected {x}, got {x}\n", .{ pi, @tagName(kind), lane, word, wv, gv });
+                    differ += 1;
+                }
+            }
+        }
+    }
+    std.testing.expectEqual(@as(usize, 0), differ) catch |err| {
+        std.debug.print("{d} of {d} words differ\n", .{ differ, checked });
+        return err;
+    };
+    // Enough vertices compared to mean something.
+    try std.testing.expect(checked > 10000);
 }

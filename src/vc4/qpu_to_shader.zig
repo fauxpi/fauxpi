@@ -39,6 +39,8 @@ pub const Sample = struct { p0: usize, p1: usize };
 pub const msl_common =
     \\#include <metal_stdlib>
     \\using namespace metal;
+    \\// Each QPU operation rounded on its own, as qpu_sim's are: no multiply-adds fused.
+    \\#pragma clang fp contract(off)
     \\
     \\struct Vertex {
     \\  float x, y, z, inv_w;
@@ -49,7 +51,7 @@ pub const msl_common =
     \\struct VOut {
     \\  float4 pos [[position]];
     \\  float inv_w [[center_no_perspective]];
-    \\  uint unit_w [[flat]];
+    \\  float not_unit_w [[center_no_perspective]];
     \\  float4 v0 [[center_no_perspective]];
     \\  float4 v1 [[center_no_perspective]];
     \\  float4 v2 [[center_no_perspective]];
@@ -65,6 +67,19 @@ pub const msl_common =
     \\
     \\struct FragOut {
     \\  uint color [[color(0)]];
+    \\};
+    \\
+    \\// What a vertex shader's kernel shades: `count` vertices, each given `n_vpm` VPM words (from word
+    \\// first_input, `stride` words apart), into verts from first_vertex.
+    \\struct VertexInfo {
+    \\  uint n_vpm;
+    \\  uint n_var;
+    \\  uint first_input;
+    \\  uint stride;
+    \\  uint count;
+    \\  uint first_vertex;
+    \\  float vp_x;
+    \\  float vp_y;
     \\};
     \\
     \\static inline float f(uint x) { return as_type<float>(x); }
@@ -301,7 +316,7 @@ pub const msl_shared_functions =
     \\  VOut o;
     \\  o.pos = float4(v.x / fb.x * 2.0f - 1.0f, 1.0f - v.y / fb.y * 2.0f, v.z, 1.0f);
     \\  o.inv_w = v.inv_w;
-    \\  o.unit_w = v.unit_w;
+    \\  o.not_unit_w = v.unit_w != 0u ? 0.0f : 1.0f;
     \\  o.v0 = v.v0;
     \\  o.v1 = v.v1;
     \\  o.v2 = v.v2;
@@ -348,6 +363,34 @@ pub const msl_shared_functions =
     \\  }
     \\}
     \\
+    \\
+    \\// A draw's triangles' corners (its vertices, from first_vertex), and V3D's configuration bits 0
+    \\// to 2: which triangles are drawn.
+    \\struct CullInfo {
+    \\  uint first_corner;
+    \\  uint triangles;
+    \\  uint first_vertex;
+    \\  uint cull;
+    \\};
+    \\
+    \\// Each triangle's corners as drawn, or the first three times (drawing nothing) if V3D doesn't
+    \\// draw it: facing the way it isn't drawing, or with no area (as the CPU path decides).
+    \\kernel void cull_triangles(device const uint* corners [[buffer(0)]], device const Vertex* verts [[buffer(1)]],
+    \\    device uint* indices [[buffer(2)]], constant CullInfo& ci [[buffer(3)]], uint t [[thread_position_in_grid]]) {
+    \\  if (t >= ci.triangles) return;
+    \\  uint c0 = ci.first_vertex + corners[ci.first_corner + t * 3];
+    \\  uint c1 = ci.first_vertex + corners[ci.first_corner + t * 3 + 1];
+    \\  uint c2 = ci.first_vertex + corners[ci.first_corner + t * 3 + 2];
+    \\  Vertex v0 = verts[c0], v1 = verts[c1], v2 = verts[c2];
+    \\  float a = (v1.x - v0.x) * (v2.y - v0.y);
+    \\  float b = (v1.y - v0.y) * (v2.x - v0.x);
+    \\  float area = a - b;
+    \\  bool forward = (ci.cull & 4u) != 0u ? area < 0.0f : area > 0.0f;
+    \\  bool drawn = fabs(area) >= 1e-6f && ((forward ? ci.cull & 1u : ci.cull & 2u) != 0u);
+    \\  indices[ci.first_corner + t * 3] = c0;
+    \\  indices[ci.first_corner + t * 3 + 1] = drawn ? c1 : c0;
+    \\  indices[ci.first_corner + t * 3 + 2] = drawn ? c2 : c0;
+    \\}
 ;
 
 /// GLSL shared by the fragment shaders: what a fragment is given (the varyings, the draw's uniforms,
@@ -608,7 +651,8 @@ pub fn translate(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, lang: 
         if (t.shader.reads_color) try w.writeAll(",\n    uint tlb_in [[color(0)]]");
         try w.writeAll(
             \\) {
-            \\  float W = in.unit_w != 0u ? 1.0f : (fabs(in.inv_w) > 1e-12f ? 1.0f / in.inv_w : 1.0f);
+            \\  // Exactly 0 only if every corner's 1/W is exactly 1.
+            \\  float W = in.not_unit_w == 0.0f ? 1.0f : (fabs(in.inv_w) > 1e-12f ? 1.0f / in.inv_w : 1.0f);
             \\  float V[16] = {
             \\    in.v0.x * W, in.v0.y * W, in.v0.z * W, in.v0.w * W,
             \\    in.v1.x * W, in.v1.y * W, in.v1.z * W, in.v1.w * W,
@@ -708,22 +752,37 @@ pub const VertexShader = struct {
     outputs: usize = 0,
 };
 
-/// Writes the vertex shader `decoded` (`qpu_sim.decodeProgram`'s) as GLSL's `main` (after
-/// `glsl_vertex_common`): the vertex as V3D shades it (`v3d.zig`'s `VertexJob`), captured as
-/// `gpu_draw.Vertex`.
-pub fn translateVertex(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst) std.Io.Writer.Error!VertexShader {
-    var t: Translator = .{ .w = w, .lang = .glsl, .stage = .vertex };
-    try w.writeAll(
+/// Writes the vertex shader `decoded` (`qpu_sim.decodeProgram`'s) in `lang`: the vertex as V3D
+/// shades it (`v3d.zig`'s `VertexJob`), as a `gpu_draw.Vertex`. GLSL's `main` (after
+/// `glsl_vertex_common`) gives it to transform feedback; MSL's `vertex_shade` kernel (after
+/// `msl_common` and `msl_shared_functions`) shades `VertexInfo`'s vertices.
+pub fn translateVertex(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, lang: Language) std.Io.Writer.Error!VertexShader {
+    var t: Translator = .{ .w = w, .lang = lang, .stage = .vertex, .opaque_zero = " + zero" };
+    // The registers start as qpu_sim's do (ra15 and rb15 a fragment's W, 1, and Z, 0), from a zero
+    // the compiler doesn't know is 0 (a vertex's number is never 2^31 or more).
+    try w.writeAll(if (lang == .glsl)
         \\void main() {
+        \\  uint zero = uint(gl_VertexID) >> 31;
+        \\
+    else
+        \\kernel void vertex_shade(device const uint* inputs [[buffer(0)]], device Vertex* verts [[buffer(1)]],
+        \\    constant uint* unif [[buffer(2)]], constant VertexInfo& vi [[buffer(3)]], uint vid [[thread_position_in_grid]]) {
+        \\  if (vid >= vi.count) return;
+        \\  device const uint* a_in = inputs + vi.first_input + vid * vi.stride;
+        \\  uint zero = vid >> 31;
+        \\
+    );
+    try w.writeAll(
         \\  uint ra[32];
         \\  uint rb[32];
         \\  uint vo[32];
         \\  for (int i = 0; i < 32; ++i) {
-        \\    ra[i] = 0u;
-        \\    rb[i] = 0u;
-        \\    vo[i] = 0u;
+        \\    ra[i] = zero;
+        \\    rb[i] = zero;
+        \\    vo[i] = zero;
         \\  }
-        \\  uint r0 = 0u, r1 = 0u, r2 = 0u, r3 = 0u, r4 = 0u, r5 = 0u, pa = 0u, pb = 0u;
+        \\  ra[15] = 0x3f800000u + zero;
+        \\  uint r0 = zero, r1 = zero, r2 = zero, r3 = zero, r4 = zero, r5 = zero, pa = zero, pb = zero;
         \\  bool flag_z = false, flag_n = false;
         \\
     );
@@ -748,6 +807,33 @@ pub fn translateVertex(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst) 
     if (t.vpm_writes < 3) t.vertex.unsupported = true;
     // The vertex, as V3D's position words give it: x and y in 12.4 fixed point, z, and 1/W (taken
     // as 1 if 0); the varyings multiplied by 1/W.
+    if (lang == .msl) {
+        try w.print(
+            \\  int xs = int(vo[0] << 16) >> 16;
+            \\  int ys = int(vo[0]) >> 16;
+            \\  float inv_w = f(vo[2]) == 0.0f ? 1.0f : f(vo[2]);
+            \\  Vertex v;
+            \\  v.x = float(xs) * 0.0625f + vi.vp_x;
+            \\  v.y = float(ys) * 0.0625f + vi.vp_y;
+            \\  v.z = f(vo[1]);
+            \\  v.inv_w = inv_w;
+            \\  v.unit_w = inv_w == 1.0f ? 1u : 0u;
+            \\  v.pad0 = 0u;
+            \\  v.pad1 = 0u;
+            \\  v.pad2 = 0u;
+            \\  uint n_out = min(vi.n_var, {d}u);
+            \\  float V[16];
+            \\  for (uint i = 0u; i < 16u; ++i) V[i] = i < n_out ? f(vo[3u + i]) * inv_w : 0.0f;
+            \\  v.v0 = float4(V[0], V[1], V[2], V[3]);
+            \\  v.v1 = float4(V[4], V[5], V[6], V[7]);
+            \\  v.v2 = float4(V[8], V[9], V[10], V[11]);
+            \\  v.v3 = float4(V[12], V[13], V[14], V[15]);
+            \\  verts[vi.first_vertex + vid] = v;
+            \\}}
+            \\
+        , .{t.vpm_writes -| 3});
+        return t.vertex;
+    }
     try w.print(
         \\  int xs = int(vo[0] << 16) >> 16;
         \\  int ys = int(vo[0]) >> 16;
@@ -778,6 +864,9 @@ const Translator = struct {
     stage: enum { fragment, vertex } = .fragment,
     shader: Shader = .{},
     vertex: VertexShader = .{},
+    /// Added to constants, so that the compiler can't fold them into the arithmetic (and, say, take
+    /// 0 times a negative number as +0, not -0): a zero it doesn't know is 0.
+    opaque_zero: []const u8 = "",
     /// A vertex shader's VPM words read and written so far.
     vpm_reads: usize = 0,
     vpm_writes: usize = 0,
@@ -800,7 +889,7 @@ const Translator = struct {
     fn instruction(t: *Translator, d: qpu_sim.DecodedInst) !void {
         const w = t.w;
         if (d.sig == .load_imm) {
-            try w.print("    uint add_r = 0x{x}u, mul_r = 0x{x}u;\n", .{ d.imm_or_small, d.imm_or_small });
+            try w.print("    uint add_r = 0x{x}u{s}, mul_r = 0x{x}u{s};\n", .{ d.imm_or_small, t.opaque_zero, d.imm_or_small, t.opaque_zero });
         } else {
             if ((d.flags & qpu_sim.DecodedInst.FLAG_FETCH_A) != 0) {
                 try w.writeAll("    pa = ");
@@ -808,7 +897,7 @@ const Translator = struct {
                 try w.writeAll(";\n");
             }
             if (d.sig == .small_imm) {
-                try w.print("    pb = 0x{x}u;\n", .{d.imm_or_small});
+                try w.print("    pb = 0x{x}u{s};\n", .{ d.imm_or_small, t.opaque_zero });
             } else if ((d.flags & qpu_sim.DecodedInst.FLAG_FETCH_B) != 0) {
                 try w.writeAll("    pb = ");
                 try t.port(d.raddr_b, .b);
@@ -878,7 +967,10 @@ const Translator = struct {
                 const k = t.vpm_reads;
                 t.vpm_reads += 1;
                 if (k >= 32) return w.writeAll("0u");
-                try w.print("({d}u < n_vpm ? a_in[{d}].{c} : 0u)", .{ k, k / 4, "xyzw"[k % 4] });
+                if (t.lang == .glsl)
+                    try w.print("({d}u < n_vpm ? a_in[{d}].{c} : 0u)", .{ k, k / 4, "xyzw"[k % 4] })
+                else
+                    try w.print("({d}u < vi.n_vpm ? a_in[{d}] : 0u)", .{ k, k });
             },
             qpu.R.elem_qpu => {
                 if (t.stage == .vertex) t.vertex.unsupported = true;

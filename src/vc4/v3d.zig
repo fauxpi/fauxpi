@@ -1630,10 +1630,9 @@ pub const V3d = struct {
     /// The most vertices a frame's draws shade on the GPU.
     const max_gpu_vertices = 1 << 20;
 
-    /// Draws the frame with OpenGL, its vertices shaded too (not on the CPU), if OpenGL can run all
-    /// its shaders the same as qpu_sim.
+    /// Draws the frame on the GPU, its vertices shaded there too (not on the CPU), if the GPU can
+    /// run all its shaders the same as qpu_sim.
     fn renderWithGpuVertices(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
-        if (metal_renderer.supported) return false;
         const g = self.gpuState() orelse return false;
         const frame = gpuFrame(ram, start_bus, end_bus) orelse return false;
         // Without triangles, the CPU loads and stores the tiles as fast.
@@ -1727,6 +1726,7 @@ pub const V3d = struct {
             vertex_total += @intCast(unique.len);
         }
         if (n_draws == 0) return false;
+        if (metal_renderer.supported) return renderWithMetal(g, ram, frame, &.{}, g.draws[0..n_draws], g.inputs.items, g.corners.items);
         return renderWithGl(g, ram, frame.first, &frame.tiles, &.{}, g.draws[0..n_draws], g.inputs.items, g.corners.items);
     }
 
@@ -1783,30 +1783,34 @@ pub const V3d = struct {
             }
         }
 
-        if (metal_renderer.supported) {
-            var frame: metal_renderer.Frame = .{
-                .width = first.fb_w,
-                .height = first.fb_h,
-                .clear_color = first.clear_color0,
-                .clear_z = first.clear_zs,
-                .load = if (first.lazy_load) |l| .{
-                    .base = l.addr & vc_bus.ramMask(ram.len),
-                    .tiling = l.tiling,
-                    .cpp = if (l.format == 1 or l.format == 2) 2 else 4,
-                } else null,
-                .store = .{
-                    .base = first.dst_addr & vc_bus.ramMask(ram.len),
-                    .tiling = first.tiling,
-                    .cpp = if (first.ls_format == 1 or first.ls_format == 2) 2 else 4,
-                },
-                .tiles = tiles,
-            };
-            g.renderer.render(ram, &frame, g.vertices[0..n_vertices], g.draws[0..n_draws]) catch return false;
-            return true;
-        }
+        if (metal_renderer.supported) return renderWithMetal(g, ram, gpu_frame, g.vertices[0..n_vertices], g.draws[0..n_draws], &.{}, &.{});
         // Only drawing is faster on the GPU: the CPU loads and stores tiles on its own as fast.
         if (n_draws == 0) return false;
         return renderWithGl(g, ram, first, &tiles, g.vertices[0..n_vertices], g.draws[0..n_draws], &.{}, &.{});
+    }
+
+    /// Draws the frame with Metal, which loads and stores the tiles too.
+    fn renderWithMetal(g: *GpuState, ram: []u8, gpu_frame: GpuFrame, vertices: []const gpu_draw.Vertex, draws: []const gpu_draw.Draw, inputs: []const u32, corners: []const u32) bool {
+        const first = gpu_frame.first;
+        const frame: metal_renderer.Frame = .{
+            .width = first.fb_w,
+            .height = first.fb_h,
+            .clear_color = first.clear_color0,
+            .clear_z = first.clear_zs,
+            .load = if (first.lazy_load) |l| .{
+                .base = l.addr & vc_bus.ramMask(ram.len),
+                .tiling = l.tiling,
+                .cpp = if (l.format == 1 or l.format == 2) 2 else 4,
+            } else null,
+            .store = .{
+                .base = first.dst_addr & vc_bus.ramMask(ram.len),
+                .tiling = first.tiling,
+                .cpp = if (first.ls_format == 1 or first.ls_format == 2) 2 else 4,
+            },
+            .tiles = gpu_frame.tiles,
+        };
+        g.renderer.render(ram, &frame, vertices, draws, inputs, corners) catch return false;
+        return true;
     }
 
     /// Draws the frame with OpenGL: the tiles listed loaded (or cleared) on the CPU into a buffer
