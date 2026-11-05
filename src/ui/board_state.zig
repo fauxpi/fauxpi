@@ -1469,8 +1469,7 @@ test "a card is made from an image file in the background" {
         if (res == .completed_ok) break;
         try testing.expect(res == .in_progress);
         try testing.expect(spins < 100_000);
-        var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 1_000_000 };
-        _ = std.os.linux.nanosleep(&ts, null);
+        host_posix.sleepUs(1000);
     }
     try testing.expect(!b.isCreatingSdCard());
     try testing.expect(!b.sd_manage_open);
