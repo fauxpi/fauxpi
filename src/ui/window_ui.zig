@@ -425,6 +425,12 @@ const Keyboard = struct {
         return size;
     }
 
+    /// As small as what is in it can be (measured without the layout's
+    /// effects: the focus, and the window's size).
+    pub fn minSize(_: *const Keyboard, n: *WidgetNode, c: Constraints) Size {
+        return n.child(0).minSize(c);
+    }
+
     pub fn focusable(_: *const Keyboard, _: *WidgetNode) bool {
         return true;
     }
@@ -556,6 +562,12 @@ const Body = struct {
         return size;
     }
 
+    /// The display and the sheet shrink (and scroll) to fit: the window's
+    /// least size is its own.
+    pub fn minSize(_: *const Body, _: *WidgetNode, c: Constraints) Size {
+        return c.smallest();
+    }
+
     pub fn paint(self: *const Body, n: *WidgetNode, p: *kete.Painter) void {
         // Beside the sheet above the display.
         if (self.shell.sheet_docked) p.canvas().fillRect(.{ .x = 0, .y = 0, .w = n.size.w, .h = n.size.h }, n.theme().surface);
@@ -576,6 +588,10 @@ const DisplayArea = struct {
         sh.display_area = size;
         sh.display_rect = .{ .x = @floor((size.w - w) / 2), .y = @floor((size.h - h) / 2), .w = w, .h = h };
         return size;
+    }
+
+    pub fn minSize(_: *const DisplayArea, _: *WidgetNode, c: Constraints) Size {
+        return c.smallest();
     }
 
     pub fn paint(self: *const DisplayArea, n: *WidgetNode, p: *kete.Painter) void {
@@ -935,8 +951,9 @@ fn openCardMenu(n: *WidgetNode, sh: *Shell, at: Point) void {
             .on_press = .of(&sh.card_actions[i], CardAction.select),
         };
     }
-    items[count] = .divider;
-    items[count + 1] = .{ .label = "Manage Cards…", .on_press = .of(sh, Shell.openSdManager) };
+    // Managing them stays in view below the cards, however many there are.
+    items[count] = .{ .kind = .divider, .pinned = true };
+    items[count + 1] = .{ .label = "Manage Cards…", .pinned = true, .on_press = .of(sh, Shell.openSdManager) };
     // The menu copies the items, and their labels.
     n.ui.openMenu(n, at, items[0 .. count + 2]);
 }
@@ -1164,7 +1181,7 @@ fn sdDialog(cx: *BuildContext, sh: *Shell, under: Widget) Widget {
 fn cardList(cx: *BuildContext, sh: *Shell) Widget {
     const b = sh.board;
     const count = @min(b.sd_cards.items.len, Shell.max_cards);
-    const rows = cx.arena.alloc(Widget, count + 1) catch return cx.make(kete.SizedBox{});
+    const rows = cx.arena.alloc(Widget, count) catch return cx.make(kete.SizedBox{});
     for (b.sd_cards.items[0..count], 0..) |*card, i| {
         sh.card_actions[i] = .{ .shell = sh, .idx = i };
         const action = &sh.card_actions[i];
@@ -1194,13 +1211,48 @@ fn cardList(cx: *BuildContext, sh: *Shell) Widget {
             }) }),
         }).withKey(i);
     }
-    rows[count] = cx.make(kete.Padding{ .padding = .{ .top = 8 }, .child = cx.make(kete.Align{
-        .alignment = .center_left,
-        .height_factor = 1,
-        .child = cx.make(kete.OutlinedButton{ .label = "New Card…", .icon = .add, .on_press = .of(sh, Shell.showCreateCard) }),
+    // The cards scroll, as tall as they are up to what the window leaves
+    // for them; the button to make another stays below them.
+    const list = cx.make(ScrollUpTo{
+        .max_height = @max(120, @as(f32, @floatFromInt(sh.height)) - dialog_chrome),
+        .child = cx.make(kete.ScrollView{ .child = cx.make(kete.Column{ .fill = false, .cross_axis_alignment = .stretch, .spacing = 4, .children = rows }) }),
+    });
+    return cx.make(kete.Column{ .fill = false, .cross_axis_alignment = .stretch, .children = cx.makeAll(.{
+        list,
+        kete.Padding{ .padding = .{ .top = 12 }, .child = cx.make(kete.Align{
+            .alignment = .center_left,
+            .height_factor = 1,
+            .child = cx.make(kete.OutlinedButton{ .label = "New Card…", .icon = .add, .on_press = .of(sh, Shell.showCreateCard) }),
+        }) },
     }) });
-    return cx.make(kete.Column{ .fill = false, .cross_axis_alignment = .stretch, .spacing = 4, .children = rows });
 }
+
+/// What the Manage SD Cards dialog has besides its list of cards (its
+/// title, the New Card button, its own button and the space round them), and
+/// room round it in the window.
+const dialog_chrome = 300;
+
+/// A scroll view (`child`) as tall as what it holds, up to `max_height`:
+/// past that it scrolls.
+const ScrollUpTo = struct {
+    max_height: f32,
+    child: Widget,
+
+    pub fn layout(self: *const ScrollUpTo, n: *WidgetNode, c: Constraints) Size {
+        const scroll = n.child(0);
+        const w = c.max_w;
+        // The scroll view takes all the height it is given: what it holds,
+        // measured on its own, says how much that wants.
+        const want = if (scroll.childCount() > 0) scroll.child(0).layout(.{ .min_w = w, .max_w = w }).h else 0;
+        const size = scroll.layout(.tight(.{ .w = w, .h = @min(want, self.max_height) }));
+        scroll.place(0, 0);
+        return c.constrain(size);
+    }
+
+    pub fn minSize(_: *const ScrollUpTo, n: *WidgetNode, c: Constraints) Size {
+        return n.child(0).minSize(c);
+    }
+};
 
 fn createCardForm(cx: *BuildContext, sh: *Shell) Widget {
     const b = sh.board;
@@ -1506,6 +1558,13 @@ const TestWindow = struct {
         return null;
     }
 
+    /// The node of the text `text`, in `n`.
+    fn findText(n: *WidgetNode, text: []const u8) ?*WidgetNode {
+        if (n.widget.as(kete.Text)) |t| if (std.mem.eql(u8, t.text, text)) return n;
+        for (n.children.items) |ch| if (findText(ch, text)) |f| return f;
+        return null;
+    }
+
     /// The middle of node `n`, in the window.
     fn centre(n: *const WidgetNode) Point {
         const at = n.position();
@@ -1796,4 +1855,45 @@ test "the window is drawn" {
         const t = tw.ui.theme;
         try testing.expectEqual(Color.fromKete(t.surface_container).toArgb(), px[4 * size[0] + 4]);
     }
+}
+
+test "a long list of cards scrolls in their menu, with Manage Cards in view below" {
+    const tw = try TestWindow.create(1280, 764);
+    defer tw.destroy();
+    var img: [512]u8 = @splat(0);
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    for (0..40) |_| _ = try tw.board.addSdCardFromSlice("card.img", .gb_4, &img);
+    tw.frame();
+    tw.click(tw.targetPoint(.sd_card).?);
+    const menu = tw.ui.menu_root.?;
+    try testing.expect(menu.position()[1] + menu.size.h <= @as(f32, @floatFromInt(tw.height)));
+    const manage = TestWindow.findText(menu, "Manage Cards…").?;
+    try testing.expect(manage.position()[1] + manage.size.h <= menu.position()[1] + menu.size.h);
+    const st = TestWindow.findIn(menu, kete.ScrollView).?.state(kete.ScrollView.State);
+    try testing.expect(st.content > st.viewport);
+}
+
+test "a long list of cards scrolls in their dialog, which fits the window" {
+    const tw = try TestWindow.create(1280, 764);
+    defer tw.destroy();
+    var img: [512]u8 = @splat(0);
+    img[510] = 0x55;
+    img[511] = 0xAA;
+    for (0..40) |_| _ = try tw.board.addSdCardFromSlice("card.img", .gb_4, &img);
+    tw.shell.openSdManager();
+    tw.frame();
+
+    // The window needn't grow for it.
+    const root = tw.ui.root.?;
+    try testing.expect(root.minSize(.{}).h < @as(f32, @floatFromInt(tw.height)));
+    // The New Card button is in it, and in view.
+    const new_card = TestWindow.findText(root, "New Card…").?;
+    try testing.expect(new_card.position()[1] + new_card.size.h <= @as(f32, @floatFromInt(tw.height)));
+    // The dialog's list is the last scroll view (the sheet's is under it).
+    var scrolls: std.ArrayList(*WidgetNode) = .empty;
+    defer scrolls.deinit(testing.allocator);
+    try findAll(root, kete.ScrollView, &scrolls);
+    const list = scrolls.items[scrolls.items.len - 1].state(kete.ScrollView.State);
+    try testing.expect(list.content > list.viewport);
 }
