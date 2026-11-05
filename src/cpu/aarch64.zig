@@ -9310,3 +9310,39 @@ test "AArch64 superinstruction fusion (ADRP+ADD, ADRP+LDR, STP+MOV FP, CMP+B.con
         try std.testing.expectEqual(Exec.A64Op.jit_trace, @as(Exec.A64Op, @fromBackingInt(@intCast(cpu.icache[page_idx * 1024 + ((0x1300 & 0xfff) >> 2)].op))));
     }
 }
+
+test "a hot loop that would start at a code page's last word is no spin loop" {
+    const arm1176 = @import("arm1176.zig");
+    const TestBus = struct {
+        ram: []u8,
+        pub fn hasPendingIrq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn hasPendingFiq(_: *const @This()) bool {
+            return false;
+        }
+        pub fn read32(self: *@This(), paddr: u32) u32 {
+            return std.mem.readInt(u32, self.ram[paddr..][0..4], .little);
+        }
+        pub fn write32(self: *@This(), paddr: u32, val: u32) void {
+            std.mem.writeInt(u32, self.ram[paddr..][0..4], val, .little);
+        }
+        pub fn read16(self: *@This(), paddr: u32) u16 {
+            return std.mem.readInt(u16, self.ram[paddr..][0..2], .little);
+        }
+        pub fn write16(self: *@This(), paddr: u32, val: u16) void {
+            std.mem.writeInt(u16, self.ram[paddr..][0..2], val, .little);
+        }
+        pub fn read8(self: *@This(), paddr: u32) u8 {
+            return self.ram[paddr];
+        }
+        pub fn write8(self: *@This(), paddr: u32, val: u8) void {
+            self.ram[paddr] = val;
+        }
+    };
+    const Cpu = arm1176.Arm1176(TestBus);
+    var page: [4096]u8 = @splat(0);
+    // One word, to the page's end: too short to be a loop (and no overflow).
+    try std.testing.expect(!jit_mod.A64Jit(Cpu, TestBus).isSpinLoop(arm1176.DecodedSlot, &page, 1023, 1024));
+    try std.testing.expect(!jit_mod.Arm32Jit(Cpu, TestBus).isSpinLoop(&page, 1023, 1024));
+}

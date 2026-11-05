@@ -2491,7 +2491,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
             start_word: u10,
             end_word_req: u16,
         ) bool {
-            if (end_word_req <= start_word + 1 or end_word_req - start_word > 64 or end_word_req > 1024) return false;
+            if (end_word_req <= @as(u16, start_word) + 1 or end_word_req - start_word > 64 or end_word_req > 1024) return false;
             const trace_len: u16 = end_word_req - start_word;
             var read_before_write: u32 = 0;
             var written: u32 = 0;
@@ -2591,7 +2591,7 @@ pub fn A64Jit(comptime CpuType: type, comptime Bus: type) type {
             var trace_len: u16 = 0;
 
             if (requested_end_word != 0) {
-                if (requested_end_word <= start_word + 1 or requested_end_word - start_word > max_window or requested_end_word > 1024) return null;
+                if (requested_end_word <= @as(u16, start_word) + 1 or requested_end_word - start_word > max_window or requested_end_word > 1024) return null;
                 if (isSpinLoop(SlotType, code_page_ptr, start_word, requested_end_word)) return null;
                 trace_len = requested_end_word - start_word;
                 var can_bypass = false;
@@ -4685,7 +4685,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
             start_word: u10,
             end_word_req: u16,
         ) bool {
-            if (end_word_req <= start_word + 1 or end_word_req - start_word > 64 or end_word_req > 1024) return false;
+            if (end_word_req <= @as(u16, start_word) + 1 or end_word_req - start_word > 64 or end_word_req > 1024) return false;
             const trace_len: u16 = end_word_req - start_word;
             var read_before_write: u32 = 0;
             var written: u32 = 0;
@@ -4826,7 +4826,7 @@ pub fn Arm32Jit(comptime CpuType: type, comptime Bus: type) type {
             var trace_len: u16 = 0;
 
             if (requested_end_word != 0) {
-                if (requested_end_word <= start_word + 1 or requested_end_word - start_word > max_window or requested_end_word > 1024) return null;
+                if (requested_end_word <= @as(u16, start_word) + 1 or requested_end_word - start_word > max_window or requested_end_word > 1024) return null;
                 if (isSpinLoop(code_page_ptr, start_word, requested_end_word)) return null;
                 trace_len = requested_end_word - start_word;
                 for (0..trace_len) |i| {
@@ -6533,7 +6533,7 @@ pub fn ThumbJit(comptime CpuType: type, comptime Bus: type) type {
             out_end_hw: *u16,
         ) ?JitFn {
             if (!is_x86_64_linux) return null;
-            if (requested_end_hw <= start_hw + 1 or requested_end_hw - start_hw > 64 or requested_end_hw > 2048) return null;
+            if (requested_end_hw <= @as(u16, start_hw) + 1 or requested_end_hw - start_hw > 64 or requested_end_hw > 2048) return null;
 
             const trace_len: u16 = requested_end_hw - start_hw;
             var decoded: [64]ThumbSlot = undefined;
