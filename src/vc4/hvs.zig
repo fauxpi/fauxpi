@@ -388,6 +388,13 @@ pub const Hvs = struct {
         return dst_w >= out_w and dst_h >= out_h and (alpha_mode == 1 or pix_fmt == 0 or pix_fmt == 4);
     }
 
+    /// `n` `T`s from the start of `bytes`, wherever they are (unaligned): one vector load (made
+    /// from a byte array, the compiler moves the bytes one at a time).
+    inline fn load(comptime T: type, comptime n: comptime_int, bytes: []const u8) @Vector(n, T) {
+        const p: *align(1) const [n]T = @ptrCast(bytes[0 .. n * @sizeOf(T)].ptr);
+        return p.*;
+    }
+
     inline fn div255(x: u32) u32 {
         return (x + 1 + (x >> 8)) >> 8;
     }
@@ -504,7 +511,6 @@ pub const Hvs = struct {
 
         // Fast path 1a: Unity 32-bit Linear plane (8-wide SIMD)
         if (unity and tiling == 0 and !is_565) {
-            const opaque_mask8: @Vector(8, u32) = @splat(0xFF000000);
             var py: u32 = dst_y;
             while (py < max_dy) : (py += 1) {
                 const sy = py - dst_y;
@@ -513,24 +519,20 @@ pub const Hvs = struct {
                 const dst_row = out_argb[py * out_w + dst_x ..][0..span_w];
                 const src_bytes = ram[row_off..][0 .. span_w * 4];
                 if (alpha_mode == 1) {
-                    var x: u32 = 0;
-                    while (x + 8 <= span_w) : (x += 8) {
-                        const src_v: @Vector(8, u32) = @bitCast(src_bytes[x * 4 ..][0..32].*);
-                        dst_row[x..][0..8].* = @bitCast(src_v | opaque_mask8);
-                    }
-                    while (x < span_w) : (x += 1) {
-                        dst_row[x] = std.mem.readInt(u32, src_bytes[x * 4 ..][0..4], .little) | 0xFF000000;
-                    }
+                    // Opaque: copied with its alpha set. A plain loop over (unaligned) words,
+                    // which the compiler vectorizes (vectors made from byte arrays it doesn't).
+                    const src_words: [*]align(1) const u32 = @ptrCast(src_bytes.ptr);
+                    for (dst_row, src_words[0..span_w]) |*d, v| d.* = v | 0xFF000000;
                 } else {
                     var x: u32 = 0;
                     while (x + 8 <= span_w) : (x += 8) {
-                        const src_v: @Vector(8, u32) = @bitCast(src_bytes[x * 4 ..][0..32].*);
+                        const src_v: @Vector(8, u32) = load(u32, 8, src_bytes[x * 4 ..]);
                         const alphas = src_v >> @splat(24);
                         if (@reduce(.And, alphas) == 0xff) {
                             dst_row[x..][0..8].* = @bitCast(src_v);
                         } else if (@reduce(.Or, alphas) != 0) {
-                            const src_lo: @Vector(4, u32) = @bitCast(src_bytes[x * 4 ..][0..16].*);
-                            const src_hi: @Vector(4, u32) = @bitCast(src_bytes[x * 4 + 16 ..][0..16].*);
+                            const src_lo: @Vector(4, u32) = load(u32, 4, src_bytes[x * 4 ..]);
+                            const src_hi: @Vector(4, u32) = load(u32, 4, src_bytes[x * 4 + 16 ..]);
                             const dst_lo: @Vector(4, u32) = dst_row[x..][0..4].*;
                             const dst_hi: @Vector(4, u32) = dst_row[x + 4 ..][0..4].*;
                             dst_row[x..][0..4].* = blendPixels4(dst_lo, src_lo, premult);
@@ -562,7 +564,7 @@ pub const Hvs = struct {
                 const src_bytes = ram[row_off..][0 .. span_w * 2];
                 var x: u32 = 0;
                 while (x + 8 <= span_w) : (x += 8) {
-                    const p16_vec: @Vector(8, u16) = @bitCast(src_bytes[x * 2 ..][0..16].*);
+                    const p16_vec: @Vector(8, u16) = load(u16, 8, src_bytes[x * 2 ..]);
                     dst_row[x..][0..8].* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
                 }
                 while (x < span_w) : (x += 1) {
@@ -601,7 +603,7 @@ pub const Hvs = struct {
                     if (rows == 4) {
                         inline for (0..4) |ry| {
                             const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..4];
-                            const src_v: @Vector(4, u32) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
+                            const src_v: @Vector(4, u32) = load(u32, 4, ram[utile_off + ry * 16 ..]);
                             if (alpha_mode == 1) {
                                 dst_row.* = @bitCast(src_v | opaque_mask);
                             } else {
@@ -617,7 +619,7 @@ pub const Hvs = struct {
                     } else {
                         for (0..rows) |ry| {
                             const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..4];
-                            const src_v: @Vector(4, u32) = @bitCast(ram[utile_off + @as(u32, @intCast(ry)) * 16 ..][0..16].*);
+                            const src_v: @Vector(4, u32) = load(u32, 4, ram[utile_off + @as(u32, @intCast(ry)) * 16 ..]);
                             if (alpha_mode == 1) {
                                 dst_row.* = @bitCast(src_v | opaque_mask);
                             } else {
@@ -689,13 +691,13 @@ pub const Hvs = struct {
                     if (rows == 4) {
                         inline for (0..4) |ry| {
                             const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..8];
-                            const p16_vec: @Vector(8, u16) = @bitCast(ram[utile_off + ry * 16 ..][0..16].*);
+                            const p16_vec: @Vector(8, u16) = load(u16, 8, ram[utile_off + ry * 16 ..]);
                             dst_row.* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
                         }
                     } else {
                         for (0..rows) |ry| {
                             const dst_row = out_argb[(dy0 + @as(u32, @intCast(ry))) * out_w + dx0 ..][0..8];
-                            const p16_vec: @Vector(8, u16) = @bitCast(ram[utile_off + @as(u32, @intCast(ry)) * 16 ..][0..16].*);
+                            const p16_vec: @Vector(8, u16) = load(u16, 8, ram[utile_off + @as(u32, @intCast(ry)) * 16 ..]);
                             dst_row.* = @bitCast(format_mod.fromRgb565Vec8(p16_vec));
                         }
                     }
