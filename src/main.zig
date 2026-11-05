@@ -47,6 +47,7 @@ pub const vc4_gl_renderer = @import("vc4/gl_renderer.zig");
 pub const vc4_qpu_to_shader = @import("vc4/qpu_to_shader.zig");
 pub const vc4_metal_renderer = @import("vc4/metal_renderer.zig");
 pub const vc4_v3d = @import("vc4/v3d.zig");
+pub const profile = @import("profile.zig");
 pub const vc4_hvs = @import("vc4/hvs.zig");
 pub const vc4_pv = @import("vc4/pixelvalve.zig");
 pub const vc4_hdmi = @import("vc4/hdmi.zig");
@@ -75,6 +76,8 @@ const CliOptions = struct {
     sequential_cores: bool = false,
     strict: bool = false,
     clock: ClockMode = .realtime,
+    /// Where to write where the time went (`profile.zig`), when the run ends.
+    profile_path: ?[]const u8 = null,
     /// Security of the emulated Wi-Fi access point, and its WPA2 passphrase (the board settings'
     /// while null)
     wifi_security: ?ui_board_state.WifiSecurity = null,
@@ -200,6 +203,10 @@ fn printUsage(sandboxed: bool) void {
         \\                      counts executed instructions and skips idle time (reproducible --max-steps runs)
         \\  --sequential-cores  Run all emulated cores on one host thread (deterministic)
         \\  --strict            Stop if the guest uses firmware calls or peripherals fauxpi does not emulate
+        \\  --profile <file>    Write where the time went (JSON) to <file> when the run ends; headless runs
+        \\                      compose the display too, as a window would
+        \\  --v3d <mode>        Where V3D draws: gpu (default; vertices shaded on the GPU too),
+        \\                      gpu-fragments (vertices shaded on the CPU) or cpu
         \\  --help              Show this help message
         \\
     );
@@ -312,6 +319,17 @@ pub fn main(init: std.process.Init.Minimal) u8 {
             opts.sequential_cores = true;
         } else if (std.mem.eql(u8, arg, "--strict")) {
             opts.strict = true;
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            opts.profile_path = args.next() orelse {
+                printUsage(sandboxed);
+                return 1;
+            };
+        } else if (std.mem.eql(u8, arg, "--v3d")) {
+            const m = args.next() orelse "";
+            vc4_v3d.V3d.draw_mode = std.meta.stringToEnum(vc4_v3d.V3d.Mode, m) orelse if (std.mem.eql(u8, m, "gpu-fragments")) .gpu_fragments else {
+                std.debug.print("--v3d takes gpu, gpu-fragments or cpu\n", .{});
+                return 1;
+            };
         } else if (std.mem.eql(u8, arg, "--help")) {
             printUsage(sandboxed);
             return 0;
@@ -490,6 +508,21 @@ fn syncWindowPeripheralsToSoc(w: *const window.Window, soc: *Bcm2835) void {
     soc.sdhci.wifi.net.dhcp_enabled = w.status.dhcp_enabled;
 }
 
+/// Set by SIGINT or SIGTERM in a headless run: it stops as if the guest had, and reports.
+var stop_requested: std.atomic.Value(bool) = .init(false);
+
+fn requestStop(_: std.posix.SIG) callconv(.c) void {
+    stop_requested.store(true, .release);
+}
+
+/// Has SIGINT and SIGTERM stop a headless run at the next step, not kill it.
+fn stopOnSignals() void {
+    if (builtin.os.tag == .windows) return;
+    const act: std.posix.Sigaction = .{ .handler = .{ .handler = requestStop }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(.INT, &act, null);
+    std.posix.sigaction(.TERM, &act, null);
+}
+
 fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliOptions) !void {
     // Pages are committed as the guest touches them; each boot clears the board's RAM.
     const ram = try gpa.alloc(u8, Bcm2835.BUS_RAM_SIZE);
@@ -539,6 +572,15 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
     var boot_failed = false;
 
     const initial_power = opts.power or opts.headless;
+    profile.enabled = opts.profile_path != null;
+    if (opts.headless) stopOnSignals();
+    const run_start_ns = monotonicNs();
+    // A headless run being profiled composes the display as a window would, to time it.
+    const offscreen_display: ?[]u32 = if (opts.headless and profile.enabled)
+        try gpa.alloc(u32, @as(usize, opts.width) * opts.height)
+    else
+        null;
+    defer if (offscreen_display) |fb| gpa.free(fb);
 
     var wl_win: ?*window.Window = null;
     defer if (wl_win) |w| w.destroy();
@@ -727,6 +769,7 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
             idle_rendered_booted = null;
         }
         if (soc.pm.reboot_requested) break;
+        if (stop_requested.load(.acquire)) break;
         if (opts.strict and soc.unsupportedHardwareUsed()) {
             std.debug.print("fauxpi: stopping (--strict): the guest used unemulated hardware (see warnings above)\n", .{});
             strict_stopped = true;
@@ -1097,8 +1140,23 @@ fn runSimulator(gpa: std.mem.Allocator, environ: std.process.Environ, opts: CliO
                     w.compositeUi();
                     try w.present();
                 }
+            } else if (offscreen_display) |fb| {
+                const frame_active_us = active_us_accum;
+                active_us_accum = 0;
+                _ = soc.renderDisplayFrameIfChanged(fb, opts.width, opts.height, false, frame_active_us > 0);
             }
         }
+    }
+
+    if (opts.profile_path) |path| {
+        var instructions: u64 = 0;
+        for (cpus[0..num_cores]) |*c| instructions += c.cycles;
+        var report: std.Io.Writer.Allocating = .init(gpa);
+        defer report.deinit();
+        try profile.write(&report.writer, .{ .wall_ns = monotonicNs() - run_start_ns, .guest_us = soc.timer.counter, .instructions = instructions });
+        const file = try std.Io.Dir.cwd().createFile(threaded.io(), path, .{});
+        defer file.close(threaded.io());
+        try file.writeStreamingAll(threaded.io(), report.written());
     }
 
     if (opts.headless) {

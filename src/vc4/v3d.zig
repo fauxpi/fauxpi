@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const metal_renderer = @import("metal_renderer.zig");
 const gl_renderer = @import("gl_renderer.zig");
 const gpu_draw = @import("gpu_draw.zig");
+const profile = @import("../profile.zig");
 const qpu_to_shader = @import("qpu_to_shader.zig");
 
 /// VideoCore IV 3D Engine (`brcm,bcm2835-v3d`) at `0x20c00000` (size `0x1000`).
@@ -471,6 +472,8 @@ pub const V3d = struct {
     }
 
     fn executeBcl(self: *V3d, ram: []const u8, start_bus: u32, end_bus: u32) void {
+        const prof_start = profile.now();
+        defer profile.end(.v3d_bin, prof_start);
         var pc = start_bus & vc_bus.ramMask(ram.len);
         const end = end_bus & vc_bus.ramMask(ram.len);
         if (end > ram.len) return;
@@ -625,6 +628,9 @@ pub const V3d = struct {
         self.prep_fs_unifs_len = 0;
         self.overflow_draw_start = self.draws_len;
         defer self.binTriangles();
+        // After the binning (deferred before it, run after it).
+        const prof_start = profile.now();
+        defer profile.end(.v3d_vertex_shade, prof_start);
 
         var vs_buf: [512]qpu.Inst = undefined;
         var fs_buf: [512]qpu.Inst = undefined;
@@ -951,6 +957,8 @@ pub const V3d = struct {
     /// there is no room for the lists, no triangle is binned: the draws are
     /// all shaded again for each tile.
     fn binTriangles(self: *V3d) void {
+        const prof_start = profile.now();
+        defer profile.end(.v3d_tile_bin, prof_start);
         const Range = struct {
             fn of(t: *const ShadedTriangle) [4]u32 {
                 return .{ @min(t.min_x >> 6, 31), @min(t.min_y >> 6, 31), @min((t.max_x - 1) >> 6, 31), @min((t.max_y - 1) >> 6, 31) };
@@ -1518,9 +1526,23 @@ pub const V3d = struct {
     fn executeRcl(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) void {
         if ((end_bus & vc_bus.ramMask(ram.len)) > ram.len) return;
 
-        if (gpu_supported and self.renderWithGpuVertices(ram, start_bus, end_bus)) return;
+        var prof_start = profile.now();
+        if (gpu_supported and draw_mode == .gpu and self.renderWithGpuVertices(ram, start_bus, end_bus)) {
+            profile.end(.v3d_gpu_vertices_frame, prof_start);
+            profile.count(.frames_gpu_vertices, 1);
+            return;
+        }
         self.prepareDrawsForFrame(ram);
-        if (gpu_supported and self.renderWithGpu(ram, start_bus, end_bus)) return;
+        prof_start = profile.now();
+        if (gpu_supported and draw_mode != .cpu and self.renderWithGpu(ram, start_bus, end_bus)) {
+            profile.end(.v3d_gpu_frame, prof_start);
+            profile.count(.frames_gpu, 1);
+            return;
+        }
+        prof_start = profile.now();
+        defer profile.end(.v3d_cpu_frame, prof_start);
+        profile.count(.frames_cpu, 1);
+        profile.count(.triangles, self.shaded_tris.items.len);
 
         var tile_jobs: [1024]TileJob = undefined;
         var tile_jobs_len: usize = 0;
@@ -1549,6 +1571,12 @@ pub const V3d = struct {
 
         self.flushTileJobs(ram, tile_jobs[0..tile_jobs_len]);
     }
+
+    /// Where frames are drawn (for comparing, with `--v3d`): on the GPU, their vertices shaded there
+    /// too where they can be (`gpu`); on the GPU, their vertices shaded on the CPU
+    /// (`gpu_fragments`); or on the CPU. Frames the GPU can't draw are drawn on the CPU.
+    pub const Mode = enum { gpu, gpu_fragments, cpu };
+    pub var draw_mode: Mode = .gpu;
 
     /// Whether frames can be drawn on the host's GPU: with Metal on macOS, OpenGL on Linux.
     const gpu_supported = metal_renderer.supported or builtin.os.tag == .linux;
@@ -1677,6 +1705,8 @@ pub const V3d = struct {
             const vpm_words: u32 = @intCast(attr_info.vpm_words);
             const stride: u32 = @max((vpm_words + 3) / 4 * 4, 4);
 
+            const prof_start = profile.now();
+            defer profile.end(.gpu_gather_vertices, prof_start);
             if (!self.collectVertices(ram, draw, num_tris)) return false;
             const unique = self.vs_unique.items;
             if (vertex_total + unique.len > max_gpu_vertices) return false;
@@ -1825,6 +1855,7 @@ pub const V3d = struct {
         var tb: TileBuffer = .{ .color = &tile_color, .depth = &tile_depth };
         const tiles_w = (w + 63) / 64;
         const tiles_h = (h + 63) / 64;
+        const load_start = profile.now();
         for (0..@min(tiles_h, 32)) |ty| {
             for (0..@min(tiles_w, 32)) |tx| {
                 if (tiles[ty] & (@as(u32, 1) << @intCast(tx)) == 0) continue;
@@ -1842,10 +1873,14 @@ pub const V3d = struct {
             }
         }
 
+        profile.end(.gpu_load_tiles, load_start);
+
         g.renderer.render(ram, w, h, color, first.clear_zs, vertices, draws, inputs, corners) catch |err| {
             if (err != error.Unsupported) std.debug.print("fauxpi: V3D on OpenGL: {s}\n", .{@errorName(err)});
             return false;
         };
+        const store_start = profile.now();
+        defer profile.end(.gpu_store_tiles, store_start);
 
         for (0..@min(tiles_h, 32)) |ty| {
             for (0..@min(tiles_w, 32)) |tx| {

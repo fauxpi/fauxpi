@@ -2,6 +2,7 @@ const std = @import("std");
 const vc_bus = @import("../soc/vc_bus.zig");
 const format_mod = @import("format.zig");
 const texture = @import("texture.zig");
+const profile = @import("../profile.zig");
 
 /// VideoCore IV Hardware Video Scaler (`brcm,bcm2835-hvs`) at `0x20400000` (size `0x6000`).
 /// Parses HVS Display Lists (DLIST) and composites linear & T-tiled DRM planes into the HDMI output buffer.
@@ -229,6 +230,8 @@ pub const Hvs = struct {
     /// Computes a fast 64-bit Wyhash signature over the active HVS display list and plane backing memory.
     /// Used to skip re-compositing 1280x720 frames when neither DLIST nor scanout pixel data changed.
     pub fn computeActivePlanesHash(self: *const Hvs, ram: []const u8, width: u32, height: u32) u64 {
+        const prof_start = profile.now();
+        defer profile.end(.hvs_hash, prof_start);
         var active_ch: ?usize = null;
         for ([_]usize{ 1, 0, 2 }) |ch| {
             const head = self.displact[ch] & DLIST_MASK;
@@ -345,6 +348,9 @@ pub const Hvs = struct {
 
     /// Composites the active HVS display list into `out_argb` (`width * height` pixels of `0xFFRRGGBB`).
     pub fn compositeFrame(self: *const Hvs, ram: []const u8, out_argb: []u32, width: u32, height: u32) bool {
+        const prof_start = profile.now();
+        defer profile.end(.hvs_compose, prof_start);
+        profile.count(.display_frames, 1);
         if (out_argb.len < width * height) return false;
 
         // Find active channel (HDMI on BCM2835 uses channel 1, fallback to 0 or 2)

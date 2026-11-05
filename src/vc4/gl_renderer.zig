@@ -15,6 +15,7 @@ const qpu = @import("qpu.zig");
 const qpu_sim = @import("qpu_sim.zig");
 const shader = @import("qpu_to_shader.zig");
 const gpu_draw = @import("gpu_draw.zig");
+const profile = @import("../profile.zig");
 
 pub const Vertex = gpu_draw.Vertex;
 pub const Draw = gpu_draw.Draw;
@@ -397,6 +398,9 @@ pub const Renderer = struct {
         e.ok = false;
         if (dt.width == 0 or dt.height == 0) return null;
         r.texels.resize(std.heap.smp_allocator, @as(usize, dt.width) * dt.height) catch return null;
+        const prof_start = profile.now();
+        defer profile.end(.gpu_textures, prof_start);
+        profile.count(.textures_decoded, 1);
         if (!qpu_sim.DecodedTexture.decode(ram, p0, p1, r.texels.items)) return null;
         const gl = &r.gl;
         if (e.tex == 0) gl.GenTextures(1, @ptrCast(&e.tex));
@@ -571,6 +575,7 @@ pub const Renderer = struct {
         r.frame += 1;
 
         // The shaders first: one OpenGL can't run sends the frame to the CPU.
+        var prof_start = profile.now();
         var programs: [gpu_draw.max_draws]*const Program = undefined;
         for (draws, 0..) |d, i| programs[i] = r.program(d.code) orelse return error.Unsupported;
         var vertex_programs: [gpu_draw.max_draws]*const VertexProgram = undefined;
@@ -583,6 +588,8 @@ pub const Renderer = struct {
             vertex_total = @max(vertex_total, d.first_vertex + d.vertex_count);
         }
 
+        profile.end(.gpu_programs, prof_start);
+        prof_start = profile.now();
         try r.useSize(width, height);
         gl.BindFramebuffer(GL_FRAMEBUFFER, r.fbo);
         gl.Viewport(0, 0, @intCast(width), @intCast(height));
@@ -601,6 +608,8 @@ pub const Renderer = struct {
                 gl.GetBufferSubData(GL_ARRAY_BUFFER, 0, @intCast(@as(usize, vertex_total) * @sizeOf(Vertex)), r.shaded.items.ptr);
                 drawn = r.shaded.items;
             }
+            profile.end(.gpu_shade_vertices, prof_start);
+            prof_start = profile.now();
         } else {
             gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
             gl.BufferData(GL_ARRAY_BUFFER, @intCast(vertices.len * @sizeOf(Vertex)), vertices.ptr, GL_STREAM_DRAW);
@@ -616,11 +625,13 @@ pub const Renderer = struct {
             const base: u32 = @intCast(r.indices.items.len);
             const draw_corners: ?[]const u32 = if (d.vertex_stage) |vs| corners[vs.first_corner..][0..vs.corner_count] else null;
             if (p.shader.reads_color) {
+                profile.count(.blended_triangles, if (draw_corners) |dc| dc.len / 3 else d.vertex_count / 3);
                 const tris_vertices = if (shaded_on_gpu) drawn[d.first_vertex..][0..d.vertex_count] else drawn[d.first_vertex..][0 .. d.vertex_count / 3 * 3];
                 const cull: u8 = if (d.vertex_stage) |vs| vs.cull else 3;
                 r.layers.build(width, height, tris_vertices, draw_corners, cull, d.first_vertex) catch return error.Unsupported;
                 r.indices.appendSlice(std.heap.smp_allocator, r.layers.order.items) catch return error.Unsupported;
                 for (r.layers.start.items) |st| r.layer_starts.append(std.heap.smp_allocator, base + st) catch return error.Unsupported;
+                profile.count(.layers, r.layers.start.items.len -| 1);
             } else if (draw_corners) |dc| {
                 r.indices.ensureUnusedCapacity(std.heap.smp_allocator, dc.len) catch return error.Unsupported;
                 for (dc) |c| r.indices.appendAssumeCapacity(d.first_vertex + c);
@@ -628,6 +639,8 @@ pub const Renderer = struct {
             }
         }
         draw_layers[draws.len] = @intCast(r.layer_starts.items.len);
+        profile.count(.draws, draws.len);
+        for (draws) |d| profile.count(.triangles, if (d.vertex_stage) |vs| vs.corner_count / 3 else d.vertex_count / 3);
         gl.BindVertexArray(r.vao);
         gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, @intCast(r.indices.items.len * 4), r.indices.items.ptr, GL_STREAM_DRAW);
 
@@ -693,7 +706,10 @@ pub const Renderer = struct {
             }
         }
 
+        profile.end(.gpu_draw, prof_start);
+        prof_start = profile.now();
         gl.ReadPixels(0, 0, @intCast(width), @intCast(height), GL_RED_INTEGER, GL_UNSIGNED_INT, color.ptr);
+        profile.end(.gpu_read_back, prof_start);
         if (gl.GetError() != GL_NO_ERROR) return error.GlFailed;
     }
 };
