@@ -257,8 +257,7 @@ pub const Shell = struct {
 
     pub fn setNewCardSize(sh: *Shell, idx: usize) void {
         if (idx >= SdCardSize.all.len) return;
-        sh.board.new_card_size = SdCardSize.all[idx];
-        sh.board.revalidatePendingSdImage();
+        sh.board.pickNewCardSize(SdCardSize.all[idx]);
     }
 
     pub fn setRenameName(sh: *Shell, text: []const u8) void {
@@ -1162,7 +1161,7 @@ fn sdDialog(cx: *BuildContext, sh: *Shell, under: Widget) Widget {
             .confirm_label = if (b.isCreatingSdCard()) "Creating…" else "Create Card",
             .on_confirm = if (sh.canCreateCard()) .of(sh, Shell.createCard) else null,
             .dismiss_label = "Cancel",
-            .on_dismiss = .of(sh, Shell.cancelCreateCard),
+            .on_dismiss = if (b.isCreatingSdCard()) null else .of(sh, Shell.cancelCreateCard),
             .width = 480,
             .child = under,
         });
@@ -1254,13 +1253,41 @@ const ScrollUpTo = struct {
     }
 };
 
+/// The form that makes a card: the image to put on it (which names it, and
+/// picks the smallest size it fits, unless they are set), its name and its
+/// size; or, while it is being made, how far that is.
 fn createCardForm(cx: *BuildContext, sh: *Shell) Widget {
     const b = sh.board;
     const t = cx.theme();
-    const creating = b.isCreatingSdCard();
     const label: kete.TextStyle = .{ .size = 12.5, .color = t.on_surface_variant };
-    var rows: [9]Widget = undefined;
+
+    if (b.sdCreationProgress()) |done| {
+        return cx.make(kete.Column{ .fill = false, .cross_axis_alignment = .stretch, .spacing = 8, .children = cx.makeAll(.{
+            kete.Text{ .text = cx.fmt("Making \u{201c}{s}\u{201d}…", .{b.newCardName()}), .style = .{ .size = 14, .color = t.on_surface } },
+            kete.ProgressBar{ .value = done },
+            kete.Text{ .text = cx.fmt("{d}%", .{@as(u32, @intFromFloat(done * 100))}), .style = label },
+        }) });
+    }
+
+    var rows: [7]Widget = undefined;
     var n: usize = 0;
+
+    // The image: the button shows the one chosen, and chooses another.
+    rows[n] = cx.make(kete.Text{ .text = "OS image", .style = label });
+    n += 1;
+    const has_image = b.pending_sd_image_path_len > 0;
+    rows[n] = cx.make(kete.Align{ .alignment = .center_left, .height_factor = 1, .child = cx.make(kete.OutlinedButton{
+        .label = if (has_image) blk: {
+            var size_buf: [32]u8 = undefined;
+            const base = std.fs.path.basename(b.pending_sd_image_path_buf[0..b.pending_sd_image_path_len]);
+            var short_buf: [max_file_name + 4]u8 = undefined;
+            break :blk cx.fmt("{s}  ·  {s}", .{ shortName(&short_buf, base), board_state.formatByteSize(&size_buf, b.pending_sd_image_size) });
+        } else "Choose Image…",
+        .icon = .insert_drive_file,
+        .trailing_icon = if (has_image) .edit else null,
+        .on_press = .of(sh, Shell.chooseImage),
+    }) });
+    n += 1;
 
     rows[n] = cx.make(kete.Text{ .text = "Card name", .style = label });
     n += 1;
@@ -1268,15 +1295,15 @@ fn createCardForm(cx: *BuildContext, sh: *Shell) Widget {
         .initial = b.newCardName(),
         .max_len = 64,
         .width = 432,
-        .enabled = !creating,
         .on_changed = .of(sh, Shell.setNewCardName),
     }).withKey(fieldKey(5, b.new_card_name_gen));
     n += 1;
 
+    // The sizes the image doesn't fit on can't be picked.
     var size_options: [SdCardSize.all.len]kete.MenuItem = undefined;
     var size_idx: usize = 0;
     for (SdCardSize.all, 0..) |sz, i| {
-        size_options[i] = .{ .label = sz.label() };
+        size_options[i] = .{ .label = sz.label(), .enabled = !has_image or b.pending_sd_image_size <= sz.bytes() };
         if (sz == b.new_card_size) size_idx = i;
     }
     rows[n] = cx.make(kete.Text{ .text = "Card size", .style = label });
@@ -1284,26 +1311,8 @@ fn createCardForm(cx: *BuildContext, sh: *Shell) Widget {
     rows[n] = cx.make(kete.Align{ .alignment = .center_left, .height_factor = 1, .child = cx.make(kete.DropdownMenu{
         .options = &size_options,
         .selected = size_idx,
-        .on_selected = if (creating) null else .of(sh, Shell.setNewCardSize),
+        .on_selected = .of(sh, Shell.setNewCardSize),
         .width = 160,
-    }) });
-    n += 1;
-
-    rows[n] = cx.make(kete.Text{ .text = "OS image file", .style = label });
-    n += 1;
-    const image: []const u8 = if (b.pending_sd_image_path_len > 0) blk: {
-        var size_buf: [32]u8 = undefined;
-        const base = std.fs.path.basename(b.pending_sd_image_path_buf[0..b.pending_sd_image_path_len]);
-        break :blk cx.fmt("{s} ({s})", .{ base, board_state.formatByteSize(&size_buf, b.pending_sd_image_size) });
-    } else "No image file chosen";
-    rows[n] = cx.make(kete.Row{ .spacing = 8, .children = cx.makeAll(.{
-        kete.Expanded{ .child = cx.make(kete.Text{
-            .text = image,
-            .style = .{ .size = 13.5, .color = if (b.pending_sd_image_path_len > 0) t.on_surface else t.on_surface_variant },
-            .wrap = false,
-            .ellipsis = true,
-        }) },
-        kete.OutlinedButton{ .label = "Choose Image…", .on_press = if (creating) null else .of(sh, Shell.chooseImage) },
     }) });
     n += 1;
 
@@ -1311,16 +1320,22 @@ fn createCardForm(cx: *BuildContext, sh: *Shell) Widget {
         rows[n] = cx.make(kete.Text{ .text = b.sdErrorMessage(), .style = .{ .size = 12, .color = t.@"error" } });
         n += 1;
     }
-    if (b.sdCreationProgress()) |done| {
-        rows[n] = cx.make(kete.ProgressBar{ .value = done });
-        n += 1;
-        rows[n] = cx.make(kete.Text{
-            .text = cx.fmt("Creating SD card image… {d}%", .{@as(u32, @intFromFloat(done * 100))}),
-            .style = label,
-        });
-        n += 1;
-    }
     return cx.make(kete.Column{ .fill = false, .cross_axis_alignment = .stretch, .spacing = 6, .children = rows[0..n] });
+}
+
+/// The most bytes of a file's name the image button shows.
+const max_file_name = 36;
+
+/// `name`, if it is long with its middle left out: its start and its end (a
+/// date, and the extension) are what tell images apart.
+fn shortName(buf: *[max_file_name + 4]u8, name: []const u8) []const u8 {
+    if (name.len <= max_file_name) return name;
+    var head: usize = max_file_name / 2;
+    var tail: usize = name.len - (max_file_name - head);
+    // Not in the middle of a character.
+    while (head > 0 and name[head] & 0xc0 == 0x80) head -= 1;
+    while (tail < name.len and name[tail] & 0xc0 == 0x80) tail += 1;
+    return std.fmt.bufPrint(buf, "{s}…{s}", .{ name[0..head], name[tail..] }) catch name[0..head];
 }
 
 /// Below the display, while the GPIO ribbon cable is in: an LED for each
@@ -1689,10 +1704,7 @@ test "the SD card slot offers to make a card, then the cards made" {
     try testing.expect(!tw.shell.canCreateCard());
 
     // Choosing the image is the window's (a file chooser).
-    var choose: std.ArrayList(*WidgetNode) = .empty;
-    defer choose.deinit(testing.allocator);
-    try findAll(tw.ui.root.?, kete.OutlinedButton, &choose);
-    tw.click(TestWindow.centre(choose.items[choose.items.len - 1]));
+    tw.click(TestWindow.centre(TestWindow.findText(tw.ui.root.?, "Choose Image…").?));
     try testing.expect(tw.shell.events.pick_image);
 
     // An image in memory is made into a card at once.
@@ -1701,11 +1713,14 @@ test "the SD card slot offers to make a card, then the cards made" {
     img[511] = 0xAA;
     tw.board.setPendingSdImageSlice("test.img", &img);
     tw.frame();
+    // The button shows it, and it names the card.
+    try testing.expect(TestWindow.findText(tw.ui.root.?, "test.img  ·  512 B") != null);
+    try testing.expectEqualStrings("test", tw.board.newCardName());
     try testing.expect(tw.shell.canCreateCard());
     tw.shell.createCard();
     tw.frame();
     try testing.expect(!tw.board.sd_manage_open);
-    try testing.expectEqualStrings("Card 1", tw.board.activeSdCardName());
+    try testing.expectEqualStrings("test", tw.board.activeSdCardName());
     try testing.expect(tw.shell.events.sd_chosen);
 
     // Now pressing the slot puts the card in, and the card takes it out.
@@ -1896,4 +1911,10 @@ test "a long list of cards scrolls in their dialog, which fits the window" {
     try findAll(root, kete.ScrollView, &scrolls);
     const list = scrolls.items[scrolls.items.len - 1].state(kete.ScrollView.State);
     try testing.expect(list.content > list.viewport);
+}
+
+test "long file names are shortened in the middle" {
+    var buf: [max_file_name + 4]u8 = undefined;
+    try testing.expectEqualStrings("raspios.img", shortName(&buf, "raspios.img"));
+    try testing.expectEqualStrings("2025-05-13-raspios…-bookworm-lite.img", shortName(&buf, "2025-05-13-raspios-bookworm-arm64-bookworm-lite.img"));
 }

@@ -178,6 +178,10 @@ pub const BoardState = struct {
     /// Counts the times `new_card_name_buf` was set other than by typing.
     new_card_name_gen: u32 = 0,
     new_card_size: SdCardSize = .gb_4,
+    /// Whether the new card's name was typed, and its size picked: if not,
+    /// they follow the image chosen (its name, and the smallest size it fits).
+    new_card_name_typed: bool = false,
+    new_card_size_picked: bool = false,
     renaming_sd_card_idx: ?usize = null,
     rename_card_name_buf: [64]u8 = @splat(0),
     rename_card_name_len: usize = 0,
@@ -270,10 +274,64 @@ pub const BoardState = struct {
         return self.new_card_name_buf[0..self.new_card_name_len];
     }
 
+    /// Sets the name the next card is made with, as typed.
     pub fn setNewCardName(self: *BoardState, name: []const u8) void {
+        self.assignNewCardName(name);
+        self.new_card_name_typed = true;
+    }
+
+    /// Sets the name the next card is made with, other than by typing (for
+    /// a field showing it to start again).
+    fn assignNewCardName(self: *BoardState, name: []const u8) void {
         const n = @min(name.len, self.new_card_name_buf.len);
         @memcpy(self.new_card_name_buf[0..n], name[0..n]);
         self.new_card_name_len = n;
+        self.new_card_name_gen +%= 1;
+    }
+
+    /// Picks the size of the next card (the image chosen then keeps it, if
+    /// the image fits).
+    pub fn pickNewCardSize(self: *BoardState, size: SdCardSize) void {
+        self.new_card_size = size;
+        self.new_card_size_picked = true;
+        self.revalidatePendingSdImage();
+    }
+
+    /// An image was chosen to make the next card from: unless they were set,
+    /// the card is named after it, and is the smallest size it fits.
+    fn imageChosen(self: *BoardState) void {
+        if (!self.new_card_name_typed) {
+            var stem = std.fs.path.basename(self.pending_sd_image_path_buf[0..self.pending_sd_image_path_len]);
+            // "raspios-lite.img.xz" is "raspios-lite".
+            while (true) {
+                const ext = std.fs.path.extension(stem);
+                const known = [_][]const u8{ ".img", ".xz", ".gz", ".zst", ".zip", ".qcow2", ".iso", ".raw" };
+                const strip = for (known) |k| {
+                    if (std.ascii.eqlIgnoreCase(ext, k)) break true;
+                } else false;
+                if (!strip or ext.len == stem.len) break;
+                stem = stem[0 .. stem.len - ext.len];
+            }
+            if (stem.len > 0) self.assignUniqueNewCardName(stem);
+        }
+        const fits = self.pending_sd_image_size <= self.new_card_size.bytes();
+        if (!(self.new_card_size_picked and fits)) {
+            if (SdCardSize.smallestFitting(self.pending_sd_image_size)) |size| self.new_card_size = size;
+        }
+    }
+
+    /// Names the next card `base`, or `base 2`, `base 3` and so on if a card
+    /// has that name.
+    fn assignUniqueNewCardName(self: *BoardState, base: []const u8) void {
+        const trimmed = base[0..@min(base.len, 56)];
+        if (!self.hasCardNamed(trimmed)) return self.assignNewCardName(trimmed);
+        var n: usize = 2;
+        while (n < 10_000) : (n += 1) {
+            var buf: [64]u8 = undefined;
+            const cand = std.fmt.bufPrint(&buf, "{s} {d}", .{ trimmed, n }) catch break;
+            if (!self.hasCardNamed(cand)) return self.assignNewCardName(cand);
+        }
+        self.assignNewCardName(trimmed);
     }
 
     /// Sets `new_card_name_buf` to the first unused `"Card N"` (`"Card 1"`, `"Card 2"`, ...).
@@ -282,14 +340,16 @@ pub const BoardState = struct {
         while (n < 10_000) : (n += 1) {
             var cand_buf: [64]u8 = undefined;
             const cand = std.fmt.bufPrint(&cand_buf, "Card {d}", .{n}) catch break;
-            if (!self.hasCardNamed(cand)) {
-                self.setNewCardName(cand);
-                self.new_card_name_gen +%= 1;
-                return;
-            }
+            if (!self.hasCardNamed(cand)) return self.resetNewCard(cand);
         }
-        self.setNewCardName("Card 1");
-        self.new_card_name_gen +%= 1;
+        self.resetNewCard("Card 1");
+    }
+
+    /// The next card starts again: named `name`, its size to follow its image.
+    fn resetNewCard(self: *BoardState, name: []const u8) void {
+        self.assignNewCardName(name);
+        self.new_card_name_typed = false;
+        self.new_card_size_picked = false;
     }
 
     pub fn hasCardNamed(self: *const BoardState, candidate: []const u8) bool {
@@ -858,6 +918,7 @@ pub const BoardState = struct {
         self.pending_sd_image_size = size_bytes;
         self.pending_sd_image_slice = null;
         self.sd_create_open = true;
+        self.imageChosen();
         self.revalidatePendingSdImage();
     }
 
@@ -869,6 +930,7 @@ pub const BoardState = struct {
         self.pending_sd_image_size = Qcow2Disk.getSliceLogicalSize(data) catch data.len;
         self.pending_sd_image_slice = data;
         self.sd_create_open = true;
+        self.imageChosen();
         self.revalidatePendingSdImage();
     }
 
@@ -935,7 +997,7 @@ pub const BoardState = struct {
     ) !usize {
         const logical_size = try Qcow2Disk.getSliceLogicalSize(image_bytes);
         if (logical_size > size.bytes()) {
-            self.new_card_size = size;
+            self.pickNewCardSize(size);
             self.setPendingSdImageSlice(label_or_path, image_bytes);
             return error.ImageTooLarge;
         }
@@ -970,7 +1032,7 @@ pub const BoardState = struct {
     pub fn addNamedSdCardFromFile(self: *BoardState, card_name_opt: ?[]const u8, path: []const u8, size: SdCardSize) !usize {
         const file_size = try Qcow2Disk.getFileSizeLinux(path);
         if (file_size > size.bytes()) {
-            self.new_card_size = size;
+            self.pickNewCardSize(size);
             self.setPendingSdImageFile(path, file_size);
             return error.ImageTooLarge;
         }
@@ -1033,7 +1095,7 @@ pub const BoardState = struct {
             return false;
         };
         if (file_size > size.bytes()) {
-            self.new_card_size = size;
+            self.pickNewCardSize(size);
             self.setPendingSdImageFile(path, file_size);
             return false;
         }
@@ -1417,17 +1479,45 @@ test "a card is made from an image file in the background" {
     try testing.expectEqual(@as(u8, 0xAA), b.sd_cards.items[0].disk.readByte(511));
 }
 
-test "an image too big for the card size is an error until a big enough size is picked" {
+test "the image chosen names the card, and sizes it, unless they were set" {
     var b = try BoardState.init(testing.allocator);
     defer b.deinit();
-    b.new_card_size = .mb_256;
-    b.setPendingSdImageFile("/tmp/big.img", 300 * 1024 * 1024);
+    const mb = 1024 * 1024;
+
+    // Named after the file, and the smallest size it fits.
+    try testing.expectEqualStrings("Card 1", b.newCardName());
+    const gen = b.new_card_name_gen;
+    b.setPendingSdImageFile("/tmp/raspios-lite.img.xz", 300 * mb);
+    try testing.expectEqualStrings("raspios-lite", b.newCardName());
+    try testing.expect(b.new_card_name_gen != gen);
+    try testing.expectEqual(SdCardSize.mb_512, b.new_card_size);
+    try testing.expect(!b.hasImageTooLargeError());
+
+    // A size picked is kept for an image that fits it, and is an error for
+    // one that doesn't.
+    b.pickNewCardSize(.gb_8);
+    b.setPendingSdImageFile("/tmp/small.img", 100 * mb);
+    try testing.expectEqual(SdCardSize.gb_8, b.new_card_size);
+    b.pickNewCardSize(.mb_256);
+    b.setPendingSdImageFile("/tmp/big.img", 300 * mb);
+    try testing.expectEqual(SdCardSize.mb_512, b.new_card_size);
+    b.pickNewCardSize(.mb_256);
     try testing.expect(b.hasImageTooLargeError());
     try testing.expectEqualStrings("Error: Image (300 MB) is too large for a 256 MB SD card", b.sdErrorMessage());
-    b.new_card_size = .gb_1;
-    b.revalidatePendingSdImage();
-    try testing.expect(!b.hasImageTooLargeError());
-    try testing.expectEqualStrings("", b.sdErrorMessage());
+
+    // A name typed is kept.
+    b.setNewCardName("Mine");
+    b.setPendingSdImageFile("/tmp/other.img", 100 * mb);
+    try testing.expectEqualStrings("Mine", b.newCardName());
+}
+
+test "a card named after its image doesn't take another card's name" {
+    var b = try BoardState.init(testing.allocator);
+    defer b.deinit();
+    const img = testImage();
+    _ = try b.addNamedSdCardFromSlice("raspios", "a.img", .gb_4, &img);
+    b.setPendingSdImageFile("/tmp/raspios.img", 512);
+    try testing.expectEqualStrings("raspios 2", b.newCardName());
 }
 
 test "boot errors are told in words" {
