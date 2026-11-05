@@ -279,6 +279,17 @@ pub const V3d = struct {
     prep_fs_unifs_len: usize = 0,
     /// The frame's triangles, shaded, in draw order.
     shaded_tris: std.ArrayList(ShadedTriangle) = .empty,
+    /// A draw's vertices, while it is shaded (`shadeVertices`): each corner's slot, each slot's
+    /// vertex index, and its shaded vertex (if it was).
+    vs_corner_slot: std.ArrayList(u32) = .empty,
+    vs_unique: std.ArrayList(u32) = .empty,
+    vs_out: std.ArrayList(ShadedVertex) = .empty,
+    vs_ok: std.ArrayList(bool) = .empty,
+    /// Which slot a vertex index has, if `vs_slot_gen` is the draw's `vs_gen`.
+    vs_slot_key: std.ArrayList(u32) = .empty,
+    vs_slot_gen: std.ArrayList(u32) = .empty,
+    vs_slot_index: std.ArrayList(u32) = .empty,
+    vs_gen: u32 = 0,
     overflow_draw_start: usize = 0,
     /// Each 64-pixel tile's triangles (`y * 32 + x`), in draw order: indices
     /// into `shaded_tris`, from `tile_tri_start[t]` to `tile_tri_start[t + 1]`
@@ -705,159 +716,214 @@ pub const V3d = struct {
             const clip_max_x: f32 = @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w);
             const clip_max_y: f32 = @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h);
 
-            var tri_idx: u32 = 0;
-            while (tri_idx < num_tris) {
-                const batch_tris: usize = @min(@as(usize, num_tris - tri_idx), 5);
-                const batch_verts: usize = batch_tris * 3;
-                var v_indices: [15]u32 = undefined;
-
-                if (draw.mode == 4) {
-                    const base_v = tri_idx * 3;
-                    if (draw.indexed) {
-                        const idx_base: usize = draw.index_buffer_addr & vc_bus.ramMask(ram.len);
-                        if (draw.u16_indices) {
-                            const start_off = idx_base + @as(usize, base_v) * 2;
-                            if (start_off + batch_verts * 2 <= ram.len) {
-                                for (0..batch_verts) |k| {
-                                    v_indices[k] = std.mem.readInt(u16, ram[start_off + k * 2 ..][0..2], .little);
-                                }
-                            } else {
-                                for (0..batch_verts) |k| {
-                                    const off = start_off + k * 2;
-                                    v_indices[k] = if (off + 2 <= ram.len) std.mem.readInt(u16, ram[off..][0..2], .little) else 0;
-                                }
-                            }
-                        } else {
-                            const start_off = idx_base + @as(usize, base_v);
-                            if (start_off + batch_verts <= ram.len) {
-                                for (0..batch_verts) |k| {
-                                    v_indices[k] = ram[start_off + k];
-                                }
-                            } else {
-                                for (0..batch_verts) |k| {
-                                    const off = start_off + k;
-                                    v_indices[k] = if (off < ram.len) ram[off] else 0;
-                                }
-                            }
-                        }
-                    } else {
-                        const start_v = base_v + draw.first_or_offset;
-                        for (0..batch_verts) |k| {
-                            v_indices[k] = start_v + @as(u32, @intCast(k));
-                        }
-                    }
-                    tri_idx += @intCast(batch_tris);
-                } else {
-                    for (0..batch_tris) |t_i| {
-                        const cur_tri = tri_idx + @as(u32, @intCast(t_i));
-                        const base_l = t_i * 3;
-                        switch (draw.mode) {
-                            5 => {
-                                if ((cur_tri & 1) == 0) {
-                                    v_indices[base_l + 0] = cur_tri + 0;
-                                    v_indices[base_l + 1] = cur_tri + 1;
-                                    v_indices[base_l + 2] = cur_tri + 2;
-                                } else {
-                                    v_indices[base_l + 0] = cur_tri + 1;
-                                    v_indices[base_l + 1] = cur_tri + 0;
-                                    v_indices[base_l + 2] = cur_tri + 2;
-                                }
-                            },
-                            6 => {
-                                v_indices[base_l + 0] = 0;
-                                v_indices[base_l + 1] = cur_tri + 1;
-                                v_indices[base_l + 2] = cur_tri + 2;
-                            },
-                            else => {
-                                v_indices[base_l + 0] = 0;
-                                v_indices[base_l + 1] = 0;
-                                v_indices[base_l + 2] = 0;
-                            },
-                        }
-                    }
-                    tri_idx += @intCast(batch_tris);
-
-                    if (draw.indexed) {
-                        const idx_base = draw.index_buffer_addr & vc_bus.ramMask(ram.len);
-                        if (draw.u16_indices) {
-                            for (v_indices[0..batch_verts]) |*vi| {
-                                const off = idx_base + vi.* * 2;
-                                vi.* = if (off + 2 <= ram.len) std.mem.readInt(u16, ram[off..][0..2], .little) else 0;
-                            }
-                        } else {
-                            for (v_indices[0..batch_verts]) |*vi| {
-                                const off = idx_base + vi.*;
-                                vi.* = if (off < ram.len) ram[off] else 0;
-                            }
-                        }
-                    } else if (draw.first_or_offset != 0) {
-                        for (v_indices[0..batch_verts]) |*vi| {
-                            vi.* += draw.first_or_offset;
-                        }
-                    }
+            // Each triangle's corners, each vertex shaded once (a mesh's triangles share them),
+            // then the triangles kept.
+            const shaded = self.shadeVertices(ram, draw, num_tris, vs_decoded, vs_unifs, active_attrs, vpm_words, n_var) orelse {
+                self.overflow_draw_start = draw_idx;
+                break;
+            };
+            for (0..num_tris) |t| {
+                var verts: [3]ShadedVertex = undefined;
+                var ok = true;
+                inline for (0..3) |corner| {
+                    const slot = self.vs_corner_slot.items[t * 3 + corner];
+                    ok = ok and self.vs_ok.items[slot];
+                    verts[corner] = shaded[slot];
                 }
+                if (!ok) continue;
 
-                var vpm_in: [32]qpu_sim.Vec = undefined;
-                populateBatchVpmIn(ram, active_attrs, v_indices[0..batch_verts], &vpm_in);
+                const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
+                    (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
+                if (@abs(area) < 1e-6) continue;
+                if (culled(draw.config_b0, area)) continue;
 
-                const vs_res = qpu_sim.runDecoded(vs_decoded, .{
-                    .uniforms = vs_unifs,
-                    .vpm_in = vpm_in[0..vpm_words],
-                }) catch continue;
-                if (vs_res.vpm_out_len < 3) continue;
-                const valid_vars = @min(n_var, vs_res.vpm_out_len - 3);
+                const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
+                const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
+                const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
+                const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
+                if (min_fx >= max_fx or min_fy >= max_fy) continue;
 
-                for (0..batch_tris) |t_i| {
-                    const base_l = t_i * 3;
-                    var verts: [3]ShadedVertex = .{ .{}, .{}, .{} };
-                    inline for (0..3) |corner| {
-                        const lane = base_l + corner;
-                        const xy_packed = vs_res.vpm_out[0][lane];
-                        const xs: i16 = @bitCast(@as(u16, @truncate(xy_packed)));
-                        const ys: i16 = @bitCast(@as(u16, @truncate(xy_packed >> 16)));
-                        verts[corner].x = @as(f32, @floatFromInt(xs)) * (1.0 / 16.0) + draw.vp_x;
-                        verts[corner].y = @as(f32, @floatFromInt(ys)) * (1.0 / 16.0) + draw.vp_y;
-                        verts[corner].z = @bitCast(vs_res.vpm_out[1][lane]);
-                        const raw_inv_w: f32 = @bitCast(vs_res.vpm_out[2][lane]);
-                        const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
-                        verts[corner].inv_w = inv_w;
-                        for (0..valid_vars) |vi| {
-                            const raw_v: f32 = @bitCast(vs_res.vpm_out[3 + vi][lane]);
-                            verts[corner].persp_varyings[vi] = raw_v * inv_w;
-                        }
-                    }
-
-                    const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
-                        (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
-                    if (@abs(area) < 1e-6) continue;
-                    if (culled(draw.config_b0, area)) continue;
-
-                    const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
-                    const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
-                    const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
-                    const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
-                    if (min_fx >= max_fx or min_fy >= max_fy) continue;
-
-                    if (self.shaded_tris.items.len == MAX_PREBINNED_TRIS) {
-                        // This draw, and those after it, are drawn whole for each tile.
-                        self.shaded_tris.shrinkRetainingCapacity(draw_start);
-                        self.overflow_draw_start = draw_idx;
-                        break :draws;
-                    }
-                    self.shaded_tris.appendAssumeCapacity(ShadedTriangle.init(
-                        @intCast(draw_idx),
-                        @intFromFloat(min_fx),
-                        @intFromFloat(min_fy),
-                        @intFromFloat(max_fx),
-                        @intFromFloat(max_fy),
-                        area,
-                        verts,
-                        n_var,
-                    ));
+                if (self.shaded_tris.items.len == MAX_PREBINNED_TRIS) {
+                    // This draw, and those after it, are drawn whole for each tile.
+                    self.shaded_tris.shrinkRetainingCapacity(draw_start);
+                    self.overflow_draw_start = draw_idx;
+                    break :draws;
                 }
+                self.shaded_tris.appendAssumeCapacity(ShadedTriangle.init(
+                    @intCast(draw_idx),
+                    @intFromFloat(min_fx),
+                    @intFromFloat(min_fy),
+                    @intFromFloat(max_fx),
+                    @intFromFloat(max_fy),
+                    area,
+                    verts,
+                    n_var,
+                ));
             }
         }
     }
+
+    /// The vertex `index` of a draw's triangle `tri`'s `corner`, as V3D reads it (from the index
+    /// buffer, for an indexed draw), or null if it is past the end of RAM.
+    fn triangleCorner(ram: []const u8, draw: DrawCall, tri: u32, corner: u32) u32 {
+        const pos: u32 = switch (draw.mode) {
+            4 => tri * 3 + corner,
+            // Strips: odd triangles have their first two corners the other way round.
+            5 => if (tri & 1 == 0) tri + corner else switch (corner) {
+                0 => tri + 1,
+                1 => tri,
+                else => tri + 2,
+            },
+            6 => if (corner == 0) 0 else tri + corner,
+            else => 0,
+        };
+        if (!draw.indexed) return pos + draw.first_or_offset;
+        const idx_base: usize = draw.index_buffer_addr & vc_bus.ramMask(ram.len);
+        if (draw.u16_indices) {
+            const off = idx_base + @as(usize, pos) * 2;
+            return if (off + 2 <= ram.len) std.mem.readInt(u16, ram[off..][0..2], .little) else 0;
+        }
+        const off = idx_base + pos;
+        return if (off < ram.len) ram[off] else 0;
+    }
+
+    /// Shades each vertex of `draw`'s `num_tris` triangles once: their corners' slots go in
+    /// `vs_corner_slot`, and each slot's vertex (and whether it was shaded) in the result (and
+    /// `vs_ok`). Null if there isn't the memory.
+    fn shadeVertices(
+        self: *V3d,
+        ram: []const u8,
+        draw: DrawCall,
+        num_tris: u32,
+        vs_decoded: []const qpu_sim.DecodedInst,
+        vs_unifs: []const u32,
+        attrs: []const AttrStream,
+        vpm_words: usize,
+        n_var: usize,
+    ) ?[]const ShadedVertex {
+        const corners: usize = @as(usize, num_tris) * 3;
+        self.vs_corner_slot.resize(tri_allocator, corners) catch return null;
+        self.vs_unique.clearRetainingCapacity();
+        self.vs_unique.ensureTotalCapacity(tri_allocator, corners) catch return null;
+        if (self.vs_slot_key.items.len == 0) {
+            self.vs_slot_key.resize(tri_allocator, vs_slot_count) catch return null;
+            self.vs_slot_gen.resize(tri_allocator, vs_slot_count) catch return null;
+            self.vs_slot_index.resize(tri_allocator, vs_slot_count) catch return null;
+            @memset(self.vs_slot_gen.items, 0);
+        }
+        self.vs_gen +%= 1;
+        if (self.vs_gen == 0) {
+            @memset(self.vs_slot_gen.items, 0);
+            self.vs_gen = 1;
+        }
+        // The distinct vertices, found by their index (in a table that forgets one when another
+        // takes its place: it is then shaded twice, the same).
+        for (0..num_tris) |t| {
+            for (0..3) |corner| {
+                const index = triangleCorner(ram, draw, @intCast(t), @intCast(corner));
+                const h = index & (vs_slot_count - 1);
+                if (self.vs_slot_gen.items[h] != self.vs_gen or self.vs_slot_key.items[h] != index) {
+                    self.vs_slot_gen.items[h] = self.vs_gen;
+                    self.vs_slot_key.items[h] = index;
+                    self.vs_slot_index.items[h] = @intCast(self.vs_unique.items.len);
+                    self.vs_unique.appendAssumeCapacity(index);
+                }
+                self.vs_corner_slot.items[t * 3 + corner] = self.vs_slot_index.items[h];
+            }
+        }
+        const unique = self.vs_unique.items;
+        self.vs_out.resize(tri_allocator, unique.len) catch return null;
+        self.vs_ok.resize(tri_allocator, unique.len) catch return null;
+
+        const job: VertexJob = .{
+            .ram = ram,
+            .draw = draw,
+            .decoded = vs_decoded,
+            .unifs = vs_unifs,
+            .attrs = attrs,
+            .vpm_words = vpm_words,
+            .n_var = n_var,
+            .indices = unique,
+            .out = self.vs_out.items,
+            .ok = self.vs_ok.items,
+        };
+        // The vertices, a QPU's 16 at a time, shared among threads when there are many.
+        const batches = (unique.len + 15) / 16;
+        const max_helpers = 3;
+        const helpers: usize = if (unique.len < 1024) 0 else @min(max_helpers, batches / 16);
+        var threads: [max_helpers]std.Thread = undefined;
+        var spawned: usize = 0;
+        const per = (batches + helpers) / (helpers + 1);
+        for (0..helpers) |h| {
+            const lo = @min((h + 1) * per, batches);
+            const hi = @min((h + 2) * per, batches);
+            threads[spawned] = std.Thread.spawn(.{}, VertexJob.run, .{ &job, lo, hi }) catch {
+                job.run(lo, hi);
+                continue;
+            };
+            spawned += 1;
+        }
+        job.run(0, @min(per, batches));
+        for (threads[0..spawned]) |th| th.join();
+        return self.vs_out.items;
+    }
+
+    /// Vertices shaded together: `indices` into `out` and `ok`, in batches of 16.
+    const VertexJob = struct {
+        ram: []const u8,
+        draw: DrawCall,
+        decoded: []const qpu_sim.DecodedInst,
+        unifs: []const u32,
+        attrs: []const AttrStream,
+        vpm_words: usize,
+        n_var: usize,
+        indices: []const u32,
+        out: []ShadedVertex,
+        ok: []bool,
+
+        fn run(job: *const VertexJob, first_batch: usize, end_batch: usize) void {
+            var b = first_batch;
+            while (b < end_batch) : (b += 1) {
+                const lo = b * 16;
+                const hi = @min(lo + 16, job.indices.len);
+                var vpm_in: [32]qpu_sim.Vec = undefined;
+                populateBatchVpmIn(job.ram, job.attrs, job.indices[lo..hi], &vpm_in);
+                const res = qpu_sim.runDecoded(job.decoded, .{
+                    .uniforms = job.unifs,
+                    .vpm_in = vpm_in[0..job.vpm_words],
+                }) catch {
+                    @memset(job.ok[lo..hi], false);
+                    continue;
+                };
+                if (res.vpm_out_len < 3) {
+                    @memset(job.ok[lo..hi], false);
+                    continue;
+                }
+                const valid_vars = @min(job.n_var, res.vpm_out_len - 3);
+                for (lo..hi) |i| {
+                    const lane = i - lo;
+                    var v: ShadedVertex = .{};
+                    const xy_packed = res.vpm_out[0][lane];
+                    const xs: i16 = @bitCast(@as(u16, @truncate(xy_packed)));
+                    const ys: i16 = @bitCast(@as(u16, @truncate(xy_packed >> 16)));
+                    v.x = @as(f32, @floatFromInt(xs)) * (1.0 / 16.0) + job.draw.vp_x;
+                    v.y = @as(f32, @floatFromInt(ys)) * (1.0 / 16.0) + job.draw.vp_y;
+                    v.z = @bitCast(res.vpm_out[1][lane]);
+                    const raw_inv_w: f32 = @bitCast(res.vpm_out[2][lane]);
+                    const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
+                    v.inv_w = inv_w;
+                    for (0..valid_vars) |vi| {
+                        const raw_v: f32 = @bitCast(res.vpm_out[3 + vi][lane]);
+                        v.persp_varyings[vi] = raw_v * inv_w;
+                    }
+                    job.out[i] = v;
+                    job.ok[i] = true;
+                }
+            }
+        }
+    };
+
+    const vs_slot_count = 65536;
 
     /// What the frame's triangles and their tiles are kept in.
     const tri_allocator = std.heap.smp_allocator;
@@ -3489,4 +3555,148 @@ test "V3D bins more triangles than tiles once did, into each tile in draw order"
     }
     // Each in one tile, and those that are wider in two.
     try std.testing.expectEqual(@as(usize, 5000 + (5000 + 6) / 7), total);
+}
+
+test "V3D shades each vertex once, as shading each triangle's corners would" {
+    var v3d = V3d{};
+    defer {
+        inline for (.{ "shaded_tris", "tile_tris", "vs_corner_slot", "vs_unique", "vs_out", "vs_ok", "vs_slot_key", "vs_slot_gen", "vs_slot_index" }) |f| @field(v3d, f).deinit(V3d.tri_allocator);
+    }
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 512 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    // The vertex shader: x and y scaled (by uniforms) into pixels, and three varyings.
+    var vs: qpu.Program(32) = .{};
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_write_setup, .value = 0x00001a00 }));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_read_setup, .value = 0x00501a00 }));
+    vs.emit(try qpu.mov(qpu.wr(0), qpu.vpm_read));
+    vs.emit(try qpu.mov(qpu.wr(1), qpu.vpm_read));
+    vs.emit(try qpu.mov(qpu.wa(0), qpu.vpm_read));
+    vs.emit(try qpu.mov(qpu.wr(3), qpu.vpm_read));
+    vs.emit(try qpu.mov(qpu.wa(2), qpu.vpm_read));
+    vs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(0), .a = qpu.r(0), .b = qpu.unif } }));
+    vs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(1), .a = qpu.r(1), .b = qpu.unif } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .ftoi, .dst = qpu.wa(1), .a = qpu.r(0), .b = qpu.r(0) }, .pack = .{ .regfile_a = .@"16a" } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .ftoi, .dst = qpu.wa(1), .a = qpu.r(1), .b = qpu.r(1) }, .pack = .{ .regfile_a = .@"16b" } }));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.wr(2), .value = @bitCast(@as(f32, 0.5)) }));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(1)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(2)));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_write, .value = @bitCast(@as(f32, 1.0)) }));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(0)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(3)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(2)));
+    vs.end(.vertex);
+    var fs: qpu.Program(4) = .{};
+    fs.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(0)));
+    fs.end(.fragment);
+    @memcpy(ram[0x1000..][0 .. vs.code().len * 8], std.mem.sliceAsBytes(vs.code()));
+    @memcpy(ram[0x1400..][0 .. fs.code().len * 8], std.mem.sliceAsBytes(fs.code()));
+    std.mem.writeInt(u32, ram[0x1800..0x1804], @bitCast(@as(f32, 300.0 * 16.0)), .little);
+    std.mem.writeInt(u32, ram[0x1804..0x1808], @bitCast(@as(f32, 300.0 * 16.0)), .little);
+
+    // A 40 by 40 grid of vertices at 0x10000 (x, y, r, g, b), a little uneven, and their
+    // triangles' indices at 0x30000.
+    const n = 40;
+    var prng = std.Random.DefaultPrng.init(1);
+    const rand = prng.random();
+    for (0..n) |gy| {
+        for (0..n) |gx| {
+            const off = 0x10000 + (gy * n + gx) * 20;
+            const vals = [5]f32{
+                -1 + 2 * @as(f32, @floatFromInt(gx)) / (n - 1) + (rand.float(f32) - 0.5) * 0.01,
+                -1 + 2 * @as(f32, @floatFromInt(gy)) / (n - 1) + (rand.float(f32) - 0.5) * 0.01,
+                rand.float(f32),
+                rand.float(f32),
+                rand.float(f32),
+            };
+            @memcpy(ram[off..][0..20], std.mem.sliceAsBytes(&vals));
+        }
+    }
+    var n_idx: u32 = 0;
+    for (0..n - 1) |gy| {
+        for (0..n - 1) |gx| {
+            const a: u16 = @intCast(gy * n + gx);
+            // Alternately facing each way, so culling has some to cull.
+            const quad = if ((gx + gy) % 3 == 0) [6]u16{ a, a + 1, a + n, a + 1, a + n + 1, a + n } else [6]u16{ a, a + n, a + 1, a + 1, a + n, a + n + 1 };
+            for (quad) |ix| {
+                std.mem.writeInt(u16, ram[0x30000 + n_idx * 2 ..][0..2], ix, .little);
+                n_idx += 1;
+            }
+        }
+    }
+    // The shader record: 3 varyings, one attribute of 20 bytes.
+    ram[0x3003] = 3;
+    std.mem.writeInt(u32, ram[0x3004..0x3008], 0x1400, .little);
+    std.mem.writeInt(u32, ram[0x3008..0x300c], 0x1900, .little);
+    ram[0x300e] = 1;
+    std.mem.writeInt(u32, ram[0x3010..0x3014], 0x1000, .little);
+    std.mem.writeInt(u32, ram[0x3014..0x3018], 0x1800, .little);
+    std.mem.writeInt(u32, ram[0x3024..0x3028], 0x10000, .little);
+    ram[0x3028] = 19;
+    ram[0x3029] = 20;
+
+    // The mesh, culling one way; a strip and a fan through the grid's vertices.
+    const draws = [_]V3d.DrawCall{
+        .{ .shader_rec_addr = 0x3000, .num_attrs = 1, .mode = 4, .indexed = true, .count = n_idx, .index_buffer_addr = 0x30000, .vp_x = 320, .vp_y = 320, .config_b0 = 0x01 },
+        .{ .shader_rec_addr = 0x3000, .num_attrs = 1, .mode = 5, .count = 200, .first_or_offset = 7, .vp_x = 320, .vp_y = 320 },
+        .{ .shader_rec_addr = 0x3000, .num_attrs = 1, .mode = 6, .count = 60, .first_or_offset = 400, .vp_x = 320, .vp_y = 320 },
+    };
+    @memcpy(v3d.draws[0..draws.len], &draws);
+    v3d.draws_len = draws.len;
+    v3d.prepareDrawsForFrame(ram);
+    try std.testing.expect(v3d.overflow_draw_start >= v3d.draws_len);
+
+    // Each triangle's corners shaded together, as a batch of their own.
+    var vs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
+    const vs_decoded = qpu_sim.decodeProgram(vs.code(), &vs_decoded_buf);
+    const unifs = [2]u32{ std.mem.readInt(u32, ram[0x1800..0x1804], .little), std.mem.readInt(u32, ram[0x1804..0x1808], .little) };
+    var attr_streams: [8]V3d.AttrStream = undefined;
+    const attr_info = V3d.decodeAttrStreams(ram, 0x3000, 1, 1, &attr_streams);
+    var expected: usize = 0;
+    var culled_some = false;
+    for (draws, 0..) |draw, draw_idx| {
+        const num_tris: u32 = if (draw.mode == 4) draw.count / 3 else draw.count - 2;
+        for (0..num_tris) |t| {
+            var indices: [3]u32 = undefined;
+            for (&indices, 0..) |*ix, c| ix.* = V3d.triangleCorner(ram, draw, @intCast(t), @intCast(c));
+            var vpm_in: [32]qpu_sim.Vec = undefined;
+            V3d.populateBatchVpmIn(ram, attr_streams[0..attr_info.count], &indices, &vpm_in);
+            const res = try qpu_sim.runDecoded(vs_decoded, .{ .uniforms = &unifs, .vpm_in = vpm_in[0..attr_info.vpm_words] });
+            var verts: [3]V3d.ShadedVertex = undefined;
+            for (&verts, 0..) |*v, lane| {
+                const xy = res.vpm_out[0][lane];
+                v.* = .{
+                    .x = @as(f32, @floatFromInt(@as(i16, @bitCast(@as(u16, @truncate(xy)))))) / 16.0 + draw.vp_x,
+                    .y = @as(f32, @floatFromInt(@as(i16, @bitCast(@as(u16, @truncate(xy >> 16)))))) / 16.0 + draw.vp_y,
+                    .z = @bitCast(res.vpm_out[1][lane]),
+                    .inv_w = @bitCast(res.vpm_out[2][lane]),
+                };
+                for (0..3) |k| v.persp_varyings[k] = @as(f32, @bitCast(res.vpm_out[3 + k][lane])) * v.inv_w;
+            }
+            const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) - (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
+            if (@abs(area) < 1e-6) continue;
+            if (V3d.culled(draw.config_b0, area)) {
+                culled_some = true;
+                continue;
+            }
+            try std.testing.expect(expected < v3d.shaded_tris.items.len);
+            const got = v3d.shaded_tris.items[expected];
+            try std.testing.expectEqual(@as(u16, @intCast(draw_idx)), got.draw_idx);
+            for (got.v, verts) |g, e| {
+                try std.testing.expectEqual(e.x, g.x);
+                try std.testing.expectEqual(e.y, g.y);
+                try std.testing.expectEqual(e.z, g.z);
+                try std.testing.expectEqual(e.inv_w, g.inv_w);
+                try std.testing.expectEqualSlices(f32, e.persp_varyings[0..3], g.persp_varyings[0..3]);
+            }
+            expected += 1;
+        }
+    }
+    try std.testing.expect(culled_some);
+    try std.testing.expect(expected > 1000);
+    try std.testing.expectEqual(expected, v3d.shaded_tris.items.len);
+    // More vertices than one thread shades.
+    try std.testing.expect(n * n >= 1024);
 }
