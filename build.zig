@@ -58,6 +58,9 @@ pub fn build(b: *std.Build) void {
         // See the `use_llvm` comment on `exe` (https://codeberg.org/ziglang/zig/issues/37289).
         .use_llvm = true,
     });
+    // Debug builds keep several copies of the large SoC and CPU structs on the stack, which
+    // overflows macOS's fixed 8 MiB main-thread stack.
+    unit_tests.stack_size = 64 * 1024 * 1024;
     const run_unit_tests = b.addRunArtifact(unit_tests);
 
     const test_step = b.step("test", "Run unit tests");
