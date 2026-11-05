@@ -5,8 +5,8 @@
 //! they sample are decoded from RAM as the TMU reads them, and kept until those bytes change.
 //!
 //! Shaders that read the tile's colour (V3D blends in its fragment shaders) read the framebuffer as
-//! a texture, which is only defined after a texture barrier for pixels drawn since: their draws go
-//! a triangle at a time, a barrier before each.
+//! a texture, which is only defined after a texture barrier for pixels drawn since: their triangles
+//! are drawn in batches no two of which cover the same pixel, a barrier before each (`Batcher`).
 
 const std = @import("std");
 const host_posix = @import("../host/posix.zig");
@@ -151,6 +151,7 @@ pub const Renderer = struct {
     frame: u64 = 0,
     /// Where textures are decoded.
     texels: std.ArrayList(u32) = .empty,
+    batcher: Batcher = .{},
 
     /// A fragment shader's program (0 if OpenGL can't draw it), and where its uniforms are.
     const Program = struct {
@@ -446,11 +447,25 @@ pub const Renderer = struct {
             gl.DepthMask(@intFromBool(d.depth_write));
             gl.Scissor(@intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0));
             if (p.shader.reads_color) {
-                // Each triangle reads what those before it drew.
-                var v: u32 = 0;
-                while (v + 3 <= d.vertex_count) : (v += 3) {
+                // Each triangle reads what those before it drew: those it covers pixels of are
+                // drawn, with a barrier, before it.
+                const tris = vertices[d.first_vertex..][0 .. d.vertex_count / 3 * 3];
+                r.batcher.start(width, height);
+                var batch_start: u32 = 0;
+                var t: u32 = 0;
+                while (t * 3 < tris.len) : (t += 1) {
+                    const tri = tris[t * 3 ..][0..3];
+                    if (!r.batcher.add(tri)) {
+                        gl.TextureBarrier.?();
+                        gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex + batch_start * 3), @intCast((t - batch_start) * 3));
+                        batch_start = t;
+                        r.batcher.clear();
+                        _ = r.batcher.add(tri);
+                    }
+                }
+                if (t > batch_start) {
                     gl.TextureBarrier.?();
-                    gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex + v), 3);
+                    gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex + batch_start * 3), @intCast((t - batch_start) * 3));
                 }
             } else {
                 gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex), @intCast(d.vertex_count));
@@ -461,3 +476,159 @@ pub const Renderer = struct {
         if (gl.GetError() != GL_NO_ERROR) return error.GlFailed;
     }
 };
+
+/// Makes batches of triangles no two of which cover the same pixel, so a batch can be drawn at once
+/// by shaders reading the framebuffer (each pixel drawn once since the barrier before it). Triangles
+/// are only said to overlap if their insides do: those sharing an edge (a quad's two halves, say)
+/// cover no pixel centre in common.
+pub const Batcher = struct {
+    /// The triangles in the batch, by the 16-pixel cells their bounds touch: a list of entries for
+    /// each cell, valid if the cell's generation is the batch's.
+    cell_gen: [cells * cells]u32 = @splat(0),
+    cell_head: [cells * cells]u32 = undefined,
+    entries: std.ArrayList(Entry) = .empty,
+    gen: u32 = 1,
+    /// The cells the framebuffer is wide and high.
+    cols: u32 = 0,
+    rows: u32 = 0,
+    /// The batch's triangles' corners, by their index.
+    tris: std.ArrayList([3][2]f32) = .empty,
+
+    const cell_size = 16;
+    /// As many as a 2048-pixel framebuffer has.
+    const cells = 2048 / cell_size;
+    const none = std.math.maxInt(u32);
+
+    const Entry = struct { tri: u32, next: u32 };
+
+    /// Starts a draw's batches, in a framebuffer `width` by `height`.
+    pub fn start(b: *Batcher, width: u32, height: u32) void {
+        b.cols = @min((width + cell_size - 1) / cell_size, cells);
+        b.rows = @min((height + cell_size - 1) / cell_size, cells);
+        b.clear();
+    }
+
+    /// Starts a new batch.
+    pub fn clear(b: *Batcher) void {
+        b.gen +%= 1;
+        if (b.gen == 0) {
+            b.cell_gen = @splat(0);
+            b.gen = 1;
+        }
+        b.entries.clearRetainingCapacity();
+        b.tris.clearRetainingCapacity();
+    }
+
+    /// Adds triangle `tri` to the batch (true), unless it covers pixels one in it does (false).
+    /// A triangle that can't be added (out of memory) is said to overlap.
+    pub fn add(b: *Batcher, tri: *const [3]Vertex) bool {
+        const corners: [3][2]f32 = .{ .{ tri[0].x, tri[0].y }, .{ tri[1].x, tri[1].y }, .{ tri[2].x, tri[2].y } };
+        const lo = .{ @min(corners[0][0], corners[1][0], corners[2][0]), @min(corners[0][1], corners[1][1], corners[2][1]) };
+        const hi = .{ @max(corners[0][0], corners[1][0], corners[2][0]), @max(corners[0][1], corners[1][1], corners[2][1]) };
+        if (!(lo[0] < hi[0] and lo[1] < hi[1])) return true; // No inside (or NaN): covers no pixel.
+        const c0 = cellOf(lo[0], b.cols);
+        const c1 = cellOf(hi[0], b.cols);
+        const r0 = cellOf(lo[1], b.rows);
+        const r1 = cellOf(hi[1], b.rows);
+        var cy = r0;
+        while (cy <= r1) : (cy += 1) {
+            var cx = c0;
+            while (cx <= c1) : (cx += 1) {
+                const c = cy * cells + cx;
+                if (b.cell_gen[c] != b.gen) continue;
+                var e = b.cell_head[c];
+                while (e != none) : (e = b.entries.items[e].next) {
+                    if (overlap(&corners, &b.tris.items[b.entries.items[e].tri])) return false;
+                }
+            }
+        }
+        const index: u32 = @intCast(b.tris.items.len);
+        b.tris.append(std.heap.smp_allocator, corners) catch return false;
+        cy = r0;
+        while (cy <= r1) : (cy += 1) {
+            var cx = c0;
+            while (cx <= c1) : (cx += 1) {
+                const c = cy * cells + cx;
+                if (b.cell_gen[c] != b.gen) {
+                    b.cell_gen[c] = b.gen;
+                    b.cell_head[c] = none;
+                }
+                b.entries.append(std.heap.smp_allocator, .{ .tri = index, .next = b.cell_head[c] }) catch return false;
+                b.cell_head[c] = @intCast(b.entries.items.len - 1);
+            }
+        }
+        return true;
+    }
+
+    fn cellOf(v: f32, n: u32) u32 {
+        if (!(v > 0)) return 0;
+        const c = v / cell_size;
+        return if (c >= @as(f32, @floatFromInt(n))) n -| 1 else @intFromFloat(c);
+    }
+
+    /// Whether the insides of triangles `a` and `b` overlap: no edge of either separates them
+    /// (touching is apart).
+    fn overlap(a: *const [3][2]f32, b: *const [3][2]f32) bool {
+        return !separates(a, a, b) and !separates(b, a, b);
+    }
+
+    /// Whether one of `edges`' edges has `a` on one side of it and `b` on the other.
+    fn separates(edges: *const [3][2]f32, a: *const [3][2]f32, b: *const [3][2]f32) bool {
+        for (0..3) |i| {
+            const p = edges[i];
+            const q = edges[(i + 1) % 3];
+            const n = .{ p[1] - q[1], q[0] - p[0] };
+            var a_lo: f32 = std.math.inf(f32);
+            var a_hi: f32 = -std.math.inf(f32);
+            var b_lo: f32 = std.math.inf(f32);
+            var b_hi: f32 = -std.math.inf(f32);
+            for (a, b) |va, vb| {
+                const pa = n[0] * va[0] + n[1] * va[1];
+                const pb = n[0] * vb[0] + n[1] * vb[1];
+                a_lo = @min(a_lo, pa);
+                a_hi = @max(a_hi, pa);
+                b_lo = @min(b_lo, pb);
+                b_hi = @max(b_hi, pb);
+            }
+            if (a_hi <= b_lo or b_hi <= a_lo) return true;
+        }
+        return false;
+    }
+};
+
+fn testTri(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32) [3]Vertex {
+    const v = struct {
+        fn at(x: f32, y: f32) Vertex {
+            return .{ .x = x, .y = y, .z = 0, .inv_w = 1, .unit_w = 1, .varyings = @splat(0) };
+        }
+    };
+    return .{ v.at(x0, y0), v.at(x1, y1), v.at(x2, y2) };
+}
+
+test "Batcher batches a quad's halves and apart triangles, not overlapping ones" {
+    var b: Batcher = .{};
+    defer b.entries.deinit(std.heap.smp_allocator);
+    defer b.tris.deinit(std.heap.smp_allocator);
+    b.start(640, 480);
+    // A quad's two halves share an edge.
+    try std.testing.expect(b.add(&testTri(10, 10, 40, 10, 10, 40)));
+    try std.testing.expect(b.add(&testTri(40, 10, 40, 40, 10, 40)));
+    // The next quad, touching the first along x = 40.
+    try std.testing.expect(b.add(&testTri(40, 10, 70, 10, 40, 40)));
+    // Far away, in other cells.
+    try std.testing.expect(b.add(&testTri(500, 400, 600, 400, 500, 470)));
+    // Inside the first.
+    try std.testing.expect(!b.add(&testTri(12, 12, 14, 12, 12, 14)));
+    // In a new batch, inside the first's bounds but past its diagonal (x + y = 50).
+    b.clear();
+    try std.testing.expect(b.add(&testTri(10, 10, 40, 10, 10, 40)));
+    try std.testing.expect(b.add(&testTri(35, 35, 39, 35, 39, 39)));
+    // Over the first.
+    try std.testing.expect(!b.add(&testTri(15, 15, 30, 15, 15, 30)));
+    // A new batch takes it.
+    b.clear();
+    try std.testing.expect(b.add(&testTri(15, 15, 30, 15, 15, 30)));
+    // Off the framebuffer, or with no inside, it covers nothing.
+    try std.testing.expect(b.add(&testTri(-100, -100, -90, -100, -100, -90)));
+    try std.testing.expect(b.add(&testTri(30, 30, 50, 30, 70, 30)));
+}
