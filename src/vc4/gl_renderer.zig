@@ -6,7 +6,8 @@
 //!
 //! Shaders that read the tile's colour (V3D blends in its fragment shaders) read the framebuffer as
 //! a texture, which is only defined after a texture barrier for pixels drawn since: their triangles
-//! are drawn in batches no two of which cover the same pixel, a barrier before each (`Batcher`).
+//! are drawn in layers no two triangles of which cover the same pixel, each after those it covers
+//! pixels of, with a barrier before each layer (`Layers`).
 
 const std = @import("std");
 const host_posix = @import("../host/posix.zig");
@@ -46,6 +47,7 @@ const GL_VERTEX_SHADER: GLenum = 0x8B31;
 const GL_COMPILE_STATUS: GLenum = 0x8B81;
 const GL_LINK_STATUS: GLenum = 0x8B82;
 const GL_ARRAY_BUFFER: GLenum = 0x8892;
+const GL_ELEMENT_ARRAY_BUFFER: GLenum = 0x8893;
 const GL_STREAM_DRAW: GLenum = 0x88E0;
 const GL_FLOAT: GLenum = 0x1406;
 const GL_UNSIGNED_INT: GLenum = 0x1405;
@@ -103,6 +105,7 @@ const Gl = struct {
     GenBuffers: *const fn (GLsizei, [*]GLuint) callconv(.c) void,
     BindBuffer: *const fn (GLenum, GLuint) callconv(.c) void,
     BufferData: *const fn (GLenum, isize, ?*const anyopaque, GLenum) callconv(.c) void,
+    DrawElements: *const fn (GLenum, GLsizei, GLenum, ?*const anyopaque) callconv(.c) void,
     VertexAttribPointer: *const fn (GLuint, GLint, GLenum, GLboolean, GLsizei, ?*const anyopaque) callconv(.c) void,
     VertexAttribIPointer: *const fn (GLuint, GLint, GLenum, GLsizei, ?*const anyopaque) callconv(.c) void,
     EnableVertexAttribArray: *const fn (GLuint) callconv(.c) void,
@@ -139,6 +142,8 @@ pub const Renderer = struct {
     vertex_shader: GLuint = 0,
     vao: GLuint = 0,
     vbo: GLuint = 0,
+    /// The vertices of the triangles of a draw reading the tile's colour, layer by layer.
+    ebo: GLuint = 0,
     fbo: GLuint = 0,
     color: GLuint = 0,
     depth: GLuint = 0,
@@ -151,7 +156,7 @@ pub const Renderer = struct {
     frame: u64 = 0,
     /// Where textures are decoded.
     texels: std.ArrayList(u32) = .empty,
-    batcher: Batcher = .{},
+    layers: Layers = .{},
 
     /// A fragment shader's program (0 if OpenGL can't draw it), and where its uniforms are.
     const Program = struct {
@@ -230,6 +235,8 @@ pub const Renderer = struct {
         gl.VertexAttribIPointer(1, 1, GL_UNSIGNED_INT, stride, @ptrFromInt(@offsetOf(Vertex, "unit_w")));
         for (0..4) |i| gl.VertexAttribPointer(@intCast(2 + i), 4, GL_FLOAT, 0, stride, @ptrFromInt(@offsetOf(Vertex, "varyings") + i * 16));
         for (0..6) |i| gl.EnableVertexAttribArray(@intCast(i));
+        gl.GenBuffers(1, @ptrCast(&r.ebo));
+        gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, r.ebo);
         gl.GenFramebuffers(1, @ptrCast(&r.fbo));
         gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
         gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -450,22 +457,21 @@ pub const Renderer = struct {
                 // Each triangle reads what those before it drew: those it covers pixels of are
                 // drawn, with a barrier, before it.
                 const tris = vertices[d.first_vertex..][0 .. d.vertex_count / 3 * 3];
-                r.batcher.start(width, height);
-                var batch_start: u32 = 0;
-                var t: u32 = 0;
-                while (t * 3 < tris.len) : (t += 1) {
-                    const tri = tris[t * 3 ..][0..3];
-                    if (!r.batcher.add(tri)) {
+                if (r.layers.build(width, height, tris, d.first_vertex)) {
+                    const order = r.layers.order.items;
+                    gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, @intCast(order.len * 4), order.ptr, GL_STREAM_DRAW);
+                    const starts = r.layers.start.items;
+                    for (starts[0 .. starts.len - 1], starts[1..]) |lo, hi| {
                         gl.TextureBarrier.?();
-                        gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex + batch_start * 3), @intCast((t - batch_start) * 3));
-                        batch_start = t;
-                        r.batcher.clear();
-                        _ = r.batcher.add(tri);
+                        gl.DrawElements(GL_TRIANGLES, @intCast(hi - lo), GL_UNSIGNED_INT, @ptrFromInt(@as(usize, lo) * 4));
                     }
-                }
-                if (t > batch_start) {
-                    gl.TextureBarrier.?();
-                    gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex + batch_start * 3), @intCast((t - batch_start) * 3));
+                } else |_| {
+                    // A triangle at a time.
+                    var v: u32 = 0;
+                    while (v < tris.len) : (v += 3) {
+                        gl.TextureBarrier.?();
+                        gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex + v), 3);
+                    }
                 }
             } else {
                 gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex), @intCast(d.vertex_count));
@@ -477,87 +483,113 @@ pub const Renderer = struct {
     }
 };
 
-/// Makes batches of triangles no two of which cover the same pixel, so a batch can be drawn at once
-/// by shaders reading the framebuffer (each pixel drawn once since the barrier before it). Triangles
-/// are only said to overlap if their insides do: those sharing an edge (a quad's two halves, say)
-/// cover no pixel centre in common.
-pub const Batcher = struct {
-    /// The triangles in the batch, by the 16-pixel cells their bounds touch: a list of entries for
-    /// each cell, valid if the cell's generation is the batch's.
-    cell_gen: [cells * cells]u32 = @splat(0),
+/// Puts triangles drawn in order in layers, each after every earlier triangle covering pixels it
+/// covers, and no two in one layer covering the same pixel: a layer can be drawn at once by shaders
+/// reading the framebuffer, after a barrier (each pixel drawn once since). Triangles are only said
+/// to overlap if their insides do: those sharing an edge (a quad's two halves, say) cover no pixel
+/// centre in common.
+pub const Layers = struct {
+    /// The vertices of the triangles, layer by layer (in draw order in each), and where each layer
+    /// starts in them (and, last, where the last ends).
+    order: std.ArrayList(u32) = .empty,
+    start: std.ArrayList(u32) = .empty,
+
+    /// The triangles so far, by the 16-pixel cells their bounds touch: a list of entries for
+    /// each cell, and the highest layer in it.
     cell_head: [cells * cells]u32 = undefined,
+    cell_max: [cells * cells]u32 = undefined,
     entries: std.ArrayList(Entry) = .empty,
-    gen: u32 = 1,
-    /// The cells the framebuffer is wide and high.
-    cols: u32 = 0,
-    rows: u32 = 0,
-    /// The batch's triangles' corners, by their index.
+    /// Each triangle's corners and layer.
     tris: std.ArrayList([3][2]f32) = .empty,
+    layer: std.ArrayList(u32) = .empty,
 
     const cell_size = 16;
     /// As many as a 2048-pixel framebuffer has.
     const cells = 2048 / cell_size;
     const none = std.math.maxInt(u32);
+    const gpa = std.heap.smp_allocator;
 
     const Entry = struct { tri: u32, next: u32 };
 
-    /// Starts a draw's batches, in a framebuffer `width` by `height`.
-    pub fn start(b: *Batcher, width: u32, height: u32) void {
-        b.cols = @min((width + cell_size - 1) / cell_size, cells);
-        b.rows = @min((height + cell_size - 1) / cell_size, cells);
-        b.clear();
+    pub fn deinit(l: *Layers) void {
+        inline for (.{ "order", "start", "entries", "tris", "layer" }) |f| @field(l, f).deinit(gpa);
     }
 
-    /// Starts a new batch.
-    pub fn clear(b: *Batcher) void {
-        b.gen +%= 1;
-        if (b.gen == 0) {
-            b.cell_gen = @splat(0);
-            b.gen = 1;
+    /// Puts `vertices`' triangles (in a framebuffer `width` by `height`, the first vertex numbered
+    /// `first`) in layers: `order` and `start`.
+    pub fn build(l: *Layers, width: u32, height: u32, vertices: []const Vertex, first: u32) error{OutOfMemory}!void {
+        const cols = @min((width + cell_size - 1) / cell_size, cells);
+        const rows = @min((height + cell_size - 1) / cell_size, cells);
+        for (0..rows) |cy| {
+            @memset(l.cell_head[cy * cells ..][0..cols], none);
+            @memset(l.cell_max[cy * cells ..][0..cols], 0);
         }
-        b.entries.clearRetainingCapacity();
-        b.tris.clearRetainingCapacity();
-    }
-
-    /// Adds triangle `tri` to the batch (true), unless it covers pixels one in it does (false).
-    /// A triangle that can't be added (out of memory) is said to overlap.
-    pub fn add(b: *Batcher, tri: *const [3]Vertex) bool {
-        const corners: [3][2]f32 = .{ .{ tri[0].x, tri[0].y }, .{ tri[1].x, tri[1].y }, .{ tri[2].x, tri[2].y } };
-        const lo = .{ @min(corners[0][0], corners[1][0], corners[2][0]), @min(corners[0][1], corners[1][1], corners[2][1]) };
-        const hi = .{ @max(corners[0][0], corners[1][0], corners[2][0]), @max(corners[0][1], corners[1][1], corners[2][1]) };
-        if (!(lo[0] < hi[0] and lo[1] < hi[1])) return true; // No inside (or NaN): covers no pixel.
-        const c0 = cellOf(lo[0], b.cols);
-        const c1 = cellOf(hi[0], b.cols);
-        const r0 = cellOf(lo[1], b.rows);
-        const r1 = cellOf(hi[1], b.rows);
-        var cy = r0;
-        while (cy <= r1) : (cy += 1) {
-            var cx = c0;
-            while (cx <= c1) : (cx += 1) {
-                const c = cy * cells + cx;
-                if (b.cell_gen[c] != b.gen) continue;
-                var e = b.cell_head[c];
-                while (e != none) : (e = b.entries.items[e].next) {
-                    if (overlap(&corners, &b.tris.items[b.entries.items[e].tri])) return false;
+        const n = vertices.len / 3;
+        l.entries.clearRetainingCapacity();
+        try l.tris.resize(gpa, n);
+        try l.layer.resize(gpa, n);
+        var layers: u32 = 0;
+        for (0..n) |t| {
+            const v = vertices[t * 3 ..][0..3];
+            const corners: [3][2]f32 = .{ .{ v[0].x, v[0].y }, .{ v[1].x, v[1].y }, .{ v[2].x, v[2].y } };
+            l.tris.items[t] = corners;
+            const lo_x = @min(corners[0][0], corners[1][0], corners[2][0]);
+            const lo_y = @min(corners[0][1], corners[1][1], corners[2][1]);
+            const hi_x = @max(corners[0][0], corners[1][0], corners[2][0]);
+            const hi_y = @max(corners[0][1], corners[1][1], corners[2][1]);
+            if (!(lo_x < hi_x and lo_y < hi_y)) {
+                // No inside (or NaN): it covers no pixel.
+                l.layer.items[t] = 0;
+                layers = @max(layers, 1);
+                continue;
+            }
+            const c0 = cellOf(lo_x, cols);
+            const c1 = cellOf(hi_x, cols);
+            const r0 = cellOf(lo_y, rows);
+            const r1 = cellOf(hi_y, rows);
+            // Its layer: one past the highest of the triangles it overlaps (no higher than one
+            // past the highest in its cells).
+            var bound: u32 = 0;
+            for (r0..r1 + 1) |cy| {
+                for (c0..c1 + 1) |cx| bound = @max(bound, l.cell_max[cy * cells + cx]);
+            }
+            var layer: u32 = 0;
+            search: for (r0..r1 + 1) |cy| {
+                for (c0..c1 + 1) |cx| {
+                    var e = l.cell_head[cy * cells + cx];
+                    while (e != none) : (e = l.entries.items[e].next) {
+                        const u = l.entries.items[e].tri;
+                        if (l.layer.items[u] + 1 <= layer) continue;
+                        if (overlap(&corners, &l.tris.items[u])) {
+                            layer = l.layer.items[u] + 1;
+                            if (layer == bound) break :search;
+                        }
+                    }
+                }
+            }
+            l.layer.items[t] = layer;
+            layers = @max(layers, layer + 1);
+            for (r0..r1 + 1) |cy| {
+                for (c0..c1 + 1) |cx| {
+                    const c = cy * cells + cx;
+                    try l.entries.append(gpa, .{ .tri = @intCast(t), .next = l.cell_head[c] });
+                    l.cell_head[c] = @intCast(l.entries.items.len - 1);
+                    l.cell_max[c] = @max(l.cell_max[c], layer + 1);
                 }
             }
         }
-        const index: u32 = @intCast(b.tris.items.len);
-        b.tris.append(std.heap.smp_allocator, corners) catch return false;
-        cy = r0;
-        while (cy <= r1) : (cy += 1) {
-            var cx = c0;
-            while (cx <= c1) : (cx += 1) {
-                const c = cy * cells + cx;
-                if (b.cell_gen[c] != b.gen) {
-                    b.cell_gen[c] = b.gen;
-                    b.cell_head[c] = none;
-                }
-                b.entries.append(std.heap.smp_allocator, .{ .tri = index, .next = b.cell_head[c] }) catch return false;
-                b.cell_head[c] = @intCast(b.entries.items.len - 1);
-            }
+        // Each layer's triangles, in order.
+        try l.start.resize(gpa, layers + 1);
+        @memset(l.start.items, 0);
+        for (l.layer.items) |layer| l.start.items[layer + 1] += 3;
+        for (1..l.start.items.len) |i| l.start.items[i] += l.start.items[i - 1];
+        try l.order.resize(gpa, n * 3);
+        var next = try gpa.dupe(u32, l.start.items[0..layers]);
+        defer gpa.free(next);
+        for (l.layer.items, 0..) |layer, t| {
+            for (0..3) |c| l.order.items[next[layer] + c] = first + @as(u32, @intCast(t * 3 + c));
+            next[layer] += 3;
         }
-        return true;
     }
 
     fn cellOf(v: f32, n: u32) u32 {
@@ -605,30 +637,25 @@ fn testTri(x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32) [3]Vertex {
     return .{ v.at(x0, y0), v.at(x1, y1), v.at(x2, y2) };
 }
 
-test "Batcher batches a quad's halves and apart triangles, not overlapping ones" {
-    var b: Batcher = .{};
-    defer b.entries.deinit(std.heap.smp_allocator);
-    defer b.tris.deinit(std.heap.smp_allocator);
-    b.start(640, 480);
-    // A quad's two halves share an edge.
-    try std.testing.expect(b.add(&testTri(10, 10, 40, 10, 10, 40)));
-    try std.testing.expect(b.add(&testTri(40, 10, 40, 40, 10, 40)));
-    // The next quad, touching the first along x = 40.
-    try std.testing.expect(b.add(&testTri(40, 10, 70, 10, 40, 40)));
-    // Far away, in other cells.
-    try std.testing.expect(b.add(&testTri(500, 400, 600, 400, 500, 470)));
-    // Inside the first.
-    try std.testing.expect(!b.add(&testTri(12, 12, 14, 12, 12, 14)));
-    // In a new batch, inside the first's bounds but past its diagonal (x + y = 50).
-    b.clear();
-    try std.testing.expect(b.add(&testTri(10, 10, 40, 10, 10, 40)));
-    try std.testing.expect(b.add(&testTri(35, 35, 39, 35, 39, 39)));
-    // Over the first.
-    try std.testing.expect(!b.add(&testTri(15, 15, 30, 15, 15, 30)));
-    // A new batch takes it.
-    b.clear();
-    try std.testing.expect(b.add(&testTri(15, 15, 30, 15, 15, 30)));
-    // Off the framebuffer, or with no inside, it covers nothing.
-    try std.testing.expect(b.add(&testTri(-100, -100, -90, -100, -100, -90)));
-    try std.testing.expect(b.add(&testTri(30, 30, 50, 30, 70, 30)));
+test "Layers puts each triangle after those it overlaps, and as early as it can" {
+    var l: Layers = .{};
+    defer l.deinit();
+    const tris = testTri(10, 10, 40, 10, 10, 40) ++ // 0: layer 0
+        testTri(40, 10, 40, 40, 10, 40) ++ // 1: shares the first's diagonal: 0
+        testTri(40, 10, 70, 10, 40, 40) ++ // 2: touches the second along x = 40: 0
+        testTri(15, 15, 30, 15, 15, 30) ++ // 3: inside the first: 1
+        testTri(16, 16, 20, 16, 16, 20) ++ // 4: inside the first and the fourth: 2
+        testTri(35, 35, 39, 35, 39, 39) ++ // 5: in the second, past the first's diagonal: 1
+        testTri(500, 400, 600, 400, 500, 470) ++ // 6: overlaps none: 0
+        testTri(30, 30, 50, 30, 70, 30) ++ // 7: no inside: 0
+        testTri(-100, -100, -90, -100, -100, -90); // 8: off the framebuffer: 0
+    try l.build(640, 480, &tris, 100);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 1, 2, 1, 0, 0, 0 }, l.layer.items);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 18, 24, 27 }, l.start.items);
+    // Layer by layer, in draw order, numbered from the first vertex.
+    var expect_order: [27]u32 = undefined;
+    for (&[_]u32{ 0, 1, 2, 6, 7, 8, 3, 5, 4 }, 0..) |t, i| {
+        for (0..3) |c| expect_order[i * 3 + c] = 100 + t * 3 + @as(u32, @intCast(c));
+    }
+    try std.testing.expectEqualSlices(u32, &expect_order, l.order.items);
 }
