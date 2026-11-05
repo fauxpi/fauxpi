@@ -48,6 +48,15 @@ const GL_COMPILE_STATUS: GLenum = 0x8B81;
 const GL_LINK_STATUS: GLenum = 0x8B82;
 const GL_ARRAY_BUFFER: GLenum = 0x8892;
 const GL_ELEMENT_ARRAY_BUFFER: GLenum = 0x8893;
+const GL_TRANSFORM_FEEDBACK_BUFFER: GLenum = 0x8C8E;
+const GL_INTERLEAVED_ATTRIBS: GLenum = 0x8C8C;
+const GL_RASTERIZER_DISCARD: GLenum = 0x8C89;
+const GL_POINTS: GLenum = 0x0000;
+const GL_CULL_FACE: GLenum = 0x0B44;
+const GL_FRONT: GLenum = 0x0404;
+const GL_BACK: GLenum = 0x0405;
+const GL_CW: GLenum = 0x0900;
+const GL_CCW: GLenum = 0x0901;
 const GL_STREAM_DRAW: GLenum = 0x88E0;
 const GL_FLOAT: GLenum = 0x1406;
 const GL_UNSIGNED_INT: GLenum = 0x1405;
@@ -106,6 +115,15 @@ const Gl = struct {
     BindBuffer: *const fn (GLenum, GLuint) callconv(.c) void,
     BufferData: *const fn (GLenum, isize, ?*const anyopaque, GLenum) callconv(.c) void,
     DrawElements: *const fn (GLenum, GLsizei, GLenum, ?*const anyopaque) callconv(.c) void,
+    TransformFeedbackVaryings: *const fn (GLuint, GLsizei, [*]const [*:0]const u8, GLenum) callconv(.c) void,
+    BindBufferRange: *const fn (GLenum, GLuint, GLuint, isize, isize) callconv(.c) void,
+    BindBufferBase: *const fn (GLenum, GLuint, GLuint) callconv(.c) void,
+    BeginTransformFeedback: *const fn (GLenum) callconv(.c) void,
+    EndTransformFeedback: *const fn () callconv(.c) void,
+    GetBufferSubData: *const fn (GLenum, isize, isize, ?*anyopaque) callconv(.c) void,
+    CullFace: *const fn (GLenum) callconv(.c) void,
+    FrontFace: *const fn (GLenum) callconv(.c) void,
+    DisableVertexAttribArray: *const fn (GLuint) callconv(.c) void,
     VertexAttribPointer: *const fn (GLuint, GLint, GLenum, GLboolean, GLsizei, ?*const anyopaque) callconv(.c) void,
     VertexAttribIPointer: *const fn (GLuint, GLint, GLenum, GLsizei, ?*const anyopaque) callconv(.c) void,
     EnableVertexAttribArray: *const fn (GLuint) callconv(.c) void,
@@ -142,8 +160,19 @@ pub const Renderer = struct {
     vertex_shader: GLuint = 0,
     vao: GLuint = 0,
     vbo: GLuint = 0,
-    /// The vertices of the triangles of a draw reading the tile's colour, layer by layer.
+    /// The vertices of the frame's triangles, draw by draw (and those reading the tile's colour,
+    /// layer by layer).
     ebo: GLuint = 0,
+    /// What vertex shaders shade the frame's vertices from: their VPM words.
+    input_vao: GLuint = 0,
+    inputs: GLuint = 0,
+    vertex_programs: [32]VertexProgram = @splat(.{}),
+    next_vertex_program: usize = 0,
+    /// The frame's triangles' vertices (in `ebo`), and its shaded vertices read back.
+    indices: std.ArrayList(u32) = .empty,
+    shaded: std.ArrayList(Vertex) = .empty,
+    /// Each draw's layers (as `Layers.start`) in `indices`, the draws' one after another.
+    layer_starts: std.ArrayList(u32) = .empty,
     fbo: GLuint = 0,
     color: GLuint = 0,
     depth: GLuint = 0,
@@ -170,6 +199,18 @@ pub const Renderer = struct {
         tex_ok: GLint = -1,
     };
 
+    /// A vertex shader's program, capturing its vertices (0 if OpenGL can't shade them), and where
+    /// its uniforms are.
+    const VertexProgram = struct {
+        hash: u64 = 0,
+        used: bool = false,
+        program: GLuint = 0,
+        unif: GLint = -1,
+        n_vpm: GLint = -1,
+        n_var: GLint = -1,
+        vp: GLint = -1,
+    };
+
     /// A texture decoded from RAM: which (its TMU parameters, less its filters and wrapping, which
     /// don't change what is decoded), and what its bytes hashed to when it was.
     const Texture = struct {
@@ -188,7 +229,7 @@ pub const Renderer = struct {
     /// Parameter 1's filter and wrap bits.
     const p1_sampling_bits: u32 = 0xff;
 
-    /// The GPU, or `error.Unsupported` if there isn't one OpenGL 3.3 draws with (a software renderer
+    /// The GPU, or `error.Unsupported` if there isn't one OpenGL 4.0 draws with (a software renderer
     /// would be slower than V3D's own).
     pub fn init() Error!Renderer {
         var lib = std.DynLib.open("libEGL.so.1") catch return error.Unsupported;
@@ -205,8 +246,8 @@ pub const Renderer = struct {
         if (initialize(dpy, null, null) == 0) return error.Unsupported;
         if (bindApi(EGL_OPENGL_API) == 0) return error.Unsupported;
         const attribs = [_]EGLint{
-            EGL_CONTEXT_MAJOR_VERSION,       3,
-            EGL_CONTEXT_MINOR_VERSION,       3,
+            EGL_CONTEXT_MAJOR_VERSION,       4,
+            EGL_CONTEXT_MINOR_VERSION,       0,
             EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT,
             EGL_NONE,
         };
@@ -237,6 +278,8 @@ pub const Renderer = struct {
         for (0..6) |i| gl.EnableVertexAttribArray(@intCast(i));
         gl.GenBuffers(1, @ptrCast(&r.ebo));
         gl.BindBuffer(GL_ELEMENT_ARRAY_BUFFER, r.ebo);
+        gl.GenVertexArrays(1, @ptrCast(&r.input_vao));
+        gl.GenBuffers(1, @ptrCast(&r.inputs));
         gl.GenFramebuffers(1, @ptrCast(&r.fbo));
         gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
         gl.PixelStorei(GL_PACK_ALIGNMENT, 4);
@@ -371,6 +414,121 @@ pub const Renderer = struct {
         return e.tex;
     }
 
+    /// The program shading a vertex shader's vertices, translated and compiled the first time it
+    /// shades (null if OpenGL can't shade them as qpu_sim does).
+    fn vertexProgram(r: *Renderer, code: []const qpu.Inst) ?*const VertexProgram {
+        const hash = std.hash.Wyhash.hash(1, std.mem.sliceAsBytes(code));
+        for (&r.vertex_programs) |*p| {
+            if (p.used and p.hash == hash) return if (p.program != 0) p else null;
+        }
+        const gl = &r.gl;
+        const slot = &r.vertex_programs[r.next_vertex_program];
+        r.next_vertex_program = (r.next_vertex_program + 1) % r.vertex_programs.len;
+        if (slot.program != 0) gl.DeleteProgram(slot.program);
+        slot.* = .{ .hash = hash, .used = true };
+
+        var decoded_buf: [512]qpu_sim.DecodedInst = undefined;
+        if (code.len > decoded_buf.len) return null;
+        const decoded = qpu_sim.decodeProgram(code, &decoded_buf);
+        var src: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
+        defer src.deinit();
+        src.writer.writeAll(shader.glsl_vertex_common) catch return null;
+        const vs = shader.translateVertex(&src.writer, decoded) catch return null;
+        if (vs.unsupported) return null;
+
+        const sh = r.compileShader(GL_VERTEX_SHADER, src.written()) orelse return null;
+        defer gl.DeleteShader(sh);
+        const prog = gl.CreateProgram();
+        gl.AttachShader(prog, sh);
+        gl.TransformFeedbackVaryings(prog, shader.glsl_vertex_captured.len, &shader.glsl_vertex_captured, GL_INTERLEAVED_ATTRIBS);
+        gl.LinkProgram(prog);
+        var ok: GLint = 0;
+        gl.GetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (ok == 0) {
+            var log: [2048]u8 = undefined;
+            var len: GLsizei = 0;
+            gl.GetProgramInfoLog(prog, log.len, &len, &log);
+            std.debug.print("fauxpi: V3D on OpenGL: linking a vertex program failed: {s}\n", .{log[0..@intCast(@max(len, 0))]});
+            gl.DeleteProgram(prog);
+            return null;
+        }
+        slot.* = .{
+            .hash = hash,
+            .used = true,
+            .program = prog,
+            .unif = gl.GetUniformLocation(prog, "unif"),
+            .n_vpm = gl.GetUniformLocation(prog, "n_vpm"),
+            .n_var = gl.GetUniformLocation(prog, "n_var"),
+            .vp = gl.GetUniformLocation(prog, "vp"),
+        };
+        return slot;
+    }
+
+    /// Shades the vertices of `draws` with a vertex stage, from `inputs`, into the vertex buffer.
+    fn shadeVertices(r: *Renderer, draws: []const Draw, programs: []const *const VertexProgram, inputs: []const u32, vertex_total: u32) void {
+        const gl = &r.gl;
+        gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
+        gl.BufferData(GL_ARRAY_BUFFER, @intCast(@as(usize, vertex_total) * @sizeOf(Vertex)), null, GL_STREAM_DRAW);
+        gl.BindVertexArray(r.input_vao);
+        gl.BindBuffer(GL_ARRAY_BUFFER, r.inputs);
+        gl.BufferData(GL_ARRAY_BUFFER, @intCast(inputs.len * 4), inputs.ptr, GL_STREAM_DRAW);
+        gl.Enable(GL_RASTERIZER_DISCARD);
+        defer gl.Disable(GL_RASTERIZER_DISCARD);
+        for (draws, programs) |d, p| {
+            const vs = d.vertex_stage.?;
+            if (d.vertex_count == 0) continue;
+            gl.UseProgram(p.program);
+            gl.Uniform1uiv(p.unif, shader.max_uniforms, vs.uniforms);
+            gl.Uniform1ui(p.n_vpm, vs.vpm_words);
+            gl.Uniform1ui(p.n_var, @min(d.num_varyings, shader.max_varyings));
+            gl.Uniform2f(p.vp, vs.vp_x, vs.vp_y);
+            const stride: GLsizei = @intCast(@max(vs.input_stride, 4) * 4);
+            for (0..8) |i| {
+                const loc: GLuint = @intCast(i);
+                if (i * 4 < vs.vpm_words) {
+                    gl.VertexAttribIPointer(loc, 4, GL_UNSIGNED_INT, stride, @ptrFromInt((@as(usize, vs.first_input) + i * 4) * 4));
+                    gl.EnableVertexAttribArray(loc);
+                } else {
+                    gl.DisableVertexAttribArray(loc);
+                }
+            }
+            gl.BindBufferRange(GL_TRANSFORM_FEEDBACK_BUFFER, 0, r.vbo, @intCast(@as(usize, d.first_vertex) * @sizeOf(Vertex)), @intCast(@as(usize, d.vertex_count) * @sizeOf(Vertex)));
+            gl.BeginTransformFeedback(GL_POINTS);
+            gl.DrawArrays(GL_POINTS, 0, @intCast(d.vertex_count));
+            gl.EndTransformFeedback();
+        }
+        gl.BindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0);
+    }
+
+    /// Shades `count` vertices with the vertex shader `code` (for tests): from `inputs`, each
+    /// vertex's `vpm_words` words a multiple of 4 words apart, into `out`.
+    fn shadeForTest(r: *Renderer, code: []const qpu.Inst, uniforms: *const [shader.max_uniforms]u32, vpm_words: u32, inputs: []const u32, count: u32, n_var: u32, vp: [2]f32, out: []Vertex) Error!void {
+        if (r.makeCurrent(r.dpy, null, null, r.ctx) == 0) return error.GlFailed;
+        defer _ = r.makeCurrent(r.dpy, null, null, null);
+        const p = r.vertexProgram(code) orelse return error.Unsupported;
+        // Drawing (even with nothing rasterized) needs a framebuffer.
+        try r.useSize(64, 64);
+        r.gl.BindFramebuffer(GL_FRAMEBUFFER, r.fbo);
+        const d: Draw = .{
+            .first_vertex = 0,
+            .vertex_count = count,
+            .vertex_stage = .{ .code = code, .uniforms = uniforms, .vpm_words = vpm_words, .first_input = 0, .input_stride = (vpm_words + 3) / 4 * 4, .first_corner = 0, .corner_count = 0, .cull = 3, .vp_x = vp[0], .vp_y = vp[1] },
+            .code = code,
+            .uniforms = uniforms,
+            .num_varyings = n_var,
+            .depth_func = 7,
+            .depth_write = false,
+            .clip_x = 0,
+            .clip_y = 0,
+            .clip_w = 0,
+            .clip_h = 0,
+        };
+        r.shadeVertices(&.{d}, &.{p}, inputs, count);
+        r.gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
+        r.gl.GetBufferSubData(GL_ARRAY_BUFFER, 0, @intCast(@as(usize, count) * @sizeOf(Vertex)), out.ptr);
+        if (r.gl.GetError() != GL_NO_ERROR) return error.GlFailed;
+    }
+
     fn useSize(r: *Renderer, width: u32, height: u32) Error!void {
         if (r.color != 0 and r.width == width and r.height == height) return;
         const gl = &r.gl;
@@ -396,20 +554,33 @@ pub const Renderer = struct {
 
     /// Draws `draws` of `vertices` into `color` (`width` by `height`, its rows from the top as V3D
     /// has them: the tile buffer, loaded or cleared), with depth cleared to `clear_z`, and leaves
-    /// what was drawn in `color`. `error.Unsupported` (a shader OpenGL can't draw) leaves `color`
-    /// as it was, for the CPU to draw the frame.
-    pub fn render(r: *Renderer, ram: []const u8, width: u32, height: u32, color: []u32, clear_z: f32, vertices: []const Vertex, draws: []const Draw) Error!void {
+    /// what was drawn in `color`. Draws with a vertex stage (all of them, or none) shade their
+    /// vertices from `inputs` (`vertices` unused), and make triangles of them by `corners`.
+    /// `error.Unsupported` (a shader OpenGL can't run) leaves `color` as it was, for the CPU to draw
+    /// the frame.
+    pub fn render(r: *Renderer, ram: []const u8, width: u32, height: u32, color: []u32, clear_z: f32, vertices: []const Vertex, draws: []const Draw, inputs: []const u32, corners: []const u32) Error!void {
         if (draws.len > gpu_draw.max_draws or vertices.len > gpu_draw.max_vertices) return error.Unsupported;
         if (width == 0 or height == 0 or color.len < @as(usize, width) * height) return error.Unsupported;
+        const shaded_on_gpu = draws.len > 0 and draws[0].vertex_stage != null;
+        for (draws) |d| if ((d.vertex_stage != null) != shaded_on_gpu) return error.Unsupported;
         if (r.makeCurrent(r.dpy, null, null, r.ctx) == 0) return error.GlFailed;
         // The next frame may be drawn from another thread.
         defer _ = r.makeCurrent(r.dpy, null, null, null);
         const gl = &r.gl;
         r.frame += 1;
 
-        // The shaders first: one OpenGL can't draw sends the frame to the CPU.
+        // The shaders first: one OpenGL can't run sends the frame to the CPU.
         var programs: [gpu_draw.max_draws]*const Program = undefined;
         for (draws, 0..) |d, i| programs[i] = r.program(d.code) orelse return error.Unsupported;
+        var vertex_programs: [gpu_draw.max_draws]*const VertexProgram = undefined;
+        var vertex_total: u32 = 0;
+        var any_reads_color = false;
+        for (draws, 0..) |d, i| {
+            any_reads_color = any_reads_color or programs[i].shader.reads_color;
+            if (!shaded_on_gpu) continue;
+            vertex_programs[i] = r.vertexProgram(d.vertex_stage.?.code) orelse return error.Unsupported;
+            vertex_total = @max(vertex_total, d.first_vertex + d.vertex_count);
+        }
 
         try r.useSize(width, height);
         gl.BindFramebuffer(GL_FRAMEBUFFER, r.fbo);
@@ -417,6 +588,48 @@ pub const Renderer = struct {
         gl.ActiveTexture(GL_TEXTURE0);
         gl.BindTexture(GL_TEXTURE_2D, r.color);
         gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, @intCast(width), @intCast(height), GL_RED_INTEGER, GL_UNSIGNED_INT, color.ptr);
+
+        // The vertices: shaded here, and read back if the layers of triangles reading the tile's
+        // colour need them; or as given.
+        var drawn: []const Vertex = vertices;
+        if (shaded_on_gpu) {
+            r.shadeVertices(draws, vertex_programs[0..draws.len], inputs, vertex_total);
+            if (any_reads_color) {
+                r.shaded.resize(std.heap.smp_allocator, vertex_total) catch return error.Unsupported;
+                gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
+                gl.GetBufferSubData(GL_ARRAY_BUFFER, 0, @intCast(@as(usize, vertex_total) * @sizeOf(Vertex)), r.shaded.items.ptr);
+                drawn = r.shaded.items;
+            }
+        } else {
+            gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
+            gl.BufferData(GL_ARRAY_BUFFER, @intCast(vertices.len * @sizeOf(Vertex)), vertices.ptr, GL_STREAM_DRAW);
+        }
+
+        // The triangles' vertices, draw by draw, those reading the tile's colour layer by layer:
+        // each layer's triangles after the triangles they cover pixels of.
+        r.indices.clearRetainingCapacity();
+        r.layer_starts.clearRetainingCapacity();
+        var draw_layers: [gpu_draw.max_draws + 1]u32 = undefined;
+        for (draws, programs[0..draws.len], 0..) |d, p, i| {
+            draw_layers[i] = @intCast(r.layer_starts.items.len);
+            const base: u32 = @intCast(r.indices.items.len);
+            const draw_corners: ?[]const u32 = if (d.vertex_stage) |vs| corners[vs.first_corner..][0..vs.corner_count] else null;
+            if (p.shader.reads_color) {
+                const tris_vertices = if (shaded_on_gpu) drawn[d.first_vertex..][0..d.vertex_count] else drawn[d.first_vertex..][0 .. d.vertex_count / 3 * 3];
+                const cull: u8 = if (d.vertex_stage) |vs| vs.cull else 3;
+                r.layers.build(width, height, tris_vertices, draw_corners, cull, d.first_vertex) catch return error.Unsupported;
+                r.indices.appendSlice(std.heap.smp_allocator, r.layers.order.items) catch return error.Unsupported;
+                for (r.layers.start.items) |st| r.layer_starts.append(std.heap.smp_allocator, base + st) catch return error.Unsupported;
+            } else if (draw_corners) |dc| {
+                r.indices.ensureUnusedCapacity(std.heap.smp_allocator, dc.len) catch return error.Unsupported;
+                for (dc) |c| r.indices.appendAssumeCapacity(d.first_vertex + c);
+                r.layer_starts.appendSlice(std.heap.smp_allocator, &.{ base, base + @as(u32, @intCast(dc.len)) }) catch return error.Unsupported;
+            }
+        }
+        draw_layers[draws.len] = @intCast(r.layer_starts.items.len);
+        gl.BindVertexArray(r.vao);
+        gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, @intCast(r.indices.items.len * 4), r.indices.items.ptr, GL_STREAM_DRAW);
+
         gl.Disable(GL_SCISSOR_TEST);
         gl.DepthMask(1);
         gl.ClearBufferfv(GL_DEPTH, 0, @ptrCast(&clear_z));
@@ -424,16 +637,29 @@ pub const Renderer = struct {
         gl.Enable(GL_DEPTH_CLAMP);
         gl.Enable(GL_DEPTH_TEST);
         gl.Enable(GL_SCISSOR_TEST);
-        gl.BindVertexArray(r.vao);
-        gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
-        gl.BufferData(GL_ARRAY_BUFFER, @intCast(vertices.len * @sizeOf(Vertex)), vertices.ptr, GL_STREAM_DRAW);
+        defer gl.Disable(GL_CULL_FACE);
 
-        for (draws, programs[0..draws.len]) |d, p| {
+        for (draws, programs[0..draws.len], 0..) |d, p, i| {
             const x0 = @min(d.clip_x, width);
             const y0 = @min(d.clip_y, height);
             const x1 = @min(d.clip_x +| d.clip_w, width);
             const y1 = @min(d.clip_y +| d.clip_h, height);
-            if (x1 <= x0 or y1 <= y0 or d.vertex_count < 3) continue;
+            if (x1 <= x0 or y1 <= y0) continue;
+            if (d.vertex_stage) |vs| {
+                // V3D's facing: with bit 2 clear, triangles anticlockwise in the framebuffer
+                // (rows down, as GL's y up here) face forward; bit 0 draws those facing forward, and
+                // bit 1 those facing back.
+                const forward = vs.cull & 1 != 0;
+                const reverse = vs.cull & 2 != 0;
+                if (!forward and !reverse) continue;
+                if (forward and reverse) {
+                    gl.Disable(GL_CULL_FACE);
+                } else {
+                    gl.Enable(GL_CULL_FACE);
+                    gl.FrontFace(if (vs.cull & 4 != 0) GL_CW else GL_CCW);
+                    gl.CullFace(if (forward) GL_BACK else GL_FRONT);
+                }
+            } else if (d.vertex_count < 3) continue;
             gl.UseProgram(p.program);
             gl.Uniform1uiv(p.unif, shader.max_uniforms, d.uniforms);
             gl.Uniform1ui(p.n_var, @min(d.num_varyings, shader.max_varyings));
@@ -453,28 +679,16 @@ pub const Renderer = struct {
             gl.DepthFunc(GL_NEVER + @as(GLenum, d.depth_func));
             gl.DepthMask(@intFromBool(d.depth_write));
             gl.Scissor(@intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0));
-            if (p.shader.reads_color) {
-                // Each triangle reads what those before it drew: those it covers pixels of are
-                // drawn, with a barrier, before it.
-                const tris = vertices[d.first_vertex..][0 .. d.vertex_count / 3 * 3];
-                if (r.layers.build(width, height, tris, d.first_vertex)) {
-                    const order = r.layers.order.items;
-                    gl.BufferData(GL_ELEMENT_ARRAY_BUFFER, @intCast(order.len * 4), order.ptr, GL_STREAM_DRAW);
-                    const starts = r.layers.start.items;
-                    for (starts[0 .. starts.len - 1], starts[1..]) |lo, hi| {
-                        gl.TextureBarrier.?();
-                        gl.DrawElements(GL_TRIANGLES, @intCast(hi - lo), GL_UNSIGNED_INT, @ptrFromInt(@as(usize, lo) * 4));
-                    }
-                } else |_| {
-                    // A triangle at a time.
-                    var v: u32 = 0;
-                    while (v < tris.len) : (v += 3) {
-                        gl.TextureBarrier.?();
-                        gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex + v), 3);
-                    }
+            const starts = r.layer_starts.items[draw_layers[i]..draw_layers[i + 1]];
+            if (starts.len >= 2) {
+                for (starts[0 .. starts.len - 1], starts[1..]) |lo, hi| {
+                    if (hi == lo) continue;
+                    // Each layer reads what those before it drew.
+                    if (p.shader.reads_color) gl.TextureBarrier.?();
+                    gl.DrawElements(GL_TRIANGLES, @intCast(hi - lo), GL_UNSIGNED_INT, @ptrFromInt(@as(usize, lo) * 4));
                 }
             } else {
-                gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex), @intCast(d.vertex_count));
+                gl.DrawArrays(GL_TRIANGLES, @intCast(d.first_vertex), @intCast(d.vertex_count / 3 * 3));
             }
         }
 
@@ -515,28 +729,42 @@ pub const Layers = struct {
         inline for (.{ "order", "start", "entries", "tris", "layer" }) |f| @field(l, f).deinit(gpa);
     }
 
-    /// Puts `vertices`' triangles (in a framebuffer `width` by `height`, the first vertex numbered
-    /// `first`) in layers: `order` and `start`.
-    pub fn build(l: *Layers, width: u32, height: u32, vertices: []const Vertex, first: u32) error{OutOfMemory}!void {
+    /// Puts triangles (in a framebuffer `width` by `height`) in layers, `order` and `start`: those
+    /// of `vertices` by `corners` (3 a triangle), or each 3 of `vertices` if null, numbered from
+    /// `first`. Those V3D's configuration bits `cull` don't draw are left out.
+    pub fn build(l: *Layers, width: u32, height: u32, vertices: []const Vertex, corners: ?[]const u32, cull: u8, first: u32) error{OutOfMemory}!void {
         const cols = @min((width + cell_size - 1) / cell_size, cells);
         const rows = @min((height + cell_size - 1) / cell_size, cells);
         for (0..rows) |cy| {
             @memset(l.cell_head[cy * cells ..][0..cols], none);
             @memset(l.cell_max[cy * cells ..][0..cols], 0);
         }
-        const n = vertices.len / 3;
+        const n = if (corners) |c| c.len / 3 else vertices.len / 3;
         l.entries.clearRetainingCapacity();
         try l.tris.resize(gpa, n);
         try l.layer.resize(gpa, n);
         var layers: u32 = 0;
         for (0..n) |t| {
-            const v = vertices[t * 3 ..][0..3];
-            const corners: [3][2]f32 = .{ .{ v[0].x, v[0].y }, .{ v[1].x, v[1].y }, .{ v[2].x, v[2].y } };
-            l.tris.items[t] = corners;
-            const lo_x = @min(corners[0][0], corners[1][0], corners[2][0]);
-            const lo_y = @min(corners[0][1], corners[1][1], corners[2][1]);
-            const hi_x = @max(corners[0][0], corners[1][0], corners[2][0]);
-            const hi_y = @max(corners[0][1], corners[1][1], corners[2][1]);
+            var v: [3]u32 = undefined;
+            for (&v, 0..) |*vi, c| vi.* = if (corners) |cs| cs[t * 3 + c] else @intCast(t * 3 + c);
+            if (v[0] >= vertices.len or v[1] >= vertices.len or v[2] >= vertices.len) {
+                l.layer.items[t] = none;
+                continue;
+            }
+            const p: [3][2]f32 = .{ .{ vertices[v[0]].x, vertices[v[0]].y }, .{ vertices[v[1]].x, vertices[v[1]].y }, .{ vertices[v[2]].x, vertices[v[2]].y } };
+            l.tris.items[t] = p;
+            const area = (p[1][0] - p[0][0]) * (p[2][1] - p[0][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[0][0]);
+            const forward = if (cull & 4 != 0) area < 0 else area > 0;
+            if ((if (forward) cull & 1 else cull & 2) == 0) {
+                // Not drawn.
+                l.layer.items[t] = none;
+                continue;
+            }
+            const corners_xy = p;
+            const lo_x = @min(corners_xy[0][0], corners_xy[1][0], corners_xy[2][0]);
+            const lo_y = @min(corners_xy[0][1], corners_xy[1][1], corners_xy[2][1]);
+            const hi_x = @max(corners_xy[0][0], corners_xy[1][0], corners_xy[2][0]);
+            const hi_y = @max(corners_xy[0][1], corners_xy[1][1], corners_xy[2][1]);
             if (!(lo_x < hi_x and lo_y < hi_y)) {
                 // No inside (or NaN): it covers no pixel.
                 l.layer.items[t] = 0;
@@ -560,7 +788,7 @@ pub const Layers = struct {
                     while (e != none) : (e = l.entries.items[e].next) {
                         const u = l.entries.items[e].tri;
                         if (l.layer.items[u] + 1 <= layer) continue;
-                        if (overlap(&corners, &l.tris.items[u])) {
+                        if (overlap(&corners_xy, &l.tris.items[u])) {
                             layer = l.layer.items[u] + 1;
                             if (layer == bound) break :search;
                         }
@@ -581,13 +809,16 @@ pub const Layers = struct {
         // Each layer's triangles, in order.
         try l.start.resize(gpa, layers + 1);
         @memset(l.start.items, 0);
-        for (l.layer.items) |layer| l.start.items[layer + 1] += 3;
+        for (l.layer.items) |layer| {
+            if (layer != none) l.start.items[layer + 1] += 3;
+        }
         for (1..l.start.items.len) |i| l.start.items[i] += l.start.items[i - 1];
-        try l.order.resize(gpa, n * 3);
+        try l.order.resize(gpa, l.start.items[layers]);
         var next = try gpa.dupe(u32, l.start.items[0..layers]);
         defer gpa.free(next);
         for (l.layer.items, 0..) |layer, t| {
-            for (0..3) |c| l.order.items[next[layer] + c] = first + @as(u32, @intCast(t * 3 + c));
+            if (layer == none) continue;
+            for (0..3) |c| l.order.items[next[layer] + c] = first + if (corners) |cs| cs[t * 3 + c] else @as(u32, @intCast(t * 3 + c));
             next[layer] += 3;
         }
     }
@@ -649,7 +880,7 @@ test "Layers puts each triangle after those it overlaps, and as early as it can"
         testTri(500, 400, 600, 400, 500, 470) ++ // 6: overlaps none: 0
         testTri(30, 30, 50, 30, 70, 30) ++ // 7: no inside: 0
         testTri(-100, -100, -90, -100, -100, -90); // 8: off the framebuffer: 0
-    try l.build(640, 480, &tris, 100);
+    try l.build(640, 480, &tris, null, 3, 100);
     try std.testing.expectEqualSlices(u32, &.{ 0, 0, 0, 1, 2, 1, 0, 0, 0 }, l.layer.items);
     try std.testing.expectEqualSlices(u32, &.{ 0, 18, 24, 27 }, l.start.items);
     // Layer by layer, in draw order, numbered from the first vertex.
@@ -658,4 +889,101 @@ test "Layers puts each triangle after those it overlaps, and as early as it can"
         for (0..3) |c| expect_order[i * 3 + c] = 100 + t * 3 + @as(u32, @intCast(c));
     }
     try std.testing.expectEqualSlices(u32, &expect_order, l.order.items);
+}
+
+test "vertex shaders shade on the GPU as qpu_sim shades them" {
+    var r = Renderer.init() catch return error.SkipZigTest;
+    // A shader doing a bit of everything: 7 VPM words read (6 given), x and y scaled and packed
+    // as 12.4 fixed point, a reciprocal, integer and byte arithmetic, and a condition.
+    var vs: qpu.Program(64) = .{};
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_write_setup, .value = 0x00001a00 }));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_read_setup, .value = 0x00701a00 }));
+    vs.emit(try qpu.mov(qpu.wr(0), qpu.vpm_read)); // x
+    vs.emit(try qpu.mov(qpu.wr(1), qpu.vpm_read)); // y
+    vs.emit(try qpu.mov(qpu.wa(0), qpu.vpm_read)); // a
+    vs.emit(try qpu.mov(qpu.wr(3), qpu.vpm_read)); // b
+    vs.emit(try qpu.mov(qpu.wa(2), qpu.vpm_read)); // c (an integer)
+    vs.emit(try qpu.mov(qpu.wb(3), qpu.vpm_read)); // d (an integer)
+    vs.emit(try qpu.mov(qpu.wa(4), qpu.vpm_read)); // past those given: 0
+    vs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(0), .a = qpu.r(0), .b = qpu.unif } }));
+    vs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(1), .a = qpu.r(1), .b = qpu.unif } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .ftoi, .dst = qpu.wa(1), .a = qpu.r(0), .b = qpu.r(0) }, .pack = .{ .regfile_a = .@"16a" } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .ftoi, .dst = qpu.wa(1), .a = qpu.r(1), .b = qpu.r(1) }, .pack = .{ .regfile_a = .@"16b" } }));
+    vs.emit(try qpu.mov(.{ .periph = qpu.W.sfu_recip }, qpu.r(3)));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .fadd, .dst = qpu.wr(2), .a = qpu.r(4), .b = qpu.ra(0) }, .mul = .{ .op = .fmul, .dst = qpu.wb(5), .a = qpu.ra(0), .b = qpu.r(3) } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .itof, .dst = qpu.wa(6), .a = qpu.ra(2), .b = qpu.ra(2) }, .mul = .{ .op = .mul24, .dst = qpu.wb(7), .a = qpu.ra(2), .b = qpu.rb(3) } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .asr, .dst = qpu.wa(8), .a = qpu.ra(2), .b = qpu.rb(3) } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .fsub, .dst = qpu.wr(3), .a = qpu.r(2), .b = qpu.ra(0) }, .sf = true }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .fmax, .dst = qpu.wr(3), .a = qpu.r(0), .b = qpu.r(1), .cond = .ns } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .v8adds, .dst = qpu.wa(9), .a = qpu.ra(2), .b = qpu.rb(3) } }));
+    // The integers as floats (varyings are multiplied by 1/W, which as floats they mostly
+    // wouldn't survive: denormals).
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .itof, .dst = qpu.wb(7), .a = qpu.rb(7), .b = qpu.rb(7) } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .itof, .dst = qpu.wa(8), .a = qpu.ra(8), .b = qpu.ra(8) } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .itof, .dst = qpu.wa(9), .a = qpu.ra(9), .b = qpu.ra(9) } }));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(1)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.rb(5))); // z: a * b
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(4))); // 1/W: 1 / b
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(2)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(3)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(6)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.rb(7)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(8)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(9)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(4)));
+    vs.end(.vertex);
+
+    var unifs: [shader.max_uniforms]u32 = @splat(0);
+    unifs[0] = @bitCast(@as(f32, 100.0 * 16.0));
+    unifs[1] = @bitCast(@as(f32, -60.0 * 16.0));
+    const count = 1000;
+    const vpm_words = 6;
+    const stride = 8;
+    var inputs: [count * stride]u32 = @splat(0);
+    var prng = std.Random.DefaultPrng.init(2);
+    const rand = prng.random();
+    for (0..count) |v| {
+        const in = inputs[v * stride ..][0..vpm_words];
+        in[0] = @bitCast(rand.float(f32) * 2 - 1);
+        in[1] = @bitCast(rand.float(f32) * 2 - 1);
+        in[2] = @bitCast((rand.float(f32) - 0.5) * 50);
+        // Exactly 1 now and then, for the vertices with 1/W of 1.
+        in[3] = @bitCast(if (v % 7 == 0) 1.0 else (rand.float(f32) - 0.5) * 8);
+        in[4] = rand.int(u32) >> @intCast(rand.uintLessThan(u32, 32));
+        in[5] = rand.int(u32);
+    }
+    var gpu: [count]Vertex = undefined;
+    const n_var = 7;
+    const vp = [2]f32{ 320.5, 200.25 };
+    try r.shadeForTest(vs.code(), &unifs, vpm_words, &inputs, count, n_var, vp, &gpu);
+
+    var decoded_buf: [64]qpu_sim.DecodedInst = undefined;
+    const decoded = qpu_sim.decodeProgram(vs.code(), &decoded_buf);
+    var v: usize = 0;
+    while (v < count) : (v += 16) {
+        const lanes = @min(16, count - v);
+        var vpm_in: [vpm_words]qpu_sim.Vec = undefined;
+        for (&vpm_in, 0..) |*word, k| {
+            for (0..16) |lane| word[lane] = inputs[(v + @min(lane, lanes - 1)) * stride + k];
+        }
+        const res = try qpu_sim.runDecoded(decoded, .{ .uniforms = &unifs, .vpm_in = &vpm_in });
+        try std.testing.expectEqual(@as(usize, 10), res.vpm_out_len);
+        for (0..lanes) |lane| {
+            const g = gpu[v + lane];
+            const xy = res.vpm_out[0][lane];
+            const xs: i16 = @bitCast(@as(u16, @truncate(xy)));
+            const ys: i16 = @bitCast(@as(u16, @truncate(xy >> 16)));
+            const raw_inv_w: f32 = @bitCast(res.vpm_out[2][lane]);
+            const inv_w: f32 = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
+            try std.testing.expectEqual(@as(f32, @floatFromInt(xs)) * (1.0 / 16.0) + vp[0], g.x);
+            try std.testing.expectEqual(@as(f32, @floatFromInt(ys)) * (1.0 / 16.0) + vp[1], g.y);
+            try std.testing.expectEqual(res.vpm_out[1][lane], @as(u32, @bitCast(g.z)));
+            try std.testing.expectEqual(@as(u32, @bitCast(inv_w)), @as(u32, @bitCast(g.inv_w)));
+            try std.testing.expectEqual(@as(u32, @intFromBool(inv_w == 1.0)), g.unit_w);
+            for (0..16) |k| {
+                const want: f32 = if (k < n_var) @as(f32, @bitCast(res.vpm_out[3 + k][lane])) * inv_w else 0;
+                try std.testing.expectEqual(@as(u32, @bitCast(want)), @as(u32, @bitCast(g.varyings[k])));
+            }
+        }
+    }
 }

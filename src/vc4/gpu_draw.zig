@@ -18,10 +18,32 @@ pub const Vertex = extern struct {
     varyings: [shader.max_varyings]f32,
 };
 
-/// A run of triangles drawn with one fragment shader.
+/// A draw's vertices as its vertex shader shades them on the GPU (`gl_renderer.zig`), instead of
+/// on the CPU: what it is given, and the triangles it makes.
+pub const VertexStage = struct {
+    code: []const qpu.Inst,
+    uniforms: *const [shader.max_uniforms]u32,
+    /// The VPM words each vertex is given, in the frame's inputs from word `first_input`, each
+    /// vertex's `input_stride` words after the last's.
+    vpm_words: u32,
+    first_input: u32,
+    input_stride: u32,
+    /// Its triangles' corners (its vertices, numbered from 0), 3 a triangle, in the frame's corners.
+    first_corner: u32,
+    corner_count: u32,
+    /// V3D's configuration bits 0 to 2: which way triangles face forward, and which are drawn.
+    cull: u8,
+    /// Where the viewport's origin is, in pixels.
+    vp_x: f32,
+    vp_y: f32,
+};
+
+/// A run of triangles drawn with one fragment shader: `vertex_count` vertices from `first_vertex`,
+/// each 3 a triangle or, with `vertex_stage`, shaded on the GPU and made triangles of by its corners.
 pub const Draw = struct {
     first_vertex: u32,
     vertex_count: u32,
+    vertex_stage: ?VertexStage = null,
     /// The fragment shader, and its uniforms.
     code: []const qpu.Inst,
     uniforms: *const [shader.max_uniforms]u32,

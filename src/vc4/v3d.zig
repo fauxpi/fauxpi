@@ -801,36 +801,9 @@ pub const V3d = struct {
         vpm_words: usize,
         n_var: usize,
     ) ?[]const ShadedVertex {
+        if (!self.collectVertices(ram, draw, num_tris)) return null;
         const corners: usize = @as(usize, num_tris) * 3;
-        self.vs_corner_slot.resize(tri_allocator, corners) catch return null;
-        self.vs_unique.clearRetainingCapacity();
-        self.vs_unique.ensureTotalCapacity(tri_allocator, corners) catch return null;
-        if (self.vs_slot_key.items.len == 0) {
-            self.vs_slot_key.resize(tri_allocator, vs_slot_count) catch return null;
-            self.vs_slot_gen.resize(tri_allocator, vs_slot_count) catch return null;
-            self.vs_slot_index.resize(tri_allocator, vs_slot_count) catch return null;
-            @memset(self.vs_slot_gen.items, 0);
-        }
-        self.vs_gen +%= 1;
-        if (self.vs_gen == 0) {
-            @memset(self.vs_slot_gen.items, 0);
-            self.vs_gen = 1;
-        }
-        // The distinct vertices, found by their index (in a table that forgets one when another
-        // takes its place: it is then shaded twice, the same).
-        for (0..num_tris) |t| {
-            for (0..3) |corner| {
-                const index = triangleCorner(ram, draw, @intCast(t), @intCast(corner));
-                const h = index & (vs_slot_count - 1);
-                if (self.vs_slot_gen.items[h] != self.vs_gen or self.vs_slot_key.items[h] != index) {
-                    self.vs_slot_gen.items[h] = self.vs_gen;
-                    self.vs_slot_key.items[h] = index;
-                    self.vs_slot_index.items[h] = @intCast(self.vs_unique.items.len);
-                    self.vs_unique.appendAssumeCapacity(index);
-                }
-                self.vs_corner_slot.items[t * 3 + corner] = self.vs_slot_index.items[h];
-            }
-        }
+        _ = corners;
         const unique = self.vs_unique.items;
         self.vs_out.resize(tri_allocator, unique.len) catch return null;
         self.vs_ok.resize(tri_allocator, unique.len) catch return null;
@@ -866,6 +839,42 @@ pub const V3d = struct {
         job.run(0, @min(per, batches));
         for (threads[0..spawned]) |th| th.join();
         return self.vs_out.items;
+    }
+
+    /// Lists `draw`'s `num_tris` triangles' distinct vertices (`vs_unique`) and each corner's
+    /// (`vs_corner_slot`). False if there isn't the memory.
+    fn collectVertices(self: *V3d, ram: []const u8, draw: DrawCall, num_tris: u32) bool {
+        const corners: usize = @as(usize, num_tris) * 3;
+        self.vs_corner_slot.resize(tri_allocator, corners) catch return false;
+        self.vs_unique.clearRetainingCapacity();
+        self.vs_unique.ensureTotalCapacity(tri_allocator, corners) catch return false;
+        if (self.vs_slot_key.items.len == 0) {
+            self.vs_slot_key.resize(tri_allocator, vs_slot_count) catch return false;
+            self.vs_slot_gen.resize(tri_allocator, vs_slot_count) catch return false;
+            self.vs_slot_index.resize(tri_allocator, vs_slot_count) catch return false;
+            @memset(self.vs_slot_gen.items, 0);
+        }
+        self.vs_gen +%= 1;
+        if (self.vs_gen == 0) {
+            @memset(self.vs_slot_gen.items, 0);
+            self.vs_gen = 1;
+        }
+        // The distinct vertices, found by their index (in a table that forgets one when another
+        // takes its place: it is then shaded twice, the same).
+        for (0..num_tris) |t| {
+            for (0..3) |corner| {
+                const index = triangleCorner(ram, draw, @intCast(t), @intCast(corner));
+                const h = index & (vs_slot_count - 1);
+                if (self.vs_slot_gen.items[h] != self.vs_gen or self.vs_slot_key.items[h] != index) {
+                    self.vs_slot_gen.items[h] = self.vs_gen;
+                    self.vs_slot_key.items[h] = index;
+                    self.vs_slot_index.items[h] = @intCast(self.vs_unique.items.len);
+                    self.vs_unique.appendAssumeCapacity(index);
+                }
+                self.vs_corner_slot.items[t * 3 + corner] = self.vs_slot_index.items[h];
+            }
+        }
+        return true;
     }
 
     /// Vertices shaded together: `indices` into `out` and `ok`, in batches of 16.
@@ -1509,6 +1518,7 @@ pub const V3d = struct {
     fn executeRcl(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) void {
         if ((end_bus & vc_bus.ramMask(ram.len)) > ram.len) return;
 
+        if (gpu_supported and self.renderWithGpuVertices(ram, start_bus, end_bus)) return;
         self.prepareDrawsForFrame(ram);
         if (gpu_supported and self.renderWithGpu(ram, start_bus, end_bus)) return;
 
@@ -1553,54 +1563,179 @@ pub const V3d = struct {
         code: [gpu_draw.max_draws][512]qpu.Inst = undefined,
         /// OpenGL: the tile buffer, as big as the framebuffer.
         color: std.ArrayList(u32) = .empty,
+        /// OpenGL, shading vertices itself: each draw's vertex shader and its uniforms, and the
+        /// frame's vertices' VPM words and triangles' corners.
+        vs_code: [gpu_draw.max_draws][512]qpu.Inst = undefined,
+        vs_uniforms: [gpu_draw.max_draws][qpu_to_shader.max_uniforms]u32 = undefined,
+        inputs: std.ArrayList(u32) = .empty,
+        corners: std.ArrayList(u32) = .empty,
     };
 
     /// Draws the frame on the GPU, if it is one the GPU can draw the same as the CPU: each tile
     /// once, all loaded (or cleared) and stored alike, and every shader one the GPU runs.
-    fn renderWithGpu(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
+    /// What drawing on the GPU needs, made the first time (null if it can't).
+    fn gpuState(self: *V3d) ?*GpuState {
         if (!self.gpu_tried) {
             self.gpu_tried = true;
             const api = if (metal_renderer.supported) "Metal" else "OpenGL";
             var renderer = GpuRenderer.init() catch |err| {
                 if (err != error.Unsupported) std.debug.print("fauxpi: V3D on {s}: {s}\n", .{ api, @errorName(err) });
-                return false;
+                return null;
             };
             const state = std.heap.page_allocator.create(GpuState) catch {
                 if (metal_renderer.supported) renderer.deinit();
-                return false;
+                return null;
             };
             state.* = .{ .renderer = renderer };
             self.gpu = state;
         }
-        const g = self.gpu orelse return false;
-        if (self.overflow_draw_start < self.draws_len) return false;
+        return self.gpu;
+    }
 
+    /// A frame the GPU can draw the same as the CPU: each tile once, all loaded (or cleared) and
+    /// stored alike. Its first tile's job, and the tiles.
+    const GpuFrame = struct { first: TileJob, tiles: [32]u32 };
+
+    fn gpuFrame(ram: []u8, start_bus: u32, end_bus: u32) ?GpuFrame {
         var reader: RclReader = .init(ram, start_bus, end_bus);
-        const first = reader.next(ram) orelse return false;
-        if (first.fb_w == 0 or first.fb_h == 0 or first.fb_w > 2048 or first.fb_h > 2048) return false;
+        const first = reader.next(ram) orelse return null;
+        if (first.fb_w == 0 or first.fb_h == 0 or first.fb_w > 2048 or first.fb_h > 2048) return null;
         var tiles: [32]u32 = @splat(0);
         var job: ?TileJob = first;
         while (job) |j| : (job = reader.next(ram)) {
-            if (j.tile_x >= 32 or j.tile_y >= 32) return false;
+            if (j.tile_x >= 32 or j.tile_y >= 32) return null;
             const bit = @as(u32, 1) << @intCast(j.tile_x);
-            if ((tiles[j.tile_y] & bit) != 0) return false;
+            if ((tiles[j.tile_y] & bit) != 0) return null;
             tiles[j.tile_y] |= bit;
             if (j.fb_w != first.fb_w or j.fb_h != first.fb_h or j.clear_color0 != first.clear_color0 or
                 j.clear_zs != first.clear_zs or j.has_render != first.has_render or j.dst_addr != first.dst_addr or
                 j.tiling != first.tiling or j.ls_format != first.ls_format)
             {
-                return false;
+                return null;
             }
-            if ((j.lazy_load == null) != (first.lazy_load == null)) return false;
+            if ((j.lazy_load == null) != (first.lazy_load == null)) return null;
             if (j.lazy_load) |l| {
                 const f = first.lazy_load.?;
                 if (l.addr != f.addr or l.tiling != f.tiling or l.format != f.format or
                     l.fb_w != f.fb_w or l.fb_h != f.fb_h or l.tile_size != 64 or l.tile_x != j.tile_x or l.tile_y != j.tile_y)
                 {
-                    return false;
+                    return null;
                 }
             }
         }
+
+        return .{ .first = first, .tiles = tiles };
+    }
+
+    /// The most vertices a frame's draws shade on the GPU.
+    const max_gpu_vertices = 1 << 20;
+
+    /// Draws the frame with OpenGL, its vertices shaded too (not on the CPU), if OpenGL can run all
+    /// its shaders the same as qpu_sim.
+    fn renderWithGpuVertices(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
+        if (metal_renderer.supported) return false;
+        const g = self.gpuState() orelse return false;
+        const frame = gpuFrame(ram, start_bus, end_bus) orelse return false;
+        // Without triangles, the CPU loads and stores the tiles as fast.
+        if (!frame.first.has_render) return false;
+        g.inputs.clearRetainingCapacity();
+        g.corners.clearRetainingCapacity();
+        var n_draws: usize = 0;
+        var vertex_total: u32 = 0;
+        var vs_unif_buf: [qpu_to_shader.max_uniforms]u32 = undefined;
+        for (self.draws[0..self.draws_len]) |draw| {
+            // What prepareDrawsForFrame skips, drawing nothing.
+            if (draw.count < 3) continue;
+            const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
+            if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) continue;
+            const fs_num_varyings = ram[rec_phys + 3];
+            const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+            const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+            const vs_attr_mask = ram[rec_phys + 14];
+            const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+            const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+            if (n_draws == g.draws.len) return false;
+            const vs_code = extractQpuProgram(ram, vs_code_phys, &g.vs_code[n_draws]);
+            const fs_code = extractQpuProgram(ram, fs_code_phys, &g.code[n_draws]);
+            if (vs_code.len == 0 or fs_code.len == 0) continue;
+            const num_tris: u32 = switch (draw.mode) {
+                4 => draw.count / 3,
+                5, 6 => draw.count - 2,
+                else => 0,
+            };
+            if (num_tris == 0) continue;
+            // The fragment shader's uniforms, all there are room for.
+            if (fs_unif_phys + qpu_to_shader.max_uniforms * 4 > ram.len) return false;
+            for (&g.uniforms[n_draws], 0..) |*u, k| u.* = std.mem.readInt(u32, ram[fs_unif_phys + k * 4 ..][0..4], .little);
+            // The vertex shader's: 0 past the end of RAM, as qpu_sim reads them.
+            const vs_unifs = extractUniforms(ram, vs_unif_phys, &vs_unif_buf);
+            g.vs_uniforms[n_draws] = @splat(0);
+            @memcpy(g.vs_uniforms[n_draws][0..vs_unifs.len], vs_unifs);
+
+            var attr_streams: [8]AttrStream = undefined;
+            const attr_info = decodeAttrStreams(ram, rec_phys, draw.num_attrs, vs_attr_mask, &attr_streams);
+            const attrs = attr_streams[0..attr_info.count];
+            const vpm_words: u32 = @intCast(attr_info.vpm_words);
+            const stride: u32 = @max((vpm_words + 3) / 4 * 4, 4);
+
+            if (!self.collectVertices(ram, draw, num_tris)) return false;
+            const unique = self.vs_unique.items;
+            if (vertex_total + unique.len > max_gpu_vertices) return false;
+            // Each vertex's VPM words, as qpu_sim is given them.
+            const first_input: u32 = @intCast(g.inputs.items.len);
+            g.inputs.resize(tri_allocator, first_input + unique.len * stride) catch return false;
+            const in = g.inputs.items[first_input..];
+            var b: usize = 0;
+            while (b < unique.len) : (b += 16) {
+                const lanes = @min(16, unique.len - b);
+                var vpm_in: [32]qpu_sim.Vec = undefined;
+                populateBatchVpmIn(ram, attrs, unique[b..][0..lanes], &vpm_in);
+                for (0..lanes) |lane| {
+                    const words = in[(b + lane) * stride ..][0..stride];
+                    for (words, 0..) |*word, k| word.* = if (k < vpm_words) vpm_in[k][lane] else 0;
+                }
+            }
+            const first_corner: u32 = @intCast(g.corners.items.len);
+            g.corners.appendSlice(tri_allocator, self.vs_corner_slot.items) catch return false;
+
+            g.draws[n_draws] = .{
+                .first_vertex = vertex_total,
+                .vertex_count = @intCast(unique.len),
+                .vertex_stage = .{
+                    .code = vs_code,
+                    .uniforms = &g.vs_uniforms[n_draws],
+                    .vpm_words = vpm_words,
+                    .first_input = first_input,
+                    .input_stride = stride,
+                    .first_corner = first_corner,
+                    .corner_count = @intCast(self.vs_corner_slot.items.len),
+                    .cull = draw.config_b0 & 7,
+                    .vp_x = draw.vp_x,
+                    .vp_y = draw.vp_y,
+                },
+                .code = fs_code,
+                .uniforms = &g.uniforms[n_draws],
+                .num_varyings = fs_num_varyings,
+                .depth_func = @truncate((draw.config_b1 >> 4) & 7),
+                .depth_write = (draw.config_b1 & 0x80) != 0,
+                .clip_x = draw.clip_x,
+                .clip_y = draw.clip_y,
+                .clip_w = draw.clip_w,
+                .clip_h = draw.clip_h,
+            };
+            n_draws += 1;
+            vertex_total += @intCast(unique.len);
+        }
+        if (n_draws == 0) return false;
+        return renderWithGl(g, ram, frame.first, &frame.tiles, &.{}, g.draws[0..n_draws], g.inputs.items, g.corners.items);
+    }
+
+    fn renderWithGpu(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
+        const g = self.gpuState() orelse return false;
+        if (self.overflow_draw_start < self.draws_len) return false;
+        const gpu_frame = gpuFrame(ram, start_bus, end_bus) orelse return false;
+        const first = gpu_frame.first;
+        const tiles = gpu_frame.tiles;
 
         // The triangles, in a run for each draw.
         var n_vertices: usize = 0;
@@ -1671,13 +1806,12 @@ pub const V3d = struct {
         }
         // Only drawing is faster on the GPU: the CPU loads and stores tiles on its own as fast.
         if (n_draws == 0) return false;
-        return self.renderWithGl(g, ram, first, &tiles, n_vertices, n_draws);
+        return renderWithGl(g, ram, first, &tiles, g.vertices[0..n_vertices], g.draws[0..n_draws], &.{}, &.{});
     }
 
     /// Draws the frame with OpenGL: the tiles listed loaded (or cleared) on the CPU into a buffer
     /// as big as the framebuffer, drawn into, and stored from it.
-    fn renderWithGl(self: *V3d, g: *GpuState, ram: []u8, first: TileJob, tiles: *const [32]u32, n_vertices: usize, n_draws: usize) bool {
-        _ = self;
+    fn renderWithGl(g: *GpuState, ram: []u8, first: TileJob, tiles: *const [32]u32, vertices: []const gpu_draw.Vertex, draws: []const gpu_draw.Draw, inputs: []const u32, corners: []const u32) bool {
         const w = first.fb_w;
         const h = first.fb_h;
         g.color.resize(std.heap.page_allocator, @as(usize, w) * h) catch return false;
@@ -1704,7 +1838,7 @@ pub const V3d = struct {
             }
         }
 
-        g.renderer.render(ram, w, h, color, first.clear_zs, g.vertices[0..n_vertices], g.draws[0..n_draws]) catch |err| {
+        g.renderer.render(ram, w, h, color, first.clear_zs, vertices, draws, inputs, corners) catch |err| {
             if (err != error.Unsupported) std.debug.print("fauxpi: V3D on OpenGL: {s}\n", .{@errorName(err)});
             return false;
         };
@@ -3130,7 +3264,8 @@ test "V3D BCL + RCL execution renders triangle into T-tiled framebuffer" {
 }
 
 test "V3D counts only the triangles drawn against the most it shades ahead" {
-    var v3d = V3d{};
+    // The CPU's limit: no GPU.
+    var v3d = V3d{ .gpu_tried = true };
     const gpa = std.testing.allocator;
     const ram = try gpa.alloc(u8, 256 * 1024);
     defer gpa.free(ram);

@@ -355,9 +355,9 @@ pub const msl_shared_functions =
 /// as `msl_common`'s do. Each texture sampled is decoded as the TMU reads it (`qpu_sim`), 32 bits a
 /// texel, so sampling it only wraps and filters.
 pub const glsl_common =
-    \\#version 330 core
+    \\#version 400 core
     \\noperspective in float v_inv_w;
-    \\flat in uint v_unit_w;
+    \\noperspective in float v_not_unit_w;
     \\noperspective in vec4 v_v0;
     \\noperspective in vec4 v_v1;
     \\noperspective in vec4 v_v2;
@@ -369,8 +369,46 @@ pub const glsl_common =
     \\uniform usampler2D tlb_tex;
     \\layout(location = 0) out uint o_color;
     \\
+++ glsl_helpers;
+
+/// GLSL shared by the vertex shaders: a vertex's VPM words (`a_in`, `n_vpm` of them), the draw's
+/// uniforms, and what is captured of the vertex (as `gpu_draw.Vertex`), then the helpers.
+pub const glsl_vertex_common =
+    \\#version 400 core
+    \\layout(location = 0) in uvec4 a_in[8];
+    \\uniform uint unif[128];
+    \\uniform uint n_vpm;
+    \\uniform uint n_var;
+    \\uniform vec2 vp;
+    \\out vec4 tf_pos;
+    \\flat out uvec4 tf_unit_w;
+    \\out vec4 tf_v0;
+    \\out vec4 tf_v1;
+    \\out vec4 tf_v2;
+    \\out vec4 tf_v3;
+    \\
+++ glsl_helpers;
+
+/// The names of what a vertex shader's vertex is captured as, in `gpu_draw.Vertex`'s order.
+pub const glsl_vertex_captured = [_][*:0]const u8{ "tf_pos", "tf_unit_w", "tf_v0", "tf_v1", "tf_v2", "tf_v3" };
+
+/// The GLSL helpers the shaders share. The QPU's float arithmetic is `precise`: each operation
+/// rounded on its own, as qpu_sim does, not fused or rearranged.
+const glsl_helpers =
     \\float f(uint x) { return uintBitsToFloat(x); }
     \\uint u(float x) { return floatBitsToUint(x); }
+    \\uint q_fadd(uint a, uint b) { precise float r = f(a) + f(b); return u(r); }
+    \\uint q_fsub(uint a, uint b) { precise float r = f(a) - f(b); return u(r); }
+    \\uint q_fmul(uint a, uint b) { precise float r = f(a) * f(b); return u(r); }
+    \\// 1/x rounded as dividing is (a GPU's reciprocal is only nearly), by a step of Newton's method.
+    \\uint q_recip(uint a) {
+    \\  precise float x = f(a);
+    \\  precise float r = 1.0 / x;
+    \\  if (isinf(r) || r == 0.0 || isnan(r)) return u(r);
+    \\  precise float e = fma(-x, r, 1.0);
+    \\  precise float r2 = fma(e, r, r);
+    \\  return u(r2);
+    \\}
     \\float fmin(float a, float b) { return min(a, b); }
     \\float fmax(float a, float b) { return max(a, b); }
     \\float fabs(float a) { return abs(a); }
@@ -496,7 +534,8 @@ pub const glsl_common =
 /// The start of a GLSL fragment shader's `main`: its inputs, as `translate` reads them.
 const glsl_prologue =
     \\void main() {
-    \\  float W = v_unit_w != 0u ? 1.0 : (abs(v_inv_w) > 1e-12 ? 1.0 / v_inv_w : 1.0);
+    \\  // Exactly 0 only if every corner's 1/W is exactly 1.
+    \\  float W = v_not_unit_w == 0.0 ? 1.0 : (abs(v_inv_w) > 1e-12 ? 1.0 / v_inv_w : 1.0);
     \\  float V[16] = float[16](
     \\    v_v0.x * W, v_v0.y * W, v_v0.z * W, v_v0.w * W,
     \\    v_v1.x * W, v_v1.y * W, v_v1.z * W, v_v1.w * W,
@@ -518,7 +557,7 @@ const glsl_prologue =
 /// framebuffer (`fb` pixels big; its rows up from the bottom of the GL framebuffer, as in RAM), and
 /// what the fragments get.
 pub const glsl_vertex =
-    \\#version 330 core
+    \\#version 400 core
     \\layout(location = 0) in vec4 a_pos;
     \\layout(location = 1) in uint a_unit_w;
     \\layout(location = 2) in vec4 a_v0;
@@ -527,7 +566,7 @@ pub const glsl_vertex =
     \\layout(location = 5) in vec4 a_v3;
     \\uniform vec2 fb;
     \\noperspective out float v_inv_w;
-    \\flat out uint v_unit_w;
+    \\noperspective out float v_not_unit_w;
     \\noperspective out vec4 v_v0;
     \\noperspective out vec4 v_v1;
     \\noperspective out vec4 v_v2;
@@ -535,7 +574,7 @@ pub const glsl_vertex =
     \\void main() {
     \\  gl_Position = vec4(a_pos.x / fb.x * 2.0 - 1.0, a_pos.y / fb.y * 2.0 - 1.0, a_pos.z * 2.0 - 1.0, 1.0);
     \\  v_inv_w = a_pos.w;
-    \\  v_unit_w = a_unit_w;
+    \\  v_not_unit_w = a_unit_w != 0u ? 0.0 : 1.0;
     \\  v_v0 = a_v0;
     \\  v_v1 = a_v1;
     \\  v_v2 = a_v2;
@@ -617,54 +656,7 @@ pub fn translate(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, lang: 
             continue;
         }
 
-        if (d.sig == .load_imm) {
-            try w.print("    uint add_r = 0x{x}u, mul_r = 0x{x}u;\n", .{ d.imm_or_small, d.imm_or_small });
-        } else {
-            if ((d.flags & qpu_sim.DecodedInst.FLAG_FETCH_A) != 0) {
-                try w.writeAll("    pa = ");
-                try t.port(d.raddr_a, .a);
-                try w.writeAll(";\n");
-            }
-            if (d.sig == .small_imm) {
-                try w.print("    pb = 0x{x}u;\n", .{d.imm_or_small});
-            } else if ((d.flags & qpu_sim.DecodedInst.FLAG_FETCH_B) != 0) {
-                try w.writeAll("    pb = ");
-                try t.port(d.raddr_b, .b);
-                try w.writeAll(";\n");
-            }
-
-            const unpacks = (d.flags & qpu_sim.DecodedInst.FLAG_HAS_UNPACK) != 0;
-            try w.writeAll("    uint add_r = ");
-            if (d.add_op != .nop) {
-                const flt = (d.flags & qpu_sim.DecodedInst.FLAG_FLT_ADD) != 0;
-                var in0: [48]u8 = undefined;
-                var in1: [48]u8 = undefined;
-                try addOp(w, d.add_op, mux(&in0, d.mux0, d, unpacks, flt), mux(&in1, d.mux1, d, unpacks, flt));
-            } else {
-                try w.writeAll("0u");
-            }
-            try w.writeAll(";\n    uint mul_r = ");
-            if (d.mul_op != .nop) {
-                const flt = (d.flags & qpu_sim.DecodedInst.FLAG_FLT_MUL) != 0;
-                var in2: [48]u8 = undefined;
-                var in3: [48]u8 = undefined;
-                try mulOp(w, d.mul_op, mux(&in2, d.mux2, d, unpacks, flt), mux(&in3, d.mux3, d, unpacks, flt));
-            } else {
-                try w.writeAll("0u");
-            }
-            try w.writeAll(";\n");
-
-            if ((d.flags & qpu_sim.DecodedInst.FLAG_SF) != 0) {
-                const from = if (d.add_op != .nop) "add_r" else "mul_r";
-                try w.print("    flag_z = int({s}) == 0; flag_n = int({s}) < 0;\n", .{ from, from });
-            }
-            if ((d.flags & qpu_sim.DecodedInst.FLAG_READS_VARY) != 0) {
-                try w.print("    r5 = u({s});\n", .{varying_c});
-            }
-        }
-
-        try t.write(d.waddr_add, d.add_file, "add_r", d.cond_add, d.add_pack_a, 0);
-        try t.write(d.waddr_mul, d.mul_file, "mul_r", d.cond_mul, d.mul_pack_a, d.mul_pack_m);
+        try t.instruction(d);
 
         switch (d.sig) {
             .load_tmu0, .load_tmu1 => {
@@ -706,10 +698,89 @@ pub fn translate(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, lang: 
     return t.shader;
 }
 
+/// What a translated vertex shader needs, or that it can't be.
+pub const VertexShader = struct {
+    /// It can't be run as a GPU shader the same as qpu_sim runs it: it reads something only the
+    /// QPU has (its lane's number, a varying, a texture or the tile), writes fewer than the 3 words
+    /// of a vertex's position, or doesn't end.
+    unsupported: bool = false,
+    /// The VPM words it writes: the position (x and y, z, 1/W) and then the varyings.
+    outputs: usize = 0,
+};
+
+/// Writes the vertex shader `decoded` (`qpu_sim.decodeProgram`'s) as GLSL's `main` (after
+/// `glsl_vertex_common`): the vertex as V3D shades it (`v3d.zig`'s `VertexJob`), captured as
+/// `gpu_draw.Vertex`.
+pub fn translateVertex(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst) std.Io.Writer.Error!VertexShader {
+    var t: Translator = .{ .w = w, .lang = .glsl, .stage = .vertex };
+    try w.writeAll(
+        \\void main() {
+        \\  uint ra[32];
+        \\  uint rb[32];
+        \\  uint vo[32];
+        \\  for (int i = 0; i < 32; ++i) {
+        \\    ra[i] = 0u;
+        \\    rb[i] = 0u;
+        \\    vo[i] = 0u;
+        \\  }
+        \\  uint r0 = 0u, r1 = 0u, r2 = 0u, r3 = 0u, r4 = 0u, r5 = 0u, pa = 0u, pb = 0u;
+        \\  bool flag_z = false, flag_n = false;
+        \\
+    );
+    var end_at: ?usize = null;
+    var ip: usize = 0;
+    while (ip < decoded.len) : (ip += 1) {
+        if (end_at) |e| if (ip > e) break;
+        const d = decoded[ip];
+        if (d.sig == .branch) continue;
+        if ((d.flags & qpu_sim.DecodedInst.FLAG_FUSED_LINTERP) != 0) t.vertex.unsupported = true;
+        try w.print("  {{ // {d}\n", .{ip});
+        try t.instruction(d);
+        switch (d.sig) {
+            .load_tmu0, .load_tmu1, .color_load, .color_load_end, .coverage_load, .alpha_mask_load => t.vertex.unsupported = true,
+            .prog_end => end_at = ip + 2,
+            else => {},
+        }
+        try w.writeAll("  }\n");
+    }
+    if (end_at == null) t.vertex.unsupported = true;
+    t.vertex.outputs = t.vpm_writes;
+    if (t.vpm_writes < 3) t.vertex.unsupported = true;
+    // The vertex, as V3D's position words give it: x and y in 12.4 fixed point, z, and 1/W (taken
+    // as 1 if 0); the varyings multiplied by 1/W.
+    try w.print(
+        \\  int xs = int(vo[0] << 16) >> 16;
+        \\  int ys = int(vo[0]) >> 16;
+        \\  float inv_w = f(vo[2]) == 0.0 ? 1.0 : f(vo[2]);
+        \\  precise float x = float(xs) * 0.0625;
+        \\  precise float y = float(ys) * 0.0625;
+        \\  precise float px = x + vp.x;
+        \\  precise float py = y + vp.y;
+        \\  tf_pos = vec4(px, py, f(vo[1]), inv_w);
+        \\  tf_unit_w = uvec4(inv_w == 1.0 ? 1u : 0u, 0u, 0u, 0u);
+        \\  uint n_out = min(n_var, {d}u);
+        \\  float V[16];
+        \\  for (uint i = 0u; i < 16u; ++i) V[i] = i < n_out ? f(q_fmul(vo[3u + i], u(inv_w))) : 0.0;
+        \\  tf_v0 = vec4(V[0], V[1], V[2], V[3]);
+        \\  tf_v1 = vec4(V[4], V[5], V[6], V[7]);
+        \\  tf_v2 = vec4(V[8], V[9], V[10], V[11]);
+        \\  tf_v3 = vec4(V[12], V[13], V[14], V[15]);
+        \\  gl_Position = vec4(0.0);
+        \\}}
+        \\
+    , .{t.vpm_writes -| 3});
+    return t.vertex;
+}
+
 const Translator = struct {
     w: *std.Io.Writer,
     lang: Language,
+    stage: enum { fragment, vertex } = .fragment,
     shader: Shader = .{},
+    vertex: VertexShader = .{},
+    /// A vertex shader's VPM words read and written so far.
+    vpm_reads: usize = 0,
+    vpm_writes: usize = 0,
     /// The next uniform and varying read.
     uniforms: usize = 0,
     varyings: usize = 0,
@@ -724,6 +795,59 @@ const Translator = struct {
         head: u2 = 0,
         len: u3 = 0,
     };
+
+    /// An instruction's ALU operations and register writes (not its signal's).
+    fn instruction(t: *Translator, d: qpu_sim.DecodedInst) !void {
+        const w = t.w;
+        if (d.sig == .load_imm) {
+            try w.print("    uint add_r = 0x{x}u, mul_r = 0x{x}u;\n", .{ d.imm_or_small, d.imm_or_small });
+        } else {
+            if ((d.flags & qpu_sim.DecodedInst.FLAG_FETCH_A) != 0) {
+                try w.writeAll("    pa = ");
+                try t.port(d.raddr_a, .a);
+                try w.writeAll(";\n");
+            }
+            if (d.sig == .small_imm) {
+                try w.print("    pb = 0x{x}u;\n", .{d.imm_or_small});
+            } else if ((d.flags & qpu_sim.DecodedInst.FLAG_FETCH_B) != 0) {
+                try w.writeAll("    pb = ");
+                try t.port(d.raddr_b, .b);
+                try w.writeAll(";\n");
+            }
+
+            const unpacks = (d.flags & qpu_sim.DecodedInst.FLAG_HAS_UNPACK) != 0;
+            try w.writeAll("    uint add_r = ");
+            if (d.add_op != .nop) {
+                const flt = (d.flags & qpu_sim.DecodedInst.FLAG_FLT_ADD) != 0;
+                var in0: [48]u8 = undefined;
+                var in1: [48]u8 = undefined;
+                try addOp(w, t.lang, d.add_op, mux(&in0, d.mux0, d, unpacks, flt), mux(&in1, d.mux1, d, unpacks, flt));
+            } else {
+                try w.writeAll("0u");
+            }
+            try w.writeAll(";\n    uint mul_r = ");
+            if (d.mul_op != .nop) {
+                const flt = (d.flags & qpu_sim.DecodedInst.FLAG_FLT_MUL) != 0;
+                var in2: [48]u8 = undefined;
+                var in3: [48]u8 = undefined;
+                try mulOp(w, t.lang, d.mul_op, mux(&in2, d.mux2, d, unpacks, flt), mux(&in3, d.mux3, d, unpacks, flt));
+            } else {
+                try w.writeAll("0u");
+            }
+            try w.writeAll(";\n");
+
+            if ((d.flags & qpu_sim.DecodedInst.FLAG_SF) != 0) {
+                const from = if (d.add_op != .nop) "add_r" else "mul_r";
+                try w.print("    flag_z = int({s}) == 0; flag_n = int({s}) < 0;\n", .{ from, from });
+            }
+            if ((d.flags & qpu_sim.DecodedInst.FLAG_READS_VARY) != 0) {
+                try w.print("    r5 = u({s});\n", .{varying_c});
+            }
+        }
+
+        try t.write(d.waddr_add, d.add_file, "add_r", d.cond_add, d.add_pack_a, 0);
+        try t.write(d.waddr_mul, d.mul_file, "mul_r", d.cond_mul, d.mul_pack_a, d.mul_pack_m);
+    }
 
     /// How many varyings the draw gives.
     fn nVar(t: *const Translator) []const u8 {
@@ -740,12 +864,33 @@ const Translator = struct {
                 t.uniforms += 1;
             },
             qpu.R.vary => {
+                if (t.stage == .vertex) {
+                    t.vertex.unsupported = true;
+                    return w.writeAll("0u");
+                }
                 const k = t.varyings;
                 t.varyings += 1;
                 try w.print("({d}u < {s} ? u((V[{d}] - {s}) / W) : 0u)", .{ k, t.nVar(), @min(k, max_varyings - 1), varying_c });
             },
-            qpu.R.elem_qpu => try w.writeAll("(px & 15u)"),
-            qpu.R.xy_pixel_coord => try w.writeAll(if (file == .a) "px" else "py"),
+            qpu.R.vpm => {
+                if (t.stage != .vertex) return w.writeAll("0u");
+                // As qpu_sim reads them: in order, 0 past those given.
+                const k = t.vpm_reads;
+                t.vpm_reads += 1;
+                if (k >= 32) return w.writeAll("0u");
+                try w.print("({d}u < n_vpm ? a_in[{d}].{c} : 0u)", .{ k, k / 4, "xyzw"[k % 4] });
+            },
+            qpu.R.elem_qpu => {
+                if (t.stage == .vertex) t.vertex.unsupported = true;
+                try w.writeAll("(px & 15u)");
+            },
+            qpu.R.xy_pixel_coord => {
+                if (t.stage == .vertex) {
+                    t.vertex.unsupported = true;
+                    return w.writeAll("0u");
+                }
+                try w.writeAll(if (file == .a) "px" else "py");
+            },
             else => try w.writeAll("0u"),
         }
     }
@@ -778,9 +923,26 @@ const Translator = struct {
         }
 
         // Everything else is written whatever the condition (as qpu_sim does).
+        if (t.stage == .vertex) {
+            switch (waddr) {
+                qpu.W.vpm => {
+                    if (t.vpm_writes < 32) try w.print("    vo[{d}] = {s};\n", .{ t.vpm_writes, val });
+                    t.vpm_writes += 1;
+                    return;
+                },
+                qpu.W.tmu0_s...qpu.W.tmu1_b, qpu.W.tlb_color_all, qpu.W.tlb_color_ms => {
+                    t.vertex.unsupported = true;
+                    return;
+                },
+                else => {},
+            }
+        }
         switch (waddr) {
             qpu.W.tlb_color_all, qpu.W.tlb_color_ms => try w.print("    tlb_c = {s}; tlb_w = true;\n", .{val}),
-            qpu.W.sfu_recip => try w.print("    r4 = u(1.0f / f({s}));\n", .{val}),
+            qpu.W.sfu_recip => if (t.lang == .glsl)
+                try w.print("    r4 = q_recip({s});\n", .{val})
+            else
+                try w.print("    r4 = u(1.0f / f({s}));\n", .{val}),
             qpu.W.sfu_recipsqrt => try w.print("    r4 = u(1.0f / sqrt(f({s})));\n", .{val}),
             qpu.W.sfu_exp => try w.print("    r4 = u(exp2(f({s})));\n", .{val}),
             qpu.W.sfu_log => try w.print("    r4 = u(log2(f({s})));\n", .{val}),
@@ -857,7 +1019,12 @@ fn mux(buf: []u8, m: qpu.Mux, d: qpu_sim.DecodedInst, unpacks: bool, flt: bool) 
     return std.fmt.bufPrint(buf, "unpack({s}, {d}u, {s})", .{ name, mode, if (flt) "true" else "false" }) catch unreachable;
 }
 
-fn addOp(w: *std.Io.Writer, op: qpu.AddOp, a: []const u8, b: []const u8) !void {
+fn addOp(w: *std.Io.Writer, lang: Language, op: qpu.AddOp, a: []const u8, b: []const u8) !void {
+    if (lang == .glsl) switch (op) {
+        .fadd => return w.print("q_fadd({s}, {s})", .{ a, b }),
+        .fsub => return w.print("q_fsub({s}, {s})", .{ a, b }),
+        else => {},
+    };
     switch (op) {
         .fadd => try w.print("u(f({s}) + f({s}))", .{ a, b }),
         .fsub => try w.print("u(f({s}) - f({s}))", .{ a, b }),
@@ -886,7 +1053,8 @@ fn addOp(w: *std.Io.Writer, op: qpu.AddOp, a: []const u8, b: []const u8) !void {
     }
 }
 
-fn mulOp(w: *std.Io.Writer, op: qpu.MulOp, a: []const u8, b: []const u8) !void {
+fn mulOp(w: *std.Io.Writer, lang: Language, op: qpu.MulOp, a: []const u8, b: []const u8) !void {
+    if (lang == .glsl and op == .fmul) return w.print("q_fmul({s}, {s})", .{ a, b });
     switch (op) {
         .nop => try w.writeAll("0u"),
         .fmul => try w.print("u(f({s}) * f({s}))", .{ a, b }),
