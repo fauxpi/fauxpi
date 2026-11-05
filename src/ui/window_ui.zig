@@ -477,10 +477,14 @@ const TitleBar = struct {
         });
         n += 1;
         if (!sh.sheet_docked) {
-            items[n] = cx.make(kete.IconButton{
+            // The board, and which way the sheet goes: tinted while it is open.
+            items[n] = if (sh.sheet_open) cx.make(kete.TonalButton{
                 .icon = .developer_board,
-                .selected = sh.sheet_open,
-                .size = 34,
+                .trailing_icon = .expand_less,
+                .on_press = .of(sh, Shell.toggleSheet),
+            }) else cx.make(kete.TextButton{
+                .icon = .developer_board,
+                .trailing_icon = .expand_more,
                 .on_press = .of(sh, Shell.toggleSheet),
             });
             n += 1;
@@ -1630,7 +1634,8 @@ test "the sheet stays above the display when there is room, or else covers it un
     defer tall.destroy();
     try testing.expect(tall.shell.sheet_docked);
     try testing.expect(!tall.shell.sheetCovers());
-    try testing.expect(tall.find(kete.IconButton) == null);
+    try testing.expect(tall.find(kete.TonalButton) == null);
+    try testing.expect(tall.find(kete.TextButton) == null);
     try testing.expect(tall.find(Scrim) == null);
     const sheet = tall.find(Sheet).?;
     const display = tall.find(DisplayArea).?;
@@ -1643,17 +1648,23 @@ test "the sheet stays above the display when there is room, or else covers it un
     defer tw.destroy();
     try testing.expect(!tw.shell.sheet_docked);
     try testing.expect(tw.shell.sheetCovers());
-    const button = tw.find(kete.IconButton).?;
+    // Open: the board with an arrow up, tinted.
+    const button = tw.find(kete.TonalButton).?;
+    try testing.expectEqual(kete.IconName.expand_less, button.widget.as(kete.TonalButton).?.trailing_icon.?);
     tw.click(TestWindow.centre(button));
     try testing.expect(!tw.shell.sheet_open);
     try testing.expect(tw.find(Sheet) == null);
-    tw.click(TestWindow.centre(tw.find(kete.IconButton).?));
+    // Closed: an arrow down.
+    const closed = tw.find(kete.TextButton).?;
+    try testing.expectEqual(kete.IconName.developer_board, closed.widget.as(kete.TextButton).?.icon.?);
+    try testing.expectEqual(kete.IconName.expand_more, closed.widget.as(kete.TextButton).?.trailing_icon.?);
+    tw.click(TestWindow.centre(closed));
     try testing.expect(tw.shell.sheet_open);
     tw.click(.{ 20, 600 });
     try testing.expect(!tw.shell.sheet_open);
 
     // Escape closes it too, and keys don't reach the guest under it.
-    tw.click(TestWindow.centre(tw.find(kete.IconButton).?));
+    tw.click(TestWindow.centre(tw.find(kete.TextButton).?));
     try testing.expect(tw.ui.focused == tw.find(Keyboard).?);
     pressKey(tw, .escape, 1);
     try testing.expect(!tw.shell.sheet_open);
