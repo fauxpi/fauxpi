@@ -1,5 +1,5 @@
-//! The bare-metal benchmark's tests, by name (shared by the suite and its runner), and what each
-//! measures.
+//! The benchmark's tests, by name (shared by the suites and their runner), and what each
+//! measures: the bare-metal suite's (bench/baremetal) and the Linux one's (bench/linux).
 
 pub const Test = struct {
     name: []const u8,
@@ -21,4 +21,16 @@ pub const all = [_]Test{
     .{ .name = "v3d_blend", .about = "V3D: 500 translucent quads a frame, blended in the shader" },
     .{ .name = "v3d_draws", .about = "V3D: 1,000 draws of a quad each, a frame" },
     .{ .name = "hvs_planes", .about = "the HVS composing 10 planes, moving, 60 times a second" },
+};
+
+pub const linux = [_]Test{
+    .{ .name = "linux_boot", .about = "Linux booting to init, and vc4 to /dev/dri/card0" },
+    .{ .name = "linux_syscalls", .about = "system calls (200,000 getppid)" },
+    .{ .name = "linux_pagefault", .about = "page faults (fresh memory touched a page at a time)" },
+    .{ .name = "kms_flip", .about = "KMS page flips, each waited for (vblank-paced)" },
+    .{ .name = "kms_triangles", .about = "vc4 (SUBMIT_CL): 20,000 small triangles a frame, shown by page flips" },
+    .{ .name = "kms_fill", .about = "vc4: 32 full-screen depth-tested quads a frame" },
+    .{ .name = "kms_texture", .about = "vc4: 2,000 bilinear-textured quads a frame" },
+    .{ .name = "kms_blend", .about = "vc4: 500 translucent quads a frame, blended in the shader" },
+    .{ .name = "kms_draws", .about = "vc4: 1,000 draws of a quad each, a frame" },
 };

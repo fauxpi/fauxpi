@@ -85,13 +85,38 @@ fn addBench(b: *std.Build, fauxpi: *std.Build.Step.Compile) void {
         .optimize = .ReleaseFast,
     });
     guest_mod.addImport("bench_tests", tests_mod);
-    guest_mod.addImport("qpu", b.createModule(.{ .root_source_file = b.path("src/vc4/qpu.zig"), .target = arm, .optimize = .ReleaseFast }));
+    const qpu_mod = b.createModule(.{ .root_source_file = b.path("src/vc4/qpu.zig"), .target = arm, .optimize = .ReleaseFast });
+    const scene_mod = b.createModule(.{ .root_source_file = b.path("bench/scene.zig"), .target = arm, .optimize = .ReleaseFast });
+    scene_mod.addImport("qpu", qpu_mod);
+    guest_mod.addImport("qpu", qpu_mod);
+    guest_mod.addImport("scene", scene_mod);
     const guest = b.addExecutable(.{ .name = "fauxpi-bench", .root_module = guest_mod });
     guest.setLinkerScript(b.path("bench/baremetal/link.ld"));
     guest.entry = .{ .symbol_name = "_start" };
     const kernel_img = b.addObjCopy(guest.getEmittedBin(), .{ .format = .binary, .basename = "kernel.img" });
     const install_kernel = b.addInstallFile(kernel_img.getOutput(), "bench/kernel.img");
     b.step("bench-kernel", "Build the bare-metal benchmark (zig-out/bench/kernel.img)").dependOn(&install_kernel.step);
+
+    // The Linux benchmark's init, for the Pi Zero's Linux (static, no C library).
+    const arm_linux = b.resolveTargetQuery(.{
+        .cpu_arch = .arm,
+        .os_tag = .linux,
+        .abi = .eabihf,
+        .cpu_model = .{ .explicit = &std.Target.arm.cpu.arm1176jzf_s },
+    });
+    const linux_qpu = b.createModule(.{ .root_source_file = b.path("src/vc4/qpu.zig"), .target = arm_linux, .optimize = .ReleaseFast });
+    const linux_scene = b.createModule(.{ .root_source_file = b.path("bench/scene.zig"), .target = arm_linux, .optimize = .ReleaseFast });
+    linux_scene.addImport("qpu", linux_qpu);
+    const init_mod = b.createModule(.{
+        .root_source_file = b.path("bench/linux/init.zig"),
+        .target = arm_linux,
+        .optimize = .ReleaseFast,
+    });
+    init_mod.addImport("scene", linux_scene);
+    init_mod.addImport("bench_tests", tests_mod);
+    const init = b.addExecutable(.{ .name = "init", .root_module = init_mod });
+    const install_init = b.addInstallFile(init.getEmittedBin(), "bench/init");
+    b.step("bench-init", "Build the Linux benchmark's init (zig-out/bench/init)").dependOn(&install_init.step);
 
     const host = b.graph.host;
     const mkimage = b.addExecutable(.{ .name = "fauxpi-mkimage", .root_module = b.createModule(.{
@@ -111,6 +136,8 @@ fn addBench(b: *std.Build, fauxpi: *std.Build.Step.Compile) void {
     run.addPrefixedFileArg("--fauxpi=", fauxpi.getEmittedBin());
     run.addPrefixedFileArg("--kernel=", kernel_img.getOutput());
     run.addPrefixedFileArg("--mkimage=", mkimage.getEmittedBin());
+    run.addPrefixedFileArg("--init=", init.getEmittedBin());
+    run.addPrefixedFileArg("--linux-config=", b.path("bench/linux/bench.config"));
     run.addPassthruArgs();
     run.has_side_effects = true;
     run.stdio = .inherit;

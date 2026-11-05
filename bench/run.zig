@@ -1,6 +1,7 @@
-//! Runs FauxPi's benchmark: boots the bare-metal tests (bench/baremetal) in FauxPi, headless, a
-//! test a boot, and reports how long each took and where FauxPi spent the time (its `--profile`
-//! report), as JSON on stdout (or `--json <file>`) and a table on stderr.
+//! Runs FauxPi's benchmark: boots the bare-metal tests (bench/baremetal), or with --linux the Linux
+//! ones (a minimal Raspberry Pi kernel and bench/linux/init.zig), in FauxPi, headless, a test a
+//! boot, and reports how long each took and where FauxPi spent the time (its `--profile` report),
+//! as JSON on stdout (or `--json <file>`) and a table on stderr.
 //!
 //! `zig build bench` builds FauxPi, the tests and this, and passes this the paths of all three;
 //! what comes after `--` is for this (`zig build bench -- --help`).
@@ -11,10 +12,15 @@ const bench_tests = @import("bench_tests");
 const usage =
     \\usage: zig build bench -- [options] [test ...]
     \\
-    \\Boots FauxPi's bare-metal benchmark (bench/baremetal), a test a boot, headless, and reports
-    \\each test's time and where FauxPi spent it, as JSON (stdout, or --json) and a table (stderr).
-    \\With no tests named, runs them all.
+    \\Boots FauxPi's bare-metal benchmark (bench/baremetal), or the Linux one (--linux), a test a
+    \\boot, headless, and reports each test's time and where FauxPi spent it, as JSON (stdout, or
+    \\--json) and a table (stderr). With no tests named, runs them all.
     \\
+    \\  --linux           The Linux tests: a minimal Raspberry Pi kernel for the Pi Zero (built
+    \\                    once, into ~/.cache/fauxpi-bench, with arm-linux-gnueabihf-gcc), and init
+    \\                    drawing through vc4 and KMS; naming one of them does too
+    \\  --linux-src <dir> Build the kernel from this Raspberry Pi kernel tree, as it is (default:
+    \\                    the pinned commit, fetched once)
     \\  --v3d <mode>      Where V3D draws: gpu (default), gpu-fragments, cpu, or all (each in turn);
     \\                    may be given more than once
     \\  --scale <n>       How much work each test does: 100 is usual (default), 1 to 10000
@@ -23,8 +29,9 @@ const usage =
     \\  --timeout <s>     Stop a test's boot after s seconds (default 300)
     \\  --json <file>     Write the JSON there, not to stdout
     \\  --log <dir>       Keep each boot's serial output and FauxPi's messages there
-    \\  --image <file>    Only write an SD card image that runs the tests on a Raspberry Pi Zero
-    \\                    (with its firmware), printing results on the serial port
+    \\  --image <file>    Only write an SD card image that runs the tests (all, bare-metal or Linux)
+    \\                    on a Raspberry Pi Zero (with its firmware), printing results on the
+    \\                    serial port
     \\  --list            List the tests
     \\
 ;
@@ -48,10 +55,120 @@ const config_txt =
     \\
 ;
 
+const linux_config_txt =
+    \\# FauxPi's Linux benchmark: a minimal Raspberry Pi kernel, init in an initramfs, vc4 for KMS.
+    \\kernel=kernel.img
+    \\arm_64bit=0
+    \\enable_uart=1
+    \\initramfs initramfs.cpio followkernel
+    \\dtoverlay=vc4-kms-v3d
+    \\
+;
+
+const linux_cmdline_txt = "console=ttyAMA0,115200 cma=64M loglevel=3\n";
+
+/// The Raspberry Pi kernel the Linux tests build: rpi-6.18.y as of 2026-11-03.
+const linux_repo = "https://github.com/raspberrypi/linux.git";
+const linux_commit = "a4985478de14b3a83c8e04fed68377c1bdae735d";
+
+/// An initramfs (cpio, newc) of `init`, with /dev/console (its output, before devtmpfs), /dev and
+/// /proc.
+fn initramfs(arena: std.mem.Allocator, init: []const u8) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    const w = &out.writer;
+    const Entry = struct { name: []const u8, mode: u32, data: []const u8 = "", rdev: [2]u32 = .{ 0, 0 } };
+    const entries = [_]Entry{
+        .{ .name = "dev", .mode = 0o040755 },
+        .{ .name = "proc", .mode = 0o040755 },
+        .{ .name = "dev/console", .mode = 0o020600, .rdev = .{ 5, 1 } },
+        .{ .name = "init", .mode = 0o100755, .data = init },
+        .{ .name = "TRAILER!!!", .mode = 0 },
+    };
+    for (entries, 1..) |e, ino| {
+        try w.print("070701{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}{x:0>8}", .{
+            ino, e.mode, 0, 0, 1, 0, e.data.len, 0, 0, e.rdev[0], e.rdev[1], e.name.len + 1, 0,
+        });
+        try w.print("{s}\x00", .{e.name});
+        try w.splatByteAll(0, (4 - (110 + e.name.len + 1) % 4) % 4);
+        try w.writeAll(e.data);
+        try w.splatByteAll(0, (4 - e.data.len % 4) % 4);
+    }
+    return out.written();
+}
+
+fn runOk(arena: std.mem.Allocator, io: std.Io, argv: []const []const u8) !void {
+    const res = try std.process.run(arena, io, .{ .argv = argv });
+    if (res.term != .exited or res.term.exited != 0) {
+        std.debug.print("{s} failed:\n{s}{s}\n", .{ argv[0], res.stdout, res.stderr });
+        return error.CommandFailed;
+    }
+}
+
+/// The Linux kernel for the tests, its device tree and vc4's overlay: built (once, for a
+/// configuration) from `--linux-src`, or the pinned commit fetched into the cache.
+fn buildLinux(arena: std.mem.Allocator, io: std.Io, o: Options, cache: []const u8) ![]const NamedFile {
+    const cwd = std.Io.Dir.cwd();
+    const fragment = try cwd.readFileAlloc(io, o.linux_config, arena, .limited(1 << 20));
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(fragment, &digest, .{});
+    const stamp_text = try std.fmt.allocPrint(arena, "{s} {s}\n", .{ o.linux_src orelse linux_commit, std.fmt.bytesToHex(digest, .lower) });
+
+    const src = o.linux_src orelse blk: {
+        const dir = try std.fs.path.join(arena, &.{ cache, "linux-src-" ++ linux_commit[0..12] });
+        const makefile = try std.fs.path.join(arena, &.{ dir, "Makefile" });
+        cwd.access(io, makefile, .{}) catch {
+            std.debug.print("fetching the Raspberry Pi kernel ({s} at {s}), once\n", .{ linux_repo, linux_commit[0..12] });
+            try cwd.createDirPath(io, dir);
+            try runOk(arena, io, &.{ "git", "-C", dir, "init", "-q" });
+            try runOk(arena, io, &.{ "git", "-C", dir, "fetch", "-q", "--depth", "1", linux_repo, linux_commit });
+            try runOk(arena, io, &.{ "git", "-C", dir, "checkout", "-q", "FETCH_HEAD" });
+        };
+        break :blk dir;
+    };
+    const out = try std.fs.path.join(arena, &.{ cache, "linux-build" });
+    const stamp = try std.fs.path.join(arena, &.{ out, "fauxpi-bench.stamp" });
+    const zimage = try std.fs.path.join(arena, &.{ out, "arch/arm/boot/zImage" });
+    const dtb = try std.fs.path.join(arena, &.{ out, "arch/arm/boot/dts/broadcom/bcm2708-rpi-zero.dtb" });
+    const overlay = try std.fs.path.join(arena, &.{ out, "arch/arm/boot/dts/overlays/vc4-kms-v3d.dtbo" });
+    const built = if (cwd.readFileAlloc(io, stamp, arena, .limited(4096))) |old| std.mem.eql(u8, old, stamp_text) else |_| false;
+    if (!built) {
+        std.debug.print("building the kernel (tinyconfig and {s}), once: a minute or two\n", .{o.linux_config});
+        try cwd.createDirPath(io, out);
+        const o_arg = try std.fmt.allocPrint(arena, "O={s}", .{out});
+        const jobs = try std.fmt.allocPrint(arena, "-j{d}", .{std.Thread.getCpuCount() catch 4});
+        const make: []const []const u8 = &.{ "make", "-s", "-C", src, o_arg, "ARCH=arm", "CROSS_COMPILE=arm-linux-gnueabihf-" };
+        try runOk(arena, io, try std.mem.concat(arena, []const u8, &.{ make, &.{"tinyconfig"} }));
+        const dot_config = try std.fs.path.join(arena, &.{ out, ".config" });
+        try runOk(arena, io, &.{ try std.fs.path.join(arena, &.{ src, "scripts/kconfig/merge_config.sh" }), "-m", "-O", out, dot_config, o.linux_config });
+        try runOk(arena, io, try std.mem.concat(arena, []const u8, &.{ make, &.{"olddefconfig"} }));
+        // Every option set took effect (one whose dependencies aren't met is dropped quietly).
+        const config = try cwd.readFileAlloc(io, dot_config, arena, .limited(1 << 20));
+        var lines = std.mem.splitScalar(u8, fragment, '\n');
+        while (lines.next()) |line| {
+            if (!std.mem.startsWith(u8, line, "CONFIG_")) continue;
+            if (std.mem.indexOf(u8, config, line) == null) {
+                std.debug.print("the kernel's configuration lacks {s} (its dependencies?)\n", .{line});
+                return error.KernelConfig;
+            }
+        }
+        try runOk(arena, io, try std.mem.concat(arena, []const u8, &.{ make, &.{ jobs, "zImage", "broadcom/bcm2708-rpi-zero.dtb", "overlays/vc4-kms-v3d.dtbo" } }));
+        try cwd.writeFile(io, .{ .sub_path = stamp, .data = stamp_text });
+    }
+    return try arena.dupe(NamedFile, &.{
+        .{ .name = "kernel.img", .data = try cwd.readFileAlloc(io, zimage, arena, .limited(64 << 20)) },
+        .{ .name = "bcm2708-rpi-zero.dtb", .data = try cwd.readFileAlloc(io, dtb, arena, .limited(1 << 20)) },
+        .{ .name = "overlays/vc4-kms-v3d.dtbo", .data = try cwd.readFileAlloc(io, overlay, arena, .limited(1 << 20)) },
+    });
+}
+
 const Options = struct {
     fauxpi: []const u8 = "",
     kernel: []const u8 = "",
     mkimage: []const u8 = "",
+    init: []const u8 = "",
+    linux_config: []const u8 = "",
+    linux: bool = false,
+    linux_src: ?[]const u8 = null,
     tests: std.ArrayList([]const u8) = .empty,
     modes: std.ArrayList([]const u8) = .empty,
     scale: u32 = 100,
@@ -88,11 +205,22 @@ pub fn main(init: std.process.Init) !u8 {
             o.kernel = a["--kernel=".len..];
         } else if (std.mem.startsWith(u8, a, "--mkimage=")) {
             o.mkimage = a["--mkimage=".len..];
+        } else if (std.mem.startsWith(u8, a, "--init=")) {
+            o.init = a["--init=".len..];
+        } else if (std.mem.startsWith(u8, a, "--linux-config=")) {
+            o.linux_config = a["--linux-config=".len..];
+        } else if (std.mem.eql(u8, a, "--linux")) {
+            o.linux = true;
+        } else if (std.mem.eql(u8, a, "--linux-src")) {
+            o.linux_src = value(args, &i, a);
         } else if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
             std.debug.print("{s}", .{usage});
             return 0;
         } else if (std.mem.eql(u8, a, "--list")) {
-            for (bench_tests.all) |t| std.debug.print("{s:<14} {s}\n", .{ t.name, t.about });
+            std.debug.print("Bare-metal:\n", .{});
+            for (bench_tests.all) |t| std.debug.print("  {s:<16} {s}\n", .{ t.name, t.about });
+            std.debug.print("Linux (--linux):\n", .{});
+            for (bench_tests.linux) |t| std.debug.print("  {s:<16} {s}\n", .{ t.name, t.about });
             return 0;
         } else if (std.mem.eql(u8, a, "--v3d")) {
             const m = value(args, &i, a);
@@ -125,7 +253,9 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("unknown option {s}\n{s}", .{ a, usage });
             return 2;
         } else {
-            if (!isTest(a)) {
+            if (isTestIn(&bench_tests.linux, a)) {
+                o.linux = true;
+            } else if (!isTestIn(&bench_tests.all, a)) {
                 std.debug.print("no test named {s} (--list lists them)\n", .{a});
                 return 2;
             }
@@ -136,23 +266,32 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("run this with zig build bench\n", .{});
         return 2;
     }
-    if (o.tests.items.len == 0) for (bench_tests.all) |t| try o.tests.append(arena, t.name);
+    const list: []const bench_tests.Test = if (o.linux) &bench_tests.linux else &bench_tests.all;
+    for (o.tests.items) |t| if (!isTestIn(list, t)) {
+        std.debug.print("{s} isn't a {s} test: run the bare-metal and Linux tests apart\n", .{ t, if (o.linux) "Linux" else "bare-metal" });
+        return 2;
+    };
+    if (o.tests.items.len == 0) for (list) |t| try o.tests.append(arena, t.name);
     if (o.modes.items.len == 0) try o.modes.append(arena, "gpu");
 
     const cwd = std.Io.Dir.cwd();
-    const kernel = try cwd.readFileAlloc(io, o.kernel, arena, .limited(16 << 20));
+    // The guest: the bare-metal kernel.img, or Linux's init (and the kernel, built).
+    const kernel = try cwd.readFileAlloc(io, if (o.linux) o.init else o.kernel, arena, .limited(16 << 20));
     const cache = try cacheDir(arena, init.environ_map);
     try cwd.createDirPath(io, cache);
 
     if (o.image) |path| {
-        // For a real Pi Zero: every test, and the firmware to boot it.
-        const files = try fetchAll(arena, io, cache, &(firmware ++ [_]Download{device_tree}));
+        // For a real Pi Zero: every test, and the firmware to boot it (and Linux, built).
+        const files = if (o.linux)
+            try std.mem.concat(arena, NamedFile, &.{ try fetchAll(arena, io, cache, &firmware), try buildLinux(arena, io, o, cache) })
+        else
+            try fetchAll(arena, io, cache, &(firmware ++ [_]Download{device_tree}));
         const patched = try patch(arena, kernel, "all", o);
         try makeImage(arena, io, o, cache, path, patched, files);
         std.debug.print("wrote {s}: the benchmark for a Raspberry Pi Zero (results on the serial port, GPIO 14, 115200 baud)\n", .{path});
         return 0;
     }
-    const dtb = try fetchAll(arena, io, cache, &.{device_tree});
+    const dtb: []const NamedFile = if (o.linux) try buildLinux(arena, io, o, cache) else try fetchAll(arena, io, cache, &.{device_tree});
 
     var runs: std.ArrayList(Run) = .empty;
     var failed = false;
@@ -178,8 +317,8 @@ pub fn main(init: std.process.Init) !u8 {
     return if (failed) 1 else 0;
 }
 
-fn isTest(name: []const u8) bool {
-    for (bench_tests.all) |t| if (std.mem.eql(u8, t.name, name)) return true;
+fn isTestIn(list: []const bench_tests.Test, name: []const u8) bool {
+    for (list) |t| if (std.mem.eql(u8, t.name, name)) return true;
     return std.mem.eql(u8, name, "all");
 }
 
@@ -238,13 +377,24 @@ fn patch(arena: std.mem.Allocator, kernel: []const u8, name: []const u8, o: Opti
     return out;
 }
 
-/// Writes an SD card image at `path`: config.txt, kernel.img, and `files`.
+/// Writes an SD card image at `path`: config.txt, kernel.img, and `files`; or for Linux, `kernel`
+/// is init, in an initramfs, and `files` the kernel and its device tree and overlay.
 fn makeImage(arena: std.mem.Allocator, io: std.Io, o: Options, work: []const u8, path: []const u8, kernel: []const u8, files: []const NamedFile) !void {
     var argv: std.ArrayList([]const u8) = .empty;
     try argv.appendSlice(arena, &.{ o.mkimage, path, "auto" });
-    const all = try std.mem.concat(arena, NamedFile, &.{ &.{ .{ .name = "config.txt", .data = config_txt }, .{ .name = "kernel.img", .data = kernel } }, files });
+    const boot: []const NamedFile = if (o.linux) &.{
+        .{ .name = "config.txt", .data = linux_config_txt },
+        .{ .name = "cmdline.txt", .data = linux_cmdline_txt },
+        .{ .name = "initramfs.cpio", .data = try initramfs(arena, kernel) },
+    } else &.{
+        .{ .name = "config.txt", .data = config_txt },
+        .{ .name = "kernel.img", .data = kernel },
+    };
+    const all = try std.mem.concat(arena, NamedFile, &.{ boot, files });
     for (all) |f| {
-        const src = try std.fs.path.join(arena, &.{ work, try std.fmt.allocPrint(arena, "image-{s}", .{f.name}) });
+        const flat = try arena.dupe(u8, f.name);
+        std.mem.replaceScalar(u8, flat, '/', '-');
+        const src = try std.fs.path.join(arena, &.{ work, try std.fmt.allocPrint(arena, "image-{s}", .{flat}) });
         try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = src, .data = f.data });
         try argv.append(arena, try std.fmt.allocPrint(arena, "{s}={s}", .{ f.name, src }));
     }
@@ -259,9 +409,11 @@ fn makeImage(arena: std.mem.Allocator, io: std.Io, o: Options, work: []const u8,
 const Run = struct {
     name: []const u8,
     mode: []const u8,
-    /// The host's time from the test's start to its end (the boot not counted), and the whole boot.
+    /// The host's time from the test's start to its end (the boot not counted), the whole boot, and
+    /// from FauxPi starting to the first test (the guest booting).
     wall_ms: f64 = 0,
     boot_ms: f64 = 0,
+    to_test_ms: f64 = 0,
     /// The board's own time for it.
     guest_ms: f64 = 0,
     /// The test's numbers (name=value), as it printed them.
@@ -324,6 +476,7 @@ fn runTest(arena: std.mem.Allocator, io: std.Io, o: Options, cache: []const u8, 
         try serial.writer.print("{s}\n", .{line});
         if (std.mem.startsWith(u8, line, "BENCH-BEGIN ")) {
             begin = now(io);
+            if (run.to_test_ms == 0) run.to_test_ms = @as(f64, @floatFromInt(begin.? - boot_start)) / 1e6;
         } else if (std.mem.startsWith(u8, line, "BENCH-END ")) {
             const end = now(io);
             ended = true;
@@ -361,7 +514,7 @@ fn runTest(arena: std.mem.Allocator, io: std.Io, o: Options, cache: []const u8, 
 fn writeJson(w: *std.Io.Writer, o: Options, runs: []const Run) !void {
     try w.print("{{\n  \"scale\": {d},\n  \"size\": \"{d}x{d}\",\n  \"runs\": [", .{ o.scale, o.width, o.height });
     for (runs, 0..) |r, i| {
-        try w.print("{s}\n    {{\n      \"test\": \"{s}\",\n      \"v3d\": \"{s}\",\n      \"wall_ms\": {d:.3},\n      \"guest_ms\": {d:.3},\n      \"boot_ms\": {d:.3},\n      \"values\": {{ {s} }}", .{ if (i == 0) "" else ",", r.name, r.mode, r.wall_ms, r.guest_ms, r.boot_ms, r.values });
+        try w.print("{s}\n    {{\n      \"test\": \"{s}\",\n      \"v3d\": \"{s}\",\n      \"wall_ms\": {d:.3},\n      \"guest_ms\": {d:.3},\n      \"boot_ms\": {d:.3},\n      \"to_test_ms\": {d:.3},\n      \"values\": {{ {s} }}", .{ if (i == 0) "" else ",", r.name, r.mode, r.wall_ms, r.guest_ms, r.boot_ms, r.to_test_ms, r.values });
         if (r.err) |e| try w.print(",\n      \"error\": \"{f}\"", .{std.zig.fmtString(e)});
         if (r.profile.len > 0) {
             try w.writeAll(",\n      \"fauxpi\": ");
