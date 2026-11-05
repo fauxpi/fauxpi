@@ -4,8 +4,8 @@
     .version = "0.0.0",
     .dependencies = .{
         .kete = .{
-            .url = "git+https://github.com/robert-ancell/kete#874061365ce06e8961731f9192329339cb27cc6a",
-            .hash = "kete-0.1.0-tp3h6opoUAD8cNkfYxVOEJAXiww7AWO0MY-xYa_KHCNb",
+            .url = "git+https://github.com/robert-ancell/kete#61ca1beda9d74aea21df1cda09c8c40eb0ff7312",
+            .hash = "kete-0.1.0-tp3h6iRuUABEs0o2W_V4loMWpDDLfvRjH_KKZwfBm5dO",
         },
     },
     .fingerprint = 0xd66fda550e7c5466,
