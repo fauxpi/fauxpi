@@ -285,57 +285,33 @@ pub const Hvs = struct {
                     if (dst_x < max_dx and dst_y < max_dy) {
                         const span_w = max_dx - dst_x;
                         const span_h = max_dy - dst_y;
+                        // Every byte shown, in as few pieces as can be: as fast as sampling
+                        // some (the hash's cost is per piece as much as per byte), and no change
+                        // is missed.
                         if (tiling == 0) {
                             const raw_pitch: u32 = pitch0 & 0xffff;
                             const linear_pitch: u32 = if (raw_pitch != 0) raw_pitch else (src_w * cpp);
                             const row_bytes: usize = @as(usize, span_w) * cpp;
                             if (linear_pitch == span_w * cpp) {
                                 const total_bytes = row_bytes * @as(usize, span_h);
-                                if (@as(usize, ptr0) + total_bytes <= ram.len) {
-                                    if (total_bytes <= 16384) {
-                                        hasher.update(ram[ptr0 .. ptr0 + total_bytes]);
-                                    } else {
-                                        // Sparse strided 64-byte cacheline sampling across large linear planes
-                                        // (~20 samples per 1280px row, cutting 3.68 MB/frame bandwidth by 4x).
-                                        var off: usize = 0;
-                                        while (off + 64 <= total_bytes) : (off += 256) {
-                                            hasher.update(ram[@as(usize, ptr0) + off ..][0..64]);
-                                        }
-                                        hasher.update(ram[@as(usize, ptr0) + total_bytes - 64 ..][0..64]);
-                                    }
-                                }
+                                if (@as(usize, ptr0) + total_bytes <= ram.len) hasher.update(ram[ptr0 .. ptr0 + total_bytes]);
                             } else {
-                                const row_step: u32 = if (span_h > 64) 2 else 1;
                                 var sy: u32 = 0;
-                                while (sy < span_h) : (sy += row_step) {
+                                while (sy < span_h) : (sy += 1) {
                                     const row_off: usize = @as(usize, ptr0) + @as(usize, sy) * linear_pitch;
-                                    if (row_off + row_bytes <= ram.len) {
-                                        if (row_bytes <= 1024) {
-                                            hasher.update(ram[row_off .. row_off + row_bytes]);
-                                        } else {
-                                            var off: usize = 0;
-                                            while (off + 64 <= row_bytes) : (off += 256) {
-                                                hasher.update(ram[row_off + off ..][0..64]);
-                                            }
-                                            hasher.update(ram[row_off + row_bytes - 64 ..][0..64]);
-                                        }
-                                    }
+                                    if (row_off + row_bytes <= ram.len) hasher.update(ram[row_off .. row_off + row_bytes]);
                                 }
                             }
                         } else {
-                            // T-tiled / LT-tiled plane: sample 64-byte utiles across the plane
+                            // A T-tiled or LT-tiled plane: all of its tiles.
                             const tile_w_px: u32 = if (is_565) 64 else 32;
                             const tiled_w: u32 = if (tiling == 3 and (pitch0 & 0x7f) != 0)
                                 (pitch0 & 0x7f) * tile_w_px
                             else
                                 src_w;
                             const aligned_h = (src_h + 31) & ~@as(u32, 31);
-                            const total_bytes: usize = @as(usize, tiled_w) * @as(usize, aligned_h) * cpp;
-                            const step: usize = @max((total_bytes / 64) & ~@as(usize, 63), 64);
-                            var off: usize = 0;
-                            while (off + 64 <= total_bytes and @as(usize, ptr0) + off + 64 <= ram.len) : (off += step) {
-                                hasher.update(ram[@as(usize, ptr0) + off ..][0..64]);
-                            }
+                            const total_bytes: usize = @min(@as(usize, tiled_w) * @as(usize, aligned_h) * cpp, ram.len -| ptr0);
+                            hasher.update(ram[ptr0..][0..total_bytes]);
                         }
                     }
                 }
@@ -1156,4 +1132,33 @@ test "HVS scaled T-tiled plane compositing matches exact integer division" {
             try std.testing.expectEqual(expected, out[py * dst_w + px]);
         }
     }
+}
+
+test "HVS planes' hash changes with any pixel, not just those sampled" {
+    var hvs = Hvs{};
+    const w = 1280;
+    const h = 720;
+    const ram = try std.testing.allocator.alloc(u8, w * h * 4 + 4096);
+    defer std.testing.allocator.free(ram);
+    @memset(ram, 0x20);
+    // A full-screen unity RGBA8888 plane at 0x1000, on channel 1.
+    const words = [_]u32{
+        Hvs.SCALER_CTL0_VALID | Hvs.SCALER_CTL0_UNITY | (7 << 24) | 7,
+        0,
+        (h << 16) | w,
+        0,
+        0xc0001000,
+        0,
+        w * 4,
+        Hvs.SCALER_CTL0_END,
+    };
+    for (words, 0..) |v, i| hvs.write32(Hvs.DLIST_OFFSET + @as(u32, @intCast(i)) * 4, v);
+    hvs.write32(0x24, 0);
+    hvs.write32(0x00, 1 << 31);
+    const before = hvs.computeActivePlanesHash(ram, w, h);
+    try std.testing.expect(before != 0);
+    try std.testing.expectEqual(before, hvs.computeActivePlanesHash(ram, w, h));
+    // A pixel at byte 128 of a 256-byte stretch (sampling read only the first 64 of each).
+    ram[0x1000 + 300 * w * 4 + 640 * 4 + 128] ^= 0xff;
+    try std.testing.expect(hvs.computeActivePlanesHash(ram, w, h) != before);
 }
