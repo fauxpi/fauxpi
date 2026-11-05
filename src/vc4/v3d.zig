@@ -39,7 +39,9 @@ pub const V3d = struct {
         config_b2: u8 = 0x00,
     };
 
-    pub const MAX_PREBINNED_TRIS = 2048;
+    /// The most triangles a frame's draws are shaded and binned into tiles
+    /// with; the draws past them are shaded again for each tile.
+    pub const MAX_PREBINNED_TRIS = 65536;
     pub const MAX_PREP_FS_INSTS = 8192;
     pub const MAX_PREP_FS_UNIFS = 8192;
 
@@ -272,11 +274,14 @@ pub const V3d = struct {
     prep_fs_insts_len: usize = 0,
     prep_fs_unifs: [MAX_PREP_FS_UNIFS]u32 = undefined,
     prep_fs_unifs_len: usize = 0,
-    shaded_tris: [MAX_PREBINNED_TRIS]ShadedTriangle = undefined,
-    shaded_tris_len: usize = 0,
+    /// The frame's triangles, shaded, in draw order.
+    shaded_tris: std.ArrayList(ShadedTriangle) = .empty,
     overflow_draw_start: usize = 0,
-    tile_nonempty: [32]u32 = @splat(0),
-    tile_tri_mask: [32 * 32][MAX_PREBINNED_TRIS / 64]u64 = undefined,
+    /// Each 64-pixel tile's triangles (`y * 32 + x`), in draw order: indices
+    /// into `shaded_tris`, from `tile_tri_start[t]` to `tile_tri_start[t + 1]`
+    /// in `tile_tris`.
+    tile_tri_start: [32 * 32 + 1]u32 = @splat(0),
+    tile_tris: std.ArrayList(u32) = .empty,
 
     gl: GlRenderer = .{},
     gl_initialized: bool = false,
@@ -334,9 +339,9 @@ pub const V3d = struct {
         self.tile_modified = false;
         self.prep_fs_insts_len = 0;
         self.prep_fs_unifs_len = 0;
-        self.shaded_tris_len = 0;
+        self.shaded_tris.clearRetainingCapacity();
         self.overflow_draw_start = 0;
-        self.tile_nonempty = @splat(0);
+        self.tile_tri_start = @splat(0);
         self.gl = .{};
         self.gl_initialized = false;
         self.frame_dirty = false;
@@ -624,11 +629,11 @@ pub const V3d = struct {
 
     /// Pre-shades and bins triangles across all draw calls once per frame before tile loop.
     fn prepareDrawsForFrame(self: *V3d, ram: []const u8) void {
-        self.shaded_tris_len = 0;
+        self.shaded_tris.clearRetainingCapacity();
         self.prep_fs_insts_len = 0;
         self.prep_fs_unifs_len = 0;
         self.overflow_draw_start = self.draws_len;
-        self.tile_nonempty = @splat(0);
+        defer self.binTriangles();
 
         var vs_buf: [512]qpu.Inst = undefined;
         var fs_buf: [512]qpu.Inst = undefined;
@@ -698,10 +703,14 @@ pub const V3d = struct {
                 else => 0,
             };
 
-            if (self.shaded_tris_len + num_tris > MAX_PREBINNED_TRIS) {
+            if (self.shaded_tris.items.len + num_tris > MAX_PREBINNED_TRIS) {
                 self.overflow_draw_start = draw_idx;
                 break;
             }
+            self.shaded_tris.ensureUnusedCapacity(tri_allocator, num_tris) catch {
+                self.overflow_draw_start = draw_idx;
+                break;
+            };
 
             var attr_streams: [8]AttrStream = undefined;
             const attr_info = decodeAttrStreams(ram, rec_phys, draw.num_attrs, vs_attr_mask, &attr_streams);
@@ -838,6 +847,7 @@ pub const V3d = struct {
                     const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
                         (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
                     if (@abs(area) < 1e-6) continue;
+                    if (culled(draw.config_b0, area)) continue;
 
                     const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
                     const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
@@ -845,56 +855,68 @@ pub const V3d = struct {
                     const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
                     if (min_fx >= max_fx or min_fy >= max_fy) continue;
 
-                    const tri_slot = self.shaded_tris_len;
-                    const min_ux: u32 = @intFromFloat(min_fx);
-                    const min_uy: u32 = @intFromFloat(min_fy);
-                    const max_ux: u32 = @intFromFloat(max_fx);
-                    const max_uy: u32 = @intFromFloat(max_fy);
-                    self.shaded_tris[tri_slot] = ShadedTriangle.init(
+                    self.shaded_tris.appendAssumeCapacity(ShadedTriangle.init(
                         @intCast(draw_idx),
-                        min_ux,
-                        min_uy,
-                        max_ux,
-                        max_uy,
+                        @intFromFloat(min_fx),
+                        @intFromFloat(min_fy),
+                        @intFromFloat(max_fx),
+                        @intFromFloat(max_fy),
                         area,
                         verts,
                         n_var,
-                    );
-                    self.shaded_tris_len = tri_slot + 1;
+                    ));
+                }
+            }
+        }
+    }
 
-                    // Spatially bin this triangle into overlapping 64x64 tiles
-                    const tx0: u32 = @min(min_ux >> 6, 31);
-                    const ty0: u32 = @min(min_uy >> 6, 31);
-                    const tx1: u32 = @min((max_ux - 1) >> 6, 31);
-                    const ty1: u32 = @min((max_uy - 1) >> 6, 31);
-                    const word_idx = tri_slot >> 6;
-                    const bit_mask = @as(u64, 1) << @intCast(tri_slot & 63);
-                    if (tx0 == tx1 and ty0 == ty1) {
-                        const tx_bit = @as(u32, 1) << @intCast(tx0);
-                        const t_idx = (ty0 << 5) + tx0;
-                        if ((self.tile_nonempty[ty0] & tx_bit) == 0) {
-                            @memset(&self.tile_tri_mask[t_idx], 0);
-                            self.tile_nonempty[ty0] |= tx_bit;
-                        }
-                        self.tile_tri_mask[t_idx][word_idx] |= bit_mask;
-                    } else {
-                        var ty: u32 = ty0;
-                        while (ty <= ty1) : (ty += 1) {
-                            const row_base = ty << 5;
-                            var row_nonempty = self.tile_nonempty[ty];
-                            var tx: u32 = tx0;
-                            while (tx <= tx1) : (tx += 1) {
-                                const tx_bit = @as(u32, 1) << @intCast(tx);
-                                const t_idx = row_base + tx;
-                                if ((row_nonempty & tx_bit) == 0) {
-                                    @memset(&self.tile_tri_mask[t_idx], 0);
-                                    row_nonempty |= tx_bit;
-                                }
-                                self.tile_tri_mask[t_idx][word_idx] |= bit_mask;
-                            }
-                            self.tile_nonempty[ty] = row_nonempty;
-                        }
-                    }
+    /// What the frame's triangles and their tiles are kept in.
+    const tri_allocator = std.heap.smp_allocator;
+
+    /// Whether the configuration bits `cfg0` cull a triangle whose screen area
+    /// (`y` down) is `area`: anticlockwise ones (a negative area) face
+    /// forward, or clockwise ones if bit 2 says so; bit 0 draws those facing
+    /// forward, and bit 1 those facing back.
+    fn culled(cfg0: u8, area: f32) bool {
+        const forward = if (cfg0 & 4 != 0) area > 0 else area < 0;
+        return (if (forward) cfg0 & 1 else cfg0 & 2) == 0;
+    }
+
+    /// Lists each 64-pixel tile's triangles (`tile_tris`), in draw order. If
+    /// there is no room for the lists, no triangle is binned: the draws are
+    /// all shaded again for each tile.
+    fn binTriangles(self: *V3d) void {
+        const Range = struct {
+            fn of(t: *const ShadedTriangle) [4]u32 {
+                return .{ @min(t.min_x >> 6, 31), @min(t.min_y >> 6, 31), @min((t.max_x - 1) >> 6, 31), @min((t.max_y - 1) >> 6, 31) };
+            }
+        };
+        var counts: [32 * 32]u32 = @splat(0);
+        for (self.shaded_tris.items) |*t| {
+            const r = Range.of(t);
+            for (r[1]..r[3] + 1) |ty| {
+                for (r[0]..r[2] + 1) |tx| counts[ty * 32 + tx] += 1;
+            }
+        }
+        var total: u32 = 0;
+        for (counts, 0..) |c, i| {
+            self.tile_tri_start[i] = total;
+            total += c;
+        }
+        self.tile_tri_start[counts.len] = total;
+        self.tile_tris.resize(tri_allocator, total) catch {
+            self.shaded_tris.clearRetainingCapacity();
+            self.tile_tri_start = @splat(0);
+            self.overflow_draw_start = 0;
+            return;
+        };
+        var next = self.tile_tri_start;
+        for (self.shaded_tris.items, 0..) |*t, i| {
+            const r = Range.of(t);
+            for (r[1]..r[3] + 1) |ty| {
+                for (r[0]..r[2] + 1) |tx| {
+                    self.tile_tris.items[next[ty * 32 + tx]] = @intCast(i);
+                    next[ty * 32 + tx] += 1;
                 }
             }
         }
@@ -1465,7 +1487,7 @@ pub const V3d = struct {
     /// What drawing frames with Metal needs (on macOS), made with the first frame.
     const MetalState = struct {
         renderer: metal_renderer.Renderer,
-        vertices: [MAX_PREBINNED_TRIS * 3]metal_renderer.Vertex = undefined,
+        vertices: [metal_renderer.max_vertices]metal_renderer.Vertex = undefined,
         draws: [256]metal_renderer.Draw = undefined,
         uniforms: [256][qpu_to_msl.max_uniforms]u32 = undefined,
         code: [256][512]qpu.Inst = undefined,
@@ -1535,7 +1557,7 @@ pub const V3d = struct {
         var n_draws: usize = 0;
         if (first.has_render) {
             var last_draw: ?u16 = null;
-            for (self.shaded_tris[0..self.shaded_tris_len]) |*tri| {
+            for (self.shaded_tris.items) |*tri| {
                 const prep = self.prep_draws[tri.draw_idx];
                 if (!prep.valid) continue;
                 if (last_draw != tri.draw_idx) {
@@ -1934,13 +1956,11 @@ pub const V3d = struct {
         const tile_end_y = tile_px_y + tile_size;
 
         const use_spatial_bin = (tile_size == 64 and (tile_px_x & 63) == 0 and (tile_px_y & 63) == 0 and (tile_px_x >> 6) < 32 and (tile_px_y >> 6) < 32);
-        if (use_spatial_bin) {
-            const tx = tile_px_x >> 6;
-            const ty = tile_px_y >> 6;
-            if ((self.tile_nonempty[ty] & (@as(u32, 1) << @intCast(tx))) == 0 and self.overflow_draw_start >= self.draws_len) {
-                return;
-            }
-        }
+        const binned: []const u32 = if (use_spatial_bin) blk: {
+            const t = (tile_px_y >> 6) * 32 + (tile_px_x >> 6);
+            break :blk self.tile_tris.items[self.tile_tri_start[t]..self.tile_tri_start[t + 1]];
+        } else &.{};
+        if (use_spatial_bin and binned.len == 0 and self.overflow_draw_start >= self.draws_len) return;
 
         var fs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
         var fs_unif_buf: [128]u32 = undefined;
@@ -1949,59 +1969,46 @@ pub const V3d = struct {
         var cur_fs_unifs: []const u32 = &.{};
 
         if (use_spatial_bin) {
-            const tx = tile_px_x >> 6;
-            const ty = tile_px_y >> 6;
-            if ((self.tile_nonempty[ty] & (@as(u32, 1) << @intCast(tx))) != 0) {
-                const t_idx = ty * 32 + tx;
-                const active_words = (self.shaded_tris_len + 63) >> 6;
-                for (0..active_words) |w_i| {
-                    var bits = self.tile_tri_mask[t_idx][w_i];
-                    while (bits != 0) {
-                        const bit_pos: usize = @ctz(bits);
-                        bits &= bits - 1;
-                        const tri_idx = (w_i << 6) + bit_pos;
-                        if (tri_idx >= self.shaded_tris_len) break;
-                        const tri = &self.shaded_tris[tri_idx];
-                        const prep = self.prep_draws[tri.draw_idx];
-                        if (!prep.valid) continue;
+            for (binned) |tri_idx| {
+                const tri = &self.shaded_tris.items[tri_idx];
+                const prep = self.prep_draws[tri.draw_idx];
+                if (!prep.valid) continue;
 
-                        if (cur_draw_idx == null or cur_draw_idx.? != tri.draw_idx) {
-                            cur_draw_idx = tri.draw_idx;
-                            if (prep.fs_cached) {
-                                cur_fs_decoded = self.prep_fs_insts[prep.fs_inst_start..][0..prep.fs_code_len];
-                                cur_fs_unifs = self.prep_fs_unifs[prep.fs_unif_start..][0..prep.fs_unif_len];
-                            } else {
-                                for (0..prep.fs_code_len) |i| {
-                                    const raw_inst = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
-                                    fs_decoded_buf[i] = qpu_sim.decodeInst(raw_inst);
-                                }
-                                cur_fs_decoded = fs_decoded_buf[0..prep.fs_code_len];
-                                for (0..prep.fs_unif_len) |i| {
-                                    fs_unif_buf[i] = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
-                                }
-                                cur_fs_unifs = fs_unif_buf[0..prep.fs_unif_len];
-                            }
+                if (cur_draw_idx == null or cur_draw_idx.? != tri.draw_idx) {
+                    cur_draw_idx = tri.draw_idx;
+                    if (prep.fs_cached) {
+                        cur_fs_decoded = self.prep_fs_insts[prep.fs_inst_start..][0..prep.fs_code_len];
+                        cur_fs_unifs = self.prep_fs_unifs[prep.fs_unif_start..][0..prep.fs_unif_len];
+                    } else {
+                        for (0..prep.fs_code_len) |i| {
+                            const raw_inst = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
+                            fs_decoded_buf[i] = qpu_sim.decodeInst(raw_inst);
                         }
-
-                        const draw = self.draws[tri.draw_idx];
-                        rasterizeShadedTriangleDecodedInTileBuf(
-                            tb,
-                            ram,
-                            draw,
-                            tri,
-                            cur_fs_decoded,
-                            cur_fs_unifs,
-                            prep.fs_num_varyings,
-                            prep.fast_frag,
-                            tile_px_x,
-                            tile_px_y,
-                            tile_size,
-                        );
+                        cur_fs_decoded = fs_decoded_buf[0..prep.fs_code_len];
+                        for (0..prep.fs_unif_len) |i| {
+                            fs_unif_buf[i] = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
+                        }
+                        cur_fs_unifs = fs_unif_buf[0..prep.fs_unif_len];
                     }
                 }
+
+                const draw = self.draws[tri.draw_idx];
+                rasterizeShadedTriangleDecodedInTileBuf(
+                    tb,
+                    ram,
+                    draw,
+                    tri,
+                    cur_fs_decoded,
+                    cur_fs_unifs,
+                    prep.fs_num_varyings,
+                    prep.fast_frag,
+                    tile_px_x,
+                    tile_px_y,
+                    tile_size,
+                );
             }
         } else {
-            for (self.shaded_tris[0..self.shaded_tris_len]) |*tri| {
+            for (self.shaded_tris.items) |*tri| {
                 if (tri.max_x <= tile_px_x or tri.min_x >= tile_end_x or
                     tri.max_y <= tile_px_y or tri.min_y >= tile_end_y)
                 {
@@ -2191,6 +2198,7 @@ pub const V3d = struct {
                 const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
                     (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
                 if (@abs(area) < 1e-6) continue;
+                if (culled(draw.config_b0, area)) continue;
 
                 const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
                 const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
@@ -3241,4 +3249,49 @@ test "V3D multi-tile RCL parallel rasterization across 16 tiles" {
             try std.testing.expectEqual(@as(u32, 0xff00ff00), std.mem.readInt(u32, ram[off..][0..4], .little));
         }
     }
+}
+
+test "V3D culls triangles by the way they face, as the configuration bits ask" {
+    // Anticlockwise on the screen (y down) is a negative area: forward.
+    const ccw: f32 = -10;
+    const cw: f32 = 10;
+    // Both drawn.
+    try std.testing.expect(!V3d.culled(0x03, ccw) and !V3d.culled(0x03, cw));
+    // Only forward facing: the back (clockwise) culled.
+    try std.testing.expect(!V3d.culled(0x01, ccw) and V3d.culled(0x01, cw));
+    // Only reverse facing.
+    try std.testing.expect(V3d.culled(0x02, ccw) and !V3d.culled(0x02, cw));
+    // Clockwise primitives face forward.
+    try std.testing.expect(V3d.culled(0x05, ccw) and !V3d.culled(0x05, cw));
+}
+
+test "V3D bins more triangles than tiles once did, into each tile in draw order" {
+    const v = try std.testing.allocator.create(V3d);
+    defer std.testing.allocator.destroy(v);
+    v.* = .{};
+    defer v.shaded_tris.deinit(V3d.tri_allocator);
+    defer v.tile_tris.deinit(V3d.tri_allocator);
+
+    // 5000 triangles, each in the tile its number picks (some across two).
+    const verts = [3]V3d.ShadedVertex{ .{}, .{ .x = 1 }, .{ .y = 1 } };
+    for (0..5000) |i| {
+        const tx: u32 = @intCast(i % 20);
+        const ty: u32 = @intCast((i / 20) % 12);
+        const wide: u32 = if (i % 7 == 0) 64 else 0;
+        try v.shaded_tris.append(V3d.tri_allocator, V3d.ShadedTriangle.init(0, tx * 64 + 8, ty * 64 + 8, tx * 64 + 16 + wide, ty * 64 + 16, 1, verts, 0));
+    }
+    v.binTriangles();
+
+    var total: usize = 0;
+    for (0..32 * 32) |t| {
+        const list = v.tile_tris.items[v.tile_tri_start[t]..v.tile_tri_start[t + 1]];
+        total += list.len;
+        for (list, 0..) |tri, k| {
+            const s = &v.shaded_tris.items[tri];
+            try std.testing.expect(s.min_x >> 6 <= t % 32 and (s.max_x - 1) >> 6 >= t % 32);
+            if (k > 0) try std.testing.expect(list[k - 1] < tri);
+        }
+    }
+    // Each in one tile, and those that are wider in two.
+    try std.testing.expectEqual(@as(usize, 5000 + (5000 + 6) / 7), total);
 }

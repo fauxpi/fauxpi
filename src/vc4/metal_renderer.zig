@@ -93,7 +93,8 @@ pub const Draw = struct {
 pub const Error = error{ Unsupported, MetalFailed };
 
 const max_draws = 256;
-const max_vertices = 2048 * 3;
+/// A frame's triangles' corners: as many as V3D bins (`V3d.MAX_PREBINNED_TRIS`).
+pub const max_vertices = 65536 * 3;
 const pixel_r32uint: u64 = 53;
 const pixel_depth32: u64 = 252;
 const primitive_triangle: u64 = 3;
