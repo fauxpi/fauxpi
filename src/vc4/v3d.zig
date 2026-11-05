@@ -874,11 +874,12 @@ pub const V3d = struct {
     const tri_allocator = std.heap.smp_allocator;
 
     /// Whether the configuration bits `cfg0` cull a triangle whose screen area
-    /// (`y` down) is `area`: anticlockwise ones (a negative area) face
-    /// forward, or clockwise ones if bit 2 says so; bit 0 draws those facing
-    /// forward, and bit 1 those facing back.
+    /// (`y` down) is `area`: those with a positive area face forward, or with
+    /// a negative one if bit 2 ("clockwise") is set, as it is for OpenGL's
+    /// anticlockwise triangles drawn with `y` flipped (Mesa's vc4); bit 0
+    /// draws those facing forward, and bit 1 those facing back.
     fn culled(cfg0: u8, area: f32) bool {
-        const forward = if (cfg0 & 4 != 0) area > 0 else area < 0;
+        const forward = if (cfg0 & 4 != 0) area < 0 else area > 0;
         return (if (forward) cfg0 & 1 else cfg0 & 2) == 0;
     }
 
@@ -3252,17 +3253,17 @@ test "V3D multi-tile RCL parallel rasterization across 16 tiles" {
 }
 
 test "V3D culls triangles by the way they face, as the configuration bits ask" {
-    // Anticlockwise on the screen (y down) is a negative area: forward.
-    const ccw: f32 = -10;
-    const cw: f32 = 10;
+    // A positive screen area (y down) faces forward, unless bit 2 is set.
+    const pos: f32 = 10;
+    const neg: f32 = -10;
     // Both drawn.
-    try std.testing.expect(!V3d.culled(0x03, ccw) and !V3d.culled(0x03, cw));
-    // Only forward facing: the back (clockwise) culled.
-    try std.testing.expect(!V3d.culled(0x01, ccw) and V3d.culled(0x01, cw));
+    try std.testing.expect(!V3d.culled(0x03, pos) and !V3d.culled(0x03, neg));
+    // Only forward facing: the back culled.
+    try std.testing.expect(!V3d.culled(0x01, pos) and V3d.culled(0x01, neg));
     // Only reverse facing.
-    try std.testing.expect(V3d.culled(0x02, ccw) and !V3d.culled(0x02, cw));
-    // Clockwise primitives face forward.
-    try std.testing.expect(V3d.culled(0x05, ccw) and !V3d.culled(0x05, cw));
+    try std.testing.expect(V3d.culled(0x02, pos) and !V3d.culled(0x02, neg));
+    // With bit 2, a negative area faces forward.
+    try std.testing.expect(V3d.culled(0x05, pos) and !V3d.culled(0x05, neg));
 }
 
 test "V3D bins more triangles than tiles once did, into each tile in draw order" {
