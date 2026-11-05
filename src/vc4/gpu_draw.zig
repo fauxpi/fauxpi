@@ -2,6 +2,7 @@
 //! triangles V3D shaded and binned on the CPU, with their corners, and the runs of them each fragment
 //! shader draws.
 
+const std = @import("std");
 const qpu = @import("qpu.zig");
 const shader = @import("qpu_to_shader.zig");
 
@@ -61,3 +62,54 @@ pub const Draw = struct {
 /// The most draws, and corners, a frame is drawn with: as many as V3D bins.
 pub const max_draws = 256;
 pub const max_vertices = 65536 * 3;
+
+/// Whether draw `b`, straight after `a`, can have its vertices shaded in the same pass as `a`'s:
+/// the same vertex shader, given the same (uniforms, VPM words, viewport, varyings), with its
+/// inputs and vertices straight after `a`'s. Many small draws then cost a pass, not one each.
+pub fn shadeTogether(a: Draw, b: Draw) bool {
+    const va = a.vertex_stage orelse return false;
+    const vb = b.vertex_stage orelse return false;
+    return vb.first_input == va.first_input + a.vertex_count * va.input_stride and
+        b.first_vertex == a.first_vertex + a.vertex_count and
+        va.vpm_words == vb.vpm_words and
+        va.input_stride == vb.input_stride and
+        va.vp_x == vb.vp_x and
+        va.vp_y == vb.vp_y and
+        a.num_varyings == b.num_varyings and
+        std.mem.eql(qpu.Inst, va.code, vb.code) and
+        std.mem.eql(u32, va.uniforms, vb.uniforms);
+}
+
+/// The draws from `first` whose vertices are shaded in one pass (`shadeTogether`): up to the
+/// index returned, and how many vertices they have.
+pub fn shadeRun(draws: []const Draw, first: usize) struct { end: usize, vertices: u32 } {
+    var end = first + 1;
+    var vertices = draws[first].vertex_count;
+    while (end < draws.len and shadeTogether(draws[end - 1], draws[end])) : (end += 1) vertices += draws[end].vertex_count;
+    return .{ .end = end, .vertices = vertices };
+}
+
+test "draws of the same shader, one after another, are shaded in one pass" {
+    const code = [_]qpu.Inst{ 1, 2, 3 };
+    const other = [_]qpu.Inst{ 1, 2, 4 };
+    var unifs: [shader.max_uniforms]u32 = @splat(0);
+    var unifs2: [shader.max_uniforms]u32 = @splat(0);
+    unifs2[1] = 5;
+    const stage: VertexStage = .{ .code = &code, .uniforms = &unifs, .vpm_words = 6, .first_input = 0, .input_stride = 8, .first_corner = 0, .corner_count = 6, .cull = 3, .vp_x = 1, .vp_y = 2 };
+    var draws: [5]Draw = undefined;
+    for (&draws, 0..) |*d, i| {
+        var vs = stage;
+        vs.first_input = @intCast(i * 6 * 8);
+        d.* = .{ .first_vertex = @intCast(i * 6), .vertex_count = 6, .vertex_stage = vs, .code = &code, .uniforms = &unifs, .num_varyings = 3, .depth_func = 7, .depth_write = false, .clip_x = 0, .clip_y = 0, .clip_w = 64, .clip_h = 64 };
+    }
+    // Another shader from the third, and other uniforms from the fifth.
+    draws[2].vertex_stage.?.code = &other;
+    draws[3].vertex_stage.?.code = &other;
+    draws[4].vertex_stage.?.code = &other;
+    draws[4].vertex_stage.?.uniforms = &unifs2;
+    const run = shadeRun(&draws, 0);
+    try std.testing.expectEqual(@as(usize, 2), run.end);
+    try std.testing.expectEqual(@as(u32, 12), run.vertices);
+    try std.testing.expectEqual(@as(usize, 4), shadeRun(&draws, 2).end);
+    try std.testing.expectEqual(@as(usize, 5), shadeRun(&draws, 4).end);
+}

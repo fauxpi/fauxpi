@@ -479,9 +479,15 @@ pub const Renderer = struct {
         gl.BufferData(GL_ARRAY_BUFFER, @intCast(inputs.len * 4), inputs.ptr, GL_STREAM_DRAW);
         gl.Enable(GL_RASTERIZER_DISCARD);
         defer gl.Disable(GL_RASTERIZER_DISCARD);
-        for (draws, programs) |d, p| {
+        // Each run of draws shading alike in one pass (`gpu_draw.shadeRun`).
+        var first: usize = 0;
+        while (first < draws.len) {
+            const run = gpu_draw.shadeRun(draws, first);
+            const d = draws[first];
+            const p = programs[first];
+            first = run.end;
             const vs = d.vertex_stage.?;
-            if (d.vertex_count == 0) continue;
+            if (run.vertices == 0) continue;
             gl.UseProgram(p.program);
             gl.Uniform1uiv(p.unif, shader.max_uniforms, vs.uniforms);
             gl.Uniform1ui(p.n_vpm, vs.vpm_words);
@@ -497,9 +503,9 @@ pub const Renderer = struct {
                     gl.DisableVertexAttribArray(loc);
                 }
             }
-            gl.BindBufferRange(GL_TRANSFORM_FEEDBACK_BUFFER, 0, r.vbo, @intCast(@as(usize, d.first_vertex) * @sizeOf(Vertex)), @intCast(@as(usize, d.vertex_count) * @sizeOf(Vertex)));
+            gl.BindBufferRange(GL_TRANSFORM_FEEDBACK_BUFFER, 0, r.vbo, @intCast(@as(usize, d.first_vertex) * @sizeOf(Vertex)), @intCast(@as(usize, run.vertices) * @sizeOf(Vertex)));
             gl.BeginTransformFeedback(GL_POINTS);
-            gl.DrawArrays(GL_POINTS, 0, @intCast(d.vertex_count));
+            gl.DrawArrays(GL_POINTS, 0, @intCast(run.vertices));
             gl.EndTransformFeedback();
         }
         gl.BindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0);

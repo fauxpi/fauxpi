@@ -44,6 +44,7 @@ pub const vc4_texture = @import("vc4/texture.zig");
 pub const vc4_qpu = @import("vc4/qpu.zig");
 pub const vc4_qpu_sim = @import("vc4/qpu_sim.zig");
 pub const vc4_gl_renderer = @import("vc4/gl_renderer.zig");
+pub const vc4_gpu_draw = @import("vc4/gpu_draw.zig");
 pub const vc4_qpu_to_shader = @import("vc4/qpu_to_shader.zig");
 pub const vc4_metal_renderer = @import("vc4/metal_renderer.zig");
 pub const vc4_v3d = @import("vc4/v3d.zig");

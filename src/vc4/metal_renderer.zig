@@ -412,15 +412,21 @@ pub const Renderer = struct {
         if (shaded_on_gpu) {
             // Each draw's vertices shaded, then its triangles culled, as V3D does.
             const enc = msg(Id, cmd, "computeCommandEncoder", .{}) orelse return error.MetalFailed;
-            for (draws, 0..) |d, i| {
+            // Each run of draws shading alike in one dispatch (`gpu_draw.shadeRun`).
+            var first: usize = 0;
+            while (first < draws.len) {
+                const run = gpu_draw.shadeRun(draws, first);
+                const i = first;
+                const d = draws[first];
+                first = run.end;
                 const vs = d.vertex_stage.?;
-                if (d.vertex_count == 0) continue;
+                if (run.vertices == 0) continue;
                 const info: VertexInfo = .{
                     .n_vpm = vs.vpm_words,
                     .n_var = @min(d.num_varyings, msl.max_varyings),
                     .first_input = vs.first_input,
                     .stride = vs.input_stride,
-                    .count = d.vertex_count,
+                    .count = run.vertices,
                     .first_vertex = d.first_vertex,
                     .vp_x = vs.vp_x,
                     .vp_y = vs.vp_y,
@@ -430,7 +436,7 @@ pub const Renderer = struct {
                 msg(void, enc, "setBuffer:offset:atIndex:", .{ r.vertices, @as(u64, 0), @as(u64, 1) });
                 msg(void, enc, "setBytes:length:atIndex:", .{ @as(*const anyopaque, vs.uniforms), @as(u64, msl.max_uniforms * 4), @as(u64, 2) });
                 msg(void, enc, "setBytes:length:atIndex:", .{ @as(*const anyopaque, &info), @as(u64, @sizeOf(VertexInfo)), @as(u64, 3) });
-                msg(void, enc, "dispatchThreadgroups:threadsPerThreadgroup:", .{ MtlSize{ .width = (d.vertex_count + 63) / 64, .height = 1, .depth = 1 }, MtlSize{ .width = 64, .height = 1, .depth = 1 } });
+                msg(void, enc, "dispatchThreadgroups:threadsPerThreadgroup:", .{ MtlSize{ .width = (run.vertices + 63) / 64, .height = 1, .depth = 1 }, MtlSize{ .width = 64, .height = 1, .depth = 1 } });
             }
             // The culling reads every draw's vertices once they are all shaded.
             msg(void, enc, "memoryBarrierWithScope:", .{@as(u64, 1)}); // MTLBarrierScopeBuffers
