@@ -35,11 +35,8 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (@hasField(std.Build, "args")) {
-        if (b.args) |args| {
-            run_cmd.addArgs(args);
-        }
-    }
+    // `zig build run -- <args>` passes them on.
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run the Raspberry Pi Zero simulator");
     run_step.dependOn(&run_cmd.step);
@@ -65,6 +62,65 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    addBench(b, exe);
+}
+
+/// The benchmark (bench/): a bare-metal kernel.img for the Pi Zero that runs tests of the CPU, the
+/// DMA engine, V3D and the HVS, and a runner that boots it in FauxPi (headless, a test a boot) and
+/// reports where the time went, as JSON. `zig build bench -- --help` says how to use it.
+fn addBench(b: *std.Build, fauxpi: *std.Build.Step.Compile) void {
+    const tests_mod = b.createModule(.{ .root_source_file = b.path("bench/tests.zig") });
+
+    // The Pi Zero's ARM1176, with no operating system.
+    const arm = b.resolveTargetQuery(.{
+        .cpu_arch = .arm,
+        .os_tag = .freestanding,
+        .abi = .eabihf,
+        .cpu_model = .{ .explicit = &std.Target.arm.cpu.arm1176jzf_s },
+    });
+    const guest_mod = b.createModule(.{
+        .root_source_file = b.path("bench/baremetal/main.zig"),
+        .target = arm,
+        .optimize = .ReleaseFast,
+    });
+    guest_mod.addImport("bench_tests", tests_mod);
+    guest_mod.addImport("qpu", b.createModule(.{ .root_source_file = b.path("src/vc4/qpu.zig"), .target = arm, .optimize = .ReleaseFast }));
+    const guest = b.addExecutable(.{ .name = "fauxpi-bench", .root_module = guest_mod });
+    guest.setLinkerScript(b.path("bench/baremetal/link.ld"));
+    guest.entry = .{ .symbol_name = "_start" };
+    const kernel_img = b.addObjCopy(guest.getEmittedBin(), .{ .format = .binary, .basename = "kernel.img" });
+    const install_kernel = b.addInstallFile(kernel_img.getOutput(), "bench/kernel.img");
+    b.step("bench-kernel", "Build the bare-metal benchmark (zig-out/bench/kernel.img)").dependOn(&install_kernel.step);
+
+    const host = b.graph.host;
+    const mkimage = b.addExecutable(.{ .name = "fauxpi-mkimage", .root_module = b.createModule(.{
+        .root_source_file = b.path("bench/mkimage.zig"),
+        .target = host,
+        .optimize = .ReleaseSafe,
+    }) });
+    const runner_mod = b.createModule(.{
+        .root_source_file = b.path("bench/run.zig"),
+        .target = host,
+        .optimize = .ReleaseSafe,
+    });
+    runner_mod.addImport("bench_tests", tests_mod);
+    const runner = b.addExecutable(.{ .name = "fauxpi-bench", .root_module = runner_mod });
+
+    const run = b.addRunArtifact(runner);
+    run.addPrefixedFileArg("--fauxpi=", fauxpi.getEmittedBin());
+    run.addPrefixedFileArg("--kernel=", kernel_img.getOutput());
+    run.addPrefixedFileArg("--mkimage=", mkimage.getEmittedBin());
+    run.addPassthruArgs();
+    run.has_side_effects = true;
+    run.stdio = .inherit;
+    const step = b.step("bench", "Benchmark FauxPi: boot the bare-metal tests in it and report (-- --help)");
+    step.dependOn(&run.step);
+    step.dependOn(&install_kernel.step);
+
+    const unit = b.addTest(.{ .root_module = runner_mod });
+    const bench_tests_step = b.step("bench-test", "Test the benchmark's runner");
+    bench_tests_step.dependOn(&b.addRunArtifact(unit).step);
 }
 
 /// What `git <args>` prints in the source tree, trimmed; null without git or its history.
