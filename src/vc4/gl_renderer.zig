@@ -258,9 +258,10 @@ pub const Renderer = struct {
         var gl: Gl = undefined;
         inline for (@typeInfo(Gl).@"struct".field_names) |name| {
             const p = getProcAddress("gl" ++ name);
-            @field(gl, name) = if (@typeInfo(@FieldType(Gl, name)) == .optional) @ptrCast(p) else @ptrCast(p orelse return error.Unsupported);
+            // Functions are aligned (on arm64, to 4 bytes).
+            @field(gl, name) = if (@typeInfo(@FieldType(Gl, name)) == .optional) @ptrCast(@alignCast(p)) else @ptrCast(@alignCast(p orelse return error.Unsupported));
         }
-        if (gl.TextureBarrier == null) gl.TextureBarrier = @ptrCast(getProcAddress("glTextureBarrierNV"));
+        if (gl.TextureBarrier == null) gl.TextureBarrier = @ptrCast(@alignCast(getProcAddress("glTextureBarrierNV")));
 
         const name = std.mem.span(gl.GetString(GL_RENDERER) orelse return error.Unsupported);
         if (std.mem.indexOf(u8, name, "llvmpipe") != null or std.mem.indexOf(u8, name, "softpipe") != null) return error.Unsupported;
