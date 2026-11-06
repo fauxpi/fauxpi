@@ -23,8 +23,11 @@ pub fn splatF(v: f32) Vec {
     return @splat(@bitCast(v));
 }
 
+/// A program's uniforms: read in turn, as many as it reads (from guest RAM, so maybe unaligned).
+pub const Uniforms = []align(1) const u32;
+
 pub const Env = struct {
-    uniforms: []const u32 = &.{},
+    uniforms: Uniforms = &.{},
     vpm_in: []const Vec = &.{},
     varyings: []const Vec = &.{},
     frag_w: Vec = splatF(1.0),
@@ -477,7 +480,7 @@ const SymVal = union(enum) {
     },
 };
 
-pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: []const u32) FastFragShader {
+pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: Uniforms) FastFragShader {
     if (decoded.len == 0) return .{};
 
     var reads_vary = false;
@@ -971,10 +974,11 @@ inline fn resolveMuxSlow(
     };
 }
 
+/// Runs `code` (a test's: decoded each time).
 pub fn run(code: []const qpu.Inst, env: Env) Error!Result {
-    var decoded_buf: [512]DecodedInst = undefined;
-    const decoded = decodeProgram(code, &decoded_buf);
-    return runDecoded(decoded, env);
+    const decoded_buf = std.heap.smp_allocator.alloc(DecodedInst, code.len) catch return error.Unsupported;
+    defer std.heap.smp_allocator.free(decoded_buf);
+    return runDecoded(decodeProgram(code, decoded_buf), env);
 }
 
 pub fn runDecoded(decoded: []const DecodedInst, env: Env) Error!Result {

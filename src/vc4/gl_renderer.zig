@@ -323,14 +323,14 @@ pub const Renderer = struct {
         if (slot.program != 0) gl.DeleteProgram(slot.program);
         slot.* = .{ .hash = hash, .used = true };
 
-        var decoded_buf: [512]qpu_sim.DecodedInst = undefined;
+        var decoded_buf: [gpu_draw.max_program_len]qpu_sim.DecodedInst = undefined;
         if (code.len > decoded_buf.len) return null;
         const decoded = qpu_sim.decodeProgram(code, &decoded_buf);
         var src: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
         defer src.deinit();
         src.writer.writeAll(shader.glsl_common) catch return null;
         const sh = shader.translate(&src.writer, decoded, .glsl) catch return null;
-        if (sh.too_many_samples) return null;
+        if (sh.too_many_samples or sh.too_many_uniforms) return null;
         if (sh.reads_color and gl.TextureBarrier == null) return null;
 
         const frag = r.compileShader(GL_FRAGMENT_SHADER, src.written()) orelse return null;
@@ -432,7 +432,7 @@ pub const Renderer = struct {
         if (slot.program != 0) gl.DeleteProgram(slot.program);
         slot.* = .{ .hash = hash, .used = true };
 
-        var decoded_buf: [512]qpu_sim.DecodedInst = undefined;
+        var decoded_buf: [gpu_draw.max_program_len]qpu_sim.DecodedInst = undefined;
         if (code.len > decoded_buf.len) return null;
         const decoded = qpu_sim.decodeProgram(code, &decoded_buf);
         var src: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);

@@ -28,6 +28,8 @@ pub const Shader = struct {
     sample_count: usize = 0,
     /// GLSL: it samples more textures than it has units for, so it can't be drawn.
     too_many_samples: bool = false,
+    /// It reads more uniforms than are given to it (`max_uniforms`), so it can't be drawn.
+    too_many_uniforms: bool = false,
 };
 
 /// A texture sampled: the uniforms with its TMU parameters 0 and 1.
@@ -938,6 +940,11 @@ const Translator = struct {
         try t.write(d.waddr_mul, d.mul_file, "mul_r", d.cond_mul, d.mul_pack_a, d.mul_pack_m);
     }
 
+    /// The program reads past the uniforms it is given: it can't be drawn (on the GPU).
+    fn tooManyUniforms(t: *Translator) void {
+        if (t.stage == .vertex) t.vertex.unsupported = true else t.shader.too_many_uniforms = true;
+    }
+
     /// How many varyings the draw gives.
     fn nVar(t: *const Translator) []const u8 {
         return if (t.lang == .glsl) "n_var" else "di.n_var";
@@ -948,7 +955,10 @@ const Translator = struct {
         if (raddr < 32) return w.print("{s}[{d}]", .{ if (file == .a) "ra" else "rb", raddr });
         switch (raddr) {
             qpu.R.unif => {
-                if (t.uniforms >= max_uniforms) return w.writeAll("0u");
+                if (t.uniforms >= max_uniforms) {
+                    t.tooManyUniforms();
+                    return w.writeAll("0u");
+                }
                 try w.print("unif[{d}]", .{t.uniforms});
                 t.uniforms += 1;
             },
@@ -1041,6 +1051,7 @@ const Translator = struct {
             qpu.W.tmu0_s...qpu.W.tmu1_b => {
                 const unit: usize = if (waddr <= qpu.W.tmu0_b) 0 else 1;
                 const tmu = &t.tmu[unit];
+                if (t.uniforms >= max_uniforms) t.tooManyUniforms();
                 if (t.uniforms < max_uniforms and tmu.param_count < 4) {
                     tmu.params[tmu.param_count] = t.uniforms;
                     tmu.param_count += 1;

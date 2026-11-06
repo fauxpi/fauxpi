@@ -40,23 +40,28 @@ pub const V3d = struct {
         config_b0: u8 = 0x03, // enable forward + reverse
         config_b1: u8 = 0x70, // depth_func = always
         config_b2: u8 = 0x00,
+        /// The clipper's scaling (CLIPPER_XY_SCALING, CLIPPER_Z_SCALING): from clip coordinates
+        /// (divided by W) to screen ones, x and y in 16ths of a pixel from the viewport offset.
+        clip_scale_x: f32 = 0,
+        clip_scale_y: f32 = 0,
+        z_scale: f32 = 1,
+        z_offset: f32 = 0,
     };
+
+    /// A vertex's clip coordinates, as its coordinate shader writes them (W NaN if it can't be run).
+    pub const ClipVertex = struct { x: f32, y: f32, z: f32, w: f32 };
 
     /// The most triangles a frame's draws are shaded and binned into tiles
     /// with (those drawn: not culled, or off the framebuffer); the draws past
     /// them are shaded again for each tile.
     pub const MAX_PREBINNED_TRIS = 65536;
-    pub const MAX_PREP_FS_INSTS = 8192;
-    pub const MAX_PREP_FS_UNIFS = 8192;
 
     pub const PreparedDraw = struct {
         fs_code_phys: u32 = 0,
-        fs_code_len: u16 = 0,
+        fs_code_len: u32 = 0,
         fs_unif_phys: u32 = 0,
-        fs_unif_len: u16 = 0,
-        fs_inst_start: u16 = 0,
-        fs_unif_start: u16 = 0,
-        fs_cached: bool = false,
+        /// The fragment shader, decoded: `fs_code_len` instructions from here in `prep_fs_insts`.
+        fs_inst_start: u32 = 0,
         fs_num_varyings: u8 = 0,
         fast_frag: qpu_sim.FastFragShader = .{},
         valid: bool = false,
@@ -121,7 +126,7 @@ pub const V3d = struct {
     };
 
     pub const ShadedTriangle = struct {
-        draw_idx: u16,
+        draw_idx: u32,
         min_x: u32,
         min_y: u32,
         max_x: u32,
@@ -145,7 +150,7 @@ pub const V3d = struct {
         setup_valid: bool = false,
 
         pub fn init(
-            draw_idx: u16,
+            draw_idx: u32,
             min_x: u32,
             min_y: u32,
             max_x: u32,
@@ -247,8 +252,8 @@ pub const V3d = struct {
     vpmbase: u32 = 0,
 
     // Binning state collected during BCL execution
-    draws: [256]DrawCall = undefined,
-    draws_len: usize = 0,
+    /// The frame's draws, as many as the binner is given (it has no limit).
+    draws: std.ArrayList(DrawCall) = .empty,
     cur_shader_rec: u32 = 0,
     cur_num_attrs: u4 = 0,
     cur_vp_x: f32 = 0,
@@ -260,6 +265,10 @@ pub const V3d = struct {
     cur_cfg0: u8 = 0x03,
     cur_cfg1: u8 = 0x70,
     cur_cfg2: u8 = 0x00,
+    cur_clip_scale_x: f32 = 0,
+    cur_clip_scale_y: f32 = 0,
+    cur_z_scale: f32 = 1,
+    cur_z_offset: f32 = 0,
     multisample_bin: bool = false,
 
     // Tile buffer (64x64 pixels max per tile)
@@ -273,11 +282,16 @@ pub const V3d = struct {
     tile_modified: bool = false,
 
     // Pre-shaded & pre-binned state for the current RCL frame
-    prep_draws: [256]PreparedDraw = undefined,
-    prep_fs_insts: [MAX_PREP_FS_INSTS]qpu_sim.DecodedInst = undefined,
-    prep_fs_insts_len: usize = 0,
-    prep_fs_unifs: [MAX_PREP_FS_UNIFS]u32 = undefined,
-    prep_fs_unifs_len: usize = 0,
+    prep_draws: std.ArrayList(PreparedDraw) = .empty,
+    /// The frame's fragment shaders, decoded (see `PreparedDraw.fs_inst_start`).
+    prep_fs_insts: std.ArrayList(qpu_sim.DecodedInst) = .empty,
+    /// A draw's vertex shader, while it is shaded: as read, and decoded.
+    vs_code: std.ArrayList(qpu.Inst) = .empty,
+    vs_decoded: std.ArrayList(qpu_sim.DecodedInst) = .empty,
+    /// A draw's coordinate shader, decoded, and its vertices' clip coordinates (by slot, as
+    /// `vs_out`).
+    cs_decoded: std.ArrayList(qpu_sim.DecodedInst) = .empty,
+    vs_clip: std.ArrayList(ClipVertex) = .empty,
     /// The frame's triangles, shaded, in draw order.
     shaded_tris: std.ArrayList(ShadedTriangle) = .empty,
     /// A draw's vertices, while it is shaded (`shadeVertices`): each corner's slot, each slot's
@@ -330,7 +344,7 @@ pub const V3d = struct {
         self.srqul = 0;
         self.srqcs = 0;
         self.vpmbase = 0;
-        self.draws_len = 0;
+        self.draws.clearRetainingCapacity();
         self.cur_shader_rec = 0;
         self.cur_num_attrs = 0;
         self.cur_vp_x = 0;
@@ -342,6 +356,10 @@ pub const V3d = struct {
         self.cur_cfg0 = 0x03;
         self.cur_cfg1 = 0x70;
         self.cur_cfg2 = 0x00;
+        self.cur_clip_scale_x = 0;
+        self.cur_clip_scale_y = 0;
+        self.cur_z_scale = 1;
+        self.cur_z_offset = 0;
         self.multisample_bin = false;
         @memset(&self.tile_color, 0);
         @memset(&self.tile_depth, 1.0);
@@ -351,8 +369,7 @@ pub const V3d = struct {
         self.lazy_load = null;
         self.loaded_from = null;
         self.tile_modified = false;
-        self.prep_fs_insts_len = 0;
-        self.prep_fs_unifs_len = 0;
+        self.prep_fs_insts.clearRetainingCapacity();
         self.shaded_tris.clearRetainingCapacity();
         self.overflow_draw_start = 0;
         self.tile_tri_start = @splat(0);
@@ -485,7 +502,7 @@ pub const V3d = struct {
                 1, 5, 8, 18 => pc += 1, // NOP, FLUSH_ALL, WAIT_SEMAPHORE, RETURN
                 4, 7 => pc += 1, // FLUSH, INCREMENT_SEMAPHORE
                 6 => { // START_TILE_BINNING
-                    self.draws_len = 0;
+                    self.draws.clearRetainingCapacity();
                     pc += 1;
                 },
                 16, 17 => { // BRANCH / BRANCH_TO_SUB_LIST
@@ -497,8 +514,9 @@ pub const V3d = struct {
                     const mode_byte = ram[pc + 1];
                     const count = std.mem.readInt(u32, ram[pc + 2 ..][0..4], .little);
                     const index_off = std.mem.readInt(u32, ram[pc + 6 ..][0..4], .little);
-                    if (self.draws_len < self.draws.len) {
-                        self.draws[self.draws_len] = .{
+                    {
+                        // Only running out of memory loses a draw.
+                        self.draws.append(tri_allocator, .{
                             .shader_rec_addr = self.cur_shader_rec,
                             .num_attrs = self.cur_num_attrs,
                             .mode = mode_byte & 0x0f,
@@ -516,8 +534,11 @@ pub const V3d = struct {
                             .config_b0 = self.cur_cfg0,
                             .config_b1 = self.cur_cfg1,
                             .config_b2 = self.cur_cfg2,
-                        };
-                        self.draws_len += 1;
+                            .clip_scale_x = self.cur_clip_scale_x,
+                            .clip_scale_y = self.cur_clip_scale_y,
+                            .z_scale = self.cur_z_scale,
+                            .z_offset = self.cur_z_offset,
+                        }) catch {};
                     }
                     pc += 14;
                 },
@@ -526,8 +547,8 @@ pub const V3d = struct {
                     const mode = ram[pc + 1] & 0x0f;
                     const count = std.mem.readInt(u32, ram[pc + 2 ..][0..4], .little);
                     const first = std.mem.readInt(u32, ram[pc + 6 ..][0..4], .little);
-                    if (self.draws_len < self.draws.len) {
-                        self.draws[self.draws_len] = .{
+                    {
+                        self.draws.append(tri_allocator, .{
                             .shader_rec_addr = self.cur_shader_rec,
                             .num_attrs = self.cur_num_attrs,
                             .mode = mode,
@@ -543,8 +564,11 @@ pub const V3d = struct {
                             .config_b0 = self.cur_cfg0,
                             .config_b1 = self.cur_cfg1,
                             .config_b2 = self.cur_cfg2,
-                        };
-                        self.draws_len += 1;
+                            .clip_scale_x = self.cur_clip_scale_x,
+                            .clip_scale_y = self.cur_clip_scale_y,
+                            .z_scale = self.cur_z_scale,
+                            .z_offset = self.cur_z_offset,
+                        }) catch {};
                     }
                     pc += 10;
                 },
@@ -582,11 +606,23 @@ pub const V3d = struct {
                     self.cur_vp_y = @as(f32, @floatFromInt(vy)) / 16.0;
                     pc += 5;
                 },
-                104, 105, 106 => pc += 9, // Z_CLIPPING, CLIPPER_XY_SCALING, CLIPPER_Z_SCALING
+                104 => pc += 9, // Z_CLIPPING
+                105 => { // CLIPPER_XY_SCALING (9 bytes): x and y, in 16ths of a pixel
+                    if (pc + 9 > end) break;
+                    self.cur_clip_scale_x = @bitCast(std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little));
+                    self.cur_clip_scale_y = @bitCast(std.mem.readInt(u32, ram[pc + 5 ..][0..4], .little));
+                    pc += 9;
+                },
+                106 => { // CLIPPER_Z_SCALING (9 bytes): scale, then offset
+                    if (pc + 9 > end) break;
+                    self.cur_z_scale = @bitCast(std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little));
+                    self.cur_z_offset = @bitCast(std.mem.readInt(u32, ram[pc + 5 ..][0..4], .little));
+                    pc += 9;
+                },
                 112 => { // TILE_BINNING_MODE_CONFIG (16 bytes)
                     if (pc + 16 > end) break;
                     self.multisample_bin = (ram[pc + 15] & 1) != 0;
-                    self.draws_len = 0;
+                    self.draws.clearRetainingCapacity();
                     pc += 16;
                 },
                 else => break,
@@ -594,51 +630,58 @@ pub const V3d = struct {
         }
     }
 
-    fn extractQpuProgram(ram: []const u8, phys: u32, out_buf: *[512]qpu.Inst) []const qpu.Inst {
-        if (phys >= ram.len) return &.{};
-        const max_bytes = ram.len - phys;
-        const max_insts = @min(max_bytes / 8, out_buf.len);
+    /// The length of the QPU program at `phys`: to the instruction that signals its end and the two
+    /// after it (which the QPU runs too), or to the end of RAM. The QPU has no other limit.
+    fn programLen(ram: []const u8, phys: u32) usize {
+        if (phys >= ram.len) return 0;
+        const max_insts = (ram.len - phys) / 8;
         for (0..max_insts) |i| {
-            const inst = std.mem.readInt(u64, ram[phys + i * 8 ..][0..8], .little);
-            out_buf[i] = inst;
-            const sig = qpu.getSig(inst);
-            if (sig == .prog_end or sig == .color_load_end) {
-                const len = @min(i + 3, max_insts);
-                for (i + 1..len) |j| {
-                    out_buf[j] = std.mem.readInt(u64, ram[phys + j * 8 ..][0..8], .little);
-                }
-                return out_buf[0..len];
-            }
+            const sig = qpu.getSig(std.mem.readInt(u64, ram[phys + i * 8 ..][0..8], .little));
+            if (sig == .prog_end or sig == .color_load_end) return @min(i + 3, max_insts);
         }
-        return out_buf[0..max_insts];
+        return max_insts;
     }
 
-    fn extractUniforms(ram: []const u8, phys: u32, out_buf: *[128]u32) []const u32 {
+    /// The QPU program at `phys` (see `programLen`), read into `out`; null if it is longer.
+    fn readProgram(ram: []const u8, phys: u32, out: []qpu.Inst) ?[]const qpu.Inst {
+        const len = programLen(ram, phys);
+        if (len > out.len) return null;
+        for (out[0..len], 0..) |*inst, i| inst.* = std.mem.readInt(u64, ram[phys + i * 8 ..][0..8], .little);
+        return out[0..len];
+    }
+
+    /// The QPU program at `phys` (see `programLen`), read into `code` and decoded onto the end of
+    /// `decoded`; null if there isn't the memory.
+    fn decodeProgramAt(ram: []const u8, phys: u32, code: *std.ArrayList(qpu.Inst), decoded: *std.ArrayList(qpu_sim.DecodedInst)) ?[]const qpu_sim.DecodedInst {
+        code.resize(tri_allocator, programLen(ram, phys)) catch return null;
+        const read = readProgram(ram, phys, code.items).?;
+        const out = decoded.addManyAsSlice(tri_allocator, read.len) catch return null;
+        return qpu_sim.decodeProgram(read, out);
+    }
+
+    /// The uniforms at `phys`: as many as the QPU reads, to the end of RAM (past it, it reads 0).
+    fn uniformsAt(ram: []const u8, phys: u32) qpu_sim.Uniforms {
         if (phys >= ram.len) return &.{};
-        const max_bytes = ram.len - phys;
-        const max_words: usize = @min(max_bytes / 4, out_buf.len);
-        @memcpy(std.mem.sliceAsBytes(out_buf[0..max_words]), ram[phys..][0 .. max_words * 4]);
-        return out_buf[0..max_words];
+        return std.mem.bytesAsSlice(u32, ram[phys..][0 .. (ram.len - phys) / 4 * 4]);
     }
 
     /// Pre-shades and bins triangles across all draw calls once per frame before tile loop.
     fn prepareDrawsForFrame(self: *V3d, ram: []const u8) void {
         self.shaded_tris.clearRetainingCapacity();
-        self.prep_fs_insts_len = 0;
-        self.prep_fs_unifs_len = 0;
-        self.overflow_draw_start = self.draws_len;
+        self.prep_fs_insts.clearRetainingCapacity();
+        self.overflow_draw_start = self.draws.items.len;
         defer self.binTriangles();
         // After the binning (deferred before it, run after it).
         const prof_start = profile.now();
         defer profile.end(.v3d_vertex_shade, prof_start);
 
-        var vs_buf: [512]qpu.Inst = undefined;
-        var fs_buf: [512]qpu.Inst = undefined;
-        var vs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
-        var vs_unif_buf: [128]u32 = undefined;
-
-        draws: for (self.draws[0..self.draws_len], 0..) |draw, draw_idx| {
-            self.prep_draws[draw_idx] = .{};
+        self.prep_draws.resize(tri_allocator, self.draws.items.len) catch {
+            self.overflow_draw_start = 0;
+            return;
+        };
+        @memset(self.prep_draws.items, .{});
+        draws: for (self.draws.items, 0..) |draw, draw_idx| {
+            self.prep_draws.items[draw_idx] = .{};
             if (draw.count < 3) continue;
             const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
             if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) continue;
@@ -650,45 +693,27 @@ pub const V3d = struct {
             const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & vc_bus.ramMask(ram.len);
             const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & vc_bus.ramMask(ram.len);
 
-            const vs_code = extractQpuProgram(ram, vs_code_phys, &vs_buf);
-            const fs_code = extractQpuProgram(ram, fs_code_phys, &fs_buf);
-            if (vs_code.len == 0 or fs_code.len == 0) continue;
+            // Running out of memory for a draw's shaders draws it, and those after it, as the
+            // tiles are (see `overflow_draw_start`).
+            self.vs_decoded.clearRetainingCapacity();
+            const vs_decoded = decodeProgramAt(ram, vs_code_phys, &self.vs_code, &self.vs_decoded) orelse {
+                self.overflow_draw_start = draw_idx;
+                break;
+            };
+            const fs_inst_start: u32 = @intCast(self.prep_fs_insts.items.len);
+            const fs_decoded = decodeProgramAt(ram, fs_code_phys, &self.vs_code, &self.prep_fs_insts) orelse {
+                self.overflow_draw_start = draw_idx;
+                break;
+            };
+            if (vs_decoded.len == 0 or fs_decoded.len == 0) continue;
+            const vs_unifs = uniformsAt(ram, vs_unif_phys);
+            const fast_frag = qpu_sim.analyzeFragmentShader(fs_decoded, uniformsAt(ram, fs_unif_phys));
 
-            const vs_decoded = qpu_sim.decodeProgram(vs_code, &vs_decoded_buf);
-            const vs_unifs = extractUniforms(ram, vs_unif_phys, &vs_unif_buf);
-            const max_unif_words: u16 = if (fs_unif_phys < ram.len) @intCast(@min((ram.len - fs_unif_phys) / 4, 128)) else 0;
-
-            var fs_inst_start: u16 = 0;
-            var fs_unif_start: u16 = 0;
-            var fs_cached = false;
-            var fast_frag: qpu_sim.FastFragShader = .{};
-            if (self.prep_fs_insts_len + fs_code.len <= MAX_PREP_FS_INSTS and
-                self.prep_fs_unifs_len + max_unif_words <= MAX_PREP_FS_UNIFS)
-            {
-                fs_inst_start = @intCast(self.prep_fs_insts_len);
-                const fs_dec = qpu_sim.decodeProgram(fs_code, self.prep_fs_insts[self.prep_fs_insts_len..][0..fs_code.len]);
-                self.prep_fs_insts_len += fs_code.len;
-
-                fs_unif_start = @intCast(self.prep_fs_unifs_len);
-                const unif_words: usize = max_unif_words;
-                const fs_u = self.prep_fs_unifs[self.prep_fs_unifs_len..][0..unif_words];
-                @memcpy(
-                    std.mem.sliceAsBytes(fs_u),
-                    ram[fs_unif_phys..][0 .. unif_words * 4],
-                );
-                self.prep_fs_unifs_len += unif_words;
-                fs_cached = true;
-                fast_frag = qpu_sim.analyzeFragmentShader(fs_dec, fs_u);
-            }
-
-            self.prep_draws[draw_idx] = .{
+            self.prep_draws.items[draw_idx] = .{
                 .fs_code_phys = fs_code_phys,
-                .fs_code_len = @intCast(fs_code.len),
+                .fs_code_len = @intCast(fs_decoded.len),
                 .fs_unif_phys = fs_unif_phys,
-                .fs_unif_len = max_unif_words,
                 .fs_inst_start = fs_inst_start,
-                .fs_unif_start = fs_unif_start,
-                .fs_cached = fs_cached,
                 .fs_num_varyings = fs_num_varyings,
                 .fast_frag = fast_frag,
                 .valid = true,
@@ -724,47 +749,60 @@ pub const V3d = struct {
 
             // Each triangle's corners, each vertex shaded once (a mesh's triangles share them),
             // then the triangles kept.
-            const shaded = self.shadeVertices(ram, draw, num_tris, vs_decoded, vs_unifs, active_attrs, vpm_words, n_var) orelse {
+            // Their clip coordinates too, from the coordinate shader, for the clipper.
+            var cs_attrs: [8]AttrStream = undefined;
+            const cs = coordStage(ram, rec_phys, draw.num_attrs, &self.vs_code, &self.cs_decoded, &cs_attrs);
+            const shaded = self.shadeVertices(ram, draw, num_tris, vs_decoded, vs_unifs, active_attrs, vpm_words, n_var, cs) orelse {
                 self.overflow_draw_start = draw_idx;
                 break;
             };
             for (0..num_tris) |t| {
-                var verts: [3]ShadedVertex = undefined;
+                var tri_verts: [3]ShadedVertex = undefined;
+                var tri_clip: [3]ClipVertex = @splat(.{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) });
                 var ok = true;
                 inline for (0..3) |corner| {
                     const slot = self.vs_corner_slot.items[t * 3 + corner];
                     ok = ok and self.vs_ok.items[slot];
-                    verts[corner] = shaded[slot];
+                    tri_verts[corner] = shaded[slot];
+                    if (cs != null) tri_clip[corner] = self.vs_clip.items[slot];
                 }
                 if (!ok) continue;
 
-                const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
-                    (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
-                if (@abs(area) < 1e-6) continue;
-                if (culled(draw.config_b0, area)) continue;
+                var pieces: [max_clipped][3]ShadedVertex = undefined;
+                const n_pieces = clipTriangle(draw, tri_verts, tri_clip, n_var, &pieces);
+                for (pieces[0..n_pieces]) |verts| {
+                    const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
+                        (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
+                    if (@abs(area) < 1e-6) continue;
+                    if (culled(draw.config_b0, area)) continue;
 
-                const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
-                const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
-                const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
-                const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
-                if (min_fx >= max_fx or min_fy >= max_fy) continue;
+                    const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
+                    const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
+                    const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
+                    const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
+                    if (min_fx >= max_fx or min_fy >= max_fy) continue;
 
-                if (self.shaded_tris.items.len == MAX_PREBINNED_TRIS) {
-                    // This draw, and those after it, are drawn whole for each tile.
-                    self.shaded_tris.shrinkRetainingCapacity(draw_start);
-                    self.overflow_draw_start = draw_idx;
-                    break :draws;
+                    if (self.shaded_tris.items.len == MAX_PREBINNED_TRIS) {
+                        // This draw, and those after it, are drawn whole for each tile.
+                        self.shaded_tris.shrinkRetainingCapacity(draw_start);
+                        self.overflow_draw_start = draw_idx;
+                        break :draws;
+                    }
+                    self.shaded_tris.append(tri_allocator, ShadedTriangle.init(
+                        @intCast(draw_idx),
+                        @intFromFloat(min_fx),
+                        @intFromFloat(min_fy),
+                        @intFromFloat(max_fx),
+                        @intFromFloat(max_fy),
+                        area,
+                        verts,
+                        n_var,
+                    )) catch {
+                        self.shaded_tris.shrinkRetainingCapacity(draw_start);
+                        self.overflow_draw_start = draw_idx;
+                        break :draws;
+                    };
                 }
-                self.shaded_tris.appendAssumeCapacity(ShadedTriangle.init(
-                    @intCast(draw_idx),
-                    @intFromFloat(min_fx),
-                    @intFromFloat(min_fy),
-                    @intFromFloat(max_fx),
-                    @intFromFloat(max_fy),
-                    area,
-                    verts,
-                    n_var,
-                ));
             }
         }
     }
@@ -802,17 +840,17 @@ pub const V3d = struct {
         draw: DrawCall,
         num_tris: u32,
         vs_decoded: []const qpu_sim.DecodedInst,
-        vs_unifs: []const u32,
+        vs_unifs: qpu_sim.Uniforms,
         attrs: []const AttrStream,
         vpm_words: usize,
         n_var: usize,
+        cs: ?CoordStage,
     ) ?[]const ShadedVertex {
         if (!self.collectVertices(ram, draw, num_tris)) return null;
-        const corners: usize = @as(usize, num_tris) * 3;
-        _ = corners;
         const unique = self.vs_unique.items;
         self.vs_out.resize(tri_allocator, unique.len) catch return null;
         self.vs_ok.resize(tri_allocator, unique.len) catch return null;
+        if (cs != null) self.vs_clip.resize(tri_allocator, unique.len) catch return null;
 
         const job: VertexJob = .{
             .ram = ram,
@@ -825,8 +863,17 @@ pub const V3d = struct {
             .indices = unique,
             .out = self.vs_out.items,
             .ok = self.vs_ok.items,
+            .cs = cs,
+            .clip = if (cs != null) self.vs_clip.items else &.{},
         };
-        // The vertices, a QPU's 16 at a time, shared among threads when there are many.
+        job.runAll();
+        return self.vs_out.items;
+    }
+
+    /// Runs `job` for all its vertices, a QPU's 16 at a time, shared among threads when there are
+    /// many.
+    fn runVertexJob(job: *const VertexJob) void {
+        const unique = job.indices;
         const batches = (unique.len + 15) / 16;
         const max_helpers = 3;
         const helpers: usize = if (unique.len < 1024) 0 else @min(max_helpers, batches / 16);
@@ -836,7 +883,7 @@ pub const V3d = struct {
         for (0..helpers) |h| {
             const lo = @min((h + 1) * per, batches);
             const hi = @min((h + 2) * per, batches);
-            threads[spawned] = std.Thread.spawn(.{}, VertexJob.run, .{ &job, lo, hi }) catch {
+            threads[spawned] = std.Thread.spawn(.{}, VertexJob.run, .{ job, lo, hi }) catch {
                 job.run(lo, hi);
                 continue;
             };
@@ -844,7 +891,37 @@ pub const V3d = struct {
         }
         job.run(0, @min(per, batches));
         for (threads[0..spawned]) |th| th.join();
-        return self.vs_out.items;
+    }
+
+    /// Whether the clipper cuts any of `draw`'s `num_tris` triangles (their vertices listed by
+    /// `collectVertices`), from their clip coordinates (its shader record at `rec_phys`).
+    fn needsClipping(self: *V3d, ram: []const u8, draw: DrawCall, rec_phys: u32, num_tris: u32) bool {
+        var cs_attrs: [8]AttrStream = undefined;
+        const cs = coordStage(ram, rec_phys, draw.num_attrs, &self.vs_code, &self.cs_decoded, &cs_attrs) orelse return false;
+        const unique = self.vs_unique.items;
+        self.vs_clip.resize(tri_allocator, unique.len) catch return true;
+        const job: VertexJob = .{
+            .ram = ram,
+            .draw = draw,
+            .decoded = &.{},
+            .unifs = &.{},
+            .attrs = &.{},
+            .vpm_words = 0,
+            .n_var = 0,
+            .indices = unique,
+            .out = &.{},
+            .ok = &.{},
+            .shade = false,
+            .cs = cs,
+            .clip = self.vs_clip.items,
+        };
+        job.runAll();
+        for (0..num_tris) |t| {
+            var c: [3]ClipVertex = undefined;
+            for (&c, 0..) |*v, corner| v.* = self.vs_clip.items[self.vs_corner_slot.items[t * 3 + corner]];
+            if (needsClip(draw, c)) return true;
+        }
+        return false;
     }
 
     /// Lists `draw`'s `num_tris` triangles' distinct vertices (`vs_unique`) and each corner's
@@ -883,24 +960,83 @@ pub const V3d = struct {
         return true;
     }
 
+    /// A draw's coordinate shader: run (as the binner runs it) for its vertices' clip coordinates.
+    const CoordStage = struct {
+        decoded: []const qpu_sim.DecodedInst,
+        unifs: qpu_sim.Uniforms,
+        attrs: []const AttrStream,
+        vpm_words: usize,
+    };
+
+    /// The coordinate shader of the shader record at `rec_phys` (decoded into `decoded`, reading
+    /// its program with `code`), its attributes into `attrs`: null if it has none, or there isn't
+    /// the memory.
+    fn coordStage(ram: []const u8, rec_phys: u32, num_attrs: u8, code: *std.ArrayList(qpu.Inst), decoded: *std.ArrayList(qpu_sim.DecodedInst), attrs: *[8]AttrStream) ?CoordStage {
+        const cs_attr_mask = ram[rec_phys + 26];
+        const cs_code_phys = std.mem.readInt(u32, ram[rec_phys + 28 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+        const cs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 32 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+        if (cs_code_phys == 0) return null;
+        decoded.clearRetainingCapacity();
+        const cs_decoded = decodeProgramAt(ram, cs_code_phys, code, decoded) orelse return null;
+        if (cs_decoded.len == 0) return null;
+        const info = decodeAttrStreams(ram, rec_phys, num_attrs, cs_attr_mask, attrs);
+        return .{ .decoded = cs_decoded, .unifs = uniformsAt(ram, cs_unif_phys), .attrs = attrs[0..info.count], .vpm_words = info.vpm_words };
+    }
+
     /// Vertices shaded together: `indices` into `out` and `ok`, in batches of 16.
     const VertexJob = struct {
         ram: []const u8,
         draw: DrawCall,
         decoded: []const qpu_sim.DecodedInst,
-        unifs: []const u32,
+        unifs: qpu_sim.Uniforms,
         attrs: []const AttrStream,
         vpm_words: usize,
         n_var: usize,
         indices: []const u32,
         out: []ShadedVertex,
         ok: []bool,
+        /// Whether the vertex shader is run (into `out` and `ok`).
+        shade: bool = true,
+        /// The coordinate shader, if it is run too: each vertex's clip coordinates into `clip`.
+        cs: ?CoordStage = null,
+        clip: []ClipVertex = &.{},
+
+        fn runAll(job: *const VertexJob) void {
+            runVertexJob(job);
+        }
 
         fn run(job: *const VertexJob, first_batch: usize, end_batch: usize) void {
             var b = first_batch;
             while (b < end_batch) : (b += 1) {
                 const lo = b * 16;
                 const hi = @min(lo + 16, job.indices.len);
+                if (job.cs) |cs| clipBatch(job, cs, lo, hi);
+                if (job.shade) shadeBatch(job, lo, hi);
+            }
+        }
+
+        /// The clip coordinates of vertices `lo` to `hi` (a batch), from the coordinate shader.
+        fn clipBatch(job: *const VertexJob, cs: CoordStage, lo: usize, hi: usize) void {
+            var vpm_in: [32]qpu_sim.Vec = undefined;
+            populateBatchVpmIn(job.ram, cs.attrs, job.indices[lo..hi], &vpm_in);
+            const res = qpu_sim.runDecoded(cs.decoded, .{ .uniforms = cs.unifs, .vpm_in = vpm_in[0..cs.vpm_words] }) catch {
+                @memset(job.clip[lo..hi], .{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) });
+                return;
+            };
+            for (lo..hi) |i| {
+                const lane = i - lo;
+                job.clip[i] = if (res.vpm_out_len < 4) .{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) } else .{
+                    .x = @bitCast(res.vpm_out[0][lane]),
+                    .y = @bitCast(res.vpm_out[1][lane]),
+                    .z = @bitCast(res.vpm_out[2][lane]),
+                    .w = @bitCast(res.vpm_out[3][lane]),
+                };
+            }
+        }
+
+        /// Vertices `lo` to `hi` (a batch), shaded.
+        fn shadeBatch(job: *const VertexJob, lo: usize, hi: usize) void {
+            {
                 var vpm_in: [32]qpu_sim.Vec = undefined;
                 populateBatchVpmIn(job.ram, job.attrs, job.indices[lo..hi], &vpm_in);
                 const res = qpu_sim.runDecoded(job.decoded, .{
@@ -908,11 +1044,11 @@ pub const V3d = struct {
                     .vpm_in = vpm_in[0..job.vpm_words],
                 }) catch {
                     @memset(job.ok[lo..hi], false);
-                    continue;
+                    return;
                 };
                 if (res.vpm_out_len < 3) {
                     @memset(job.ok[lo..hi], false);
-                    continue;
+                    return;
                 }
                 const valid_vars = @min(job.n_var, res.vpm_out_len - 3);
                 for (lo..hi) |i| {
@@ -942,6 +1078,97 @@ pub const V3d = struct {
 
     /// What the frame's triangles and their tiles are kept in.
     const tri_allocator = std.heap.smp_allocator;
+
+    /// The least W the clipper keeps: the near plane (W is 0 at the eye, and negative behind it).
+    const clip_min_w: f32 = 1e-5;
+    /// How far from the viewport offset the clipper keeps screen coordinates, in 16ths of a pixel:
+    /// the guard band (a pixel within the 16 bits of 12.4 fixed point they are written in).
+    const guard_band: f32 = 2047 * 16;
+    /// The most triangles the clipper cuts one into (with up to 8 corners, cut by 5 planes).
+    pub const max_clipped = 6;
+
+    /// Whether the clipper cuts a triangle whose corners have clip coordinates `c`: one is behind
+    /// the near plane, or outside the guard band (where its screen coordinates wrap around).
+    fn needsClip(draw: DrawCall, c: [3]ClipVertex) bool {
+        for (c) |v| {
+            // Without a coordinate shader's, drawn as the vertex shader puts it.
+            if (std.math.isNan(v.w)) return false;
+            if (!(v.w >= clip_min_w)) return true;
+            if (@abs(v.x * draw.clip_scale_x) > guard_band * v.w or @abs(v.y * draw.clip_scale_y) > guard_band * v.w) return true;
+        }
+        return false;
+    }
+
+    /// The triangles that the triangle `verts` (its clip coordinates `c`) is drawn as, into `out`:
+    /// itself, or what is left of it when the clipper cuts it at the near plane and the guard band,
+    /// as a fan (none if nothing is). The clipper places the corners it makes by its scaling, and
+    /// interpolates their varyings in clip space; the others are as the vertex shader shaded them.
+    pub fn clipTriangle(draw: DrawCall, verts: [3]ShadedVertex, c: [3]ClipVertex, n_var: usize, out: *[max_clipped][3]ShadedVertex) usize {
+        if (!needsClip(draw, c)) {
+            out[0] = verts;
+            return 1;
+        }
+        // A corner: its clip coordinates (x, y, z, w), varyings (not divided by W), and which of
+        // the triangle's it is, if it is one.
+        const Corner = struct { c: @Vector(4, f32), raw: [16]f32, orig: ?u2 };
+        var poly: [9]Corner = undefined;
+        var next: [9]Corner = undefined;
+        var n: usize = 3;
+        for (0..3) |i| {
+            poly[i] = .{ .c = .{ c[i].x, c[i].y, c[i].z, c[i].w }, .raw = @splat(0), .orig = @intCast(i) };
+            for (0..n_var) |k| poly[i].raw[k] = verts[i].persp_varyings[k] / verts[i].inv_w;
+        }
+        // Each plane's distance from a corner: the dot of (x, y, z, w, 1) with it; kept where >= 0.
+        const g = guard_band;
+        const planes = [_][5]f32{
+            .{ 0, 0, 0, 1, -clip_min_w },
+            .{ -draw.clip_scale_x, 0, 0, g, 0 },
+            .{ draw.clip_scale_x, 0, 0, g, 0 },
+            .{ 0, -draw.clip_scale_y, 0, g, 0 },
+            .{ 0, draw.clip_scale_y, 0, g, 0 },
+        };
+        for (planes) |pl| {
+            const normal: @Vector(4, f32) = pl[0..4].*;
+            var m: usize = 0;
+            for (0..n) |i| {
+                const p = poly[i];
+                const q = poly[(i + 1) % n];
+                const dp = @reduce(.Add, p.c * normal) + pl[4];
+                const dq = @reduce(.Add, q.c * normal) + pl[4];
+                if (dp >= 0) {
+                    next[m] = p;
+                    m += 1;
+                }
+                if ((dp >= 0) != (dq >= 0)) {
+                    const t = dp / (dp - dq);
+                    var cut: Corner = .{ .c = p.c + (q.c - p.c) * @as(@Vector(4, f32), @splat(t)), .raw = @splat(0), .orig = null };
+                    for (0..n_var) |k| cut.raw[k] = p.raw[k] + (q.raw[k] - p.raw[k]) * t;
+                    next[m] = cut;
+                    m += 1;
+                }
+            }
+            n = m;
+            if (n < 3) return 0;
+            @memcpy(poly[0..n], next[0..n]);
+        }
+        var shaded: [9]ShadedVertex = undefined;
+        for (poly[0..n], shaded[0..n]) |corner, *v| {
+            if (corner.orig) |i| {
+                v.* = verts[i];
+                continue;
+            }
+            const inv_w = 1.0 / corner.c[3];
+            v.* = .{
+                .x = corner.c[0] * inv_w * draw.clip_scale_x * (1.0 / 16.0) + draw.vp_x,
+                .y = corner.c[1] * inv_w * draw.clip_scale_y * (1.0 / 16.0) + draw.vp_y,
+                .z = corner.c[2] * inv_w * draw.z_scale + draw.z_offset,
+                .inv_w = inv_w,
+            };
+            for (0..n_var) |k| v.persp_varyings[k] = corner.raw[k] * inv_w;
+        }
+        for (0..n - 2) |k| out[k] = .{ shaded[0], shaded[k + 1], shaded[k + 2] };
+        return n - 2;
+    }
 
     /// Whether the configuration bits `cfg0` cull a triangle whose screen area
     /// (`y` down) is `area`: those with a positive area face forward, or with
@@ -1586,17 +1813,63 @@ pub const V3d = struct {
     const GpuState = struct {
         renderer: GpuRenderer,
         vertices: [gpu_draw.max_vertices]gpu_draw.Vertex = undefined,
-        draws: [gpu_draw.max_draws]gpu_draw.Draw = undefined,
-        uniforms: [gpu_draw.max_draws][qpu_to_shader.max_uniforms]u32 = undefined,
-        code: [gpu_draw.max_draws][512]qpu.Inst = undefined,
+        draws: std.ArrayList(gpu_draw.Draw) = .empty,
+        /// The draws' shaders' uniforms (`Draw.uniforms`): room is made for them all first, so
+        /// they don't move.
+        uniforms: std.ArrayList([qpu_to_shader.max_uniforms]u32) = .empty,
+        /// The draws' shaders, one after another in draw order (each draw's vertex shader, if it
+        /// has one, then its fragment shader): `Draw.code` is set from here once they are all read.
+        code: std.ArrayList(qpu.Inst) = .empty,
         /// OpenGL: the tile buffer, as big as the framebuffer.
         color: std.ArrayList(u32) = .empty,
-        /// OpenGL, shading vertices itself: each draw's vertex shader and its uniforms, and the
-        /// frame's vertices' VPM words and triangles' corners.
-        vs_code: [gpu_draw.max_draws][512]qpu.Inst = undefined,
-        vs_uniforms: [gpu_draw.max_draws][qpu_to_shader.max_uniforms]u32 = undefined,
+        /// OpenGL, shading vertices itself: the frame's vertices' VPM words and triangles' corners.
         inputs: std.ArrayList(u32) = .empty,
         corners: std.ArrayList(u32) = .empty,
+
+        /// Starts a frame of up to `max_draws` draws: false if there isn't the memory.
+        fn begin(g: *GpuState, max_draws: usize) bool {
+            g.draws.clearRetainingCapacity();
+            g.uniforms.clearRetainingCapacity();
+            g.code.clearRetainingCapacity();
+            g.draws.ensureTotalCapacity(tri_allocator, max_draws) catch return false;
+            g.uniforms.ensureTotalCapacity(tri_allocator, 2 * max_draws) catch return false;
+            return true;
+        }
+
+        /// The QPU program at `phys`, read after the others: null if it is longer than the GPU
+        /// takes (drawn on the CPU), or there isn't the memory. `Draw.code` is set by `end`.
+        fn addProgram(g: *GpuState, ram: []const u8, phys: u32) ?[]const qpu.Inst {
+            const len = programLen(ram, phys);
+            if (len > gpu_draw.max_program_len) return null;
+            const at = g.code.items.len;
+            g.code.resize(tri_allocator, at + len) catch return null;
+            return readProgram(ram, phys, g.code.items[at..]).?;
+        }
+
+        /// The uniforms at `phys`, as many as the GPU's shaders take (0 past the end of RAM, as
+        /// qpu_sim reads them).
+        fn addUniforms(g: *GpuState, ram: []const u8, phys: u32) *const [qpu_to_shader.max_uniforms]u32 {
+            const out = g.uniforms.addOneAssumeCapacity();
+            out.* = @splat(0);
+            const unifs = uniformsAt(ram, phys);
+            const n = @min(unifs.len, out.len);
+            for (out[0..n], unifs[0..n]) |*u, v| u.* = v;
+            return out;
+        }
+
+        /// The frame's draws, their shaders where `addProgram` put them.
+        fn end(g: *GpuState) []const gpu_draw.Draw {
+            var at: usize = 0;
+            for (g.draws.items) |*d| {
+                if (d.vertex_stage) |*vs| {
+                    vs.code = g.code.items[at..][0..vs.code.len];
+                    at += vs.code.len;
+                }
+                d.code = g.code.items[at..][0..d.code.len];
+                at += d.code.len;
+            }
+            return g.draws.items;
+        }
     };
 
     /// Draws the frame on the GPU, if it is one the GPU can draw the same as the CPU: each tile
@@ -1669,8 +1942,8 @@ pub const V3d = struct {
         g.corners.clearRetainingCapacity();
         var n_draws: usize = 0;
         var vertex_total: u32 = 0;
-        var vs_unif_buf: [qpu_to_shader.max_uniforms]u32 = undefined;
-        for (self.draws[0..self.draws_len]) |draw| {
+        if (!g.begin(self.draws.items.len)) return false;
+        for (self.draws.items) |draw| {
             // What prepareDrawsForFrame skips, drawing nothing.
             if (draw.count < 3) continue;
             const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
@@ -1681,23 +1954,19 @@ pub const V3d = struct {
             const vs_attr_mask = ram[rec_phys + 14];
             const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & vc_bus.ramMask(ram.len);
             const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-            if (n_draws == g.draws.len) return false;
-            const vs_code = extractQpuProgram(ram, vs_code_phys, &g.vs_code[n_draws]);
-            const fs_code = extractQpuProgram(ram, fs_code_phys, &g.code[n_draws]);
-            if (vs_code.len == 0 or fs_code.len == 0) continue;
+            if (n_draws == gpu_draw.max_draws) return false;
             const num_tris: u32 = switch (draw.mode) {
                 4 => draw.count / 3,
                 5, 6 => draw.count - 2,
                 else => 0,
             };
             if (num_tris == 0) continue;
-            // The fragment shader's uniforms, all there are room for.
-            if (fs_unif_phys + qpu_to_shader.max_uniforms * 4 > ram.len) return false;
-            for (&g.uniforms[n_draws], 0..) |*u, k| u.* = std.mem.readInt(u32, ram[fs_unif_phys + k * 4 ..][0..4], .little);
-            // The vertex shader's: 0 past the end of RAM, as qpu_sim reads them.
-            const vs_unifs = extractUniforms(ram, vs_unif_phys, &vs_unif_buf);
-            g.vs_uniforms[n_draws] = @splat(0);
-            @memcpy(g.vs_uniforms[n_draws][0..vs_unifs.len], vs_unifs);
+            if (programLen(ram, vs_code_phys) == 0 or programLen(ram, fs_code_phys) == 0) continue;
+            // Longer shaders are drawn on the CPU.
+            const vs_code = g.addProgram(ram, vs_code_phys) orelse return false;
+            const fs_code = g.addProgram(ram, fs_code_phys) orelse return false;
+            const fs_unifs = g.addUniforms(ram, fs_unif_phys);
+            const vs_unifs = g.addUniforms(ram, vs_unif_phys);
 
             var attr_streams: [8]AttrStream = undefined;
             const attr_info = decodeAttrStreams(ram, rec_phys, draw.num_attrs, vs_attr_mask, &attr_streams);
@@ -1710,6 +1979,8 @@ pub const V3d = struct {
             if (!self.collectVertices(ram, draw, num_tris)) return false;
             const unique = self.vs_unique.items;
             if (vertex_total + unique.len > max_gpu_vertices) return false;
+            // Triangles the clipper cuts are drawn from vertices shaded on the CPU, which clips.
+            if (self.needsClipping(ram, draw, rec_phys, num_tris)) return false;
             // Each vertex's VPM words, as qpu_sim is given them.
             const first_input: u32 = @intCast(g.inputs.items.len);
             g.inputs.resize(tri_allocator, first_input + unique.len * stride) catch return false;
@@ -1727,12 +1998,12 @@ pub const V3d = struct {
             const first_corner: u32 = @intCast(g.corners.items.len);
             g.corners.appendSlice(tri_allocator, self.vs_corner_slot.items) catch return false;
 
-            g.draws[n_draws] = .{
+            g.draws.appendAssumeCapacity(.{
                 .first_vertex = vertex_total,
                 .vertex_count = @intCast(unique.len),
                 .vertex_stage = .{
                     .code = vs_code,
-                    .uniforms = &g.vs_uniforms[n_draws],
+                    .uniforms = vs_unifs,
                     .vpm_words = vpm_words,
                     .first_input = first_input,
                     .input_stride = stride,
@@ -1743,7 +2014,7 @@ pub const V3d = struct {
                     .vp_y = draw.vp_y,
                 },
                 .code = fs_code,
-                .uniforms = &g.uniforms[n_draws],
+                .uniforms = fs_unifs,
                 .num_varyings = fs_num_varyings,
                 .depth_func = @truncate((draw.config_b1 >> 4) & 7),
                 .depth_write = (draw.config_b1 & 0x80) != 0,
@@ -1751,18 +2022,19 @@ pub const V3d = struct {
                 .clip_y = draw.clip_y,
                 .clip_w = draw.clip_w,
                 .clip_h = draw.clip_h,
-            };
+            });
             n_draws += 1;
             vertex_total += @intCast(unique.len);
         }
         if (n_draws == 0) return false;
-        if (metal_renderer.supported) return renderWithMetal(g, ram, frame, &.{}, g.draws[0..n_draws], g.inputs.items, g.corners.items);
-        return renderWithGl(g, ram, frame.first, &frame.tiles, &.{}, g.draws[0..n_draws], g.inputs.items, g.corners.items);
+        const draws = g.end();
+        if (metal_renderer.supported) return renderWithMetal(g, ram, frame, &.{}, draws, g.inputs.items, g.corners.items);
+        return renderWithGl(g, ram, frame.first, &frame.tiles, &.{}, draws, g.inputs.items, g.corners.items);
     }
 
     fn renderWithGpu(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
         const g = self.gpuState() orelse return false;
-        if (self.overflow_draw_start < self.draws_len) return false;
+        if (self.overflow_draw_start < self.draws.items.len) return false;
         const gpu_frame = gpuFrame(ram, start_bus, end_bus) orelse return false;
         const first = gpu_frame.first;
         const tiles = gpu_frame.tiles;
@@ -1770,23 +2042,22 @@ pub const V3d = struct {
         // The triangles, in a run for each draw.
         var n_vertices: usize = 0;
         var n_draws: usize = 0;
+        if (!g.begin(self.draws.items.len)) return false;
         if (first.has_render) {
-            var last_draw: ?u16 = null;
+            var last_draw: ?u32 = null;
             for (self.shaded_tris.items) |*tri| {
-                const prep = self.prep_draws[tri.draw_idx];
+                const prep = self.prep_draws.items[tri.draw_idx];
                 if (!prep.valid) continue;
                 if (last_draw != tri.draw_idx) {
-                    if (n_draws == g.draws.len) return false;
-                    if (prep.fs_unif_len != qpu_to_shader.max_uniforms or prep.fs_code_len > g.code[0].len) return false;
-                    const draw = self.draws[tri.draw_idx];
-                    const code = g.code[n_draws][0..prep.fs_code_len];
-                    for (code, 0..) |*inst, i| inst.* = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
-                    for (&g.uniforms[n_draws], 0..) |*u, i| u.* = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
-                    g.draws[n_draws] = .{
+                    if (n_draws == gpu_draw.max_draws) return false;
+                    const draw = self.draws.items[tri.draw_idx];
+                    // Longer shaders are drawn on the CPU.
+                    const code = g.addProgram(ram, prep.fs_code_phys) orelse return false;
+                    g.draws.appendAssumeCapacity(.{
                         .first_vertex = @intCast(n_vertices),
                         .vertex_count = 0,
                         .code = code,
-                        .uniforms = &g.uniforms[n_draws],
+                        .uniforms = g.addUniforms(ram, prep.fs_unif_phys),
                         .num_varyings = prep.fs_num_varyings,
                         .depth_func = @truncate((draw.config_b1 >> 4) & 7),
                         .depth_write = (draw.config_b1 & 0x80) != 0,
@@ -1794,7 +2065,7 @@ pub const V3d = struct {
                         .clip_y = draw.clip_y,
                         .clip_w = draw.clip_w,
                         .clip_h = draw.clip_h,
-                    };
+                    });
                     n_draws += 1;
                     last_draw = tri.draw_idx;
                 }
@@ -1809,14 +2080,15 @@ pub const V3d = struct {
                     };
                     n_vertices += 1;
                 }
-                g.draws[n_draws - 1].vertex_count += 3;
+                g.draws.items[n_draws - 1].vertex_count += 3;
             }
         }
 
-        if (metal_renderer.supported) return renderWithMetal(g, ram, gpu_frame, g.vertices[0..n_vertices], g.draws[0..n_draws], &.{}, &.{});
+        const draws = g.end();
+        if (metal_renderer.supported) return renderWithMetal(g, ram, gpu_frame, g.vertices[0..n_vertices], draws, &.{}, &.{});
         // Only drawing is faster on the GPU: the CPU loads and stores tiles on its own as fast.
         if (n_draws == 0) return false;
-        return renderWithGl(g, ram, first, &tiles, g.vertices[0..n_vertices], g.draws[0..n_draws], &.{}, &.{});
+        return renderWithGl(g, ram, first, &tiles, g.vertices[0..n_vertices], draws, &.{}, &.{});
     }
 
     /// Draws the frame with Metal, which loads and stores the tiles too.
@@ -2255,39 +2527,25 @@ pub const V3d = struct {
             const t = (tile_px_y >> 6) * 32 + (tile_px_x >> 6);
             break :blk self.tile_tris.items[self.tile_tri_start[t]..self.tile_tri_start[t + 1]];
         } else &.{};
-        if (use_spatial_bin and binned.len == 0 and self.overflow_draw_start >= self.draws_len) return;
+        if (use_spatial_bin and binned.len == 0 and self.overflow_draw_start >= self.draws.items.len) return;
 
-        var fs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
-        var fs_unif_buf: [128]u32 = undefined;
-        var cur_draw_idx: ?u16 = null;
+        var cur_draw_idx: ?u32 = null;
         var cur_fs_decoded: []const qpu_sim.DecodedInst = &.{};
-        var cur_fs_unifs: []const u32 = &.{};
+        var cur_fs_unifs: qpu_sim.Uniforms = &.{};
 
         if (use_spatial_bin) {
             for (binned) |tri_idx| {
                 const tri = &self.shaded_tris.items[tri_idx];
-                const prep = self.prep_draws[tri.draw_idx];
+                const prep = self.prep_draws.items[tri.draw_idx];
                 if (!prep.valid) continue;
 
                 if (cur_draw_idx == null or cur_draw_idx.? != tri.draw_idx) {
                     cur_draw_idx = tri.draw_idx;
-                    if (prep.fs_cached) {
-                        cur_fs_decoded = self.prep_fs_insts[prep.fs_inst_start..][0..prep.fs_code_len];
-                        cur_fs_unifs = self.prep_fs_unifs[prep.fs_unif_start..][0..prep.fs_unif_len];
-                    } else {
-                        for (0..prep.fs_code_len) |i| {
-                            const raw_inst = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
-                            fs_decoded_buf[i] = qpu_sim.decodeInst(raw_inst);
-                        }
-                        cur_fs_decoded = fs_decoded_buf[0..prep.fs_code_len];
-                        for (0..prep.fs_unif_len) |i| {
-                            fs_unif_buf[i] = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
-                        }
-                        cur_fs_unifs = fs_unif_buf[0..prep.fs_unif_len];
-                    }
+                    cur_fs_decoded = self.prep_fs_insts.items[prep.fs_inst_start..][0..prep.fs_code_len];
+                    cur_fs_unifs = uniformsAt(ram, prep.fs_unif_phys);
                 }
 
-                const draw = self.draws[tri.draw_idx];
+                const draw = self.draws.items[tri.draw_idx];
                 rasterizeShadedTriangleDecodedInTileBuf(
                     tb,
                     ram,
@@ -2310,28 +2568,16 @@ pub const V3d = struct {
                     continue;
                 }
 
-                const prep = self.prep_draws[tri.draw_idx];
+                const prep = self.prep_draws.items[tri.draw_idx];
                 if (!prep.valid) continue;
 
                 if (cur_draw_idx == null or cur_draw_idx.? != tri.draw_idx) {
                     cur_draw_idx = tri.draw_idx;
-                    if (prep.fs_cached) {
-                        cur_fs_decoded = self.prep_fs_insts[prep.fs_inst_start..][0..prep.fs_code_len];
-                        cur_fs_unifs = self.prep_fs_unifs[prep.fs_unif_start..][0..prep.fs_unif_len];
-                    } else {
-                        for (0..prep.fs_code_len) |i| {
-                            const raw_inst = std.mem.readInt(u64, ram[prep.fs_code_phys + i * 8 ..][0..8], .little);
-                            fs_decoded_buf[i] = qpu_sim.decodeInst(raw_inst);
-                        }
-                        cur_fs_decoded = fs_decoded_buf[0..prep.fs_code_len];
-                        for (0..prep.fs_unif_len) |i| {
-                            fs_unif_buf[i] = std.mem.readInt(u32, ram[prep.fs_unif_phys + i * 4 ..][0..4], .little);
-                        }
-                        cur_fs_unifs = fs_unif_buf[0..prep.fs_unif_len];
-                    }
+                    cur_fs_decoded = self.prep_fs_insts.items[prep.fs_inst_start..][0..prep.fs_code_len];
+                    cur_fs_unifs = uniformsAt(ram, prep.fs_unif_phys);
                 }
 
-                const draw = self.draws[tri.draw_idx];
+                const draw = self.draws.items[tri.draw_idx];
                 rasterizeShadedTriangleDecodedInTileBuf(
                     tb,
                     ram,
@@ -2348,8 +2594,8 @@ pub const V3d = struct {
             }
         }
 
-        if (self.overflow_draw_start < self.draws_len) {
-            for (self.draws[self.overflow_draw_start..self.draws_len]) |draw| {
+        if (self.overflow_draw_start < self.draws.items.len) {
+            for (self.draws.items[self.overflow_draw_start..]) |draw| {
                 renderDrawIntoTileBuf(tb, ram, draw, tile_px_x, tile_px_y, tile_size);
             }
         }
@@ -2367,21 +2613,24 @@ pub const V3d = struct {
         const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & vc_bus.ramMask(ram.len);
         const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & vc_bus.ramMask(ram.len);
 
-        var vs_buf: [512]qpu.Inst = undefined;
-        var fs_buf: [512]qpu.Inst = undefined;
-        const vs_code = extractQpuProgram(ram, vs_code_phys, &vs_buf);
-        const fs_code = extractQpuProgram(ram, fs_code_phys, &fs_buf);
-        if (vs_code.len == 0 or fs_code.len == 0) return;
+        // The shaders, however long (this may run on several threads at once).
+        var code: std.ArrayList(qpu.Inst) = .empty;
+        defer code.deinit(tri_allocator);
+        var vs_list: std.ArrayList(qpu_sim.DecodedInst) = .empty;
+        defer vs_list.deinit(tri_allocator);
+        var fs_list: std.ArrayList(qpu_sim.DecodedInst) = .empty;
+        defer fs_list.deinit(tri_allocator);
+        const vs_decoded = decodeProgramAt(ram, vs_code_phys, &code, &vs_list) orelse return;
+        const fs_decoded = decodeProgramAt(ram, fs_code_phys, &code, &fs_list) orelse return;
+        if (vs_decoded.len == 0 or fs_decoded.len == 0) return;
 
-        var vs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
-        var fs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
-        const vs_decoded = qpu_sim.decodeProgram(vs_code, &vs_decoded_buf);
-        const fs_decoded = qpu_sim.decodeProgram(fs_code, &fs_decoded_buf);
-
-        var vs_unif_buf: [128]u32 = undefined;
-        var fs_unif_buf: [128]u32 = undefined;
-        const vs_unifs = extractUniforms(ram, vs_unif_phys, &vs_unif_buf);
-        const fs_unifs = extractUniforms(ram, fs_unif_phys, &fs_unif_buf);
+        const vs_unifs = uniformsAt(ram, vs_unif_phys);
+        const fs_unifs = uniformsAt(ram, fs_unif_phys);
+        // The coordinate shader, for the clipper.
+        var cs_list: std.ArrayList(qpu_sim.DecodedInst) = .empty;
+        defer cs_list.deinit(tri_allocator);
+        var cs_attrs: [8]AttrStream = undefined;
+        const cs = coordStage(ram, rec_phys, draw.num_attrs, &code, &cs_list, &cs_attrs);
         const fast_frag = qpu_sim.analyzeFragmentShader(fs_decoded, fs_unifs);
 
         const num_tris: u32 = switch (draw.mode) {
@@ -2467,10 +2716,16 @@ pub const V3d = struct {
                 .vpm_in = vpm_in[0..vpm_words],
             }) catch continue;
             if (vs_res.vpm_out_len < 3) continue;
+            var clip: [16]ClipVertex = @splat(.{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) });
+            if (cs) |c| {
+                const job: VertexJob = .{ .ram = ram, .draw = draw, .decoded = &.{}, .unifs = &.{}, .attrs = &.{}, .vpm_words = 0, .n_var = 0, .indices = v_indices[0..batch_verts], .out = &.{}, .ok = &.{}, .shade = false, .cs = c, .clip = clip[0..batch_verts] };
+                job.run(0, 1);
+            }
 
             for (0..batch_tris) |t_i| {
                 const base_l = t_i * 3;
-                var verts: [3]ShadedVertex = .{ .{}, .{}, .{} };
+                var tri_verts: [3]ShadedVertex = .{ .{}, .{}, .{} };
+                const verts = &tri_verts;
                 for (0..3) |corner| {
                     const lane = base_l + corner;
                     const xy_packed = vs_res.vpm_out[0][lane];
@@ -2490,28 +2745,32 @@ pub const V3d = struct {
                     }
                 }
 
-                const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
-                    (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
-                if (@abs(area) < 1e-6) continue;
-                if (culled(draw.config_b0, area)) continue;
+                var pieces: [max_clipped][3]ShadedVertex = undefined;
+                const n_pieces = clipTriangle(draw, tri_verts, clip[base_l..][0..3].*, n_var, &pieces);
+                for (pieces[0..n_pieces]) |p_verts| {
+                    const area = (p_verts[1].x - p_verts[0].x) * (p_verts[2].y - p_verts[0].y) -
+                        (p_verts[1].y - p_verts[0].y) * (p_verts[2].x - p_verts[0].x);
+                    if (@abs(area) < 1e-6) continue;
+                    if (culled(draw.config_b0, area)) continue;
 
-                const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
-                const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
-                const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
-                const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
-                if (min_fx >= max_fx or min_fy >= max_fy) continue;
+                    const min_fx = @max(@floor(@min(p_verts[0].x, @min(p_verts[1].x, p_verts[2].x))), clip_min_x);
+                    const min_fy = @max(@floor(@min(p_verts[0].y, @min(p_verts[1].y, p_verts[2].y))), clip_min_y);
+                    const max_fx = @min(@ceil(@max(p_verts[0].x, @max(p_verts[1].x, p_verts[2].x))), clip_max_x);
+                    const max_fy = @min(@ceil(@max(p_verts[0].y, @max(p_verts[1].y, p_verts[2].y))), clip_max_y);
+                    if (min_fx >= max_fx or min_fy >= max_fy) continue;
 
-                const tri = ShadedTriangle.init(
-                    0,
-                    @intFromFloat(min_fx),
-                    @intFromFloat(min_fy),
-                    @intFromFloat(max_fx),
-                    @intFromFloat(max_fy),
-                    area,
-                    verts,
-                    n_var,
-                );
-                rasterizeShadedTriangleDecodedInTileBuf(tb, ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
+                    const tri = ShadedTriangle.init(
+                        0,
+                        @intFromFloat(min_fx),
+                        @intFromFloat(min_fy),
+                        @intFromFloat(max_fx),
+                        @intFromFloat(max_fy),
+                        area,
+                        p_verts,
+                        n_var,
+                    );
+                    rasterizeShadedTriangleDecodedInTileBuf(tb, ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
+                }
             }
         }
     }
@@ -2539,14 +2798,15 @@ pub const V3d = struct {
         draw: DrawCall,
         tri: *const ShadedTriangle,
         fs_code: []const qpu.Inst,
-        fs_unifs: []const u32,
+        fs_unifs: qpu_sim.Uniforms,
         num_varyings: u8,
         tile_px_x: u32,
         tile_px_y: u32,
         tile_size: u32,
     ) void {
-        var fs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
-        const fs_decoded = qpu_sim.decodeProgram(fs_code, &fs_decoded_buf);
+        const fs_decoded_buf = tri_allocator.alloc(qpu_sim.DecodedInst, fs_code.len) catch return;
+        defer tri_allocator.free(fs_decoded_buf);
+        const fs_decoded = qpu_sim.decodeProgram(fs_code, fs_decoded_buf);
         const fast_frag = qpu_sim.analyzeFragmentShader(fs_decoded, fs_unifs);
         var tb = self.tileBuf();
         defer self.syncFromTileBuf(&tb);
@@ -2559,7 +2819,7 @@ pub const V3d = struct {
         draw: DrawCall,
         tri: *const ShadedTriangle,
         fs_decoded: []const qpu_sim.DecodedInst,
-        fs_unifs: []const u32,
+        fs_unifs: qpu_sim.Uniforms,
         num_varyings: u8,
         fast_frag: qpu_sim.FastFragShader,
         tile_px_x: u32,
@@ -2633,7 +2893,7 @@ pub const V3d = struct {
                 vvecs: []qpu_sim.Vec,
                 ffrag: qpu_sim.FastFragShader,
                 fcode: []const qpu_sim.DecodedInst,
-                funifs: []const u32,
+                funifs: qpu_sim.Uniforms,
                 mem: []const u8,
                 z_upd: bool,
                 tcache: *[2]qpu_sim.TexCache,
@@ -3436,10 +3696,235 @@ test "V3D counts only the triangles drawn against the most it shades ahead" {
     try std.testing.expect((v3d.read32(0x030) & V3d.INT_FRDONE) != 0);
 
     // Both draws were shaded ahead, and the triangle drawn.
-    try std.testing.expectEqual(@as(usize, 2), v3d.draws_len);
-    try std.testing.expect(v3d.overflow_draw_start >= v3d.draws_len);
+    try std.testing.expectEqual(@as(usize, 2), v3d.draws.items.len);
+    try std.testing.expect(v3d.overflow_draw_start >= v3d.draws.items.len);
     const center_off = 0x10000 + (32 * 64 + 32) * 4;
     try std.testing.expectEqual(@as(u32, 0xffff0000), std.mem.readInt(u32, ram[center_off..][0..4], .little));
+}
+
+test "V3D runs shaders however long, with as many uniforms as they read, for every draw" {
+    // The QPU runs a program to its end, reading as many uniforms as it asks for, and the binner
+    // takes as many draws as it is given: none of the limits FauxPi once had (512 instructions,
+    // 128 uniforms, 256 draws). Drawn on the CPU (no GPU).
+    var v3d = V3d{ .gpu_tried = true };
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 512 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    // A vertex shader of over 700 instructions at 0x20000, its scale uniforms 200 and 201.
+    const skipped_uniforms = 200;
+    var vs: qpu.Program(1024) = .{};
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_write_setup, .value = 0x00001a00 }));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_read_setup, .value = 0x00501a00 }));
+    for (0..skipped_uniforms) |_| vs.emit(try qpu.mov(qpu.wr(3), qpu.unif));
+    for (0..500) |_| vs.emit(qpu.nop(.none));
+    vs.emit(try qpu.mov(qpu.wr(0), qpu.vpm_read)); // x
+    vs.emit(try qpu.mov(qpu.wr(1), qpu.vpm_read)); // y
+    vs.emit(try qpu.mov(qpu.wa(0), qpu.vpm_read)); // r
+    vs.emit(try qpu.mov(qpu.wr(3), qpu.vpm_read)); // g
+    vs.emit(try qpu.mov(qpu.wa(2), qpu.vpm_read)); // b
+    vs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(0), .a = qpu.r(0), .b = qpu.unif } }));
+    vs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(1), .a = qpu.r(1), .b = qpu.unif } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .ftoi, .dst = qpu.wa(1), .a = qpu.r(0), .b = qpu.r(0) }, .pack = .{ .regfile_a = .@"16a" } }));
+    vs.emit(try qpu.alu(.{ .add = .{ .op = .ftoi, .dst = qpu.wa(1), .a = qpu.r(1), .b = qpu.r(1) }, .pack = .{ .regfile_a = .@"16b" } }));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.wr(2), .value = @bitCast(@as(f32, 0.5)) }));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(1)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(2)));
+    vs.emit(try qpu.loadImm(.{ .add_dst = qpu.vpm_write, .value = @bitCast(@as(f32, 1.0)) }));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(0)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.r(3)));
+    vs.emit(try qpu.mov(qpu.vpm_write, qpu.ra(2)));
+    vs.end(.vertex);
+    try std.testing.expect(vs.code().len > 700);
+
+    // The fragment shader: the colour varyings.
+    var fs: qpu.Program(32) = .{};
+    for (0..3) |i| {
+        const acc: u3 = @intCast(i);
+        fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(acc), .a = qpu.vary, .b = qpu.frag_w } }));
+        fs.emit(try qpu.alu(.{ .add = .{ .op = .fadd, .dst = qpu.wr(acc), .a = qpu.r(acc), .b = qpu.r(5) } }));
+    }
+    const one = qpu.smallImmFloat(1.0);
+    fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(2), .b = one }, .pack = .{ .mul = .@"8a" } }));
+    fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(1), .b = one }, .pack = .{ .mul = .@"8b" } }));
+    fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(0), .b = one }, .pack = .{ .mul = .@"8c" } }));
+    fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = one, .b = one }, .pack = .{ .mul = .@"8d" } }));
+    fs.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(3)));
+    fs.end(.fragment);
+
+    @memcpy(ram[0x20000..][0 .. vs.code().len * 8], std.mem.sliceAsBytes(vs.code()));
+    @memcpy(ram[0x1400..][0 .. fs.code().len * 8], std.mem.sliceAsBytes(fs.code()));
+
+    // The vertex shader's uniforms at 0x8000: those it skips, then x and y scaled to 12.4 pixels.
+    for (0..skipped_uniforms) |k| std.mem.writeInt(u32, ram[0x8000 + k * 4 ..][0..4], 0xdeadbeef, .little);
+    std.mem.writeInt(u32, ram[0x8000 + skipped_uniforms * 4 ..][0..4], @bitCast(@as(f32, 32.0 * 16.0)), .little);
+    std.mem.writeInt(u32, ram[0x8000 + (skipped_uniforms + 1) * 4 ..][0..4], @bitCast(@as(f32, 32.0 * 16.0)), .little);
+
+    // A red triangle over the middle of the tile (x, y, r, g, b).
+    const verts = [_]f32{
+        -1.0, -1.0, 1.0, 0.0, 0.0,
+        1.0,  -1.0, 1.0, 0.0, 0.0,
+        0.0,  1.0,  1.0, 0.0, 0.0,
+    };
+    @memcpy(ram[0x2000..][0..@sizeOf(@TypeOf(verts))], std.mem.sliceAsBytes(&verts));
+
+    // The shader record at 0x3000, and at 0x3100 the same with every vertex the first (stride 0):
+    // triangles with no area, drawing nothing.
+    ram[0x3003] = 3;
+    std.mem.writeInt(u32, ram[0x3004..0x3008], 0x1400, .little);
+    std.mem.writeInt(u32, ram[0x3008..0x300c], 0x1900, .little);
+    ram[0x300e] = 1;
+    std.mem.writeInt(u32, ram[0x3010..0x3014], 0x20000, .little);
+    std.mem.writeInt(u32, ram[0x3014..0x3018], 0x8000, .little);
+    std.mem.writeInt(u32, ram[0x3024..0x3028], 0x2000, .little);
+    ram[0x3028] = 19;
+    ram[0x3029] = 20;
+    @memcpy(ram[0x3100..0x3130], ram[0x3000..0x3030]);
+    ram[0x3129] = 0;
+
+    // The binning control list at 0x40000: 299 draws of nothing, then the triangle.
+    const empty_draws = 299;
+    var bcl: usize = 0x40000;
+    ram[bcl] = 6; // START_TILE_BINNING
+    bcl += 1;
+    ram[bcl] = 103; // VIEWPORT_OFFSET (32.0, 32.0)
+    std.mem.writeInt(u16, ram[bcl + 1 ..][0..2], 32 * 16, .little);
+    std.mem.writeInt(u16, ram[bcl + 3 ..][0..2], 32 * 16, .little);
+    bcl += 5;
+    ram[bcl] = 64; // GL_SHADER_STATE (0x3100, 1 attribute)
+    std.mem.writeInt(u32, ram[bcl + 1 ..][0..4], 0x3101, .little);
+    bcl += 5;
+    for (0..empty_draws) |_| {
+        ram[bcl] = 33; // GL_ARRAY_PRIMITIVE (triangles, 3 vertices from 0)
+        ram[bcl + 1] = 4;
+        std.mem.writeInt(u32, ram[bcl + 2 ..][0..4], 3, .little);
+        std.mem.writeInt(u32, ram[bcl + 6 ..][0..4], 0, .little);
+        bcl += 10;
+    }
+    ram[bcl] = 64; // GL_SHADER_STATE (0x3000, 1 attribute)
+    std.mem.writeInt(u32, ram[bcl + 1 ..][0..4], 0x3001, .little);
+    bcl += 5;
+    ram[bcl] = 33;
+    ram[bcl + 1] = 4;
+    std.mem.writeInt(u32, ram[bcl + 2 ..][0..4], 3, .little);
+    std.mem.writeInt(u32, ram[bcl + 6 ..][0..4], 0, .little);
+    bcl += 10;
+    ram[bcl] = 4; // FLUSH
+    bcl += 1;
+
+    v3d.write32(0x034, V3d.INT_FLDONE | V3d.INT_FRDONE, ram);
+    v3d.write32(0x110, 0x40000, ram); // CT0CA
+    v3d.write32(0x108, @intCast(bcl), ram); // CT0EA
+    try std.testing.expect((v3d.read32(0x030) & V3d.INT_FLDONE) != 0);
+    try std.testing.expectEqual(@as(usize, empty_draws + 1), v3d.draws.items.len);
+
+    // The rendering control list at 0x5000: one 64x64 tile, linear RGBA8888, at 0x10000.
+    var rcl: usize = 0x5000;
+    ram[rcl] = 113; // TILE_RENDERING_MODE_CONFIG
+    std.mem.writeInt(u32, ram[rcl + 1 ..][0..4], 0x10000, .little);
+    std.mem.writeInt(u16, ram[rcl + 5 ..][0..2], 64, .little);
+    std.mem.writeInt(u16, ram[rcl + 7 ..][0..2], 64, .little);
+    std.mem.writeInt(u16, ram[rcl + 9 ..][0..2], 1 << 2, .little);
+    rcl += 11;
+    ram[rcl] = 114; // CLEAR_COLORS (black)
+    std.mem.writeInt(u32, ram[rcl + 1 ..][0..4], 0xff000000, .little);
+    std.mem.writeInt(u32, ram[rcl + 9 ..][0..4], 0x00ffffff, .little);
+    rcl += 14;
+    ram[rcl] = 115; // TILE_COORDINATES (0, 0)
+    rcl += 3;
+    ram[rcl] = 17; // BRANCH_TO_SUB_LIST
+    rcl += 5;
+    ram[rcl] = 25; // STORE_MS_TILE_BUFFER_AND_EOF
+    rcl += 1;
+
+    v3d.write32(0x114, 0x5000, ram); // CT1CA
+    v3d.write32(0x10c, @intCast(rcl), ram); // CT1EA
+    try std.testing.expect((v3d.read32(0x030) & V3d.INT_FRDONE) != 0);
+
+    // The triangle, where its vertex shader put it: red in the middle, black beside its apex.
+    const center_off = 0x10000 + (32 * 64 + 32) * 4;
+    try std.testing.expectEqual(@as(u32, 0xffff0000), std.mem.readInt(u32, ram[center_off..][0..4], .little));
+    const outside_off = 0x10000 + (63 * 64 + 0) * 4;
+    try std.testing.expectEqual(@as(u32, 0xff000000), std.mem.readInt(u32, ram[outside_off..][0..4], .little));
+}
+
+/// Whether screen point (`x`, `y`) is in one of the triangles `pieces`.
+fn inAnyPiece(pieces: []const [3]V3d.ShadedVertex, x: f32, y: f32) bool {
+    for (pieces) |t| {
+        const d0 = (t[1].x - t[0].x) * (y - t[0].y) - (t[1].y - t[0].y) * (x - t[0].x);
+        const d1 = (t[2].x - t[1].x) * (y - t[1].y) - (t[2].y - t[1].y) * (x - t[1].x);
+        const d2 = (t[0].x - t[2].x) * (y - t[2].y) - (t[0].y - t[2].y) * (x - t[2].x);
+        if ((d0 >= 0 and d1 >= 0 and d2 >= 0) or (d0 <= 0 and d1 <= 0 and d2 <= 0)) return true;
+    }
+    return false;
+}
+
+/// A vertex at clip coordinates `c`, shaded as the clipper's scaling for `draw` places it, with one
+/// varying `v` (not divided by W).
+fn shadedAt(draw: V3d.DrawCall, c: V3d.ClipVertex, v: f32) V3d.ShadedVertex {
+    const inv_w = 1.0 / c.w;
+    var out: V3d.ShadedVertex = .{
+        .x = c.x * inv_w * draw.clip_scale_x / 16.0 + draw.vp_x,
+        .y = c.y * inv_w * draw.clip_scale_y / 16.0 + draw.vp_y,
+        .z = c.z * inv_w * draw.z_scale + draw.z_offset,
+        .inv_w = inv_w,
+    };
+    out.persp_varyings[0] = v * inv_w;
+    return out;
+}
+
+test "V3D clips triangles behind the eye at the near plane, as the Pi's clipper does" {
+    const draw: V3d.DrawCall = .{ .vp_x = 32, .vp_y = 32, .clip_scale_x = 32 * 16, .clip_scale_y = 32 * 16, .z_scale = 0.5, .z_offset = 0.5 };
+    const c = [3]V3d.ClipVertex{
+        .{ .x = -0.5, .y = -0.5, .z = 0, .w = 1 },
+        .{ .x = 0.5, .y = -0.5, .z = 0, .w = 1 },
+        // Behind the eye: its screen position (as the vertex shader writes it) means nothing.
+        .{ .x = 0, .y = 1, .z = 0, .w = -1 },
+    };
+    var verts = [3]V3d.ShadedVertex{ shadedAt(draw, c[0], 0), shadedAt(draw, c[1], 1), .{ .x = 999, .y = -999, .inv_w = -1 } };
+    verts[2].persp_varyings[0] = -10;
+    var pieces: [V3d.max_clipped][3]V3d.ShadedVertex = undefined;
+    const n = V3d.clipTriangle(draw, verts, c, 1, &pieces);
+    try std.testing.expect(n >= 1);
+    var kept: usize = 0;
+    for (pieces[0..n]) |t| for (t) |v| {
+        // In front of the eye, and inside the guard band.
+        try std.testing.expect(v.inv_w > 0);
+        try std.testing.expect(@abs(v.x - 32) <= 2047.01 and @abs(v.y - 32) <= 2047.01);
+        if (std.meta.eql(v, verts[0]) or std.meta.eql(v, verts[1])) kept += 1;
+    };
+    // The corners in front are kept as shaded; what is drawn runs from them away from the eye
+    // (through (32, 40), the screen point of clip coordinates (0, 0.0625, 0, 0.25)), not to the
+    // corner behind it.
+    try std.testing.expect(kept >= 2);
+    try std.testing.expect(inAnyPiece(pieces[0..n], 32, 40));
+    try std.testing.expect(!inAnyPiece(pieces[0..n], 32, 10));
+}
+
+test "V3D clips triangles past the guard band to it, their varyings interpolated in clip space" {
+    const draw: V3d.DrawCall = .{ .vp_x = 32, .vp_y = 32, .clip_scale_x = 32 * 16, .clip_scale_y = 32 * 16 };
+    // About 6400 pixels across, so their 12.4 screen coordinates would wrap; W differs so the
+    // interpolation is perspective-correct. The varying is 1 + x + 2y (in clip coordinates / W).
+    const c = [3]V3d.ClipVertex{
+        .{ .x = -100, .y = -100, .z = 0, .w = 1 },
+        .{ .x = 200, .y = -200, .z = 0, .w = 2 },
+        .{ .x = 0, .y = 50, .z = 0, .w = 0.5 },
+    };
+    var verts: [3]V3d.ShadedVertex = undefined;
+    for (&verts, c) |*v, cv| v.* = shadedAt(draw, cv, cv.w + cv.x + 2 * cv.y);
+    var pieces: [V3d.max_clipped][3]V3d.ShadedVertex = undefined;
+    const n = V3d.clipTriangle(draw, verts, c, 1, &pieces);
+    try std.testing.expect(n >= 2);
+    for (pieces[0..n]) |t| for (t) |v| {
+        try std.testing.expect(@abs(v.x - 32) <= 2047.01 and @abs(v.y - 32) <= 2047.01);
+        // Each corner's varying, divided by W (1 + x/W + 2y/W), as at its place on the screen.
+        const ndc_x = (v.x - 32) / 32;
+        const ndc_y = (v.y - 32) / 32;
+        try std.testing.expectApproxEqRel(1 + ndc_x + 2 * ndc_y, v.persp_varyings[0], 1e-3);
+    };
+    // The middle of the screen is still drawn.
+    try std.testing.expect(inAnyPiece(pieces[0..n], 32, 32));
 }
 
 test "V3D quad top-left to bottom-right diagonal shades each pixel exactly once" {
@@ -3817,14 +4302,15 @@ test "V3D shades each vertex once, as shading each triangle's corners would" {
         .{ .shader_rec_addr = 0x3000, .num_attrs = 1, .mode = 5, .count = 200, .first_or_offset = 7, .vp_x = 320, .vp_y = 320 },
         .{ .shader_rec_addr = 0x3000, .num_attrs = 1, .mode = 6, .count = 60, .first_or_offset = 400, .vp_x = 320, .vp_y = 320 },
     };
-    @memcpy(v3d.draws[0..draws.len], &draws);
-    v3d.draws_len = draws.len;
+    v3d.draws.clearRetainingCapacity();
+    try v3d.draws.appendSlice(V3d.tri_allocator, &draws);
     v3d.prepareDrawsForFrame(ram);
-    try std.testing.expect(v3d.overflow_draw_start >= v3d.draws_len);
+    try std.testing.expect(v3d.overflow_draw_start >= v3d.draws.items.len);
 
     // Each triangle's corners shaded together, as a batch of their own.
-    var vs_decoded_buf: [512]qpu_sim.DecodedInst = undefined;
-    const vs_decoded = qpu_sim.decodeProgram(vs.code(), &vs_decoded_buf);
+    const vs_decoded_buf = try std.testing.allocator.alloc(qpu_sim.DecodedInst, vs.code().len);
+    defer std.testing.allocator.free(vs_decoded_buf);
+    const vs_decoded = qpu_sim.decodeProgram(vs.code(), vs_decoded_buf);
     const unifs = [2]u32{ std.mem.readInt(u32, ram[0x1800..0x1804], .little), std.mem.readInt(u32, ram[0x1804..0x1808], .little) };
     var attr_streams: [8]V3d.AttrStream = undefined;
     const attr_info = V3d.decodeAttrStreams(ram, 0x3000, 1, 1, &attr_streams);

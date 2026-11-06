@@ -293,7 +293,7 @@ pub const Renderer = struct {
         objc.release(slot.pipeline);
         slot.* = .{ .hash = hash, .used = true };
 
-        var decoded_buf: [512]qpu_sim.DecodedInst = undefined;
+        var decoded_buf: [gpu_draw.max_program_len]qpu_sim.DecodedInst = undefined;
         if (code.len > decoded_buf.len) return null;
         const decoded = qpu_sim.decodeProgram(code, &decoded_buf);
         var src: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
@@ -319,13 +319,14 @@ pub const Renderer = struct {
         objc.release(slot.pipeline);
         slot.* = .{ .hash = hash, .used = true };
 
-        var decoded_buf: [512]qpu_sim.DecodedInst = undefined;
+        var decoded_buf: [gpu_draw.max_program_len]qpu_sim.DecodedInst = undefined;
+        if (code.len > decoded_buf.len) return null;
         const decoded = qpu_sim.decodeProgram(code, &decoded_buf);
         var src: std.Io.Writer.Allocating = .init(std.heap.page_allocator);
         defer src.deinit();
         src.writer.writeAll(msl.msl_common) catch return null;
         const shader = msl.translate(&src.writer, decoded, .msl) catch return null;
-        if (shader.reads_color and !r.framebuffer_fetch) return null;
+        if (shader.too_many_uniforms or (shader.reads_color and !r.framebuffer_fetch)) return null;
 
         const lib = r.compile(src.written()) catch return null;
         defer objc.release(lib);

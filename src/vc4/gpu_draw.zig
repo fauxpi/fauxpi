@@ -59,9 +59,11 @@ pub const Draw = struct {
     clip_h: u32,
 };
 
-/// The most draws, and corners, a frame is drawn with: as many as V3D bins.
-pub const max_draws = 256;
+/// The most draws, corners, and instructions in a shader, a frame is drawn with on the GPU. V3D has
+/// no such limits: frames with more are drawn on the CPU.
+pub const max_draws = 4096;
 pub const max_vertices = 65536 * 3;
+pub const max_program_len = 4096;
 
 /// Whether draw `b`, straight after `a`, can have its vertices shaded in the same pass as `a`'s:
 /// the same vertex shader, given the same (uniforms, VPM words, viewport, varyings), with its
