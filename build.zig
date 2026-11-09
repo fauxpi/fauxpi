@@ -63,6 +63,11 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // The benchmark's QPU programs: each encodes (a program that doesn't would panic on the board).
+    const programs_mod = b.createModule(.{ .root_source_file = b.path("bench/programs.zig"), .target = target, .optimize = .Debug });
+    programs_mod.addImport("qpu", b.createModule(.{ .root_source_file = b.path("src/vc4/qpu.zig"), .target = target, .optimize = .Debug }));
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = programs_mod })).step);
+
     addBench(b, exe);
 }
 

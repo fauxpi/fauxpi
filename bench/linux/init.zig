@@ -15,6 +15,7 @@ const std = @import("std");
 const linux = std.os.linux;
 const scene = @import("scene");
 const bench_tests = @import("bench_tests");
+const features = @import("features.zig");
 
 /// What to run: patched in by the runner (as bench/baremetal/main.zig's).
 const Config = extern struct {
@@ -44,13 +45,13 @@ fn readConfig() Config {
     return c;
 }
 
-fn print(comptime fmt: []const u8, args: anytype) void {
+pub fn print(comptime fmt: []const u8, args: anytype) void {
     var buf: [512]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..];
     _ = linux.write(1, s.ptr, s.len);
 }
 
-fn fail(comptime fmt: []const u8, args: anytype) noreturn {
+pub fn fail(comptime fmt: []const u8, args: anytype) noreturn {
     print("BENCH-ERROR " ++ fmt ++ "\n", args);
     finish();
 }
@@ -68,7 +69,7 @@ fn clockUs(clock: linux.clockid_t) u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000 + @as(u64, @intCast(ts.nsec)) / 1000;
 }
 
-fn now() u64 {
+pub fn now() u64 {
     return clockUs(.MONOTONIC);
 }
 
@@ -99,23 +100,23 @@ pub fn main() noreturn {
     finish();
 }
 
-const Params = struct {
+pub const Params = struct {
     scale: u32,
     width: u32,
     height: u32,
     /// When init started, since the kernel did.
     boot_us: u64,
 
-    fn amount(p: Params, usual: u64) usize {
+    pub fn amount(p: Params, usual: u64) usize {
         return @intCast(@max(usual * p.scale / 100, 1));
     }
 };
 
-const Result = struct {
-    values: [8]struct { name: []const u8, value: u64 } = undefined,
+pub const Result = struct {
+    values: [64]struct { name: []const u8, value: u64 } = undefined,
     len: usize = 0,
 
-    fn add(r: *Result, name: []const u8, value: u64) void {
+    pub fn add(r: *Result, name: []const u8, value: u64) void {
         if (r.len == r.values.len) return;
         r.values[r.len] = .{ .name = name, .value = value };
         r.len += 1;
@@ -148,6 +149,12 @@ const tests = [_]Test{
     .{ .name = "kms_points", .run = pointsScene },
     .{ .name = "kms_msaa", .run = msaaScene },
     .{ .name = "kms_msaa_blend", .run = msaaBlendScene },
+    .{ .name = "kms_v3d_pipeline", .run = features.pipeline },
+    .{ .name = "kms_v3d_textures", .run = features.textures },
+    .{ .name = "kms_v3d_qpu", .run = features.qpu },
+    .{ .name = "kms_v3d_surfaces", .run = features.surfaces },
+    .{ .name = "kms_v3d_stress", .run = features.stress },
+    .{ .name = "kms_planes", .run = features.planes },
 };
 
 /// The boot: the kernel to init, and the vc4 driver to its device.
@@ -187,11 +194,11 @@ fn pageFaults(p: Params, r: *Result) void {
 
 // --- DRM and vc4 --------------------------------------------------------------------------------
 
-fn drmIowr(nr: u8, comptime T: type) u32 {
+pub fn drmIowr(nr: u8, comptime T: type) u32 {
     return linux.IOCTL.IOWR('d', nr, T);
 }
 
-fn ioctl(fd: i32, req: u32, arg: anytype) linux.E {
+pub fn ioctl(fd: i32, req: u32, arg: anytype) linux.E {
     while (true) {
         const rc = linux.ioctl(fd, req, @intFromPtr(arg));
         const e = linux.errno(rc);
@@ -199,11 +206,11 @@ fn ioctl(fd: i32, req: u32, arg: anytype) linux.E {
     }
 }
 
-fn must(e: linux.E, what: []const u8) void {
+pub fn must(e: linux.E, what: []const u8) void {
     if (e != .SUCCESS) fail("{s}: {s}", .{ what, @tagName(e) });
 }
 
-const CardRes = extern struct {
+pub const CardRes = extern struct {
     fb_id_ptr: u64 = 0,
     crtc_id_ptr: u64 = 0,
     connector_id_ptr: u64 = 0,
@@ -218,7 +225,7 @@ const CardRes = extern struct {
     max_height: u32 = 0,
 };
 
-const ModeInfo = extern struct {
+pub const ModeInfo = extern struct {
     clock: u32,
     hdisplay: u16,
     hsync_start: u16,
@@ -236,7 +243,7 @@ const ModeInfo = extern struct {
     name: [32]u8,
 };
 
-const GetConnector = extern struct {
+pub const GetConnector = extern struct {
     encoders_ptr: u64 = 0,
     modes_ptr: u64 = 0,
     props_ptr: u64 = 0,
@@ -255,7 +262,7 @@ const GetConnector = extern struct {
     pad: u32 = 0,
 };
 
-const GetEncoder = extern struct {
+pub const GetEncoder = extern struct {
     encoder_id: u32,
     encoder_type: u32 = 0,
     crtc_id: u32 = 0,
@@ -263,7 +270,7 @@ const GetEncoder = extern struct {
     possible_clones: u32 = 0,
 };
 
-const SetCrtc = extern struct {
+pub const SetCrtc = extern struct {
     set_connectors_ptr: u64,
     count_connectors: u32,
     crtc_id: u32,
@@ -275,7 +282,7 @@ const SetCrtc = extern struct {
     mode: ModeInfo,
 };
 
-const FbCmd2 = extern struct {
+pub const FbCmd2 = extern struct {
     fb_id: u32 = 0,
     width: u32,
     height: u32,
@@ -287,7 +294,7 @@ const FbCmd2 = extern struct {
     modifier: [4]u64 = @splat(0),
 };
 
-const PageFlip = extern struct {
+pub const PageFlip = extern struct {
     crtc_id: u32,
     fb_id: u32,
     flags: u32,
@@ -295,14 +302,14 @@ const PageFlip = extern struct {
     user_data: u64 = 0,
 };
 
-const SubmitRclSurface = extern struct {
+pub const SubmitRclSurface = extern struct {
     hindex: u32 = ~@as(u32, 0),
     offset: u32 = 0,
     bits: u16 = 0,
     flags: u16 = 0,
 };
 
-const SubmitCl = extern struct {
+pub const SubmitCl = extern struct {
     bin_cl: u64 = 0,
     shader_rec: u64 = 0,
     uniforms: u64 = 0,
@@ -336,16 +343,16 @@ const SubmitCl = extern struct {
     pad2: u32 = 0,
 };
 
-const WaitSeqno = extern struct { seqno: u64, timeout_ns: u64 };
-const CreateBo = extern struct { size: u32, flags: u32 = 0, handle: u32 = 0, pad: u32 = 0 };
-const MmapBo = extern struct { handle: u32, flags: u32 = 0, offset: u64 = 0 };
-const CreateShaderBo = extern struct { size: u32, flags: u32 = 0, data: u64, handle: u32 = 0, pad: u32 = 0 };
+pub const WaitSeqno = extern struct { seqno: u64, timeout_ns: u64 };
+pub const CreateBo = extern struct { size: u32, flags: u32 = 0, handle: u32 = 0, pad: u32 = 0 };
+pub const MmapBo = extern struct { handle: u32, flags: u32 = 0, offset: u64 = 0 };
+pub const CreateShaderBo = extern struct { size: u32, flags: u32 = 0, data: u64, handle: u32 = 0, pad: u32 = 0 };
 
-const drm_format_xrgb8888: u32 = 0x34325258; // 'XR24'
+pub const drm_format_xrgb8888: u32 = 0x34325258; // 'XR24'
 const page_flip_event: u32 = 1;
 
 /// Opens the vc4 device, waiting (up to 10 s) for the driver to make it.
-fn openCard() i32 {
+pub fn openCard() i32 {
     var tries: usize = 0;
     while (true) : (tries += 1) {
         const rc = linux.open("/dev/dri/card0", .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NONBLOCK = true }, 0);
@@ -357,11 +364,11 @@ fn openCard() i32 {
 }
 
 /// A buffer the V3D, and KMS, use, mapped.
-const Bo = struct {
+pub const Bo = struct {
     handle: u32,
     bytes: []u8,
 
-    fn create(fd: i32, size: usize) Bo {
+    pub fn create(fd: i32, size: usize) Bo {
         var c: CreateBo = .{ .size = @intCast(std.mem.alignForward(usize, size, 4096)) };
         must(ioctl(fd, drmIowr(0x43, CreateBo), &c), "VC4_CREATE_BO");
         var m: MmapBo = .{ .handle = c.handle };
@@ -371,19 +378,19 @@ const Bo = struct {
         return .{ .handle = c.handle, .bytes = @as([*]u8, @ptrFromInt(addr))[0..c.size] };
     }
 
-    fn floats(b: Bo) []f32 {
+    pub fn floats(b: Bo) []f32 {
         return @as([*]f32, @ptrCast(@alignCast(b.bytes.ptr)))[0 .. b.bytes.len / 4];
     }
 };
 
-fn shaderBo(fd: i32, code: []const u64) u32 {
+pub fn shaderBo(fd: i32, code: []const u64) u32 {
     var c: CreateShaderBo = .{ .size = @intCast(code.len * 8), .data = @intFromPtr(code.ptr) };
     must(ioctl(fd, drmIowr(0x45, CreateShaderBo), &c), "VC4_CREATE_SHADER_BO (the kernel rejected a shader)");
     return c.handle;
 }
 
 /// The display: a CRTC showing one of two framebuffers, each a BO the V3D draws into.
-const Display = struct {
+pub const Display = struct {
     fd: i32,
     crtc: u32,
     width: u32,
@@ -394,7 +401,7 @@ const Display = struct {
     flip_pending: bool = false,
     flips: u64 = 0,
 
-    fn init() Display {
+    pub fn init() Display {
         const fd = openCard();
         var res: CardRes = .{};
         must(ioctl(fd, drmIowr(0xA0, CardRes), &res), "MODE_GETRESOURCES");
@@ -463,7 +470,7 @@ const Display = struct {
 
     /// Shows the back framebuffer at the next vblank, unless a flip is still waiting (then it is
     /// drawn again). `wait`: until it is shown.
-    fn flip(d: *Display, wait: bool) void {
+    pub fn flip(d: *Display, wait: bool) void {
         d.drainEvents(false);
         if (d.flip_pending) {
             if (!wait) return;
@@ -478,7 +485,7 @@ const Display = struct {
     }
 
     /// Reads the flips' events: those there are, or (`block`) until the pending one comes.
-    fn drainEvents(d: *Display, block: bool) void {
+    pub fn drainEvents(d: *Display, block: bool) void {
         while (true) {
             var buf: [256]u8 = undefined;
             const rc = linux.read(d.fd, &buf, buf.len);
@@ -496,7 +503,7 @@ const Display = struct {
 };
 
 /// A frame being built: a binning list, shader records and uniforms, as SUBMIT_CL takes them.
-const Job = struct {
+pub const Job = struct {
     bcl: [64 * 1024]u8 = undefined,
     bcl_len: usize = 0,
     rec: [96 * 1024]u8 = undefined,
@@ -680,7 +687,7 @@ const Job = struct {
 };
 
 /// A shading's shaders, as shader buffers the kernel has validated.
-const ShaderSet = struct {
+pub const ShaderSet = struct {
     vs: u32,
     cs: u32,
     fs: u32,

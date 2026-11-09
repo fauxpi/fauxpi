@@ -272,7 +272,14 @@ pub const Alu = struct {
     sf: bool = false,
     pack: Pack = .none,
     unpack: Unpack = .none,
+    /// The mul ALU's output rotated up by this many elements (1 to 15), or by r5's element 0
+    /// (`rotate_by_r5`): a small immediate in raddr_b, so regfile B and small immediates can't be
+    /// read.
+    rotate: ?u5 = null,
 };
+
+/// `Alu.rotate`: by accumulator r5's element 0 (bits 3:0).
+pub const rotate_by_r5: u5 = 16;
 
 pub const EncodeError = error{
     ReadPortConflict,
@@ -321,6 +328,11 @@ pub fn alu(i: Alu) EncodeError!Inst {
     const add_b = try ports.mux(i.add.b);
     const mul_a = try ports.mux(i.mul.a);
     const mul_b = try ports.mux(i.mul.b);
+    if (i.rotate) |rot| {
+        if (ports.raddr_b != null or rot == 0 or rot > 16) return error.BadSmallImmediate;
+        ports.raddr_b = if (rot == rotate_by_r5) 48 else 48 + @as(u6, rot);
+        ports.small_imm = true;
+    }
 
     var sig = i.sig;
     if (ports.small_imm) {
@@ -405,6 +417,71 @@ pub fn loadImm(i: LoadImm) EncodeError!Inst {
         field(i.add_dst.waddr(), 38) |
         field(i.mul_dst.waddr(), 32) |
         i.value;
+}
+
+/// A load of 2-bit values, one per element (bit n of `ls` and `ms` element n's low and high
+/// bits), signed (-2 to 1) or unsigned (0 to 3).
+pub const LoadImmPerElement = struct {
+    add_dst: Dst = .nop,
+    mul_dst: Dst = .nop,
+    signed: bool,
+    ls: u16,
+    ms: u16,
+};
+
+pub fn loadImmPerElement(i: LoadImmPerElement) EncodeError!Inst {
+    const base = try loadImm(.{ .add_dst = i.add_dst, .mul_dst = i.mul_dst, .value = @as(u32, i.ms) << 16 | i.ls });
+    return base | field(if (i.signed) 1 else 3, 57);
+}
+
+/// Increments (or, `down`, decrements) system semaphore `n`, stalling to keep it in 0 to 15.
+pub fn semaphore(n: u4, down: bool) Inst {
+    return field(@backingInt(Sig.load_imm), 60) | field(4, 57) |
+        field(@backingInt(Cond.never), 49) | field(@backingInt(Cond.never), 46) |
+        field(W.nop, 38) | field(W.nop, 32) |
+        field(@intFromBool(down), 4) | n;
+}
+
+/// Branch conditions: across all 16 elements' flags.
+pub const BranchCond = enum(u4) {
+    all_z = 0,
+    all_nz = 1,
+    any_z = 2,
+    any_nz = 3,
+    all_n = 4,
+    all_nn = 5,
+    any_n = 6,
+    any_nn = 7,
+    all_c = 8,
+    all_nc = 9,
+    any_c = 10,
+    any_nc = 11,
+    always = 15,
+};
+
+/// A branch to `offset` (bytes, from the instruction after it if `rel`), plus regfile A
+/// register `reg`'s element 0 if given; the return address (it plus 4 instructions, after the
+/// delay slots) written to `link`. Its three following instructions always run.
+pub const Branch = struct {
+    cond: BranchCond = .always,
+    rel: bool = true,
+    reg: ?u5 = null,
+    offset: i32,
+    link: Dst = .nop,
+};
+
+pub fn branch(b: Branch) EncodeError!Inst {
+    const file = b.link.file();
+    const ws = file == .b;
+    return field(@backingInt(Sig.branch), 60) |
+        field(@backingInt(b.cond), 52) |
+        field(@intFromBool(b.rel), 51) |
+        field(@intFromBool(b.reg != null), 50) |
+        field(b.reg orelse 0, 45) |
+        field(@intFromBool(ws), 44) |
+        field(b.link.waddr(), 38) |
+        field(W.nop, 32) |
+        @as(u32, @bitCast(b.offset));
 }
 
 pub fn nop(sig: Sig) Inst {

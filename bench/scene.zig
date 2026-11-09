@@ -342,3 +342,4 @@ pub fn pointVertices(out: []f32, n: u32) void {
         for (v[4..7]) |*c| c.* = rand(&seed);
     }
 }
+pub const programs = @import("programs.zig");

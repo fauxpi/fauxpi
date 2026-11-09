@@ -14,6 +14,15 @@ const std = @import("std");
 const hw = @import("hw.zig");
 const v3d = @import("v3d.zig");
 const hvs = @import("hvs.zig");
+const features = @import("v3d_features.zig");
+const modes = @import("v3d_modes.zig");
+const targets = @import("v3d_targets.zig");
+const control = @import("v3d_control.zig");
+const tmu = @import("v3d_tmu.zig");
+const qpu_tests = @import("v3d_qpu.zig");
+const user = @import("v3d_user.zig");
+const hvs_features = @import("hvs_features.zig");
+const stress = @import("v3d_stress.zig");
 const bench_tests = @import("bench_tests");
 
 /// What to run: patched into kernel.img by the runner (found by `magic`).
@@ -76,6 +85,7 @@ extern var __bss_end: u8;
 export fn kmain() noreturn {
     const bss_len = @intFromPtr(&__bss_end) - @intFromPtr(&__bss_start);
     @memset(@as([*]u8, @ptrCast(&__bss_start))[0..bss_len], 0);
+    installVectors();
 
     const cfg = readConfig();
     const name = std.mem.sliceTo(&cfg.test_name, 0);
@@ -115,7 +125,7 @@ pub const Params = struct {
 /// What a test reports besides its time: named counts (what it did, and checksums, which also
 /// keep the work from being optimized away).
 pub const Result = struct {
-    values: [8]struct { name: []const u8, value: u64 } = undefined,
+    values: [64]struct { name: []const u8, value: u64 } = undefined,
     len: usize = 0,
 
     pub fn add(r: *Result, name: []const u8, value: u64) void {
@@ -155,7 +165,24 @@ const tests = [_]Test{
     .{ .name = "v3d_points", .run = v3d.points },
     .{ .name = "v3d_msaa", .run = v3d.msaa },
     .{ .name = "v3d_msaa_blend", .run = v3d.msaaBlend },
+    .{ .name = "v3d_primitives", .run = features.primitives },
+    .{ .name = "v3d_clipping", .run = features.clipping },
+    .{ .name = "v3d_rasterizer", .run = features.rasterizer },
+    .{ .name = "v3d_depth_stencil", .run = features.depthStencil },
+    .{ .name = "v3d_nv_vg", .run = modes.nvVg },
+    .{ .name = "v3d_tile_lists", .run = modes.tileLists },
+    .{ .name = "v3d_tile_buffer", .run = targets.tileBuffer },
+    .{ .name = "v3d_control", .run = control.control },
+    .{ .name = "v3d_tmu", .run = tmu.tmu },
+    .{ .name = "v3d_qpu", .run = qpu_tests.qpu },
+    .{ .name = "v3d_user_programs", .run = user.userPrograms },
+    .{ .name = "v3d_stress_geometry", .run = stress.geometry },
+    .{ .name = "v3d_stress_frame", .run = stress.frame },
+    .{ .name = "v3d_stress_textures", .run = stress.textures },
+    .{ .name = "v3d_stress_shaders", .run = stress.shaders },
+    .{ .name = "v3d_stress_draws", .run = stress.draws },
     .{ .name = "hvs_planes", .run = hvs.planes },
+    .{ .name = "hvs_features", .run = hvs_features.features },
 };
 
 /// Integer arithmetic in a tight loop: xorshift.
@@ -254,6 +281,31 @@ fn dmaCopy(p: Params, r: *Result) void {
     }
     r.add("bytes", size * n);
     r.add("checked", ok);
+}
+
+/// Exception vectors at address 0: an undefined instruction (as a trap compiles to) or an abort
+/// reports itself and ends the run, rather than the board starting over with nothing said.
+fn installVectors() void {
+    const vectors: [*]allowzero volatile u32 = @ptrFromInt(0);
+    // Each vector: ldr pc, [pc, #24] (the handler's address 32 bytes on).
+    for (0..8) |i| vectors[i] = 0xe59ff018;
+    const handlers = [8]usize{ @intFromPtr(&exceptionEntry), @intFromPtr(&exceptionEntry), @intFromPtr(&exceptionEntry), @intFromPtr(&exceptionEntry), @intFromPtr(&exceptionEntry), @intFromPtr(&exceptionEntry), @intFromPtr(&exceptionEntry), @intFromPtr(&exceptionEntry) };
+    for (handlers, 0..) |h, i| vectors[8 + i] = @intCast(h);
+}
+
+fn exceptionEntry() callconv(.naked) noreturn {
+    asm volatile (
+        \\ mov r1, lr
+        \\ mrs r0, cpsr
+        \\ ldr sp, =0x00007000
+        \\ b exceptionReport
+    );
+}
+
+export fn exceptionReport(cpsr: u32, lr: u32) noreturn {
+    hw.print("BENCH-ERROR panic: CPU exception (mode 0x{x}) at 0x{x}\n", .{ cpsr & 0x1f, lr });
+    hw.print("BENCH-DONE\n", .{});
+    hw.reset();
 }
 
 pub const panic = std.debug.FullPanic(panicked);
