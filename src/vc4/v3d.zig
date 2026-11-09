@@ -55,6 +55,9 @@ pub const V3d = struct {
     /// A vertex's clip coordinates, as its coordinate shader writes them (W NaN if it can't be run).
     pub const ClipVertex = struct { x: f32, y: f32, z: f32, w: f32 };
 
+    /// A triangle (in `shaded_tris`) binned into a tile (`y * 32 + x`).
+    const BinPair = struct { tri: u32, tile: u16 };
+
     /// The most triangles a frame's draws are shaded and binned into tiles
     /// with (those drawn: not culled, or off the framebuffer); the draws past
     /// them are shaded again for each tile.
@@ -319,6 +322,8 @@ pub const V3d = struct {
     /// in `tile_tris`.
     tile_tri_start: [32 * 32 + 1]u32 = @splat(0),
     tile_tris: std.ArrayList(u32) = .empty,
+    /// Each triangle's tiles, as binning finds them.
+    bin_pairs: std.ArrayList(BinPair) = .empty,
 
     /// What frames are drawn with on the host's GPU (made with the first frame), if they can be.
     gpu: ?*GpuState = null,
@@ -1378,12 +1383,42 @@ pub const V3d = struct {
             fn of(t: *const ShadedTriangle) [4]u32 {
                 return .{ @min(t.min_x >> 6, 31), @min(t.min_y >> 6, 31), @min((t.max_x - 1) >> 6, 31), @min((t.max_y - 1) >> 6, 31) };
             }
+
+            /// Whether `t` may cover a pixel of tile (`tx`, `ty`), of those its bounds `r` cross:
+            /// none, if all the tile's pixel centres are outside one of its edges (as a thin
+            /// triangle across the screen is of most tiles its bounds cross).
+            fn touches(t: *const ShadedTriangle, r: [4]u32, tx: usize, ty: usize) bool {
+                if ((r[0] == r[2] and r[1] == r[3]) or !t.setup_valid) return true;
+                const x0: f32 = @floatFromInt(tx * 64);
+                const y0: f32 = @floatFromInt(ty * 64);
+                inline for (.{ t.edge0, t.edge1, t.edge2 }) |e| {
+                    // A hundredth of a pixel's slack, for rounding.
+                    const slack = 0.01 * (@abs(e.dx) + @abs(e.dy));
+                    var outside = true;
+                    for ([2]f32{ y0 + 0.5, y0 + 63.5 }) |fy| {
+                        const row = e.dx * (fy - e.p0y);
+                        for ([2]f32{ x0 + 0.5, x0 + 63.5 }) |fx| {
+                            if (e.eval(row, fx) >= -slack) outside = false;
+                        }
+                    }
+                    if (outside) return false;
+                }
+                return true;
+            }
         };
+        // Each triangle's tiles, in draw order, then each tile's triangles.
+        self.bin_pairs.clearRetainingCapacity();
         var counts: [32 * 32]u32 = @splat(0);
-        for (self.shaded_tris.items) |*t| {
+        for (self.shaded_tris.items, 0..) |*t, i| {
             const r = Range.of(t);
+            self.bin_pairs.ensureUnusedCapacity(tri_allocator, (r[2] - r[0] + 1) * (r[3] - r[1] + 1)) catch return self.binNone();
             for (r[1]..r[3] + 1) |ty| {
-                for (r[0]..r[2] + 1) |tx| counts[ty * 32 + tx] += 1;
+                for (r[0]..r[2] + 1) |tx| {
+                    if (!Range.touches(t, r, tx, ty)) continue;
+                    const tile: u16 = @intCast(ty * 32 + tx);
+                    self.bin_pairs.appendAssumeCapacity(.{ .tri = @intCast(i), .tile = tile });
+                    counts[tile] += 1;
+                }
             }
         }
         var total: u32 = 0;
@@ -1392,22 +1427,19 @@ pub const V3d = struct {
             total += c;
         }
         self.tile_tri_start[counts.len] = total;
-        self.tile_tris.resize(tri_allocator, total) catch {
-            self.shaded_tris.clearRetainingCapacity();
-            self.tile_tri_start = @splat(0);
-            self.overflow_draw_start = 0;
-            return;
-        };
+        self.tile_tris.resize(tri_allocator, total) catch return self.binNone();
         var next = self.tile_tri_start;
-        for (self.shaded_tris.items, 0..) |*t, i| {
-            const r = Range.of(t);
-            for (r[1]..r[3] + 1) |ty| {
-                for (r[0]..r[2] + 1) |tx| {
-                    self.tile_tris.items[next[ty * 32 + tx]] = @intCast(i);
-                    next[ty * 32 + tx] += 1;
-                }
-            }
+        for (self.bin_pairs.items) |pair| {
+            self.tile_tris.items[next[pair.tile]] = pair.tri;
+            next[pair.tile] += 1;
         }
+    }
+
+    /// Bins no triangle: the draws are all shaded again for each tile.
+    fn binNone(self: *V3d) void {
+        self.shaded_tris.clearRetainingCapacity();
+        self.tile_tri_start = @splat(0);
+        self.overflow_draw_start = 0;
     }
 
     const AttrStream = struct {
@@ -4326,14 +4358,18 @@ test "V3D bins more triangles than tiles once did, into each tile in draw order"
     v.* = .{};
     defer v.shaded_tris.deinit(V3d.tri_allocator);
     defer v.tile_tris.deinit(V3d.tri_allocator);
+    defer v.bin_pairs.deinit(V3d.tri_allocator);
 
     // 5000 triangles, each in the tile its number picks (some across two).
-    const verts = [3]V3d.ShadedVertex{ .{}, .{ .x = 1 }, .{ .y = 1 } };
     for (0..5000) |i| {
         const tx: u32 = @intCast(i % 20);
         const ty: u32 = @intCast((i / 20) % 12);
         const wide: u32 = if (i % 7 == 0) 64 else 0;
-        try v.shaded_tris.append(V3d.tri_allocator, V3d.ShadedTriangle.init(0, tx * 64 + 8, ty * 64 + 8, tx * 64 + 16 + wide, ty * 64 + 16, 1, verts, 0));
+        const x0: f32 = @floatFromInt(tx * 64 + 8);
+        const y0: f32 = @floatFromInt(ty * 64 + 8);
+        const x1: f32 = @floatFromInt(tx * 64 + 16 + wide);
+        const verts = [3]V3d.ShadedVertex{ .{ .x = x0, .y = y0 }, .{ .x = x1, .y = y0 }, .{ .x = x0, .y = y0 + 8 } };
+        try v.shaded_tris.append(V3d.tri_allocator, V3d.ShadedTriangle.init(0, tx * 64 + 8, ty * 64 + 8, tx * 64 + 16 + wide, ty * 64 + 16, (x1 - x0) * 8, verts, 0));
     }
     v.binTriangles();
 
@@ -4683,4 +4719,92 @@ test "V3D sizes points by POINT_SIZE, or by the vertex shader if the shader reco
             };
         }
     }
+}
+
+test "V3D bins a thin triangle into the tiles it covers, not all its bounds cross" {
+    const v = try std.testing.allocator.create(V3d);
+    defer std.testing.allocator.destroy(v);
+    v.* = .{};
+    defer v.shaded_tris.deinit(V3d.tri_allocator);
+    defer v.tile_tris.deinit(V3d.tri_allocator);
+    defer v.bin_pairs.deinit(V3d.tri_allocator);
+
+    // A line 2 pixels wide from (10, 20) to (1000, 700), as its quad's two triangles.
+    const draw: V3d.DrawCall = .{ .mode = 1, .line_width = 2 };
+    const ends: [3]V3d.ShadedVertex = .{ .{ .x = 10, .y = 20 }, .{ .x = 1000, .y = 700 }, .{ .x = 1000, .y = 700 } };
+    const no_clip: V3d.ClipVertex = .{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) };
+    var pieces: [V3d.max_clipped][3]V3d.ShadedVertex = undefined;
+    const n = V3d.primitiveTriangles(draw, ends, @splat(no_clip), 0, &pieces);
+    for (pieces[0..n]) |p| {
+        const area = (p[1].x - p[0].x) * (p[2].y - p[0].y) - (p[1].y - p[0].y) * (p[2].x - p[0].x);
+        const min_x: u32 = @intFromFloat(@floor(@min(p[0].x, @min(p[1].x, p[2].x))));
+        const min_y: u32 = @intFromFloat(@floor(@min(p[0].y, @min(p[1].y, p[2].y))));
+        const max_x: u32 = @intFromFloat(@ceil(@max(p[0].x, @max(p[1].x, p[2].x))));
+        const max_y: u32 = @intFromFloat(@ceil(@max(p[0].y, @max(p[1].y, p[2].y))));
+        try v.shaded_tris.append(V3d.tri_allocator, V3d.ShadedTriangle.init(0, min_x, min_y, max_x, max_y, area, p, 0));
+    }
+    v.binTriangles();
+
+    for (v.shaded_tris.items, 0..) |*t, i| {
+        var bounds: usize = 0;
+        var binned: usize = 0;
+        for (0..32) |ty| for (0..32) |tx| {
+            const in_bounds = t.min_x >> 6 <= tx and (t.max_x - 1) >> 6 >= tx and t.min_y >> 6 <= ty and (t.max_y - 1) >> 6 >= ty;
+            if (in_bounds) bounds += 1;
+            const tile = ty * 32 + tx;
+            const list = v.tile_tris.items[v.tile_tri_start[tile]..v.tile_tri_start[tile + 1]];
+            const in_list = std.mem.indexOfScalar(u32, list, @intCast(i)) != null;
+            if (in_list) binned += 1;
+            // Binned into each tile one of its pixels is in.
+            var covers = false;
+            for (0..64) |py| for (0..64) |px| {
+                const fx: f32 = @floatFromInt(tx * 64 + px);
+                const fy: f32 = @floatFromInt(ty * 64 + py);
+                if (inAnyPiece(&.{t.v}, fx + 0.5, fy + 0.5)) covers = true;
+            };
+            if (covers) try std.testing.expect(in_list);
+        };
+        // A small part of the tiles its bounds cross.
+        try std.testing.expect(binned * 4 < bounds);
+    }
+}
+
+test "V3D draws fragment shaders that read varyings and drop them on its fast path" {
+    // Varyings each into an accumulator, or read on their own and dropped into r3, where the
+    // colour is then packed: red from r0, green r1, blue r2.
+    const cases = .{
+        .{ &[_]?u3{ 0, 1, 2 }, [4]u8{ 2, 1, 0, 0xff } },
+        .{ &[_]?u3{ null, 0, 1, 2 }, [4]u8{ 3, 2, 1, 0xff } },
+        .{ &[_]?u3{ 0, 1, null, null, 2 }, [4]u8{ 4, 1, 0, 0xff } },
+    };
+    inline for (cases) |case| {
+        var p: qpu.Program(32) = .{};
+        for (case[0]) |dst| {
+            const acc = dst orelse 3;
+            p.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(acc), .a = qpu.vary, .b = qpu.frag_w } }));
+            if (dst != null) p.emit(try qpu.alu(.{ .add = .{ .op = .fadd, .dst = qpu.wr(acc), .a = qpu.r(acc), .b = qpu.r(5) } }));
+        }
+        const one = qpu.smallImmFloat(1.0);
+        p.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(2), .b = one }, .pack = .{ .mul = .@"8a" } }));
+        p.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(1), .b = one }, .pack = .{ .mul = .@"8b" } }));
+        p.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(0), .b = one }, .pack = .{ .mul = .@"8c" } }));
+        p.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = one, .b = one }, .pack = .{ .mul = .@"8d" } }));
+        p.emit(qpu.nop(.wait_scoreboard));
+        p.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(3)));
+        p.end(.fragment);
+        var buf: [64]qpu_sim.DecodedInst = undefined;
+        const f = qpu_sim.analyzeFragmentShader(qpu_sim.decodeProgram(p.code(), &buf), &.{});
+        try std.testing.expectEqual(qpu_sim.FastFragKind.varying_pack_rgba, f.kind);
+        try std.testing.expectEqual(case[1], f.var_idx);
+        try std.testing.expectEqual(@as(u32, 0xff000000), f.color & 0xff000000);
+    }
+    // Packing only some bytes of what isn't known leaves the colour unknown: no fast path.
+    var p: qpu.Program(16) = .{};
+    p.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.vary, .b = qpu.frag_w } }));
+    p.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.smallImmFloat(1.0), .b = qpu.smallImmFloat(1.0) }, .pack = .{ .mul = .@"8d" } }));
+    p.emit(qpu.nop(.wait_scoreboard));
+    p.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(3)));
+    p.end(.fragment);
+    var buf: [32]qpu_sim.DecodedInst = undefined;
+    try std.testing.expectEqual(qpu_sim.FastFragKind.none, qpu_sim.analyzeFragmentShader(qpu_sim.decodeProgram(p.code(), &buf), &.{}).kind);
 }

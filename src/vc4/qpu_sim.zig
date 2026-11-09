@@ -461,8 +461,16 @@ const Tmu0SampleInfo = struct {
 };
 
 const PackedRgbaInfo = struct {
+    /// Each byte's varying, 0xff if it is `const_rgba`'s, or `unknown_byte` if it isn't known (what
+    /// the register held before bytes were packed into it).
     var_idx: [4]u8,
     const_rgba: u32,
+
+    const unknown_byte = 0xfe;
+
+    fn complete(p: PackedRgbaInfo) bool {
+        return std.mem.indexOfScalar(u8, &p.var_idx, unknown_byte) == null;
+    }
 };
 
 const SymVal = union(enum) {
@@ -546,6 +554,7 @@ pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: Uniforms) F
                     var cur_pack: PackedRgbaInfo = switch (dst.*) {
                         .constant => |c| .{ .var_idx = [4]u8{ 0xff, 0xff, 0xff, 0xff }, .const_rgba = c },
                         .packed_rgba => |p| p,
+                        .unknown => .{ .var_idx = @splat(PackedRgbaInfo.unknown_byte), .const_rgba = 0 },
                         else => {
                             dst.* = .unknown;
                             return;
@@ -581,6 +590,7 @@ pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: Uniforms) F
                         var cur_pack: PackedRgbaInfo = switch (dst.*) {
                             .constant => |c| .{ .var_idx = [4]u8{ 0xff, 0xff, 0xff, 0xff }, .const_rgba = c },
                             .packed_rgba => |p| p,
+                            .unknown => .{ .var_idx = @splat(PackedRgbaInfo.unknown_byte), .const_rgba = 0 },
                             else => {
                                 dst.* = .unknown;
                                 return;
@@ -697,11 +707,20 @@ pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: Uniforms) F
             continue;
         }
 
-        if ((d.flags & DecodedInst.FLAG_READS_VARY) != 0) {
+        // A varying read on its own, not fused with its add of C (as one whose value is dropped
+        // may be): what it reads isn't followed, but the next read is of the next varying, and r5
+        // then holds C.
+        const vary_alone = (d.flags & DecodedInst.FLAG_READS_VARY) != 0;
+        if (vary_alone) {
             reads_vary = true;
-            can_use_sym = false;
+            sym_varyings_read +|= 1;
+            const reads_a = (d.flags & DecodedInst.FLAG_FETCH_A) != 0 and d.raddr_a == qpu.R.vary;
+            const reads_b = (d.flags & DecodedInst.FLAG_FETCH_B) != 0 and d.raddr_b == qpu.R.vary and d.sig != .small_imm;
+            if (reads_a and reads_b) can_use_sym = false;
         }
-        if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0) {
+        // W, read to scale a varying read on its own (into what isn't followed), is no other input.
+        const reads_w_for_vary = vary_alone and d.raddr_a == qpu.R.frag_payload_zw;
+        if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0 and !reads_w_for_vary) {
             switch (d.raddr_a) {
                 qpu.R.frag_payload_zw, qpu.R.xy_pixel_coord, qpu.R.elem_qpu, qpu.R.ms_rev_flags, qpu.R.vpm => {
                     reads_other_per_pixel = true;
@@ -729,7 +748,9 @@ pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: Uniforms) F
                 mul_sym = add_sym;
             } else {
                 if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0) {
-                    acc_sym[6] = if (d.raddr_a < 32)
+                    acc_sym[6] = if (reads_w_for_vary)
+                        .unknown
+                    else if (d.raddr_a < 32)
                         ra_sym[d.raddr_a]
                     else if (d.raddr_a == qpu.R.unif) blk: {
                         const c = if (sym_unifs_read < uniforms.len) uniforms[sym_unifs_read] else 0;
@@ -865,6 +886,7 @@ pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: Uniforms) F
             .prog_end => end_at = ip + 2,
             else => {},
         }
+        if (vary_alone) acc_sym[5] = .{ .constant = @bitCast(varying_c) };
     }
 
     if (end_at == null) return .{};
@@ -884,7 +906,7 @@ pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: Uniforms) F
         switch (tlb_sym) {
             .constant => |c| return .{ .kind = .constant_color, .color = c },
             .packed_rgba => |p| {
-                if (!uses_tmu0) {
+                if (!uses_tmu0 and p.complete()) {
                     return .{
                         .kind = .varying_pack_rgba,
                         .color = p.const_rgba,
