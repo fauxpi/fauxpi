@@ -619,15 +619,25 @@ const glsl_helpers =
     \\  return pack4(((p + 1u + (p >> 8)) >> 8) & 0xffu);
     \\}
     \\
-    \\// The TMU's wrapping (qpu_sim's wrap): repeat, or clamp to the edge.
+    \\// The TMU's wrapping (qpu_sim's wrap): repeat, clamp to the edge, mirror, or the border
+    \\// (0x80000000: the border colour, 0 with no r coordinate).
     \\uint tex_wrap(float c, uint size, uint mode) {
     \\  int n = int(max(size, 1u));
     \\  int i = isnan(c) ? 0 : int(clamp(c, -1e9, 1e9));
     \\  if (mode == 0u) return uint(i >= 0 ? i % n : (n - 1) - ((-i - 1) % n));
+    \\  if (mode == 2u) {
+    \\    int p = 2 * n;
+    \\    int m = i >= 0 ? i % p : (p - 1) - ((-i - 1) % p);
+    \\    return uint(m < n ? m : p - 1 - m);
+    \\  }
+    \\  if (mode == 3u) return (i < 0 || i >= n) ? 0x80000000u : uint(i);
     \\  return uint(clamp(i, 0, n - 1));
     \\}
     \\
-    \\uint texel(usampler2D t, uint x, uint y) { return texelFetch(t, ivec2(x, y), 0).r; }
+    \\uint texel(usampler2D t, uint x, uint y) {
+    \\  if (((x | y) & 0x80000000u) != 0u) return 0u;
+    \\  return texelFetch(t, ivec2(x, y), 0).r;
+    \\}
     \\
     \\// The TMU sampling texture `t` (decoded from RAM; `ok` if it could be), as qpu_sim does.
     \\uint tmu_sample(usampler2D t, uint ok, uint p0, uint p1, float s, float tc) {
@@ -1237,11 +1247,15 @@ const Translator = struct {
                 const unit: usize = if (waddr <= qpu.W.tmu0_b) 0 else 1;
                 const tmu = &t.tmu[unit];
                 if (t.uniforms >= max_uniforms) t.tooManyUniforms();
+                if ((waddr == qpu.W.tmu0_s or waddr == qpu.W.tmu1_s) and tmu.param_count == 0) t.shader.unsupported = true;
                 if (t.uniforms < max_uniforms and tmu.param_count < 4) {
                     tmu.params[tmu.param_count] = t.uniforms;
                     tmu.param_count += 1;
                     t.uniforms += 1;
                 }
+                // The r and b coordinates (cube maps, child images, border colours, levels of
+                // detail), and general memory lookups (s alone): left to qpu_sim.
+                if ((waddr - qpu.W.tmu0_s) & 3 >= 2) t.shader.unsupported = true;
                 if (waddr == qpu.W.tmu0_t or waddr == qpu.W.tmu1_t) {
                     try w.print("    tmu{d}_t = {s};\n", .{ unit, val });
                     tmu.has_t = true;

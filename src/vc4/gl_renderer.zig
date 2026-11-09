@@ -703,9 +703,9 @@ pub const Renderer = struct {
         for (draws, 0..) |d, i| {
             const p = r.program(d.code, multisampled) orelse return error.Unsupported;
             programs[i] = p;
-            // Textures whose lookups aren't blended byte by byte: the frame on the CPU.
+            // Textures not sampled here as qpu_sim samples them: the frame on the CPU.
             for (p.shader.samples[0..p.shader.sample_count]) |sm| {
-                if (!qpu_sim.DecodedTexture.blendsBytes(d.uniforms[sm.p0], d.uniforms[sm.p1])) return error.Unsupported;
+                if (!qpu_sim.DecodedTexture.sampledOnGpu(d.uniforms[sm.p0], d.uniforms[sm.p1])) return error.Unsupported;
             }
         }
         var vertex_programs: [gpu_draw.max_draws]*const VertexProgram = undefined;

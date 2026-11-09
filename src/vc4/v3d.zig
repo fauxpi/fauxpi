@@ -3149,7 +3149,7 @@ pub const V3d = struct {
         const fast_frag = qpu_sim.analyzeFragmentShader(fs_decoded, fs_unifs);
         var tb = self.tileBuf();
         defer self.syncFromTileBuf(&tb);
-        rasterizeShadedTriangleDecodedInTileBuf(&tb, ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
+        rasterizeInTileBuf(&tb, ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
     }
 
     /// Rasterizes `tri` into the tile (multisampled or not, as `tb` is).
@@ -3166,12 +3166,188 @@ pub const V3d = struct {
         tile_px_y: u32,
         tile_size: u32,
     ) void {
-        if (tb.ms) {
+        if (fast_frag.quads) {
+            rasterizeQuadsInTileBuf(tb, ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
+        } else if (tb.ms) {
             rasterizeMsTriangleInTileBuf(tb, ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y);
         } else {
             rasterizeShadedTriangleDecodedInTileBuf(tb, ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
         }
     }
+
+    /// Rasterizes `tri` into the tile (multisampled or not, as `tb` is) as V3D does, a 2x2 quad
+    /// of pixels at a time: each quad with a sample covered (and passing the depth test) is
+    /// shaded whole, 4 quads together (the pixels not covered too, their results unused), so the
+    /// TMU's levels of detail come from the quads' differences. Slower than the other paths;
+    /// for shaders that need it.
+    fn rasterizeQuadsInTileBuf(
+        tb: *TileBuffer,
+        ram: []const u8,
+        draw: DrawCall,
+        tri: *const ShadedTriangle,
+        fs_decoded: []const qpu_sim.DecodedInst,
+        fs_unifs: qpu_sim.Uniforms,
+        num_varyings: u8,
+        fast_frag: qpu_sim.FastFragShader,
+        tile_px_x: u32,
+        tile_px_y: u32,
+        tile_size_in: u32,
+    ) void {
+        const tile_size: u32 = if (tb.ms) 32 else tile_size_in;
+        const x_start = @max(tri.min_x, tile_px_x);
+        const y_start = @max(tri.min_y, tile_px_y);
+        const x_end = @min(tri.max_x, tile_px_x + tile_size);
+        const y_end = @min(tri.max_y, tile_px_y + tile_size);
+        if (x_start >= x_end or y_start >= y_end) return;
+
+        const depth_func: u3 = @truncate((draw.config_b1 >> 4) & 7);
+        const z_updates = (draw.config_b1 & 0x80) != 0;
+        const need_depth = (depth_func != 7) or z_updates;
+        const n_var = @min(@as(usize, num_varyings), 16);
+        const t = if (tri.setup_valid) tri.* else ShadedTriangle.init(tri.draw_idx, tri.min_x, tri.min_y, tri.max_x, tri.max_y, tri.area, tri.v, n_var);
+        if (t.inv_area <= 0) return;
+        const centre = [1][2]f32{.{ 0.5, 0.5 }};
+        const offsets: []const [2]f32 = if (tb.ms) &sample_offsets else &centre;
+        const spp: u32 = if (tb.ms) 4 else 1;
+
+        var batch: QuadBatch = .{};
+        var materialized = false;
+        var qy = y_start & ~@as(u32, 1);
+        while (qy < y_end) : (qy += 2) {
+            var qx = x_start & ~@as(u32, 1);
+            while (qx < x_end) : (qx += 2) {
+                var masks: [4]u4 = @splat(0);
+                var zs: [4][4]f32 = undefined;
+                for (0..4) |i| {
+                    const px = qx + @as(u32, @intCast(i & 1));
+                    const py = qy + @as(u32, @intCast(i >> 1));
+                    if (px < x_start or px >= x_end or py < y_start or py >= y_end) continue;
+                    const idx = (py - tile_px_y) * tile_size + (px - tile_px_x);
+                    for (offsets, 0..) |off, si| {
+                        const fx = @as(f32, @floatFromInt(px)) + off[0];
+                        const fy = @as(f32, @floatFromInt(py)) + off[1];
+                        const e0 = t.edge0.eval(t.edge0.dx * (fy - t.edge0.p0y), fx);
+                        const e1 = t.edge1.eval(t.edge1.dx * (fy - t.edge1.p0y), fx);
+                        const e2 = t.edge2.eval(t.edge2.dx * (fy - t.edge2.p0y), fx);
+                        if (!t.edge0.passes(e0) or !t.edge1.passes(e1) or !t.edge2.passes(e2)) continue;
+                        const z = t.v[2].z + e0 * t.inv_area * t.dz0 + e1 * t.inv_area * t.dz1;
+                        if (depth_func != 7) {
+                            if (!materialized) {
+                                ensureTileMaterializedBuf(tb, ram, need_depth);
+                                materialized = true;
+                            }
+                            if (!depthPasses(depth_func, z, tb.depth[idx * spp + si])) continue;
+                        }
+                        masks[i] |= @as(u4, 1) << @intCast(si);
+                        zs[i][si] = z;
+                    }
+                }
+                if (masks[0] | masks[1] | masks[2] | masks[3] == 0) continue;
+                if (!materialized) {
+                    ensureTileMaterializedBuf(tb, ram, need_depth);
+                    materialized = true;
+                }
+                // The quad's pixels, covered or not, their inputs at their middles.
+                for (0..4) |i| {
+                    const px = qx + @as(u32, @intCast(i & 1));
+                    const py = qy + @as(u32, @intCast(i >> 1));
+                    const lane = batch.len;
+                    const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                    const fy = @as(f32, @floatFromInt(py)) + 0.5;
+                    const w0 = t.edge0.eval(t.edge0.dx * (fy - t.edge0.p0y), fx) * t.inv_area;
+                    const w1 = t.edge1.eval(t.edge1.dx * (fy - t.edge1.p0y), fx) * t.inv_area;
+                    const inv_w = t.v[2].inv_w + w0 * t.dinvw0 + w1 * t.dinvw1;
+                    const w: f32 = if (t.all_unit_w or @abs(inv_w) <= 1e-12) 1 else 1 / inv_w;
+                    const in_tile = px < tile_px_x + tile_size and py < tile_px_y + tile_size;
+                    const idx = if (in_tile) (py - tile_px_y) * tile_size + (px - tile_px_x) else 0;
+                    batch.idx[lane] = idx;
+                    batch.mask[lane] = if (in_tile) masks[i] else 0;
+                    batch.zs[lane] = zs[i];
+                    batch.frag_w[lane] = @bitCast(w);
+                    batch.frag_z[lane] = @bitCast(t.v[2].z + w0 * t.dz0 + w1 * t.dz1);
+                    batch.frag_x[lane] = px;
+                    batch.frag_y[lane] = py;
+                    for (0..n_var) |vi| {
+                        const v = t.v[2].persp_varyings[vi] + w0 * t.dvar0[vi] + w1 * t.dvar1[vi];
+                        batch.varyings[vi][lane] = @bitCast(v * w);
+                    }
+                    for (0..4) |si| batch.samples_in[si][lane] = if (in_tile) tb.color[idx * spp + (if (tb.ms) si else 0)] else 0;
+                    batch.len += 1;
+                }
+                if (batch.len == 16) batch.flush(tb, ram, fs_decoded, fs_unifs, n_var, fast_frag, z_updates);
+            }
+        }
+        batch.flush(tb, ram, fs_decoded, fs_unifs, n_var, fast_frag, z_updates);
+    }
+
+    /// Up to 4 quads of pixels (multisampled or not), shaded together.
+    const QuadBatch = struct {
+        len: usize = 0,
+        idx: [16]u32 = undefined,
+        /// The samples drawn (bit 0 alone, not multisampled), and their depths.
+        mask: [16]u4 = undefined,
+        zs: [16][4]f32 = undefined,
+        frag_w: qpu_sim.Vec = qpu_sim.splatF(1),
+        frag_z: qpu_sim.Vec = qpu_sim.splat(0),
+        frag_x: qpu_sim.Vec = qpu_sim.splat(0),
+        frag_y: qpu_sim.Vec = qpu_sim.splat(0),
+        varyings: [16]qpu_sim.Vec = @splat(qpu_sim.splat(0)),
+        samples_in: [4]qpu_sim.Vec = @splat(qpu_sim.splat(0)),
+        tex_cache: [2]qpu_sim.TexCache = .{ .{}, .{} },
+
+        fn flush(
+            b: *QuadBatch,
+            tb: *TileBuffer,
+            ram: []const u8,
+            fs_decoded: []const qpu_sim.DecodedInst,
+            fs_unifs: qpu_sim.Uniforms,
+            n_var: usize,
+            fast_frag: qpu_sim.FastFragShader,
+            z_updates: bool,
+        ) void {
+            const count = b.len;
+            if (count == 0) return;
+            b.len = 0;
+            // The quads past them as the last (their results unused).
+            for (count..16) |lane| {
+                const from = count - 4 + (lane & 3);
+                b.mask[lane] = 0;
+                b.frag_w[lane] = b.frag_w[from];
+                b.frag_z[lane] = b.frag_z[from];
+                b.frag_x[lane] = b.frag_x[from];
+                b.frag_y[lane] = b.frag_y[from];
+                for (b.varyings[0..n_var]) |*v| v[lane] = v[from];
+                for (&b.samples_in) |*v| v[lane] = v[from];
+            }
+            const env: qpu_sim.Env = .{
+                .uniforms = fs_unifs,
+                .varyings = b.varyings[0..n_var],
+                .frag_w = b.frag_w,
+                .frag_z = b.frag_z,
+                .frag_x = b.frag_x,
+                .frag_y = b.frag_y,
+                .texture_memory = ram,
+                .tlb_color_in = b.samples_in[0],
+                .tlb_samples_in = if (tb.ms) &b.samples_in else null,
+                .tex_cache = &b.tex_cache,
+            };
+            const res = qpu_sim.runFragmentFast(fast_frag, fs_decoded, &env) catch return;
+            if (res.tlb_color == null and res.tlb_samples == 0) return;
+            const spp: u32 = if (tb.ms) 4 else 1;
+            for (0..count) |lane| {
+                const base = b.idx[lane] * spp;
+                for (0..spp) |si| {
+                    if (b.mask[lane] & (@as(u4, 1) << @intCast(si)) == 0) continue;
+                    const color = if (res.tlb_samples > 0)
+                        (if (si < res.tlb_samples) res.tlb_color_samples[si][lane] else continue)
+                    else
+                        res.tlb_color.?[lane];
+                    tb.color[base + si] = color;
+                    if (z_updates) tb.depth[base + si] = b.zs[lane][si];
+                }
+            }
+        }
+    };
 
     /// Where a multisampled pixel's samples are, from its top-left corner (the usual 4x pattern, a
     /// grid turned so no two share a row or column).

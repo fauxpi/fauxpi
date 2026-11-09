@@ -76,6 +76,9 @@ pub const FragResult = struct {
     /// Multisampled: each sample's colour, as written in turn (to tlb_color_ms).
     tlb_color_samples: [4]Vec = undefined,
     tlb_samples: usize = 0,
+    /// A lookup took its level of detail from the differences across its 2x2 quads of
+    /// elements (which a fragment shader's must be, for it to be right).
+    needs_quads: bool = false,
 };
 
 pub const Error = error{
@@ -114,6 +117,9 @@ const State = struct {
     tmu_fifo_len: [2]u3 = .{ 0, 0 },
     tmu_params: [2][4]u32 = undefined,
     tmu_coord_t: [2]Vec = undefined,
+    /// The r and b coordinates, if written since the last request.
+    tmu_coord_r: [2]?Vec = .{ null, null },
+    tmu_coord_b: [2]?Vec = .{ null, null },
     tmu_fifo: [2][4]Vec = undefined,
     /// A lookup's second word (RGBA64's blue and alpha), read after its first.
     tmu_fifo_second: [2][4]?Vec = @splat(@splat(null)),
@@ -650,6 +656,9 @@ pub const FastFragShader = struct {
     tmu_p0_unif: u8 = 0,
     tmu_p1_unif: u8 = 1,
     tmu_modulate: bool = false,
+    /// Its texture lookups take their level of detail from 2x2 quads of pixels: it must be
+    /// given its pixels in quads (`v3d`'s quad path), not as they come.
+    quads: bool = false,
 };
 
 const Tmu0SampleInfo = struct {
@@ -688,6 +697,28 @@ const SymVal = union(enum) {
 };
 
 pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: Uniforms) FastFragShader {
+    var fast = analyzeFragmentShaderKind(decoded, uniforms);
+    fast.quads = needsQuads(decoded, uniforms);
+    return fast;
+}
+
+/// Whether a fragment shader's texture lookups take their level of detail from 2x2 quads: those
+/// with lookups run once (their textures' configs are the uniforms', whatever the inputs), to
+/// see (if it can't be, as if they did).
+fn needsQuads(decoded: []const DecodedInst, uniforms: Uniforms) bool {
+    var looks_up = false;
+    for (decoded) |d| {
+        for ([2]u6{ d.waddr_add, d.waddr_mul }) |wa| {
+            if (wa >= qpu.W.tmu0_s and wa <= qpu.W.tmu1_b) looks_up = true;
+        }
+    }
+    if (!looks_up) return false;
+    const zeros: [64]Vec = @splat(splat(0));
+    const res = runFragmentDecoded(decoded, &.{ .uniforms = uniforms, .varyings = &zeros }) catch return true;
+    return res.needs_quads;
+}
+
+fn analyzeFragmentShaderKind(decoded: []const DecodedInst, uniforms: Uniforms) FastFragShader {
     if (decoded.len == 0) return .{};
 
     var reads_vary = false;
@@ -1175,7 +1206,8 @@ pub inline fn runFragmentFast(
             const t_vec: Vec = if (t_var < env.varyings.len) env.varyings[t_var] else splat(0);
             var local_cache: TexCache = .{};
             var second: ?Vec = null;
-            const texel = sampleTmuVec(0, p0, p1, s_vec, t_vec, env, &local_cache, &second);
+            const req: TmuRequest = .{ .params = .{ p0, p1, 0, 0 }, .count = 2, .s = s_vec, .t = t_vec, .r = null, .b = null };
+            const texel = sampleTmuVec(0, &req, env, &local_cache, &second);
             if (fast.tmu_modulate) {
                 return .{ .tlb_color = v8muldVec(texel, @splat(fast.color)) };
             }
@@ -1514,31 +1546,202 @@ fn readPort(s: *State, env: *const Env, raddr: u6, file: File) Error!Vec {
     }
 }
 
+/// The next uniform (for the TMU's config parameters), from memory after a write to
+/// UNIFORMS_ADDRESS.
+fn nextUniform(s: *State, env: *const Env) u32 {
+    if (s.unif_override) |list| {
+        if (list.len == 0) return 0;
+        s.unif_override = list[1..];
+        return list[0];
+    }
+    if (s.uniforms_read >= env.uniforms.len) return 0;
+    defer s.uniforms_read += 1;
+    return env.uniforms[s.uniforms_read];
+}
+
+/// A texture lookup: its config parameters (in the order written, from the uniforms), and its
+/// coordinates.
+const TmuRequest = struct {
+    params: [4]u32,
+    count: u8,
+    s: Vec,
+    t: ?Vec,
+    r: ?Vec,
+    b: ?Vec,
+
+    fn config(q: *const TmuRequest) texture.Config {
+        return texture.decodeConfig(q.params[0], if (q.count > 1) q.params[1] else 0);
+    }
+
+    /// What config parameters 2 and 3 say.
+    fn extra(q: *const TmuRequest) TexExtra {
+        var e: TexExtra = .{};
+        for (q.params[2..@max(q.count, 2)]) |p| {
+            switch (p >> 30) {
+                1 => {
+                    e.cube_stride = p & 0x3ffff000;
+                    e.bslod = p & 1 != 0;
+                },
+                2 => {
+                    e.child_w = p & 0x7ff;
+                    e.child_h = (p >> 12) & 0x7ff;
+                },
+                3 => {
+                    e.child_x = p & 0x7ff;
+                    e.child_y = (p >> 12) & 0x7ff;
+                },
+                else => {},
+            }
+        }
+        return e;
+    }
+
+    /// Whether the level of detail comes from the coordinates' differences across 2x2 quads.
+    fn lodFromQuads(q: *const TmuRequest) bool {
+        return needsLod(q.config()) and !q.extra().bslod;
+    }
+};
+
+const TexExtra = struct {
+    /// Cube map faces' distance apart.
+    cube_stride: u32 = 0,
+    /// The level of detail is the b coordinate alone (else it's added to that computed).
+    bslod: bool = false,
+    /// A child image: the window of the texture sampled (none if 0 wide).
+    child_w: u32 = 0,
+    child_h: u32 = 0,
+    child_x: u32 = 0,
+    child_y: u32 = 0,
+};
+
+/// Whether sampling `c` depends on the level of detail: mipmapped, or minified with another
+/// filter than magnified.
+fn needsLod(c: texture.Config) bool {
+    return c.min_filter != c.mag_filter or (c.mip_filter != .none and c.mip_levels > 0);
+}
+
+/// The texture memory a TMU lookup at `addr` reads (tests may give each texture its own), and
+/// the address in it.
+fn tmuMemory(unit: usize, addr: u32, env: *const Env) struct { []const u8, u32 } {
+    const memory = if (unit == 0) env.texture_memory else if (env.texture_memory1.len > 0) env.texture_memory1 else env.texture_memory;
+    if (env.textures.len > 0) {
+        const i = addr / texture_base;
+        if (i < env.textures.len) return .{ env.textures[i], addr - i * texture_base };
+    }
+    return .{ memory, addr };
+}
+
+/// A general memory lookup: the word at each element's address.
+fn directLookup(unit: usize, addrs: Vec, env: *const Env) Vec {
+    var out: Vec = undefined;
+    for (0..lanes) |lane| {
+        const mem, const addr = tmuMemory(unit, addrs[lane], env);
+        const off = addr & vc_bus.ramMask(mem.len) & ~@as(u32, 3);
+        out[lane] = if (mem.len >= 4 and off + 4 <= mem.len) std.mem.readInt(u32, mem[off..][0..4], .little) else 0;
+    }
+    return out;
+}
+
+/// The size of a power of two at least `v`.
+fn potOf(v: u32) u32 {
+    return std.math.ceilPowerOfTwo(u32, @max(v, 1)) catch 2048;
+}
+
+/// Level `level` of the texture `c` whose level 0 is at `base`: the levels below level 0
+/// are before it in memory, each smaller after the one bigger, each half the last (its size
+/// rounded up to a power of two first), down to 1.
+fn levelConfig(c: texture.Config, base: u32, level: u32, memory_len: usize) texture.Config {
+    var l = c;
+    l.offset = base;
+    if (level == 0) return l;
+    var off = base;
+    for (1..level + 1) |j| {
+        var lj = c;
+        lj.width = @max(potOf(c.width) >> @intCast(j), 1);
+        lj.height = @max(potOf(c.height) >> @intCast(j), 1);
+        const pt = PrecomputedTex.init(lj, memory_len) catch return l;
+        off -%= pt.len;
+        l.width = lj.width;
+        l.height = lj.height;
+    }
+    l.offset = off;
+    return l;
+}
+
+/// Where a cube map's coordinates point: the face (+X, -X, +Y, -Y, +Z, -Z), and s and t on it.
+fn cubeFace(x: f32, y: f32, z: f32) struct { u32, f32, f32 } {
+    const ax = @abs(x);
+    const ay = @abs(y);
+    const az = @abs(z);
+    var face: u32 = undefined;
+    var ma: f32 = undefined;
+    var sc: f32 = undefined;
+    var tc: f32 = undefined;
+    if (ax >= ay and ax >= az) {
+        face = if (x >= 0) 0 else 1;
+        ma = ax;
+        sc = if (x >= 0) -z else z;
+        tc = -y;
+    } else if (ay >= az) {
+        face = if (y >= 0) 2 else 3;
+        ma = ay;
+        sc = x;
+        tc = if (y >= 0) z else -z;
+    } else {
+        face = if (z >= 0) 4 else 5;
+        ma = az;
+        sc = if (z >= 0) x else -x;
+        tc = -y;
+    }
+    if (!(ma > 0)) return .{ face, 0.5, 0.5 };
+    return .{ face, (sc / ma + 1) * 0.5, (tc / ma + 1) * 0.5 };
+}
+
+/// The level of detail of each element's lookup, from the differences of its coordinates
+/// (`s`, `t`, in texels of level 0) across its 2x2 quad of elements (0 and 1 its top row, 2 and
+/// 3 below): log2 of the longer of the steps across and down.
+fn quadLod(s: [lanes]f32, t: [lanes]f32) [lanes]f32 {
+    var out: [lanes]f32 = undefined;
+    for (0..lanes) |lane| {
+        const q = lane & ~@as(usize, 3);
+        const row = (lane >> 1) & 1;
+        const col = lane & 1;
+        const dsdx = s[q + row * 2 + 1] - s[q + row * 2];
+        const dtdx = t[q + row * 2 + 1] - t[q + row * 2];
+        const dsdy = s[q + 2 + col] - s[q + col];
+        const dtdy = t[q + 2 + col] - t[q + col];
+        const rx = dsdx * dsdx + dtdx * dtdx;
+        const ry = dsdy * dsdy + dtdy * dtdy;
+        const rho2 = @max(rx, ry);
+        out[lane] = if (rho2 > 0 and !std.math.isInf(rho2)) 0.5 * sfuLog2(rho2) else if (rho2 > 0) 32 else -32;
+    }
+    return out;
+}
+
 fn sampleTmuVec(
     unit: usize,
-    p0_in: u32,
-    p1: u32,
-    s_vec: Vec,
-    t_vec: ?Vec,
+    req: *const TmuRequest,
     env: *const Env,
     fallback_cache: *TexCache,
     second: *?Vec,
 ) Vec {
     second.* = null;
-    var memory = if (unit == 0) env.texture_memory else if (env.texture_memory1.len > 0) env.texture_memory1 else env.texture_memory;
-    var p0 = p0_in;
-    if (env.textures.len > 0) {
-        const i = p0 / texture_base;
-        if (i < env.textures.len) {
-            memory = env.textures[i];
-            p0 -= i * texture_base;
-        }
+    const p0_in = req.params[0];
+    const p1 = if (req.count > 1) req.params[1] else 0;
+    const memory, const p0 = tmuMemory(unit, p0_in, env);
+    const cfg = texture.decodeConfig(p0, p1);
+    const cube = (p0 >> 9) & 1 != 0;
+    const extra = req.extra();
+    if (cube or extra.child_w != 0 or needsLod(cfg) or cfg.wrap_s == .border or cfg.wrap_t == .border or extra.bslod) {
+        return sampleTmuFull(memory, cfg, cube, extra, req, second);
     }
+    const s_vec = req.s;
+    const t_vec = req.t;
     const cache_slot: *TexCache = if (env.tex_cache) |tc| &tc[unit] else fallback_cache;
     if (cache_slot.p0 != p0 or cache_slot.p1 != p1) {
         cache_slot.p0 = p0;
         cache_slot.p1 = p1;
-        if (PrecomputedTex.init(texture.decodeConfig(p0, p1), memory.len)) |inited| {
+        if (PrecomputedTex.init(cfg, memory.len)) |inited| {
             cache_slot.pt = inited;
             cache_slot.valid = true;
         } else |_| {
@@ -1565,15 +1768,15 @@ fn sampleTmuVec(
         var prev_wx: u32 = 0xffff_ffff;
         var prev_wy: u32 = 0xffff_ffff;
         var prev_out: u32 = 0;
-        const zero_wy: u32 = if (t_vec == null) (if (0.0 < pt.fh) 0 else wrap(0.0, p.height, p.wrap_t)) else 0;
+        const zero_wy: u32 = if (t_vec == null) (if (0.0 < pt.fh) 0 else wrap(0.0, pt.wh, p.wrap_t)) else 0;
         for (0..lanes) |lane| {
             const s_coord = f(s_vec[lane]);
             const fx = @floor(s_coord * pt.fw);
-            const wx: u32 = if (fx >= 0.0 and fx < pt.fw) @intFromFloat(fx) else wrap(fx, p.width, p.wrap_s);
+            const wx: u32 = if (fx >= 0.0 and fx < pt.fw) @intFromFloat(fx) else wrap(fx, pt.ww, p.wrap_s);
             const wy: u32 = if (t_vec) |tv| blk: {
                 const t_coord = f(tv[lane]);
                 const fy = @floor(t_coord * pt.fh);
-                break :blk if (fy >= 0.0 and fy < pt.fh) @intFromFloat(fy) else wrap(fy, p.height, p.wrap_t);
+                break :blk if (fy >= 0.0 and fy < pt.fh) @intFromFloat(fy) else wrap(fy, pt.wh, p.wrap_t);
             } else zero_wy;
             if (wx == prev_wx and wy == prev_wy) {
                 texel[lane] = prev_out;
@@ -1604,6 +1807,115 @@ fn sampleTmuVec(
         }
     }
     return texel;
+}
+
+/// A lookup with all the TMU's features: levels of detail (from 2x2 quads of elements, plus
+/// the b coordinate's bias, or the bias alone) choosing the filter and mipmap levels, cube maps,
+/// child images, and border colours (the r coordinate's word).
+fn sampleTmuFull(memory: []const u8, cfg: texture.Config, cube: bool, extra: TexExtra, req: *const TmuRequest, second: *?Vec) Vec {
+    var s: [lanes]f32 = undefined;
+    var t: [lanes]f32 = undefined;
+    var face: [lanes]u32 = @splat(0);
+    for (0..lanes) |lane| {
+        s[lane] = f(req.s[lane]);
+        t[lane] = if (req.t) |tv| f(tv[lane]) else 0;
+        if (cube) {
+            const r = if (req.r) |rv| f(rv[lane]) else 0;
+            face[lane], s[lane], t[lane] = cubeFace(s[lane], t[lane], r);
+        }
+    }
+    var lod: [lanes]f32 = @splat(0);
+    if (needsLod(cfg)) {
+        if (!extra.bslod) {
+            // In texels of level 0 (of the child image, if one).
+            const w: f32 = @floatFromInt(if (extra.child_w != 0) extra.child_w else cfg.width);
+            const h: f32 = @floatFromInt(if (extra.child_w != 0) extra.child_h else cfg.height);
+            var st: [lanes]f32 = undefined;
+            var tt: [lanes]f32 = undefined;
+            for (0..lanes) |lane| {
+                st[lane] = s[lane] * w;
+                tt[lane] = t[lane] * h;
+            }
+            lod = quadLod(st, tt);
+        } else lod = @splat(0);
+        if (req.b) |bv| {
+            for (0..lanes) |lane| {
+                const bias = f(bv[lane]);
+                if (!std.math.isNan(bias)) lod[lane] += bias;
+            }
+        }
+    }
+    var out: Vec = undefined;
+    var hi: Vec = undefined;
+    for (0..lanes) |lane| {
+        const border: u64 = if (req.r) |rv| (if (cube) 0 else rv[lane]) else 0;
+        const v = sampleLod(memory, cfg, extra, cfg.offset +% face[lane] *% extra.cube_stride, s[lane], t[lane], lod[lane], border);
+        out[lane] = @truncate(v);
+        hi[lane] = @truncate(v >> 32);
+    }
+    if (cfg.type == .rgba64) second.* = hi;
+    return out;
+}
+
+/// A lookup at level of detail `lod` (magnified at 0 or less).
+fn sampleLod(memory: []const u8, cfg: texture.Config, extra: TexExtra, base: u32, s: f32, t: f32, lod: f32, border: u64) u64 {
+    if (!(lod > 0)) return sampleLevel(memory, cfg, extra, base, 0, cfg.mag_filter, s, t, border);
+    const mipmapped = cfg.mip_filter != .none and cfg.mip_levels > 0;
+    if (!mipmapped) return sampleLevel(memory, cfg, extra, base, 0, cfg.min_filter, s, t, border);
+    const top: f32 = @floatFromInt(cfg.mip_levels);
+    if (cfg.mip_filter == .nearest) {
+        const l: u32 = @intFromFloat(@min(@floor(lod + 0.5), top));
+        return sampleLevel(memory, cfg, extra, base, l, cfg.min_filter, s, t, border);
+    }
+    const l0 = @floor(lod);
+    if (l0 >= top) return sampleLevel(memory, cfg, extra, base, cfg.mip_levels, cfg.min_filter, s, t, border);
+    const frac: u32 = @intFromFloat(@round((lod - l0) * 256.0));
+    const level: u32 = @intFromFloat(l0);
+    const a = sampleLevel(memory, cfg, extra, base, level, cfg.min_filter, s, t, border);
+    if (frac == 0) return a;
+    const b = sampleLevel(memory, cfg, extra, base, level + 1, cfg.min_filter, s, t, border);
+    return blendLevels(cfg.type, a, b, frac);
+}
+
+/// Two levels' lookups blended, `frac` 256ths of the way to `b`.
+fn blendLevels(ty: texture.Type, a: u64, b: u64, frac: u32) u64 {
+    switch (ty) {
+        .s8, .s16 => return if (frac < 128) a else b,
+        .s16f, .rgba64 => {
+            const channels: u32 = if (ty == .rgba64) 4 else 1;
+            const wa: f32 = @floatFromInt(256 - frac);
+            const wb: f32 = @floatFromInt(frac);
+            var out: u64 = 0;
+            for (0..channels) |ch| {
+                const sh: u6 = @intCast(ch * 16);
+                const ha = f(halfToFloatScalar(@truncate(a >> sh)));
+                const hb = f(halfToFloatScalar(@truncate(b >> sh)));
+                out |= @as(u64, halfOf(u((ha * wa + hb * wb) * (1.0 / 256.0)))) << sh;
+            }
+            return out;
+        },
+        else => {
+            var out: u32 = 0;
+            for (0..4) |i| {
+                const sh: u5 = @intCast(i * 8);
+                const ca: u32 = @truncate((a >> sh) & 0xff);
+                const cb: u32 = @truncate((b >> sh) & 0xff);
+                out |= ((ca * (256 - frac) + cb * frac + 128) >> 8) << sh;
+            }
+            return out;
+        },
+    }
+}
+
+/// A lookup of level `level` with `filter`.
+fn sampleLevel(memory: []const u8, cfg: texture.Config, extra: TexExtra, base: u32, level: u32, filter: texture.Filter, s: f32, t: f32, border: u64) u64 {
+    var lc = levelConfig(cfg, base, level, memory.len);
+    lc.mag_filter = filter;
+    var pt = PrecomputedTex.init(lc, memory.len) catch return 0xff000000;
+    if (extra.child_w != 0) pt.setChild(extra.child_w >> @intCast(level), extra.child_h >> @intCast(level), extra.child_x >> @intCast(level), extra.child_y >> @intCast(level));
+    pt.border = border;
+    if (pt.float16 or pt.unblended) return pt.sampleWide(memory, s, t) catch 0xff000000;
+    return pt.sample(memory, s, t) catch 0xff000000;
 }
 
 /// Whether `op` gives a float (which a 16-bit pack converts to a 16-bit float).
@@ -1713,37 +2025,57 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
         },
         qpu.W.tmu0_s, qpu.W.tmu0_t, qpu.W.tmu0_r, qpu.W.tmu0_b, qpu.W.tmu1_s, qpu.W.tmu1_t, qpu.W.tmu1_r, qpu.W.tmu1_b => {
             const unit: usize = if (waddr <= qpu.W.tmu0_b) 0 else 1;
+            const reg = (waddr - qpu.W.tmu0_s) & 3;
             const p_cnt = s.tmu_param_count[unit];
-            if (s.uniforms_read < env.uniforms.len and p_cnt < 4) {
-                s.tmu_params[unit][p_cnt] = env.uniforms[s.uniforms_read];
+            // S written first: a general memory lookup, of the word at each address.
+            const direct = reg == 0 and p_cnt == 0;
+            // Each other write takes the next of the texture's config parameters.
+            if (!direct and p_cnt < 4) {
+                s.tmu_params[unit][p_cnt] = nextUniform(s, env);
                 s.tmu_param_count[unit] = p_cnt + 1;
-                s.uniforms_read += 1;
             }
-            if (waddr == qpu.W.tmu0_t or waddr == qpu.W.tmu1_t) {
-                s.tmu_coord_t[unit] = value;
-                s.tmu_has_coord_t[unit] = true;
-                return;
+            switch (reg) {
+                1 => {
+                    s.tmu_coord_t[unit] = value;
+                    s.tmu_has_coord_t[unit] = true;
+                    return;
+                },
+                2 => {
+                    s.tmu_coord_r[unit] = value;
+                    return;
+                },
+                3 => {
+                    s.tmu_coord_b[unit] = value;
+                    return;
+                },
+                else => {},
             }
-            if (waddr != qpu.W.tmu0_s and waddr != qpu.W.tmu1_s) return;
-            if (s.tmu_param_count[unit] < 2 or s.tmu_fifo_len[unit] == 4) {
+            defer {
                 s.tmu_param_count[unit] = 0;
-                return;
+                s.tmu_has_coord_t[unit] = false;
+                s.tmu_coord_r[unit] = null;
+                s.tmu_coord_b[unit] = null;
             }
+            if (s.tmu_fifo_len[unit] == 4) return;
             const write_idx: u2 = s.tmu_fifo_head[unit] +% @as(u2, @truncate(s.tmu_fifo_len[unit]));
-            const t_opt: ?Vec = if (s.tmu_has_coord_t[unit]) s.tmu_coord_t[unit] else null;
-            s.tmu_fifo[unit][write_idx] = sampleTmuVec(
-                unit,
-                s.tmu_params[unit][0],
-                s.tmu_params[unit][1],
-                value,
-                t_opt,
-                env,
-                &s.tmu_cached[unit],
-                &s.tmu_fifo_second[unit][write_idx],
-            );
+            s.tmu_fifo_second[unit][write_idx] = null;
+            if (direct) {
+                s.tmu_fifo[unit][write_idx] = directLookup(unit, value, env);
+            } else {
+                const req: TmuRequest = .{
+                    .params = s.tmu_params[unit],
+                    .count = s.tmu_param_count[unit],
+                    .s = value,
+                    .t = if (s.tmu_has_coord_t[unit]) s.tmu_coord_t[unit] else null,
+                    .r = s.tmu_coord_r[unit],
+                    .b = s.tmu_coord_b[unit],
+                };
+                if (@hasField(RType, "needs_quads")) {
+                    if (req.lodFromQuads()) r.needs_quads = true;
+                }
+                s.tmu_fifo[unit][write_idx] = sampleTmuVec(unit, &req, env, &s.tmu_cached[unit], &s.tmu_fifo_second[unit][write_idx]);
+            }
             s.tmu_fifo_len[unit] += 1;
-            s.tmu_param_count[unit] = 0;
-            s.tmu_has_coord_t[unit] = false;
             if (@hasField(RType, "texture_samples")) r.texture_samples += 1;
         },
         else => {},
@@ -1792,6 +2124,14 @@ const PrecomputedTex = struct {
     tiles_per_row: u32,
     /// The bytes it takes.
     len: u32,
+    /// The size coordinates are scaled by and wrapped in (a child image's), and where that
+    /// window is in the texture.
+    ww: u32,
+    wh: u32,
+    child_x: u32 = 0,
+    child_y: u32 = 0,
+    /// What texels past the edge are, wrapped to the border.
+    border: u64 = 0,
 
     inline fn init(p: texture.Config, memory_len: usize) Error!PrecomputedTex {
         // Bits a texel (ETC1: a 4x4 block's, its texels addressed by block).
@@ -1873,7 +2213,20 @@ const PrecomputedTex = struct {
             .tile_h_shift = tile_h_shift,
             .tiles_per_row = tiles_per_row,
             .len = len,
+            .ww = p.width,
+            .wh = p.height,
         };
+    }
+
+    /// Samples the window `w` by `h` at (`x`, `y`) of it, as if it were the texture.
+    fn setChild(pt: *PrecomputedTex, w: u32, h: u32, x: u32, y: u32) void {
+        pt.ww = @max(w, 1);
+        pt.wh = @max(h, 1);
+        pt.fw = @floatFromInt(pt.ww);
+        pt.fh = @floatFromInt(pt.wh);
+        pt.child_x = x;
+        pt.child_y = y;
+        pt.fast = false;
     }
 
     /// Where microtile (`ux`, `uy`) is, from the texture's start: LT format (microtiles in rows),
@@ -1935,15 +2288,20 @@ const PrecomputedTex = struct {
 
     /// Texel (`x`, `y`) as the TMU returns it (RGBA64: its first word).
     inline fn fetchAt(pt: *const PrecomputedTex, memory: []const u8, x: u32, y: u32) Error!u32 {
+        if ((x | y) & border_texel != 0) return @truncate(pt.border);
         if (pt.fast) return pt.fetchFromOffset(memory, pt.base_off + pt.texelOffset(x, y));
         return @truncate(try pt.fetchWide(memory, x, y));
     }
 
     /// Texel (`x`, `y`) as the TMU returns it: a word (byte 0 red, or the type's first channel;
     /// S8, S16 and S16F in the low bits), or RGBA64's two (red and green, then blue and alpha).
-    fn fetchWide(pt: *const PrecomputedTex, memory: []const u8, x: u32, y_in: u32) Error!u64 {
+    fn fetchWide(pt: *const PrecomputedTex, memory: []const u8, x_in: u32, y_in: u32) Error!u64 {
+        if ((x_in | y_in) & border_texel != 0) return pt.border;
         const p = pt.cfg;
-        const y = if (p.flip_y) p.height - 1 - y_in else y_in;
+        const x = x_in + pt.child_x;
+        const y_c = y_in + pt.child_y;
+        if (x >= p.width or y_c >= p.height) return 0xff000000;
+        const y = if (p.flip_y) p.height - 1 - y_c else y_c;
         if (pt.cpp != 0) return try pt.fetchFromOffset(memory, pt.base_off + pt.texelOffset(x, y));
         switch (p.type) {
             .yuv422r => {
@@ -2004,15 +2362,15 @@ const PrecomputedTex = struct {
             r.x0 = @intFromFloat(x0);
             r.x1 = r.x0 + 1;
         } else {
-            r.x0 = wrap(x0, p.width, p.wrap_s);
-            r.x1 = wrap(x0 + 1.0, p.width, p.wrap_s);
+            r.x0 = wrap(x0, pt.ww, p.wrap_s);
+            r.x1 = wrap(x0 + 1.0, pt.ww, p.wrap_s);
         }
         if (y0 >= 0.0 and y0 + 1.0 < pt.fh) {
             r.y0 = @intFromFloat(y0);
             r.y1 = r.y0 + 1;
         } else {
-            r.y0 = wrap(y0, p.height, p.wrap_t);
-            r.y1 = wrap(y0 + 1.0, p.height, p.wrap_t);
+            r.y0 = wrap(y0, pt.wh, p.wrap_t);
+            r.y1 = wrap(y0 + 1.0, pt.wh, p.wrap_t);
         }
         r.fx = @intFromFloat(@round((fx - x0) * 256.0));
         r.fy = @intFromFloat(@round((fy - y0) * 256.0));
@@ -2023,8 +2381,8 @@ const PrecomputedTex = struct {
         const p = pt.cfg;
         const fx = @floor(s * pt.fw);
         const fy = @floor(t * pt.fh);
-        const wx: u32 = if (fx >= 0.0 and fx < pt.fw) @intFromFloat(fx) else wrap(fx, p.width, p.wrap_s);
-        const wy: u32 = if (fy >= 0.0 and fy < pt.fh) @intFromFloat(fy) else wrap(fy, p.height, p.wrap_t);
+        const wx: u32 = if (fx >= 0.0 and fx < pt.fw) @intFromFloat(fx) else wrap(fx, pt.ww, p.wrap_s);
+        const wy: u32 = if (fy >= 0.0 and fy < pt.fh) @intFromFloat(fy) else wrap(fy, pt.wh, p.wrap_t);
         return .{ wx, wy };
     }
 
@@ -2237,11 +2595,19 @@ pub const DecodedTexture = struct {
         };
     }
 
+    /// Whether the OpenGL translation's TMU samples texture `p0`, `p1` (given s and t alone) as
+    /// `sample` does: blended byte by byte, its level of detail not mattering, not a cube map.
+    pub fn sampledOnGpu(p0: u32, p1: u32) bool {
+        return blendsBytes(p0, p1) and !needsLod(texture.decodeConfig(p0, p1)) and (p0 >> 9) & 1 == 0;
+    }
+
     /// Whether the Metal translation's TMU, reading RAM itself, reads texture `p0`, `p1`: of
     /// the types it decodes (RGBA8888, RGBX8888, RGBA32R, RGB565, luminance, alpha), the right
     /// way up. Other types are 0xff000000 to it, as to `sample`.
     pub fn readInShader(p0: u32, p1: u32) bool {
         const c = texture.decodeConfig(p0, p1);
+        if (needsLod(c) or (p0 >> 9) & 1 != 0) return false;
+        if (@backingInt(c.wrap_s) >= 2 or @backingInt(c.wrap_t) >= 2) return false;
         return switch (c.type) {
             .rgba8888, .rgbx8888, .rgba32r, .rgb565, .luminance, .alpha => !c.flip_y,
             .rgba4444, .rgba5551, .lumalpha, .etc1, .s16f, .s8, .s16, .bw1, .a4, .a1, .rgba64, .yuv422r => false,
@@ -2267,12 +2633,20 @@ fn sampleConfig(memory: []const u8, p: texture.Config, s: f32, t: f32) Error!u32
     return pt.sample(memory, s, t);
 }
 
+/// A texel past the edge, wrapped to the border (its colour instead).
+const border_texel: u32 = 0x8000_0000;
+
 fn wrap(coord: f32, size: u32, mode: texture.Wrap) u32 {
     const n: i64 = @max(size, 1);
     const i: i64 = if (std.math.isNan(coord)) 0 else @intFromFloat(std.math.clamp(coord, -1e9, 1e9));
     return switch (mode) {
         .repeat => @intCast(@mod(i, n)),
-        .clamp, .mirror, .border => @intCast(std.math.clamp(i, 0, n - 1)),
+        .clamp => @intCast(std.math.clamp(i, 0, n - 1)),
+        .mirror => blk: {
+            const m = @mod(i, 2 * n);
+            break :blk @intCast(if (m < n) m else 2 * n - 1 - m);
+        },
+        .border => if (i < 0 or i >= n) border_texel else @intCast(i),
     };
 }
 
@@ -2659,4 +3033,50 @@ test "TMU decodes every texture type" {
     const flipped = try PrecomputedTex.init(.{ .type = .rgba8888, .width = 4, .height = 4, .flip_y = true }, mem.len);
     std.mem.writeInt(u32, mem[48..52], 0x11223344, .little);
     try std.testing.expectEqual(@as(u32, 0x11223344), try flipped.fetchAt(&mem, 0, 0));
+}
+
+test "TMU wraps, cube faces, mipmap levels and levels of detail" {
+    // Mirror and border wraps.
+    try std.testing.expectEqual(@as(u32, 1), wrap(-2, 4, .mirror));
+    try std.testing.expectEqual(@as(u32, 3), wrap(4, 4, .mirror));
+    try std.testing.expectEqual(@as(u32, 0), wrap(8, 4, .mirror));
+    try std.testing.expectEqual(border_texel, wrap(-1, 4, .border));
+    try std.testing.expectEqual(@as(u32, 2), wrap(2, 4, .border));
+
+    // Each axis's face, and the middle of it.
+    const faces = [6][3]f32{ .{ 1, 0, 0 }, .{ -1, 0, 0 }, .{ 0, 1, 0 }, .{ 0, -1, 0 }, .{ 0, 0, 1 }, .{ 0, 0, -1 } };
+    for (faces, 0..) |d, i| {
+        const face, const s, const t = cubeFace(d[0], d[1], d[2]);
+        try std.testing.expectEqual(@as(u32, @intCast(i)), face);
+        try std.testing.expectEqual(@as(f32, 0.5), s);
+        try std.testing.expectEqual(@as(f32, 0.5), t);
+    }
+
+    // A 64 square RGBA8888 texture's levels before it: 32 (T format, 4 KiB), then 16 (LT, 1 KiB).
+    const c: texture.Config = .{ .offset = 0x10000, .width = 64, .height = 64, .mip_levels = 2 };
+    try std.testing.expectEqual(@as(u32, 0x10000 - 4096), levelConfig(c, c.offset, 1, 1 << 20).offset);
+    try std.testing.expectEqual(@as(u32, 0x10000 - 4096 - 1024), levelConfig(c, c.offset, 2, 1 << 20).offset);
+    // A non-power-of-two texture's levels are of the next power of two's sizes.
+    const npot = levelConfig(.{ .offset = 0x10000, .width = 100, .height = 60, .mip_levels = 1 }, 0x10000, 1, 1 << 20);
+    try std.testing.expectEqual(@as(u32, 64), npot.width);
+    try std.testing.expectEqual(@as(u32, 32), npot.height);
+
+    // Coordinates 4 texels apart across a quad and 2 down: level of detail 2.
+    var s: [lanes]f32 = undefined;
+    var t: [lanes]f32 = undefined;
+    for (0..lanes) |i| {
+        s[i] = @floatFromInt((i & 1) * 4);
+        t[i] = @floatFromInt(((i >> 1) & 1) * 2);
+    }
+    for (quadLod(s, t)) |l| try std.testing.expectApproxEqAbs(@as(f32, 2), l, 1e-5);
+}
+
+test "TMU general memory lookups read the word at each address" {
+    var mem: [64]u8 = undefined;
+    for (&mem, 0..) |*b, i| b.* = @intCast(i);
+    var addrs: Vec = undefined;
+    for (0..lanes) |i| addrs[i] = @intCast((i % 16) * 4);
+    const out = directLookup(0, addrs, &.{ .texture_memory = &mem });
+    try std.testing.expectEqual(@as(u32, 0x03020100), out[0]);
+    try std.testing.expectEqual(@as(u32, 0x07060504), out[1]);
 }
