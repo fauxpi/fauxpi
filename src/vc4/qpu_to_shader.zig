@@ -730,7 +730,7 @@ const glsl_prologue =
     \\    rb[i] = 0u;
     \\  }
     \\  ra[15] = u(W);
-    \\  rb[15] = u(gl_FragCoord.z);
+    \\  rb[15] = uint(floor(clamp(gl_FragCoord.z, 0.0, 1.0) * 16777215.0 + 0.5));
     \\  uint px = uint(gl_FragCoord.x), py = uint(gl_FragCoord.y);
     \\
 ;
@@ -784,6 +784,10 @@ pub fn translateWith(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, la
         if (d.sig == .color_load or d.sig == .color_load_end) t.shader.reads_color = true;
         if (d.waddr_add == qpu.W.tlb_color_ms or d.waddr_mul == qpu.W.tlb_color_ms) t.shader.per_sample = t.multisampled;
     }
+    // The stencil test, the samples drawn, Z from the shader, and the coverage and facing:
+    // left to qpu_sim.
+    const tlb = qpu_sim.tlbUse(decoded);
+    if (tlb.stencil or tlb.ms_flags or tlb.shader_z or tlb.reads_flags) t.shader.unsupported = true;
 
     if (lang == .glsl) {
         try w.writeAll(if (t.shader.per_sample) glsl_inputs_centre else glsl_inputs);
@@ -808,7 +812,7 @@ pub fn translateWith(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, la
             \\  uint ra[32] = {};
             \\  uint rb[32] = {};
             \\  ra[15] = u(W);
-            \\  rb[15] = u(in.pos.z);
+            \\  rb[15] = uint(floor(clamp(in.pos.z, 0.0f, 1.0f) * 16777215.0f + 0.5f));
             \\  uint px = uint(in.pos.x), py = uint(in.pos.y);
             \\
         );
@@ -1229,13 +1233,23 @@ const Translator = struct {
                 else => {},
             }
         }
+        // Colours written to the fragments the condition holds for (the others discarded).
+        const tlb_test: []const u8 = switch (cond) {
+            .never, .always => "true",
+            .zs => "flag_z",
+            .zc => "!flag_z",
+            .ns => "flag_n",
+            .nc => "!flag_n",
+            .cs => "flag_c",
+            .cc => "!flag_c",
+        };
         switch (waddr) {
             // Run once a sample, each sample's colour is the write to it.
             qpu.W.tlb_color_ms => if (t.shader.per_sample) {
-                try w.print("    if (gl_SampleID == {d}) {{ tlb_c = {s}; tlb_w = true; }}\n", .{ t.sample_writes, val });
+                try w.print("    if (gl_SampleID == {d} && {s}) {{ tlb_c = {s}; tlb_w = true; }}\n", .{ t.sample_writes, tlb_test, val });
                 t.sample_writes += 1;
-            } else try w.print("    tlb_c = {s}; tlb_w = true;\n", .{val}),
-            qpu.W.tlb_color_all => try w.print("    tlb_c = {s}; tlb_w = true;\n", .{val}),
+            } else try w.print("    if ({s}) {{ tlb_c = {s}; tlb_w = true; }}\n", .{ tlb_test, val }),
+            qpu.W.tlb_color_all => try w.print("    if ({s}) {{ tlb_c = {s}; tlb_w = true; }}\n", .{ tlb_test, val }),
             qpu.W.sfu_recip => if (t.lang == .glsl)
                 try w.print("    r4 = q_recip({s});\n", .{val})
             else

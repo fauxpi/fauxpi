@@ -287,9 +287,11 @@ pub const V3d = struct {
     // Tile buffer (64x64 pixels max per tile)
     tile_color: [64 * 64]u32 = @splat(0),
     tile_depth: [64 * 64]f32 = @splat(1.0),
+    tile_stencil: [64 * 64]u8 = @splat(0),
     tile_color_solid: ?u32 = null,
     tile_depth_valid: bool = false,
     tile_clear_zs: f32 = 1.0,
+    tile_clear_stencil: u8 = 0,
     lazy_load: ?LazyTileLoad = null,
     loaded_from: ?LazyTileLoad = null,
     tile_modified: bool = false,
@@ -383,6 +385,7 @@ pub const V3d = struct {
         self.tile_color_solid = null;
         self.tile_depth_valid = false;
         self.tile_clear_zs = 1.0;
+        self.tile_clear_stencil = 0;
         self.lazy_load = null;
         self.loaded_from = null;
         self.tile_modified = false;
@@ -1370,8 +1373,12 @@ pub const V3d = struct {
     /// a negative one if bit 2 ("clockwise") is set, as it is for OpenGL's
     /// anticlockwise triangles drawn with `y` flipped (Mesa's vc4); bit 0
     /// draws those facing forward, and bit 1 those facing back.
+    fn facesForward(cfg0: u8, area: f32) bool {
+        return if (cfg0 & 4 != 0) area < 0 else area > 0;
+    }
+
     fn culled(cfg0: u8, area: f32) bool {
-        const forward = if (cfg0 & 4 != 0) area < 0 else area > 0;
+        const forward = facesForward(cfg0, area);
         return (if (forward) cfg0 & 1 else cfg0 & 2) == 0;
     }
 
@@ -1615,9 +1622,12 @@ pub const V3d = struct {
     pub const TileBuffer = struct {
         color: *[64 * 64]u32,
         depth: *[64 * 64]f32,
+        /// Each pixel's (or sample's) stencil, valid with `depth`.
+        stencil: *[64 * 64]u8,
         color_solid: ?u32 = null,
         depth_valid: bool = false,
         clear_zs: f32 = 1.0,
+        clear_stencil: u8 = 0,
         lazy_load: ?LazyTileLoad = null,
         loaded_from: ?LazyTileLoad = null,
         modified: bool = false,
@@ -1631,6 +1641,7 @@ pub const V3d = struct {
         tile_y: u32,
         clear_color0: u32,
         clear_zs: f32,
+        clear_stencil: u8 = 0,
         lazy_load: ?LazyTileLoad = null,
         has_render: bool = false,
         dst_addr: u32 = 0,
@@ -1663,9 +1674,11 @@ pub const V3d = struct {
         fn run(ctx: *const WorkerCtx) void {
             var color_buf: [64 * 64]u32 = undefined;
             var depth_buf: [64 * 64]f32 = undefined;
+            var stencil_buf: [64 * 64]u8 = undefined;
             var tb = TileBuffer{
                 .color = &color_buf,
                 .depth = &depth_buf,
+                .stencil = &stencil_buf,
             };
             while (true) {
                 const idx = ctx.next_idx.fetchAdd(1, .monotonic);
@@ -1686,9 +1699,11 @@ pub const V3d = struct {
         return .{
             .color = &self.tile_color,
             .depth = &self.tile_depth,
+            .stencil = &self.tile_stencil,
             .color_solid = self.tile_color_solid,
             .depth_valid = self.tile_depth_valid,
             .clear_zs = self.tile_clear_zs,
+            .clear_stencil = self.tile_clear_stencil,
             .lazy_load = self.lazy_load,
             .loaded_from = self.loaded_from,
             .modified = self.tile_modified,
@@ -1699,6 +1714,7 @@ pub const V3d = struct {
         self.tile_color_solid = tb.color_solid;
         self.tile_depth_valid = tb.depth_valid;
         self.tile_clear_zs = tb.clear_zs;
+        self.tile_clear_stencil = tb.clear_stencil;
         self.lazy_load = tb.lazy_load;
         self.loaded_from = tb.loaded_from;
         self.tile_modified = tb.modified;
@@ -1743,6 +1759,7 @@ pub const V3d = struct {
         }
         tb.depth_valid = false;
         tb.clear_zs = job.clear_zs;
+        tb.clear_stencil = job.clear_stencil;
         tb.modified = false;
         if (job.full_res_zs_load) |addr| loadFullResDepth(tb, ram, addr);
 
@@ -1775,7 +1792,7 @@ pub const V3d = struct {
                     const samples = tb.color[i * 4 ..][0..4];
                     px.* = if (job.resolve) averageSamples(samples.*) else samples[0];
                 }
-                const resolved: TileBuffer = .{ .color = &pixels, .depth = &depth };
+                const resolved: TileBuffer = .{ .color = &pixels, .depth = &depth, .stencil = tb.stencil };
                 storeTileFromBuf(&resolved, ram, job.dst_addr, job.fb_w, job.fb_h, job.tile_x, job.tile_y, tile_size, job.tiling, job.ls_format);
                 return;
             }
@@ -1808,9 +1825,9 @@ pub const V3d = struct {
         if (flags & 1 == 0) {
             @memcpy(out, std.mem.sliceAsBytes(tb.color));
         } else if (flags & 2 == 0) {
-            for (tb.depth, 0..) |z, i| {
+            for (tb.depth, tb.stencil, 0..) |z, st, i| {
                 const z24: u32 = @intFromFloat(@round(std.math.clamp(z, 0, 1) * 16777215.0));
-                std.mem.writeInt(u32, out[i * 4 ..][0..4], z24 << 8, .little);
+                std.mem.writeInt(u32, out[i * 4 ..][0..4], z24 << 8 | st, .little);
             }
         }
     }
@@ -1819,9 +1836,10 @@ pub const V3d = struct {
     fn loadFullResDepth(tb: *TileBuffer, ram: []const u8, addr: u32) void {
         const base = addr & vc_bus.ramMask(ram.len);
         if (base + full_res_bytes > ram.len) return;
-        for (tb.depth, 0..) |*z, i| {
+        for (tb.depth, tb.stencil, 0..) |*z, *st, i| {
             const word = std.mem.readInt(u32, ram[base + i * 4 ..][0..4], .little);
             z.* = @as(f32, @floatFromInt(word >> 8)) / 16777215.0;
+            st.* = @truncate(word);
         }
         tb.depth_valid = true;
     }
@@ -1880,6 +1898,7 @@ pub const V3d = struct {
         fb_flags: u16 = 0,
         clear_color0: u32 = 0,
         clear_zs: f32 = 1.0,
+        clear_stencil: u8 = 0,
         cur_tile_x: u32 = 0,
         cur_tile_y: u32 = 0,
         has_tile_coords: bool = false,
@@ -1909,6 +1928,7 @@ pub const V3d = struct {
                 .tile_y = it.cur_tile_y,
                 .clear_color0 = it.clear_color0,
                 .clear_zs = it.clear_zs,
+                .clear_stencil = it.clear_stencil,
                 .lazy_load = it.cur_lazy_load,
                 .has_render = it.cur_has_render,
                 .dst_addr = dst_addr,
@@ -2067,8 +2087,10 @@ pub const V3d = struct {
                     114 => { // CLEAR_COLORS (14 bytes)
                         if (pc + 14 > end) break;
                         const raw_c0 = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
-                        const zs_word = std.mem.readInt(u32, ram[pc + 9 ..][0..4], .little) & 0x00FFFFFF;
+                        const zs_raw = std.mem.readInt(u32, ram[pc + 9 ..][0..4], .little);
+                        const zs_word = zs_raw & 0x00FFFFFF;
                         it.clear_zs = @as(f32, @floatFromInt(zs_word)) / 16777215.0;
+                        it.clear_stencil = @truncate(zs_raw >> 24);
                         // Note: for RGB565 render targets, kernel/userspace packs TWO RGB565 pixels in clear_color0
                         const r_format: u2 = @truncate((it.fb_flags >> 2) & 3);
                         if (r_format == 0 or r_format == 2) {
@@ -2497,7 +2519,8 @@ pub const V3d = struct {
         const color = g.color.items;
         var tile_color: [64 * 64]u32 = undefined;
         var tile_depth: [64 * 64]f32 = undefined;
-        var tb: TileBuffer = .{ .color = &tile_color, .depth = &tile_depth };
+        var tile_stencil: [64 * 64]u8 = undefined;
+        var tb: TileBuffer = .{ .color = &tile_color, .depth = &tile_depth, .stencil = &tile_stencil };
         // 64 pixels square, or 32 multisampled.
         const size = first.tileSize();
         const tiles_w = @min((w + size - 1) / size, 64);
@@ -2690,6 +2713,7 @@ pub const V3d = struct {
         const tb = TileBuffer{
             .color = @constCast(&self.tile_color),
             .depth = @constCast(&self.tile_depth),
+            .stencil = @constCast(&self.tile_stencil),
             .color_solid = self.tile_color_solid,
             .depth_valid = self.tile_depth_valid,
             .clear_zs = self.tile_clear_zs,
@@ -2895,6 +2919,7 @@ pub const V3d = struct {
         }
         if (need_depth and !tb.depth_valid) {
             @memset(tb.depth, tb.clear_zs);
+            @memset(tb.stencil, tb.clear_stencil);
             tb.depth_valid = true;
         }
     }
@@ -3176,10 +3201,12 @@ pub const V3d = struct {
     }
 
     /// Rasterizes `tri` into the tile (multisampled or not, as `tb` is) as V3D does, a 2x2 quad
-    /// of pixels at a time: each quad with a sample covered (and passing the depth test) is
-    /// shaded whole, 4 quads together (the pixels not covered too, their results unused), so the
-    /// TMU's levels of detail come from the quads' differences. Slower than the other paths;
-    /// for shaders that need it.
+    /// of pixels at a time: each quad with a sample covered is shaded whole, 4 quads together (the
+    /// pixels not covered too, their results unused), so the TMU's levels of detail come from
+    /// the quads' differences. Each fragment is then given to the TLB as V3D's are: those whose
+    /// colour (or Z) the shader doesn't write discarded, the samples it covers as MS_FLAGS says,
+    /// its Z the shader's or the rasterizer's, through the stencil test (as TLB_STENCIL_SETUP
+    /// says) and the depth test. Slower than the other paths; for shaders that need it.
     fn rasterizeQuadsInTileBuf(
         tb: *TileBuffer,
         ram: []const u8,
@@ -3200,9 +3227,6 @@ pub const V3d = struct {
         const y_end = @min(tri.max_y, tile_px_y + tile_size);
         if (x_start >= x_end or y_start >= y_end) return;
 
-        const depth_func: u3 = @truncate((draw.config_b1 >> 4) & 7);
-        const z_updates = (draw.config_b1 & 0x80) != 0;
-        const need_depth = (depth_func != 7) or z_updates;
         const n_var = @min(@as(usize, num_varyings), 16);
         const t = if (tri.setup_valid) tri.* else ShadedTriangle.init(tri.draw_idx, tri.min_x, tri.min_y, tri.max_x, tri.max_y, tri.area, tri.v, n_var);
         if (t.inv_area <= 0) return;
@@ -3210,7 +3234,12 @@ pub const V3d = struct {
         const offsets: []const [2]f32 = if (tb.ms) &sample_offsets else &centre;
         const spp: u32 = if (tb.ms) 4 else 1;
 
-        var batch: QuadBatch = .{};
+        var batch: QuadBatch = .{
+            .depth_func = @truncate((draw.config_b1 >> 4) & 7),
+            .z_updates = (draw.config_b1 & 0x80) != 0,
+            // Lines and points face forward.
+            .back = isTriangles(draw) and !facesForward(draw.config_b0, t.area),
+        };
         var materialized = false;
         var qy = y_start & ~@as(u32, 1);
         while (qy < y_end) : (qy += 2) {
@@ -3222,7 +3251,6 @@ pub const V3d = struct {
                     const px = qx + @as(u32, @intCast(i & 1));
                     const py = qy + @as(u32, @intCast(i >> 1));
                     if (px < x_start or px >= x_end or py < y_start or py >= y_end) continue;
-                    const idx = (py - tile_px_y) * tile_size + (px - tile_px_x);
                     for (offsets, 0..) |off, si| {
                         const fx = @as(f32, @floatFromInt(px)) + off[0];
                         const fy = @as(f32, @floatFromInt(py)) + off[1];
@@ -3230,21 +3258,13 @@ pub const V3d = struct {
                         const e1 = t.edge1.eval(t.edge1.dx * (fy - t.edge1.p0y), fx);
                         const e2 = t.edge2.eval(t.edge2.dx * (fy - t.edge2.p0y), fx);
                         if (!t.edge0.passes(e0) or !t.edge1.passes(e1) or !t.edge2.passes(e2)) continue;
-                        const z = t.v[2].z + e0 * t.inv_area * t.dz0 + e1 * t.inv_area * t.dz1;
-                        if (depth_func != 7) {
-                            if (!materialized) {
-                                ensureTileMaterializedBuf(tb, ram, need_depth);
-                                materialized = true;
-                            }
-                            if (!depthPasses(depth_func, z, tb.depth[idx * spp + si])) continue;
-                        }
                         masks[i] |= @as(u4, 1) << @intCast(si);
-                        zs[i][si] = z;
+                        zs[i][si] = zq(t.v[2].z + e0 * t.inv_area * t.dz0 + e1 * t.inv_area * t.dz1);
                     }
                 }
                 if (masks[0] | masks[1] | masks[2] | masks[3] == 0) continue;
                 if (!materialized) {
-                    ensureTileMaterializedBuf(tb, ram, need_depth);
+                    ensureTileMaterializedBuf(tb, ram, true);
                     materialized = true;
                 }
                 // The quad's pixels, covered or not, their inputs at their middles.
@@ -3258,39 +3278,44 @@ pub const V3d = struct {
                     const w1 = t.edge1.eval(t.edge1.dx * (fy - t.edge1.p0y), fx) * t.inv_area;
                     const inv_w = t.v[2].inv_w + w0 * t.dinvw0 + w1 * t.dinvw1;
                     const w: f32 = if (t.all_unit_w or @abs(inv_w) <= 1e-12) 1 else 1 / inv_w;
-                    const in_tile = px < tile_px_x + tile_size and py < tile_px_y + tile_size;
-                    const idx = if (in_tile) (py - tile_px_y) * tile_size + (px - tile_px_x) else 0;
+                    const idx = (py - tile_px_y) * tile_size + (px - tile_px_x);
                     batch.idx[lane] = idx;
-                    batch.mask[lane] = if (in_tile) masks[i] else 0;
+                    batch.mask[lane] = masks[i];
                     batch.zs[lane] = zs[i];
                     batch.frag_w[lane] = @bitCast(w);
-                    batch.frag_z[lane] = @bitCast(t.v[2].z + w0 * t.dz0 + w1 * t.dz1);
+                    batch.frag_z[lane] = @bitCast(zq(t.v[2].z + w0 * t.dz0 + w1 * t.dz1));
                     batch.frag_x[lane] = px;
                     batch.frag_y[lane] = py;
+                    batch.ms_mask[lane] = if (tb.ms) masks[i] else (if (masks[i] != 0) 0xf else 0);
                     for (0..n_var) |vi| {
                         const v = t.v[2].persp_varyings[vi] + w0 * t.dvar0[vi] + w1 * t.dvar1[vi];
                         batch.varyings[vi][lane] = @bitCast(v * w);
                     }
-                    for (0..4) |si| batch.samples_in[si][lane] = if (in_tile) tb.color[idx * spp + (if (tb.ms) si else 0)] else 0;
+                    for (0..4) |si| batch.samples_in[si][lane] = tb.color[idx * spp + (if (tb.ms) si else 0)];
                     batch.len += 1;
                 }
-                if (batch.len == 16) batch.flush(tb, ram, fs_decoded, fs_unifs, n_var, fast_frag, z_updates);
+                if (batch.len == 16) batch.flush(tb, ram, fs_decoded, fs_unifs, n_var, fast_frag);
             }
         }
-        batch.flush(tb, ram, fs_decoded, fs_unifs, n_var, fast_frag, z_updates);
+        batch.flush(tb, ram, fs_decoded, fs_unifs, n_var, fast_frag);
     }
 
-    /// Up to 4 quads of pixels (multisampled or not), shaded together.
+    /// Up to 4 quads of pixels (multisampled or not), shaded together, then given to the TLB.
     const QuadBatch = struct {
+        depth_func: u3,
+        z_updates: bool,
+        /// The primitive faces back (its stencil test the back's, its REV_FLAG 1).
+        back: bool,
         len: usize = 0,
         idx: [16]u32 = undefined,
-        /// The samples drawn (bit 0 alone, not multisampled), and their depths.
+        /// The samples covered (bit 0 alone, not multisampled), and their depths.
         mask: [16]u4 = undefined,
         zs: [16][4]f32 = undefined,
         frag_w: qpu_sim.Vec = qpu_sim.splatF(1),
         frag_z: qpu_sim.Vec = qpu_sim.splat(0),
         frag_x: qpu_sim.Vec = qpu_sim.splat(0),
         frag_y: qpu_sim.Vec = qpu_sim.splat(0),
+        ms_mask: qpu_sim.Vec = qpu_sim.splat(0),
         varyings: [16]qpu_sim.Vec = @splat(qpu_sim.splat(0)),
         samples_in: [4]qpu_sim.Vec = @splat(qpu_sim.splat(0)),
         tex_cache: [2]qpu_sim.TexCache = .{ .{}, .{} },
@@ -3303,7 +3328,6 @@ pub const V3d = struct {
             fs_unifs: qpu_sim.Uniforms,
             n_var: usize,
             fast_frag: qpu_sim.FastFragShader,
-            z_updates: bool,
         ) void {
             const count = b.len;
             if (count == 0) return;
@@ -3316,6 +3340,7 @@ pub const V3d = struct {
                 b.frag_z[lane] = b.frag_z[from];
                 b.frag_x[lane] = b.frag_x[from];
                 b.frag_y[lane] = b.frag_y[from];
+                b.ms_mask[lane] = 0;
                 for (b.varyings[0..n_var]) |*v| v[lane] = v[from];
                 for (&b.samples_in) |*v| v[lane] = v[from];
             }
@@ -3326,28 +3351,139 @@ pub const V3d = struct {
                 .frag_z = b.frag_z,
                 .frag_x = b.frag_x,
                 .frag_y = b.frag_y,
+                .ms_mask = b.ms_mask,
+                .rev_flag = qpu_sim.splat(@intFromBool(b.back)),
                 .texture_memory = ram,
                 .tlb_color_in = b.samples_in[0],
                 .tlb_samples_in = if (tb.ms) &b.samples_in else null,
                 .tex_cache = &b.tex_cache,
             };
             const res = qpu_sim.runFragmentFast(fast_frag, fs_decoded, &env) catch return;
-            if (res.tlb_color == null and res.tlb_samples == 0) return;
+            const stencil = Stencil.of(res.stencil_setups[0..@min(res.stencil_count, 3)], b.back);
             const spp: u32 = if (tb.ms) 4 else 1;
             for (0..count) |lane| {
+                const bit = @as(u16, 1) << @intCast(lane);
+                const color_written = res.tlb_color_mask & bit != 0;
+                const z_written = res.tlb_z_mask & bit != 0;
+                // Neither written: discarded.
+                if (!color_written and !z_written) continue;
+                var cover = b.mask[lane];
+                if (res.ms_flags_mask & bit != 0) {
+                    const flags: u4 = @truncate(res.ms_flags[lane]);
+                    cover = if (tb.ms) cover & flags else (if (flags != 0) cover else 0);
+                }
                 const base = b.idx[lane] * spp;
                 for (0..spp) |si| {
-                    if (b.mask[lane] & (@as(u4, 1) << @intCast(si)) == 0) continue;
-                    const color = if (res.tlb_samples > 0)
-                        (if (si < res.tlb_samples) res.tlb_color_samples[si][lane] else continue)
-                    else
-                        res.tlb_color.?[lane];
-                    tb.color[base + si] = color;
-                    if (z_updates) tb.depth[base + si] = b.zs[lane][si];
+                    if (cover & (@as(u4, 1) << @intCast(si)) == 0) continue;
+                    const i = base + si;
+                    const z = if (z_written) @as(f32, @floatFromInt(res.tlb_z.?[lane] & 0xffffff)) / 16777215.0 else b.zs[lane][si];
+                    if (stencil) |st| {
+                        if (!st.passes(tb.stencil[i])) {
+                            tb.stencil[i] = st.apply(st.sfail, tb.stencil[i]);
+                            continue;
+                        }
+                    }
+                    const z_passes = depthPasses(b.depth_func, z, tb.depth[i]);
+                    if (stencil) |st| tb.stencil[i] = st.apply(if (z_passes) st.zpass else st.zfail, tb.stencil[i]);
+                    if (!z_passes) continue;
+                    if (b.z_updates) tb.depth[i] = z;
+                    if (res.tlb_samples > 0) {
+                        // Each sample's colour written in turn.
+                        if (si < res.tlb_samples and si < 4 and res.tlb_sample_masks[si] & bit != 0) tb.color[i] = res.tlb_color_samples[si][lane];
+                    } else if (color_written) tb.color[i] = res.tlb_color.?[lane];
                 }
             }
         }
     };
+
+    /// The stencil test, as the TLB_STENCIL_SETUP words written set it up for a primitive facing
+    /// one way: each word (bits 31:30) the front's (1), the back's (2), both (3), or the write
+    /// masks (0: the front's bits 7:0, the back's 15:8); configs give the write mask (bits 29:28:
+    /// 0x1, 0x3, 0xf or 0xff), the ops on depth failing (27:25), passing (24:22), and the stencil
+    /// test failing (21:19), the test (18:16, as depth tests' order), the reference (15:8), and
+    /// the mask tested (7:0).
+    const Stencil = struct {
+        func: u3,
+        ref: u8,
+        mask: u8,
+        write_mask: u8,
+        sfail: u3,
+        zfail: u3,
+        zpass: u3,
+
+        fn of(setups: []const u32, back: bool) ?Stencil {
+            var cfgs: [2]?u32 = .{ null, null };
+            var write_masks: [2]u8 = .{ 0xff, 0xff };
+            const codes = [4]u8{ 0x1, 0x3, 0xf, 0xff };
+            for (setups) |w| {
+                switch (w >> 30) {
+                    0 => write_masks = .{ @truncate(w), @truncate(w >> 8) },
+                    1, 2, 3 => {
+                        for (0..2) |side| {
+                            if ((w >> 30) & (@as(u32, 1) << @intCast(side)) == 0) continue;
+                            cfgs[side] = w;
+                            write_masks[side] = codes[(w >> 28) & 3];
+                        }
+                    },
+                    else => unreachable,
+                }
+            }
+            const side: usize = @intFromBool(back);
+            const w = cfgs[side] orelse return null;
+            return .{
+                .func = @truncate(w >> 16),
+                .ref = @truncate(w >> 8),
+                .mask = @truncate(w),
+                .write_mask = write_masks[side],
+                .sfail = @truncate(w >> 19),
+                .zpass = @truncate(w >> 22),
+                .zfail = @truncate(w >> 25),
+            };
+        }
+
+        fn passes(st: Stencil, value: u8) bool {
+            const r = st.ref & st.mask;
+            const v = value & st.mask;
+            return switch (st.func) {
+                0 => false,
+                1 => r < v,
+                2 => r == v,
+                3 => r <= v,
+                4 => r > v,
+                5 => r != v,
+                6 => r >= v,
+                7 => true,
+            };
+        }
+
+        /// `value` after `op`: zero, keep, replace (with the reference), increment and
+        /// decrement (saturating), invert, increment and decrement (wrapping); only the bits
+        /// of the write mask.
+        fn apply(st: Stencil, op: u3, value: u8) u8 {
+            const new: u8 = switch (op) {
+                0 => 0,
+                1 => value,
+                2 => st.ref,
+                3 => value +| 1,
+                4 => value -| 1,
+                5 => ~value,
+                6 => value +% 1,
+                7 => value -% 1,
+            };
+            return (value & ~st.write_mask) | (new & st.write_mask);
+        }
+    };
+
+    /// A depth as the 24-bit depth buffer holds it.
+    pub fn zq(z: f32) f32 {
+        return @round(std.math.clamp(z, 0, 1) * 16777215.0) / 16777215.0;
+    }
+
+    fn zqVec(comptime n: usize, z: @Vector(n, f32)) @Vector(n, f32) {
+        const V = @Vector(n, f32);
+        const c = @min(@max(z, @as(V, @splat(0))), @as(V, @splat(1)));
+        return @round(c * @as(V, @splat(16777215.0))) / @as(V, @splat(16777215.0));
+    }
 
     /// Where a multisampled pixel's samples are, from its top-left corner (the usual 4x pattern, a
     /// grid turned so no two share a row or column).
@@ -3402,7 +3538,7 @@ pub const V3d = struct {
                     const e2 = t.edge2.eval(t.edge2.dx * (fy - t.edge2.p0y), fx);
                     if (!t.edge0.passes(e0) or !t.edge1.passes(e1) or !t.edge2.passes(e2)) continue;
                     mask |= @as(u4, 1) << @intCast(si);
-                    zs[si] = t.v[2].z + e0 * t.inv_area * t.dz0 + e1 * t.inv_area * t.dz1;
+                    zs[si] = zq(t.v[2].z + e0 * t.inv_area * t.dz0 + e1 * t.inv_area * t.dz1);
                 }
                 if (mask == 0) continue;
                 if (!materialized) {
@@ -3766,7 +3902,7 @@ pub const V3d = struct {
                         const w0_base = cur_e0 * inv_area;
                         const w1_base = cur_e1 * inv_area;
                         const z_base = z2 + w0_base * dz0 + w1_base * dz1;
-                        const z_vec = @as(@Vector(16, f32), @splat(z_base)) + step16_z;
+                        const z_vec = zqVec(16, @as(@Vector(16, f32), @splat(z_base)) + step16_z);
 
                         const depth_all_pass: bool = if (depth_func == 7) true else blk: {
                             const cur_z_vec: @Vector(16, f32) = tb.depth[tile_idx..][0..16].*;
@@ -3878,7 +4014,7 @@ pub const V3d = struct {
                     const w0_base = cur_e0 * inv_area;
                     const w1_base = cur_e1 * inv_area;
                     const z_base = z2 + w0_base * dz0 + w1_base * dz1;
-                    const z_4 = @as(@Vector(4, f32), @splat(z_base)) + step4_z;
+                    const z_4 = zqVec(4, @as(@Vector(4, f32), @splat(z_base)) + step4_z);
                     const base_tile_idx = row_base + (px - tile_px_x);
 
                     if (depth_func != 7) {
@@ -4057,7 +4193,7 @@ pub const V3d = struct {
                 const w0 = e0 * inv_area;
                 const w1 = e1 * inv_area;
 
-                const z = z2 + w0 * dz0 + w1 * dz1;
+                const z = zq(z2 + w0 * dz0 + w1 * dz1);
                 const tile_idx = row_base + (px - 1 - tile_px_x);
 
                 if (depth_func != 7) {
@@ -5559,4 +5695,24 @@ test "V3D draws a tile stored more than once, its coordinates sent again between
     for ([_]usize{ 0x10000, 0x20000 }) |fb| {
         try std.testing.expectEqual(@as(u32, 0xffffffff), std.mem.readInt(u32, ram[fb + (32 * 64 + 32) * 4 ..][0..4], .little));
     }
+}
+
+test "V3D stencil setups test and update stencils" {
+    const S = V3d.Stencil;
+    // Both faces: write mask 0xff, z-fail incsat, z-pass replace, s-fail keep, always, ref 0x5a.
+    const both: u32 = 3 << 30 | 3 << 28 | 3 << 25 | 2 << 22 | 1 << 19 | 7 << 16 | 0x5a << 8 | 0xff;
+    const st = S.of(&.{both}, false).?;
+    try std.testing.expect(st.passes(0));
+    try std.testing.expectEqual(@as(u8, 0x5a), st.apply(st.zpass, 0));
+    try std.testing.expectEqual(@as(u8, 0xff), st.apply(st.zfail, 0xff));
+    // Front alone, equal to 0x5a with mask 0x0f, write mask 0x3 (code 1), inverting on pass.
+    const front: u32 = 1 << 30 | 1 << 28 | 1 << 25 | 5 << 22 | 1 << 19 | 2 << 16 | 0x5a << 8 | 0x0f;
+    try std.testing.expect(S.of(&.{front}, true) == null);
+    const f = S.of(&.{front}, false).?;
+    try std.testing.expect(f.passes(0xfa));
+    try std.testing.expect(!f.passes(0x5b));
+    try std.testing.expectEqual(@as(u8, 0xf0 | 0x2), f.apply(f.zpass, 0xf1));
+    // A write mask word after: the front's 0xf0.
+    const masked = S.of(&.{ front, 0x00f0 }, false).?;
+    try std.testing.expectEqual(@as(u8, 0x0e), masked.apply(masked.zpass, 0xfe));
 }

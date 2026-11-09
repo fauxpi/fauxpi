@@ -34,6 +34,10 @@ pub const Env = struct {
     frag_z: Vec = splat(0),
     frag_x: Vec = splat(0),
     frag_y: Vec = splat(0),
+    /// What MS_FLAGS reads (regfile A): the samples each fragment covers; and REV_FLAG
+    /// (regfile B): 1 where the primitive faces back.
+    ms_mask: Vec = splat(0xf),
+    rev_flag: Vec = splat(0),
     texture_memory: []const u8 = &.{},
     texture_memory1: []const u8 = &.{},
     textures: []const []const u8 = &.{},
@@ -79,7 +83,40 @@ pub const FragResult = struct {
     /// A lookup took its level of detail from the differences across its 2x2 quads of
     /// elements (which a fragment shader's must be, for it to be right).
     needs_quads: bool = false,
+    /// The elements written (bit n element n): their colour (or each sample's), their Z (a
+    /// 24-bit integer), and their MS_FLAGS (the samples they cover, from then on). A fragment
+    /// whose colour and Z aren't written is discarded.
+    tlb_color_mask: u16 = 0,
+    tlb_sample_masks: [4]u16 = @splat(0),
+    tlb_z_mask: u16 = 0,
+    ms_flags: Vec = splat(0xf),
+    ms_flags_mask: u16 = 0,
+    /// The TLB_STENCIL_SETUP words written (element 0's), in turn.
+    stencil_setups: [3]u32 = @splat(0),
+    stencil_count: usize = 0,
 };
+
+/// The lanes `cond` holds for.
+fn laneBits(cond: qpu.Cond, s: *const State) u16 {
+    return @bitCast(condMask(cond, s));
+}
+
+/// `old` with the lanes in `mask` from `new`.
+fn mergeLanes(old: ?Vec, new: Vec, mask: u16) Vec {
+    if (mask == 0xffff) return new;
+    const m: VecBool = @bitCast(mask);
+    return @select(u32, m, new, old orelse splat(0));
+}
+
+/// Depths (32-bit floats, 0 to 1) as the 24-bit integers the fragment's Z payload reads and
+/// TLB_Z is written.
+pub fn z24Of(z: Vec) Vec {
+    const zf: VecF = @bitCast(z);
+    const c = @min(@max(zf, @as(VecF, @splat(0))), @as(VecF, @splat(1)));
+    const z24: VecU = @intFromFloat(@round(c * @as(VecF, @splat(16777215.0))));
+    return z24;
+}
+
 
 pub const Error = error{
     Unsupported,
@@ -698,8 +735,61 @@ const SymVal = union(enum) {
 
 pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: Uniforms) FastFragShader {
     var fast = analyzeFragmentShaderKind(decoded, uniforms);
-    fast.quads = needsQuads(decoded, uniforms);
+    fast.quads = tlbUse(decoded).any() or needsQuads(decoded, uniforms);
     return fast;
+}
+
+/// What a fragment shader does with the TLB besides writing every fragment's colour (and its
+/// Z as the rasterizer gives it): what the quad path is for.
+pub const TlbUse = struct {
+    /// Writes TLB_STENCIL_SETUP: the stencil test.
+    stencil: bool = false,
+    /// Writes MS_FLAGS: the samples drawn.
+    ms_flags: bool = false,
+    /// Writes TLB_Z other than the Z payload as it is.
+    shader_z: bool = false,
+    /// Writes its colour, or Z, to some fragments (discarding the rest).
+    conditional: bool = false,
+    /// Reads MS_FLAGS or REV_FLAG.
+    reads_flags: bool = false,
+
+    pub fn any(t: TlbUse) bool {
+        return t.stencil or t.ms_flags or t.shader_z or t.conditional or t.reads_flags;
+    }
+};
+
+pub fn tlbUse(decoded: []const DecodedInst) TlbUse {
+    var t: TlbUse = .{};
+    for (decoded) |d| {
+        if (d.sig == .branch) continue;
+        if (d.raddr_a == qpu.R.ms_rev_flags or (d.raddr_b == qpu.R.ms_rev_flags and d.sig != .small_imm and d.sig != .load_imm)) {
+            if (d.sig != .load_imm) t.reads_flags = true;
+        }
+        if (d.sig == .load_imm) {
+            // Its value to both outputs: as a write of a constant.
+            for ([2]u6{ d.waddr_add, d.waddr_mul }, [2]qpu.Cond{ d.cond_add, d.cond_mul }) |wa, cond| tlbWrite(&t, wa, cond, false);
+            continue;
+        }
+        tlbWrite(&t, d.waddr_add, d.cond_add, d.add_op == .@"or" and d.mux0 == .b and d.mux1 == .b and d.raddr_b == qpu.R.frag_payload_zw and d.sig != .small_imm and d.add_pack_a == 0);
+        tlbWrite(&t, d.waddr_mul, d.cond_mul, d.mul_op == .v8min and d.mux2 == .b and d.mux3 == .b and d.raddr_b == qpu.R.frag_payload_zw and d.sig != .small_imm and d.mul_pack_a == 0 and d.mul_pack_m == 0);
+    }
+    return t;
+}
+
+fn tlbWrite(t: *TlbUse, waddr: u6, cond: qpu.Cond, z_payload: bool) void {
+    if (cond == .never) return;
+    switch (waddr) {
+        qpu.W.tlb_stencil_setup => t.stencil = true,
+        qpu.W.ms_flags => t.ms_flags = true,
+        qpu.W.tlb_z => {
+            if (!z_payload) t.shader_z = true;
+            if (cond != .always) t.conditional = true;
+        },
+        qpu.W.tlb_color_all, qpu.W.tlb_color_ms => if (cond != .always) {
+            t.conditional = true;
+        },
+        else => {},
+    }
 }
 
 /// Whether a fragment shader's texture lookups take their level of detail from 2x2 quads: those
@@ -1184,7 +1274,7 @@ pub inline fn runFragmentFast(
 ) Error!FragResult {
     switch (fast.kind) {
         .none => return runFragmentDecoded(decoded, env),
-        .constant_color => return .{ .tlb_color = splat(fast.color) },
+        .constant_color => return .{ .tlb_color = splat(fast.color), .tlb_color_mask = 0xffff },
         .varying_pack_rgba => {
             var out: VecU = @splat(fast.color);
             inline for (0..4) |b_i| {
@@ -1195,7 +1285,7 @@ pub inline fn runFragmentFast(
                     out |= unorm8Vec(v_vec) << @as(@Vector(lanes, u5), @splat(shift));
                 }
             }
-            return .{ .tlb_color = out };
+            return .{ .tlb_color = out, .tlb_color_mask = 0xffff };
         },
         .tmu0_blit => {
             const p0 = if (fast.tmu_p0_unif < env.uniforms.len) env.uniforms[fast.tmu_p0_unif] else 0;
@@ -1209,9 +1299,9 @@ pub inline fn runFragmentFast(
             const req: TmuRequest = .{ .params = .{ p0, p1, 0, 0 }, .count = 2, .s = s_vec, .t = t_vec, .r = null, .b = null };
             const texel = sampleTmuVec(0, &req, env, &local_cache, &second);
             if (fast.tmu_modulate) {
-                return .{ .tlb_color = v8muldVec(texel, @splat(fast.color)) };
+                return .{ .tlb_color = v8muldVec(texel, @splat(fast.color)), .tlb_color_mask = 0xffff };
             }
-            return .{ .tlb_color = texel };
+            return .{ .tlb_color = texel, .tlb_color_mask = 0xffff };
         },
     }
 }
@@ -1253,7 +1343,7 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
     var s: State = .{};
     @memset(s.acc[0..6], splat(0));
     s.ra[qpu.R.frag_payload_zw] = env.frag_w;
-    s.rb[qpu.R.frag_payload_zw] = env.frag_z;
+    s.rb[qpu.R.frag_payload_zw] = z24Of(env.frag_z);
     s.ra_init = @as(u32, 1) << qpu.R.frag_payload_zw;
     s.rb_init = @as(u32, 1) << qpu.R.frag_payload_zw;
 
@@ -1541,6 +1631,7 @@ fn readPort(s: *State, env: *const Env, raddr: u6, file: File) Error!Vec {
             return .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         },
         qpu.R.xy_pixel_coord => return if (file == .a) env.frag_x else env.frag_y,
+        qpu.R.ms_rev_flags => return if (file == .a) env.ms_mask else env.rev_flag,
         qpu.R.vpm_ld_busy, qpu.R.vpm_ld_wait, qpu.R.mutex_acquire => return splat(0),
         else => return splat(0),
     }
@@ -1997,15 +2088,38 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
                 s.vpm_read_left = if (n == 0) 16 else n;
             }
         },
-        qpu.W.tlb_color_all => r.tlb_color = value,
-        qpu.W.tlb_color_ms => {
-            if (@hasField(RType, "tlb_color_samples")) {
-                if (r.tlb_samples < r.tlb_color_samples.len) r.tlb_color_samples[r.tlb_samples] = value;
-                r.tlb_samples += 1;
-            }
-            r.tlb_color = value;
+        // Written to the elements the condition holds for (the others discarded).
+        qpu.W.tlb_color_all => {
+            const m = laneBits(cond, s);
+            r.tlb_color = mergeLanes(r.tlb_color, value, m);
+            if (@hasField(RType, "tlb_color_mask")) r.tlb_color_mask |= m;
         },
-        qpu.W.tlb_z => r.tlb_z = value,
+        qpu.W.tlb_color_ms => {
+            const m = laneBits(cond, s);
+            if (@hasField(RType, "tlb_color_samples")) {
+                if (r.tlb_samples < r.tlb_color_samples.len) {
+                    r.tlb_color_samples[r.tlb_samples] = value;
+                    if (@hasField(RType, "tlb_sample_masks")) r.tlb_sample_masks[r.tlb_samples] = m;
+                }
+                r.tlb_samples += 1;
+                if (@hasField(RType, "tlb_color_mask")) r.tlb_color_mask |= m;
+            }
+            r.tlb_color = mergeLanes(r.tlb_color, value, m);
+        },
+        qpu.W.tlb_z => {
+            const m = laneBits(cond, s);
+            r.tlb_z = mergeLanes(r.tlb_z, value, m);
+            if (@hasField(RType, "tlb_z_mask")) r.tlb_z_mask |= m;
+        },
+        qpu.W.ms_flags => if (@hasField(RType, "ms_flags")) {
+            const m = laneBits(cond, s);
+            r.ms_flags = mergeLanes(r.ms_flags, value, m);
+            r.ms_flags_mask |= m;
+        },
+        qpu.W.tlb_stencil_setup => if (@hasField(RType, "stencil_setups")) {
+            if (r.stencil_count < r.stencil_setups.len) r.stencil_setups[r.stencil_count] = value[0];
+            r.stencil_count += 1;
+        },
         qpu.W.sfu_recip, qpu.W.sfu_recipsqrt, qpu.W.sfu_exp, qpu.W.sfu_log => {
             const vf: VecF = @bitCast(value);
             var res_f: VecF = undefined;
