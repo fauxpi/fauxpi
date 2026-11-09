@@ -2000,8 +2000,8 @@ pub const V3d = struct {
                             // The decimate mode: 4x averages each pixel's samples, else sample 0.
                             j.?.resolve = (bits >> 6) & 3 == 1;
                         }
-                        // Last store for tile
-                        if ((bits & (1 << 15)) == 0) it.endTile();
+                        // The tile's last store clears its colour (bit 13 keeps it, for stores after).
+                        if (bits & (1 << 13) == 0) it.endTile();
                         it.pc += 7;
                         if (j) |stored| return stored;
                     },
@@ -2080,6 +2080,12 @@ pub const V3d = struct {
                     },
                     115 => { // TILE_COORDINATES (3 bytes)
                         if (pc + 3 > end) break;
+                        // Sent again between a tile's stores (the tile buffer kept): the same tile,
+                        // still drawn.
+                        if (it.has_tile_coords and ram[pc + 1] == it.cur_tile_x and ram[pc + 2] == it.cur_tile_y) {
+                            it.pc += 3;
+                            continue;
+                        }
                         it.cur_tile_x = ram[pc + 1];
                         it.cur_tile_y = ram[pc + 2];
                         it.has_tile_coords = true;
@@ -5299,4 +5305,82 @@ test "V3D draws multisampled frames: each pixel its samples averaged, blended a 
     try std.testing.expectEqual(@as(u32, 0xffff0000), Frame.pixel(ram, 19, 40));
     try std.testing.expectEqual(@as(u32, 0xff800000), Frame.pixel(ram, 20, 40));
     try std.testing.expectEqual(@as(u32, 0xff000000), Frame.pixel(ram, 21, 40));
+}
+
+test "V3D draws a tile stored more than once, its coordinates sent again between the stores" {
+    var v3d = V3d{};
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 256 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+    // A white triangle over the whole 64-pixel tile, coloured from its varyings.
+    _ = try writeGridScene(ram);
+    std.mem.writeInt(u32, ram[0x1800..0x1804], @bitCast(@as(f32, 32.0 * 16.0)), .little);
+    std.mem.writeInt(u32, ram[0x1804..0x1808], @bitCast(@as(f32, 32.0 * 16.0)), .little);
+    std.mem.writeInt(u32, ram[0x3024..0x3028], 0x2000, .little);
+    const verts = [_]f32{ -4, -4, 1, 1, 1, 4, -4, 1, 1, 1, 0, 4, 1, 1, 1 };
+    @memcpy(ram[0x2000..][0..@sizeOf(@TypeOf(verts))], std.mem.sliceAsBytes(&verts));
+    var flat: qpu.Program(32) = .{};
+    for (0..3) |i| {
+        const acc: u3 = @intCast(i);
+        flat.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(acc), .a = qpu.vary, .b = qpu.frag_w } }));
+        flat.emit(try qpu.alu(.{ .add = .{ .op = .fadd, .dst = qpu.wr(acc), .a = qpu.r(acc), .b = qpu.r(5) } }));
+    }
+    const one = qpu.smallImmFloat(1.0);
+    flat.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(2), .b = one }, .pack = .{ .mul = .@"8a" } }));
+    flat.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(1), .b = one }, .pack = .{ .mul = .@"8b" } }));
+    flat.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(0), .b = one }, .pack = .{ .mul = .@"8c" } }));
+    flat.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = one, .b = one }, .pack = .{ .mul = .@"8d" } }));
+    flat.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(3)));
+    flat.end(.fragment);
+    @memcpy(ram[0x1400..][0 .. flat.code().len * 8], std.mem.sliceAsBytes(flat.code()));
+
+    var c: usize = 0x4000;
+    ram[c] = 6; // START_TILE_BINNING
+    ram[c + 1] = 103; // VIEWPORT_OFFSET (32, 32)
+    std.mem.writeInt(u16, ram[c + 2 ..][0..2], 32 * 16, .little);
+    std.mem.writeInt(u16, ram[c + 4 ..][0..2], 32 * 16, .little);
+    ram[c + 6] = 64; // GL_SHADER_STATE
+    std.mem.writeInt(u32, ram[c + 7 ..][0..4], 0x3001, .little);
+    ram[c + 11] = 33; // GL_ARRAY_PRIMITIVE: a triangle
+    ram[c + 12] = 4;
+    std.mem.writeInt(u32, ram[c + 13 ..][0..4], 3, .little);
+    std.mem.writeInt(u32, ram[c + 17 ..][0..4], 0, .little);
+    ram[c + 21] = 4; // FLUSH
+    c += 22;
+    v3d.write32(0x110, 0x4000, ram);
+    v3d.write32(0x108, @intCast(c), ram);
+
+    c = 0x5000;
+    ram[c] = 113; // TILE_RENDERING_MODE_CONFIG: 64 square, RGBA8888, linear, at 0x10000
+    std.mem.writeInt(u32, ram[c + 1 ..][0..4], 0x10000, .little);
+    std.mem.writeInt(u16, ram[c + 5 ..][0..2], 64, .little);
+    std.mem.writeInt(u16, ram[c + 7 ..][0..2], 64, .little);
+    std.mem.writeInt(u16, ram[c + 9 ..][0..2], 1 << 2, .little);
+    c += 11;
+    ram[c] = 114; // CLEAR_COLORS: black
+    @memset(ram[c + 1 ..][0..13], 0);
+    std.mem.writeInt(u32, ram[c + 1 ..][0..4], 0xff000000, .little);
+    c += 14;
+    ram[c] = 115; // TILE_COORDINATES (0, 0)
+    ram[c + 1] = 0;
+    ram[c + 2] = 0;
+    ram[c + 3] = 17; // BRANCH_TO_SUB_LIST
+    std.mem.writeInt(u32, ram[c + 4 ..][0..4], 0, .little);
+    // STORE_TILE_BUFFER_GENERAL: colour, raster, keeping the tile buffer (no colour clear), to
+    // 0x20000; then the coordinates again, and the frame's store.
+    ram[c + 8] = 28;
+    std.mem.writeInt(u16, ram[c + 9 ..][0..2], 1 | 1 << 13, .little);
+    std.mem.writeInt(u32, ram[c + 11 ..][0..4], 0x20000, .little);
+    ram[c + 15] = 115;
+    ram[c + 16] = 0;
+    ram[c + 17] = 0;
+    ram[c + 18] = 25; // STORE_MS_TILE_BUFFER_AND_EOF
+    c += 19;
+    v3d.write32(0x114, 0x5000, ram);
+    v3d.write32(0x10c, @intCast(c), ram);
+
+    for ([_]usize{ 0x10000, 0x20000 }) |fb| {
+        try std.testing.expectEqual(@as(u32, 0xffffffff), std.mem.readInt(u32, ram[fb + (32 * 64 + 32) * 4 ..][0..4], .little));
+    }
 }
