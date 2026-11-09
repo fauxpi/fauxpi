@@ -25,7 +25,7 @@ pub const V3d = struct {
     pub const DrawCall = struct {
         shader_rec_addr: u32 = 0,
         num_attrs: u4 = 0,
-        mode: u8 = 4, // 1 = lines, 2 = line loop, 3 = line strip, 4 = triangles, 5 = strip, 6 = fan
+        mode: u8 = 4, // 0 = points, 1 = lines, 2 = line loop, 3 = line strip, 4 = triangles, 5 = strip, 6 = fan
         indexed: bool = false,
         u16_indices: bool = true,
         count: u32 = 0,
@@ -48,6 +48,8 @@ pub const V3d = struct {
         z_offset: f32 = 0,
         /// How wide lines are drawn, in pixels (LINE_WIDTH).
         line_width: f32 = 1,
+        /// How wide points are drawn, in pixels (POINT_SIZE), unless the vertex shader says.
+        point_size: f32 = 1,
     };
 
     /// A vertex's clip coordinates, as its coordinate shader writes them (W NaN if it can't be run).
@@ -75,6 +77,8 @@ pub const V3d = struct {
         z: f32 = 0.5,
         inv_w: f32 = 1.0,
         persp_varyings: [16]f32 = @splat(0),
+        /// How wide a point drawn at it is, in pixels.
+        point_size: f32 = 1,
     };
 
     pub const EdgeSetup = struct {
@@ -272,6 +276,7 @@ pub const V3d = struct {
     cur_z_scale: f32 = 1,
     cur_z_offset: f32 = 0,
     cur_line_width: f32 = 1,
+    cur_point_size: f32 = 1,
     multisample_bin: bool = false,
 
     // Tile buffer (64x64 pixels max per tile)
@@ -364,6 +369,7 @@ pub const V3d = struct {
         self.cur_z_scale = 1;
         self.cur_z_offset = 0;
         self.cur_line_width = 1;
+        self.cur_point_size = 1;
         self.multisample_bin = false;
         @memset(&self.tile_color, 0);
         @memset(&self.tile_depth, 1.0);
@@ -543,6 +549,7 @@ pub const V3d = struct {
                             .z_scale = self.cur_z_scale,
                             .z_offset = self.cur_z_offset,
                             .line_width = self.cur_line_width,
+                            .point_size = self.cur_point_size,
                         }) catch {};
                     }
                     pc += 14;
@@ -574,6 +581,7 @@ pub const V3d = struct {
                             .z_scale = self.cur_z_scale,
                             .z_offset = self.cur_z_offset,
                             .line_width = self.cur_line_width,
+                            .point_size = self.cur_point_size,
                         }) catch {};
                     }
                     pc += 10;
@@ -594,7 +602,12 @@ pub const V3d = struct {
                     self.cur_cfg2 = ram[pc + 3];
                     pc += 4;
                 },
-                97, 98, 101 => pc += 5, // FLAT_SHADE, POINT_SIZE, DEPTH_OFFSET
+                97, 101 => pc += 5, // FLAT_SHADE, DEPTH_OFFSET
+                98 => { // POINT_SIZE (5 bytes): a float, in pixels
+                    if (pc + 5 > end) break;
+                    self.cur_point_size = @bitCast(std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little));
+                    pc += 5;
+                },
                 99 => { // LINE_WIDTH (5 bytes): a float, in pixels
                     if (pc + 5 > end) break;
                     self.cur_line_width = @bitCast(std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little));
@@ -697,7 +710,7 @@ pub const V3d = struct {
             const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
             if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) continue;
 
-            const fs_num_varyings = ram[rec_phys + 3];
+            const fs_num_varyings = ram[rec_phys + 3] +| rasterizerVaryings(draw);
             const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & vc_bus.ramMask(ram.len);
             const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & vc_bus.ramMask(ram.len);
             const vs_attr_mask = ram[rec_phys + 14];
@@ -781,7 +794,7 @@ pub const V3d = struct {
                     const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
                         (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
                     if (@abs(area) < 1e-6) continue;
-                    if (!isLines(draw) and culled(draw.config_b0, area)) continue;
+                    if (isTriangles(draw) and culled(draw.config_b0, area)) continue;
 
                     const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
                     const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
@@ -816,10 +829,12 @@ pub const V3d = struct {
 
     /// The vertex `index` of a draw's triangle `tri`'s `corner`, as V3D reads it (from the index
     /// buffer, for an indexed draw), or null if it is past the end of RAM.
-    /// A line's ends are its first two corners, and its last corner its second end again.
+    /// A line's ends are its first two corners, and its last corner its second end again; a
+    /// point is all three.
     fn triangleCorner(ram: []const u8, draw: DrawCall, tri: u32, corner: u32) u32 {
         const end = @min(corner, 1);
         const pos: u32 = switch (draw.mode) {
+            0 => tri,
             1 => tri * 2 + end,
             2 => (tri + end) % draw.count,
             3 => tri + end,
@@ -995,6 +1010,24 @@ pub const V3d = struct {
         return .{ .decoded = cs_decoded, .unifs = uniformsAt(ram, cs_unif_phys), .attrs = attrs[0..info.count], .vpm_words = info.vpm_words };
     }
 
+    /// Where a draw's shaded vertices' varyings are, for `n_var` varyings in the fragment shader.
+    const VertexLayout = struct {
+        /// Whether the vertex shader writes each point's size, after 1/Wc.
+        point_size: bool,
+        /// The VPM word its varyings start at.
+        first_varying: usize,
+        /// The fragment shader's varyings before them (the rasterizer's).
+        skip: usize,
+        /// How many of them the fragment shader reads.
+        varyings: usize,
+
+        fn of(ram: []const u8, draw: DrawCall, n_var: usize) VertexLayout {
+            const point_size = pointSizeWritten(ram, draw);
+            const skip = @min(rasterizerVaryings(draw), n_var);
+            return .{ .point_size = point_size, .first_varying = if (point_size) 4 else 3, .skip = skip, .varyings = n_var - skip };
+        }
+    };
+
     /// Vertices shaded together: `indices` into `out` and `ok`, in batches of 16.
     const VertexJob = struct {
         ram: []const u8,
@@ -1058,11 +1091,12 @@ pub const V3d = struct {
                     @memset(job.ok[lo..hi], false);
                     return;
                 };
-                if (res.vpm_out_len < 3) {
+                const layout: VertexLayout = .of(job.ram, job.draw, job.n_var);
+                if (res.vpm_out_len < layout.first_varying) {
                     @memset(job.ok[lo..hi], false);
                     return;
                 }
-                const valid_vars = @min(job.n_var, res.vpm_out_len - 3);
+                const valid_vars = @min(layout.varyings, res.vpm_out_len - layout.first_varying);
                 for (lo..hi) |i| {
                     const lane = i - lo;
                     var v: ShadedVertex = .{};
@@ -1075,9 +1109,10 @@ pub const V3d = struct {
                     const raw_inv_w: f32 = @bitCast(res.vpm_out[2][lane]);
                     const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
                     v.inv_w = inv_w;
+                    v.point_size = if (layout.point_size) @bitCast(res.vpm_out[3][lane]) else job.draw.point_size;
                     for (0..valid_vars) |vi| {
-                        const raw_v: f32 = @bitCast(res.vpm_out[3 + vi][lane]);
-                        v.persp_varyings[vi] = raw_v * inv_w;
+                        const raw_v: f32 = @bitCast(res.vpm_out[layout.first_varying + vi][lane]);
+                        v.persp_varyings[layout.skip + vi] = raw_v * inv_w;
                     }
                     job.out[i] = v;
                     job.ok[i] = true;
@@ -1188,14 +1223,34 @@ pub const V3d = struct {
         return v;
     }
 
-    /// Whether `draw` draws lines (and a loop, or a strip, of them) rather than triangles.
+    /// Whether `draw` draws lines (and a loop, or a strip, of them).
     fn isLines(draw: DrawCall) bool {
         return draw.mode >= 1 and draw.mode <= 3;
     }
 
-    /// How many lines, or triangles, `draw` draws (none for points, which aren't drawn).
+    /// Whether `draw` draws triangles (and a strip, or a fan, of them), not points or lines.
+    fn isTriangles(draw: DrawCall) bool {
+        return draw.mode >= 4;
+    }
+
+    /// The varyings the rasterizer gives the fragment shader before the vertex shader's (which the
+    /// shader record doesn't count): a point's coordinates across it (s, then t), or a line's along
+    /// it.
+    fn rasterizerVaryings(draw: DrawCall) u8 {
+        return if (draw.mode == 0) 2 else if (isLines(draw)) 1 else 0;
+    }
+
+    /// Whether the vertex shader writes each point's size (after 1/Wc), as its shader record says.
+    fn pointSizeWritten(ram: []const u8, draw: DrawCall) bool {
+        if (draw.mode != 0) return false;
+        const rec = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
+        return rec < ram.len and ram[rec] & 2 != 0;
+    }
+
+    /// How many points, lines, or triangles `draw` draws.
     fn numPrims(draw: DrawCall) u32 {
         return switch (draw.mode) {
+            0 => draw.count,
             1 => draw.count / 2,
             2 => if (draw.count >= 2) draw.count else 0,
             3 => if (draw.count >= 2) draw.count - 1 else 0,
@@ -1206,11 +1261,20 @@ pub const V3d = struct {
     }
 
     /// The triangles one of `draw`'s primitives is drawn as, into `out`: a triangle clipped
-    /// (`clipTriangle`), or a line (its ends the first two of `verts`) clipped and made a quad
-    /// (`lineQuad`).
+    /// (`clipTriangle`), a line (its ends the first two of `verts`) clipped and made a quad
+    /// (`lineQuad`), or a point made a square (`pointQuad`). `n_var` counts the rasterizer's
+    /// varyings, which are set here.
     pub fn primitiveTriangles(draw: DrawCall, verts: [3]ShadedVertex, c: [3]ClipVertex, n_var: usize, out: *[max_clipped][3]ShadedVertex) usize {
-        if (!isLines(draw)) return clipTriangle(draw, verts, c, n_var, out);
+        if (isTriangles(draw)) return clipTriangle(draw, verts, c, n_var, out);
+        if (!isLines(draw)) {
+            // Points whose middles the clipper cuts aren't drawn.
+            if (needsClip(draw, c)) return 0;
+            return pointQuad(verts[0], out);
+        }
         var ends: [2]ShadedVertex = .{ verts[0], verts[1] };
+        // Its coordinate along it, from 0 to 1 (clipped with its varyings).
+        ends[0].persp_varyings[0] = 0;
+        ends[1].persp_varyings[0] = ends[1].inv_w;
         if (needsClip(draw, c)) {
             if (!clipLine(draw, &ends, .{ c[0], c[1] }, n_var)) return 0;
         }
@@ -1245,6 +1309,24 @@ pub const V3d = struct {
             ends[e] = clippedVertex(draw, p + (q - p) * @as(@Vector(4, f32), @splat(t)), &r, n_var);
         }
         return true;
+    }
+
+    /// The two triangles a point at `v` is drawn as: a square `v.point_size` wide, its coordinates
+    /// across it (its first two varyings) from 0 at the left and top to 1 at the right and bottom.
+    /// None if it has no size.
+    fn pointQuad(v: ShadedVertex, out: *[max_clipped][3]ShadedVertex) usize {
+        if (!(v.point_size > 0)) return 0;
+        const half = v.point_size * 0.5;
+        var corners: [4]ShadedVertex = @splat(v);
+        for (&corners, [4][2]f32{ .{ 0, 0 }, .{ 1, 0 }, .{ 1, 1 }, .{ 0, 1 } }) |*c, st| {
+            c.x += (st[0] * 2 - 1) * half;
+            c.y += (st[1] * 2 - 1) * half;
+            c.persp_varyings[0] = st[0] * v.inv_w;
+            c.persp_varyings[1] = st[1] * v.inv_w;
+        }
+        out[0] = .{ corners[0], corners[1], corners[2] };
+        out[1] = .{ corners[0], corners[2], corners[3] };
+        return 2;
     }
 
     /// The two triangles a line from `ends[0]` to `ends[1]` is drawn as: `draw.line_width` wide
@@ -2050,13 +2132,13 @@ pub const V3d = struct {
         var vertex_total: u32 = 0;
         if (!g.begin(self.draws.items.len)) return false;
         for (self.draws.items) |draw| {
-            // Lines are drawn from vertices shaded on the CPU, which makes them quads.
-            if (isLines(draw)) return false;
+            // Lines and points are drawn from vertices shaded on the CPU, which makes them quads.
+            if (!isTriangles(draw)) return false;
             // What prepareDrawsForFrame skips, drawing nothing.
             if (numPrims(draw) == 0) continue;
             const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
             if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) continue;
-            const fs_num_varyings = ram[rec_phys + 3];
+            const fs_num_varyings = ram[rec_phys + 3] +| rasterizerVaryings(draw);
             const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & vc_bus.ramMask(ram.len);
             const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & vc_bus.ramMask(ram.len);
             const vs_attr_mask = ram[rec_phys + 14];
@@ -2710,7 +2792,7 @@ pub const V3d = struct {
         const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
         if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) return;
 
-        const fs_num_varyings = ram[rec_phys + 3];
+        const fs_num_varyings = ram[rec_phys + 3] +| rasterizerVaryings(draw);
         const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & vc_bus.ramMask(ram.len);
         const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & vc_bus.ramMask(ram.len);
         const vs_attr_mask = ram[rec_phys + 14];
@@ -2768,7 +2850,8 @@ pub const V3d = struct {
                 .uniforms = vs_unifs,
                 .vpm_in = vpm_in[0..vpm_words],
             }) catch continue;
-            if (vs_res.vpm_out_len < 3) continue;
+            const layout: VertexLayout = .of(ram, draw, n_var);
+            if (vs_res.vpm_out_len < layout.first_varying) continue;
             var clip: [16]ClipVertex = @splat(.{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) });
             if (cs) |c| {
                 const job: VertexJob = .{ .ram = ram, .draw = draw, .decoded = &.{}, .unifs = &.{}, .attrs = &.{}, .vpm_words = 0, .n_var = 0, .indices = v_indices[0..batch_verts], .out = &.{}, .ok = &.{}, .shade = false, .cs = c, .clip = clip[0..batch_verts] };
@@ -2790,11 +2873,10 @@ pub const V3d = struct {
                     const raw_inv_w: f32 = @bitCast(vs_res.vpm_out[2][lane]);
                     const inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
                     verts[corner].inv_w = inv_w;
-                    for (0..n_var) |vi| {
-                        if (3 + vi < vs_res.vpm_out_len) {
-                            const raw_v: f32 = @bitCast(vs_res.vpm_out[3 + vi][lane]);
-                            verts[corner].persp_varyings[vi] = raw_v * inv_w;
-                        }
+                    verts[corner].point_size = if (layout.point_size) @bitCast(vs_res.vpm_out[3][lane]) else draw.point_size;
+                    for (0..@min(layout.varyings, vs_res.vpm_out_len - layout.first_varying)) |vi| {
+                        const raw_v: f32 = @bitCast(vs_res.vpm_out[layout.first_varying + vi][lane]);
+                        verts[corner].persp_varyings[layout.skip + vi] = raw_v * inv_w;
                     }
                 }
 
@@ -2804,7 +2886,7 @@ pub const V3d = struct {
                     const area = (p_verts[1].x - p_verts[0].x) * (p_verts[2].y - p_verts[0].y) -
                         (p_verts[1].y - p_verts[0].y) * (p_verts[2].x - p_verts[0].x);
                     if (@abs(area) < 1e-6) continue;
-                    if (!isLines(draw) and culled(draw.config_b0, area)) continue;
+                    if (isTriangles(draw) and culled(draw.config_b0, area)) continue;
 
                     const min_fx = @max(@floor(@min(p_verts[0].x, @min(p_verts[1].x, p_verts[2].x))), clip_min_x);
                     const min_fy = @max(@floor(@min(p_verts[0].y, @min(p_verts[1].y, p_verts[2].y))), clip_min_y);
@@ -4427,10 +4509,7 @@ test "V3D shades each vertex once, as shading each triangle's corners would" {
 test "V3D draws lines a pixel wide, across the axis they run along least" {
     const draw: V3d.DrawCall = .{ .mode = 1 };
     for ([_][4]f32{ .{ 10.25, 20.1, 40.25, 31.3 }, .{ 30.3, 5.2, 21.17, 50.4 } }) |l| {
-        var verts: [3]V3d.ShadedVertex = .{ .{ .x = l[0], .y = l[1] }, .{ .x = l[2], .y = l[3] }, .{ .x = l[2], .y = l[3] } };
-        verts[0].persp_varyings[0] = 0;
-        verts[1].persp_varyings[0] = 1;
-        verts[2] = verts[1];
+        const verts: [3]V3d.ShadedVertex = .{ .{ .x = l[0], .y = l[1] }, .{ .x = l[2], .y = l[3] }, .{ .x = l[2], .y = l[3] } };
         const no_clip: V3d.ClipVertex = .{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) };
         var pieces: [V3d.max_clipped][3]V3d.ShadedVertex = undefined;
         const n = V3d.primitiveTriangles(draw, verts, @splat(no_clip), 1, &pieces);
@@ -4448,7 +4527,7 @@ test "V3D draws lines a pixel wide, across the axis they run along least" {
             }
             try std.testing.expectEqual(@as(usize, 1), hits);
         }
-        // Its varyings run from one end's to the other's.
+        // Its coordinate along it (the rasterizer's varying, the fragment shader's first) runs from 0 to 1.
         for (pieces[0..n]) |t| for (t) |v| {
             const at_start = @abs(v.x - l[0]) <= 0.5 and @abs(v.y - l[1]) <= 0.5;
             try std.testing.expectEqual(@as(f32, if (at_start) 0 else 1), v.persp_varyings[0]);
@@ -4532,4 +4611,76 @@ test "V3D draws lines, line strips and line loops, whichever way they face" {
         try std.testing.expect(inAnyPiece(&loop, mx, my));
     }
     try std.testing.expect(!inAnyPiece(&loop, 320, 320));
+}
+
+test "V3D draws points as squares, their coordinates across them the first varyings" {
+    const draw: V3d.DrawCall = .{ .mode = 0 };
+    var v: V3d.ShadedVertex = .{ .x = 20.5, .y = 30.5, .point_size = 3 };
+    v.persp_varyings[2] = 0.25;
+    const no_clip: V3d.ClipVertex = .{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) };
+    var pieces: [V3d.max_clipped][3]V3d.ShadedVertex = undefined;
+    const n = V3d.primitiveTriangles(draw, @splat(v), @splat(no_clip), 3, &pieces);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    // 3 pixels by 3, round its middle.
+    for (15..26) |y| for (15..26) |x| {
+        const inside = x >= 19 and x <= 21 and y >= 29 and y <= 31;
+        const fx: f32 = @floatFromInt(x);
+        const fy: f32 = @floatFromInt(y);
+        try std.testing.expectEqual(inside, inAnyPiece(pieces[0..n], fx + 0.5, fy + 0.5));
+    };
+    for (pieces[0..n]) |t| for (t) |c| {
+        // s and t from 0 at the left and top to 1 at the right and bottom; the vertex shader's
+        // varyings after them, as shaded.
+        try std.testing.expectEqual((c.x - 19) / 3, c.persp_varyings[0]);
+        try std.testing.expectEqual((c.y - 29) / 3, c.persp_varyings[1]);
+        try std.testing.expectEqual(@as(f32, 0.25), c.persp_varyings[2]);
+    };
+    // Without size, or behind the eye, none is drawn.
+    v.point_size = 0;
+    try std.testing.expectEqual(@as(usize, 0), V3d.primitiveTriangles(draw, @splat(v), @splat(no_clip), 3, &pieces));
+    v.point_size = 3;
+    const clipped: V3d.DrawCall = .{ .mode = 0, .clip_scale_x = 32 * 16, .clip_scale_y = 32 * 16 };
+    try std.testing.expectEqual(@as(usize, 0), V3d.primitiveTriangles(clipped, @splat(v), @splat(.{ .x = 0, .y = 0, .z = 0, .w = -1 }), 3, &pieces));
+}
+
+test "V3D sizes points by POINT_SIZE, or by the vertex shader if the shader record says" {
+    var v3d = V3d{};
+    defer {
+        inline for (.{ "shaded_tris", "tile_tris", "vs_corner_slot", "vs_unique", "vs_out", "vs_ok", "vs_slot_key", "vs_slot_gen", "vs_slot_index" }) |f| @field(v3d, f).deinit(V3d.tri_allocator);
+    }
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 512 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+    _ = try writeGridScene(ram);
+    const Grid = struct {
+        // The grid's vertex `ix`'s attribute word `k` (x, y, r, g, b).
+        fn word(r: []const u8, ix: usize, k: usize) f32 {
+            return @bitCast(std.mem.readInt(u32, r[0x10000 + ix * 20 + k * 4 ..][0..4], .little));
+        }
+    };
+
+    for ([_]bool{ false, true }) |per_vertex| {
+        // The vertex shader writes x|y, z, 1/W, then r, g, b: read with the point size flag, r is
+        // each point's size.
+        ram[0x3000] = if (per_vertex) 2 else 0;
+        const draw: V3d.DrawCall = .{ .shader_rec_addr = 0x3000, .num_attrs = 1, .mode = 0, .count = 30, .first_or_offset = 100, .vp_x = 320, .vp_y = 320, .point_size = 4, .config_b0 = 0 };
+        v3d.draws.clearRetainingCapacity();
+        try v3d.draws.append(V3d.tri_allocator, draw);
+        v3d.prepareDrawsForFrame(ram);
+        // Never culled: each point two triangles.
+        try std.testing.expectEqual(@as(usize, 2 * 30), v3d.shaded_tris.items.len);
+        for (0..30) |i| {
+            const ix = 100 + i;
+            const size = if (per_vertex) Grid.word(ram, ix, 2) else 4;
+            for (v3d.shaded_tris.items[i * 2 ..][0..2]) |t| for (t.v) |c| {
+                try std.testing.expectEqual(size, c.point_size);
+                // Its coordinates first, then the vertex shader's varyings (after the size).
+                try std.testing.expect(c.persp_varyings[0] == 0 or c.persp_varyings[0] == 1);
+                const first: usize = if (per_vertex) 3 else 2;
+                try std.testing.expectEqual(Grid.word(ram, ix, first), c.persp_varyings[2]);
+                try std.testing.expectEqual(Grid.word(ram, ix, first + 1), c.persp_varyings[3]);
+            };
+        }
+    }
 }
