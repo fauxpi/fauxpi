@@ -270,7 +270,22 @@ pub const V3d = struct {
     srqua: u32 = 0,
     srqul: u32 = 0,
     srqcs: u32 = 0,
+    vpacntl: u32 = 0,
     vpmbase: u32 = 0,
+    /// QPU user programs: those queued (SRQPC, with SRQUA and SRQUL), those running (on a QPU
+    /// each), what they share (semaphores, the mutex, the VPM), the queue's counts and its error
+    /// (SRQCS), and the QPUs' interrupts (DBQITE, DBQITC).
+    user_queue: [16]UserRequest = undefined,
+    user_queued: u8 = 0,
+    user_running: [16]?*UserRun = @splat(null),
+    user_sync: qpu_sim.Sync = .{},
+    vpm: [qpu_sim.vpm_words]u32 = @splat(0),
+    srq_requests: u8 = 0,
+    srq_completed: u8 = 0,
+    srq_error: bool = false,
+    dbqite: u32 = 0,
+    dbqitc: u32 = 0,
+
     /// Performance counters: their values, sources (PCTRS), and enables (PCTRE).
     pctr: [16]u32 = @splat(0),
     pctrs: [16]u5 = @splat(0),
@@ -407,6 +422,7 @@ pub const V3d = struct {
         self.srqua = 0;
         self.srqul = 0;
         self.srqcs = 0;
+        self.vpacntl = 0;
         self.vpmbase = 0;
         self.pctr = @splat(0);
         self.pctrs = @splat(0);
@@ -417,6 +433,20 @@ pub const V3d = struct {
         self.bin_tiles = 0;
         self.semaphore = 0;
         self.rcl_waiting = null;
+        for (&self.user_running) |*slot| {
+            if (slot.*) |run| {
+                tri_allocator.free(run.decoded);
+                tri_allocator.destroy(run);
+            }
+            slot.* = null;
+        }
+        self.user_queued = 0;
+        self.user_sync = .{};
+        self.srq_requests = 0;
+        self.srq_completed = 0;
+        self.srq_error = false;
+        self.dbqite = 0;
+        self.dbqitc = 0;
         self.draws.clearRetainingCapacity();
         self.cur_shader_rec = 0;
         self.cur_num_attrs = 0;
@@ -461,7 +491,7 @@ pub const V3d = struct {
     }
 
     pub fn irqPending(self: *const V3d) bool {
-        return (self.intStatus() & self.int_mask) != 0;
+        return (self.intStatus() & self.int_mask) != 0 or (self.dbqitc & self.dbqite) != 0;
     }
 
     /// INTCTL: the interrupts raised, and OUTOMEM while the binner has no overspill memory
@@ -515,8 +545,11 @@ pub const V3d = struct {
             0x430 => self.srqpc,
             0x434 => self.srqua,
             0x438 => self.srqul,
-            0x43c => self.srqcs,
-            0x500 => self.vpmbase,
+            0x43c => @as(u32, self.user_queued) | @as(u32, @intFromBool(self.srq_error)) << 7 | @as(u32, self.srq_requests) << 8 | @as(u32, self.srq_completed) << 16,
+            0xe2c => self.dbqite,
+            0xe30 => self.dbqitc,
+            0x500 => self.vpacntl,
+            0x504 => self.vpmbase,
             0x670 => 0,
             0x674 => self.pctre,
             0x680...0x6fc => if (offset & 4 == 0) self.pctr[(offset - 0x680) / 8] else self.pctrs[(offset - 0x684) / 8],
@@ -579,15 +612,30 @@ pub const V3d = struct {
             0x410 => self.sqrsv0 = val,
             0x414 => self.sqrsv1 = val,
             0x418 => self.sqcntl = val,
-            0x430 => { // V3D_SRQPC: User QPU program request
+            0x430 => { // V3D_SRQPC: a user program queued (16 at most), then run
                 self.srqpc = val;
-                const completed = ((self.srqcs >> 16) & 0xff) +% 1;
-                self.srqcs = (self.srqcs & 0xff000000) | (completed << 16) | (completed << 8);
+                if (self.user_queued == self.user_queue.len) {
+                    self.srq_error = true;
+                } else {
+                    self.user_queue[self.user_queued] = .{ .pc = val, .unifs = self.srqua, .len = self.srqul };
+                    self.user_queued += 1;
+                    self.srq_requests +%= 1;
+                }
+                self.runUserPrograms(ram);
             },
             0x434 => self.srqua = val,
             0x438 => self.srqul = val,
-            0x43c => self.srqcs = val,
-            0x500 => self.vpmbase = val,
+            0x43c => { // SRQCS: the queue emptied (bit 0), the error and counts cleared
+                if (val & 1 != 0) self.user_queued = 0;
+                if (val & (1 << 7) != 0) self.srq_error = false;
+                if (val & (1 << 8) != 0) self.srq_requests = 0;
+                if (val & (1 << 16) != 0) self.srq_completed = 0;
+                self.runUserPrograms(ram);
+            },
+            0xe2c => self.dbqite = val,
+            0xe30 => self.dbqitc &= ~val,
+            0x500 => self.vpacntl = val,
+            0x504 => self.vpmbase = val,
             0x670 => { // PCTRC: counters cleared
                 for (&self.pctr, 0..) |*c, i| {
                     if (val & (@as(u32, 1) << @intCast(i)) != 0) c.* = 0;
@@ -600,6 +648,96 @@ pub const V3d = struct {
                 self.pctrs[(offset - 0x684) / 8] = @truncate(val);
             },
             else => {},
+        }
+    }
+
+    pub const UserRequest = struct { pc: u32, unifs: u32, len: u32 };
+
+    /// A user program running on a QPU.
+    const UserRun = struct {
+        req: UserRequest,
+        decoded: []qpu_sim.DecodedInst,
+        machine: qpu_sim.Machine,
+        result: qpu_sim.Result = .{},
+    };
+
+    /// Whether QPU `q` may run user programs (SQRSV0/1: its 4 bits; bit 3 reserves it from
+    /// them).
+    fn userQpuFree(self: *const V3d, q: usize) bool {
+        const word = if (q < 8) self.sqrsv0 else self.sqrsv1;
+        return (word >> @intCast((q % 8) * 4)) & 8 == 0;
+    }
+
+    fn userEnv(self: *V3d, ram: []u8, req: UserRequest, q: usize) qpu_sim.Env {
+        const mask = vc_bus.ramMask(ram.len);
+        const unif = req.unifs & mask & ~@as(u32, 3);
+        // Up to SRQUL of them (over 1023, unlimited).
+        const avail: u32 = if (unif < ram.len) @intCast((ram.len - unif) / 4) else 0;
+        const n = if (req.len > 1023) avail else @min(req.len, avail);
+        return .{
+            .uniforms = if (n > 0) std.mem.bytesAsSlice(u32, ram[unif..][0 .. n * 4]) else &.{},
+            .texture_memory = ram,
+            .uniform_memory = ram,
+            .code_addr = req.pc,
+            .qpu_number = @intCast(q),
+            .max_steps = std.math.maxInt(usize),
+            .sync = &self.user_sync,
+            .vpm_mem = &self.vpm,
+            .dma_ram = ram,
+        };
+    }
+
+    /// Runs the user programs: those queued started on the QPUs free for them, then each run in
+    /// turn (a slice at a time), until all have ended, or wait on each other (they go on later),
+    /// or have run long enough (a program looping for ever runs on later too). Each ending
+    /// counts as completed; host interrupts are raised (DBQITC).
+    fn runUserPrograms(self: *V3d, ram: []u8) void {
+        var budget: usize = 1 << 26;
+        while (true) {
+            // Those queued, onto free QPUs.
+            for (&self.user_running, 0..) |*slot, q| {
+                if (self.user_queued == 0) break;
+                if (slot.* != null or !self.userQpuFree(q)) continue;
+                const req = self.user_queue[0];
+                std.mem.copyForwards(UserRequest, self.user_queue[0 .. self.user_queued - 1], self.user_queue[1..self.user_queued]);
+                self.user_queued -= 1;
+                const phys = req.pc & vc_bus.ramMask(ram.len);
+                const len = programLen(ram, phys);
+                const run = tri_allocator.create(UserRun) catch break;
+                const decoded = tri_allocator.alloc(qpu_sim.DecodedInst, len) catch {
+                    tri_allocator.destroy(run);
+                    break;
+                };
+                var code: std.ArrayList(qpu.Inst) = .empty;
+                defer code.deinit(tri_allocator);
+                code.resize(tri_allocator, len) catch {};
+                if (code.items.len == len) {
+                    _ = qpu_sim.decodeProgram(readProgram(ram, phys, code.items).?, decoded);
+                } else @memset(decoded, .{});
+                const env = self.userEnv(ram, req, q);
+                run.* = .{ .req = req, .decoded = decoded, .machine = .init(&env) };
+                slot.* = run;
+            }
+            var progressed = false;
+            for (&self.user_running, 0..) |*slot, q| {
+                const run = slot.* orelse continue;
+                const env = self.userEnv(ram, run.req, q);
+                const before = run.machine.steps;
+                const stop = run.machine.run(qpu_sim.Result, run.decoded, &env, &run.result, 1 << 14) catch .ended;
+                const ran = run.machine.steps - before;
+                budget -|= ran;
+                if (ran > 0) progressed = true;
+                if (stop == .ended) {
+                    tri_allocator.free(run.decoded);
+                    tri_allocator.destroy(run);
+                    slot.* = null;
+                    self.srq_completed +%= 1;
+                    progressed = true;
+                }
+            }
+            self.dbqitc |= self.user_sync.host_int;
+            self.user_sync.host_int = 0;
+            if (!progressed or budget == 0) break;
         }
     }
 
@@ -7142,4 +7280,30 @@ test "V3D renders tile lists written by hand: XY lists, relative codes and branc
     try std.testing.expectEqual(@as(u32, 0xff00ff00), color[5 * 64 + 5]);
     try std.testing.expectEqual(@as(u32, 0xff00ff00), color[20 * 64 + 16]);
     try std.testing.expectEqual(@as(u32, 0xff000000), color[40 * 64 + 40]);
+}
+
+test "V3D runs user programs on QPUs, waiting on each other's semaphores" {
+    var v3d = V3d{};
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+    // The first program waits on semaphore 3; the second raises it, then a host interrupt.
+    var waiter: qpu.Program(8) = .{};
+    waiter.emit(qpu.semaphore(3, true));
+    waiter.end(.vertex);
+    var raiser: qpu.Program(8) = .{};
+    raiser.emit(qpu.semaphore(3, false));
+    raiser.emit(try qpu.alu(.{ .add = .{ .op = .@"or", .dst = .{ .periph = qpu.W.host_int }, .a = qpu.smallImmInt(1), .b = qpu.smallImmInt(1) } }));
+    raiser.end(.vertex);
+    @memcpy(ram[0x1000..][0 .. waiter.code().len * 8], std.mem.sliceAsBytes(waiter.code()));
+    @memcpy(ram[0x2000..][0 .. raiser.code().len * 8], std.mem.sliceAsBytes(raiser.code()));
+    v3d.write32(0xe2c, 0xffff, ram); // DBQITE
+    v3d.write32(0x430, 0x1000, ram); // SRQPC
+    // Waiting: requested, not completed.
+    try std.testing.expectEqual(@as(u32, 1 << 8), v3d.read32(0x43c) & 0xffff00);
+    v3d.write32(0x430, 0x2000, ram);
+    try std.testing.expectEqual(@as(u32, 2 << 16 | 2 << 8), v3d.read32(0x43c) & 0xffff00);
+    try std.testing.expect(v3d.read32(0xe30) != 0);
+    try std.testing.expect(v3d.irqPending());
 }

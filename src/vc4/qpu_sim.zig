@@ -53,6 +53,25 @@ pub const Env = struct {
     code_addr: u32 = 0,
     /// Memory uniforms are read from after a write to UNIFORMS_ADDRESS (bus addresses, masked).
     uniform_memory: []const u8 = &.{},
+    /// The QPU it runs on (QPU_NUMBER), the most instructions it runs, and (for user programs)
+    /// the semaphores and mutex it shares with other QPUs, the VPM it reads and writes as
+    /// addressed (not as a vertex shader's stream), and the memory its DMA reads and writes.
+    qpu_number: u32 = 0,
+    max_steps: usize = 1 << 22,
+    sync: ?*Sync = null,
+    vpm_mem: ?*[vpm_words]u32 = null,
+    dma_ram: ?[]u8 = null,
+};
+
+/// The VPM: 12 KiB, rows of 16 words.
+pub const vpm_words = 192 * 16;
+
+/// What QPUs share: the 16 semaphores, the mutex (the QPU holding it), and the host interrupts
+/// raised (a bit a QPU).
+pub const Sync = struct {
+    sema: [16]u4 = @splat(0),
+    mutex: ?u32 = null,
+    host_int: u16 = 0,
 };
 
 pub const max_vpm_out = 32;
@@ -150,6 +169,14 @@ const State = struct {
     /// Uniforms read from memory since a write to UNIFORMS_ADDRESS.
     unif_override: ?Uniforms = null,
     vpm_read_left: u32 = 16,
+    /// The VPM's generic read and write setups (each access moving them on), and its DMA's: the
+    /// load (VDR) and its extended pitch, the store (VDW) and its stride.
+    vpm_rd: u32 = 0,
+    vpm_wr: u32 = 0,
+    vdr: u32 = 0,
+    vdr_pitch: u32 = 0,
+    vdw: u32 = 0,
+    vdw_stride: u32 = 0,
     uniforms_read: usize = 0,
     varyings_read: usize = 0,
     vpm_words_read: usize = 0,
@@ -1349,32 +1376,73 @@ pub fn runFragmentDecoded(decoded: []const DecodedInst, env: *const Env) Error!F
 }
 
 fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *const Env, r: *RType) Error!void {
-    var s: State = .{};
-    @memset(s.acc[0..6], splat(0));
-    s.ra[qpu.R.frag_payload_zw] = env.frag_w;
-    s.rb[qpu.R.frag_payload_zw] = z24Of(env.frag_z);
-    s.ra_init = @as(u32, 1) << qpu.R.frag_payload_zw;
-    s.rb_init = @as(u32, 1) << qpu.R.frag_payload_zw;
+    var m: Machine = .init(env);
+    _ = try m.run(RType, decoded, env, r, std.math.maxInt(usize));
+    m.finish(RType, r);
+    if (m.end_at == null) return error.MissingProgramEnd;
+}
 
-    var end_at: ?usize = null;
-    var loads: usize = 0;
-    var ip: usize = 0;
-    // A branch taken: where to, once its three delay slots (the instructions after it) have run.
-    var branch_target: ?usize = null;
-    var branch_from: usize = 0;
-    var steps: usize = 0;
-    while (ip < decoded.len) : (ip += 1) {
-        if (branch_target) |t| {
-            if (ip >= branch_from + 4) {
-                ip = t;
-                branch_target = null;
-                if (ip >= decoded.len) break;
+/// What stops a machine: its program ended, it would wait (on a semaphore or the mutex), or it
+/// ran as long as it was given.
+pub const Stop = enum { ended, waiting, slice };
+
+/// A QPU running a program, which can stop and go on (user programs waiting on each other).
+pub const Machine = struct {
+    s: State = .{},
+    end_at: ?usize = null,
+    loads: usize = 0,
+    ip: usize = 0,
+    /// A branch taken: where to, once its three delay slots (the instructions after it) have run.
+    branch_target: ?usize = null,
+    branch_from: usize = 0,
+    steps: usize = 0,
+
+    pub fn init(env: *const Env) Machine {
+        var m: Machine = .{};
+        @memset(m.s.acc[0..6], splat(0));
+        m.s.ra[qpu.R.frag_payload_zw] = env.frag_w;
+        m.s.rb[qpu.R.frag_payload_zw] = z24Of(env.frag_z);
+        m.s.ra_init = @as(u32, 1) << qpu.R.frag_payload_zw;
+        m.s.rb_init = @as(u32, 1) << qpu.R.frag_payload_zw;
+        return m;
+    }
+
+    pub fn finish(m: *const Machine, comptime RType: type, r: *RType) void {
+        if (@hasField(RType, "uniforms_read")) {
+            r.uniforms_read = m.s.uniforms_read;
+            r.varyings_read = m.s.varyings_read;
+            r.vpm_words_read = m.s.vpm_words_read;
+        }
+    }
+
+    /// Whether `d` would wait: on a semaphore at 0, or the mutex another QPU holds.
+    fn waits(d: DecodedInst, env: *const Env) bool {
+        const sync = env.sync orelse return false;
+        if (d.sig == .load_imm and d.limm_mode == 4 and (d.imm_or_small >> 4) & 1 != 0) return sync.sema[d.imm_or_small & 15] == 0;
+        if (d.sig != .load_imm and d.sig != .branch and (d.flags & DecodedInst.FLAG_FETCH_A) != 0 and d.raddr_a == qpu.R.mutex_acquire) {
+            if (sync.mutex) |owner| return owner != env.qpu_number;
+        }
+        return false;
+    }
+
+    /// Runs (at most `slice` more instructions) until the program ends, or it waits.
+    pub fn run(m: *Machine, comptime RType: type, decoded: []const DecodedInst, env: *const Env, r: *RType, slice: usize) Error!Stop {
+    const s = &m.s;
+    const until = m.steps +| slice;
+    while (m.ip < decoded.len) : (m.ip += 1) {
+        if (m.branch_target) |t| {
+            if (m.ip >= m.branch_from + 4) {
+                m.ip = t;
+                m.branch_target = null;
+                if (m.ip >= decoded.len) break;
             }
         }
-        if (end_at) |e| if (ip > e) break;
-        steps += 1;
-        if (steps > 1 << 22) return error.TooLong;
-        const d = decoded[ip];
+        if (m.end_at) |e| if (m.ip > e) return .ended;
+        const d = decoded[m.ip];
+        if (waits(d, env)) return .waiting;
+        if (m.steps >= until) return .slice;
+        m.steps += 1;
+        if (m.steps > env.max_steps) return error.TooLong;
         if (@hasField(RType, "instructions")) r.instructions += 1;
         if (d.sig == .branch) {
             const any = struct {
@@ -1401,15 +1469,15 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                 },
             };
             // The link address (after the delay slots) comes out of both ALUs.
-            const link: u32 = env.code_addr +% @as(u32, @intCast((ip + 4) * 8));
-            try write(RType, &s, r, env, d.waddr_add, d.add_file, splat(link), .always, 0, 0, false);
-            try write(RType, &s, r, env, d.waddr_mul, d.mul_file, splat(link), .always, 0, 0, false);
-            if (taken and branch_target == null) {
+            const link: u32 = env.code_addr +% @as(u32, @intCast((m.ip + 4) * 8));
+            try write(RType, s, r, env, d.waddr_add, d.add_file, splat(link), .always, 0, 0, false);
+            try write(RType, s, r, env, d.waddr_mul, d.mul_file, splat(link), .always, 0, 0, false);
+            if (taken and m.branch_target == null) {
                 var target: u32 = d.imm_or_small;
                 if (d.branch_rel) target +%= link;
                 if (d.branch_reg) |rg| target +%= (if ((s.ra_init >> rg) & 1 != 0) s.ra[rg][0] else 0);
-                branch_target = (target -% env.code_addr) / 8;
-                branch_from = ip;
+                m.branch_target = (target -% env.code_addr) / 8;
+                m.branch_from = m.ip;
             }
             continue;
         }
@@ -1436,11 +1504,11 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                 } else if (d.waddr_add >= qpu.W.acc0 and d.waddr_add <= qpu.W.acc0 + 3) {
                     s.acc[d.waddr_add - qpu.W.acc0] = val;
                 } else {
-                    try write(RType, &s, r, env, d.waddr_add, d.add_file, val, .always, 0, 0, true);
+                    try write(RType, s, r, env, d.waddr_add, d.add_file, val, .always, 0, 0, true);
                 }
             }
             if (@hasField(RType, "instructions")) r.instructions += 1;
-            ip += 1;
+            m.ip += 1;
             continue;
         }
 
@@ -1448,6 +1516,11 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
         var mul_result: Vec = undefined;
 
         if (d.sig == .load_imm) {
+            // A semaphore counted up, or down (Machine.waits held it back at 0).
+            if (d.limm_mode == 4) if (env.sync) |sync| {
+                const n = d.imm_or_small & 15;
+                if ((d.imm_or_small >> 4) & 1 != 0) sync.sema[n] -|= 1 else sync.sema[n] +|= 1;
+            };
             add_result = switch (d.limm_mode) {
                 // Each element's 2 bits: its low bit at bit n, its high one at bit 16 + n.
                 1, 3 => blk: {
@@ -1465,12 +1538,12 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
             var add_a: Vec = splat(0);
             var add_b: Vec = splat(0);
             if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0) {
-                s.acc[6] = try readPort(&s, env, d.raddr_a, .a);
+                s.acc[6] = try readPort(s, env, d.raddr_a, .a);
             }
             if (d.sig == .small_imm) {
                 s.acc[7] = splat(d.imm_or_small);
             } else if ((d.flags & DecodedInst.FLAG_FETCH_B) != 0) {
-                s.acc[7] = try readPort(&s, env, d.raddr_b, .b);
+                s.acc[7] = try readPort(s, env, d.raddr_b, .b);
             }
 
             if ((d.flags & DecodedInst.FLAG_HAS_UNPACK) == 0) {
@@ -1489,8 +1562,8 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
             } else {
                 if (d.add_op != .nop) {
                     const flt_add = (d.flags & DecodedInst.FLAG_FLT_ADD) != 0;
-                    const in0 = resolveMuxSlow(d.mux0, &s, d.unpack_r4, d.unpack_a, flt_add);
-                    const in1 = if (d.mux1 == d.mux0) in0 else resolveMuxSlow(d.mux1, &s, d.unpack_r4, d.unpack_a, flt_add);
+                    const in0 = resolveMuxSlow(d.mux0, s, d.unpack_r4, d.unpack_a, flt_add);
+                    const in1 = if (d.mux1 == d.mux0) in0 else resolveMuxSlow(d.mux1, s, d.unpack_r4, d.unpack_a, flt_add);
                     add_a = in0;
                     add_b = in1;
                     add_result = addOpVec(d.add_op, in0, in1);
@@ -1500,8 +1573,8 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
 
                 if (d.mul_op != .nop) {
                     const flt_mul = (d.flags & DecodedInst.FLAG_FLT_MUL) != 0;
-                    const in2 = resolveMuxSlow(d.mux2, &s, d.unpack_r4, d.unpack_a, flt_mul);
-                    const in3 = if (d.mux3 == d.mux2) in2 else resolveMuxSlow(d.mux3, &s, d.unpack_r4, d.unpack_a, flt_mul);
+                    const in2 = resolveMuxSlow(d.mux2, s, d.unpack_r4, d.unpack_a, flt_mul);
+                    const in3 = if (d.mux3 == d.mux2) in2 else resolveMuxSlow(d.mux3, s, d.unpack_r4, d.unpack_a, flt_mul);
                     mul_result = mulOpVec(d.mul_op, in2, in3);
                 } else if (d.waddr_mul != qpu.W.nop or (d.flags & DecodedInst.FLAG_SF) != 0) {
                     mul_result = splat(0);
@@ -1537,10 +1610,10 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                 } else if (d.waddr_add >= qpu.W.acc0 and d.waddr_add <= qpu.W.acc0 + 3) {
                     s.acc[d.waddr_add - qpu.W.acc0] = add_result;
                 } else {
-                    try write(RType, &s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0, d.sig != .load_imm and floatResultAdd(d.add_op));
+                    try write(RType, s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0, d.sig != .load_imm and floatResultAdd(d.add_op));
                 }
             } else {
-                try write(RType, &s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0, d.sig != .load_imm and floatResultAdd(d.add_op));
+                try write(RType, s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0, d.sig != .load_imm and floatResultAdd(d.add_op));
             }
         }
         if (d.waddr_mul != qpu.W.nop) {
@@ -1557,10 +1630,10 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                 } else if (d.waddr_mul >= qpu.W.acc0 and d.waddr_mul <= qpu.W.acc0 + 3) {
                     s.acc[d.waddr_mul - qpu.W.acc0] = mul_result;
                 } else {
-                    try write(RType, &s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m, d.sig != .load_imm and d.mul_op == .fmul);
+                    try write(RType, s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m, d.sig != .load_imm and d.mul_op == .fmul);
                 }
             } else {
-                try write(RType, &s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m, d.sig != .load_imm and d.mul_op == .fmul);
+                try write(RType, s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m, d.sig != .load_imm and d.mul_op == .fmul);
             }
         }
 
@@ -1583,22 +1656,18 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
             },
             .alpha_mask_load => s.acc[4] = env.alpha_mask_in,
             .color_load, .color_load_end => {
-                s.acc[4] = if (env.tlb_samples_in) |samples| samples[loads % 4] else env.tlb_color_in;
-                loads += 1;
+                s.acc[4] = if (env.tlb_samples_in) |samples| samples[m.loads % 4] else env.tlb_color_in;
+                m.loads += 1;
                 if (@hasField(RType, "color_loads")) r.color_loads += 1;
-                if (d.sig == .color_load_end) end_at = ip + 2;
+                if (d.sig == .color_load_end) m.end_at = m.ip + 2;
             },
-            .prog_end => end_at = ip + 2,
+            .prog_end => m.end_at = m.ip + 2,
             else => {},
         }
     }
-    if (@hasField(RType, "uniforms_read")) {
-        r.uniforms_read = s.uniforms_read;
-        r.varyings_read = s.varyings_read;
-        r.vpm_words_read = s.vpm_words_read;
+    return .ended;
     }
-    if (end_at == null) return error.MissingProgramEnd;
-}
+};
 
 fn readPort(s: *State, env: *const Env, raddr: u6, file: File) Error!Vec {
     if (raddr < 32) {
@@ -1630,20 +1699,154 @@ fn readPort(s: *State, env: *const Env, raddr: u6, file: File) Error!Vec {
             return @bitCast((val_f - c_f) / w_f);
         },
         qpu.R.vpm => {
+            if (env.vpm_mem) |vpm| return vpmGenericRead(s, vpm);
             if (s.vpm_words_read >= env.vpm_in.len) return splat(0);
             if (s.vpm_read_left > 0) s.vpm_read_left -= 1;
             defer s.vpm_words_read += 1;
             return env.vpm_in[s.vpm_words_read];
         },
-        // The element number (A), or the QPU's number (B: which runs it isn't known; 0).
+        // The element number (A), or the QPU's number (B: for shaders, which runs it isn't
+        // known; 0).
         qpu.R.elem_qpu => {
-            if (file == .b) return splat(0);
+            if (file == .b) return splat(env.qpu_number);
             return .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         },
         qpu.R.xy_pixel_coord => return if (file == .a) env.frag_x else env.frag_y,
         qpu.R.ms_rev_flags => return if (file == .a) env.ms_mask else env.rev_flag,
-        qpu.R.vpm_ld_busy, qpu.R.vpm_ld_wait, qpu.R.mutex_acquire => return splat(0),
+        qpu.R.mutex_acquire => {
+            // Taken (Machine.waits held it back while another QPU had it).
+            if (file == .a) if (env.sync) |sync| {
+                sync.mutex = env.qpu_number;
+            };
+            return splat(0);
+        },
+        // The DMA is done at once: never busy, nothing to wait for.
+        qpu.R.vpm_ld_busy, qpu.R.vpm_ld_wait => return splat(0),
         else => return splat(0),
+    }
+}
+
+/// The VPM word at row `y`, column `x` (wrapping).
+fn vpmIndex(y: u32, x: u32) usize {
+    return (@as(usize, y) * 16 + x) % vpm_words;
+}
+
+/// Where a generic access `setup` (its size, 8, 16 or 32-bit; horizontal or vertical) puts
+/// element `i`: the word, and the bit offset in it (8 and 16-bit laned); then the setup moved on
+/// by its stride.
+fn vpmElement(setup: u32, i: u32) struct { usize, u5 } {
+    const size = (setup >> 8) & 3;
+    const horiz = (setup >> 11) & 1 != 0;
+    const addr = setup & 0xff;
+    return switch (size) {
+        0 => if (horiz) .{ vpmIndex(addr >> 2, i), @intCast((addr & 3) * 8) } else .{ vpmIndex(((addr >> 6) << 4) + i, (addr >> 2) & 15), @intCast((addr & 3) * 8) },
+        1 => if (horiz) .{ vpmIndex(addr >> 1, i), @intCast((addr & 1) * 16) } else .{ vpmIndex(((addr >> 5) << 4) + i, (addr >> 1) & 15), @intCast((addr & 1) * 16) },
+        else => if (horiz) .{ vpmIndex(addr, i), 0 } else .{ vpmIndex(((addr >> 4) << 4) + i, addr & 15), 0 },
+    };
+}
+
+fn vpmAdvance(setup: u32) u32 {
+    const stride: u32 = if ((setup >> 12) & 0x3f == 0) 64 else (setup >> 12) & 0x3f;
+    return (setup & ~@as(u32, 0xff)) | ((setup +% stride) & 0xff);
+}
+
+/// A generic VPM read: 32-bit words, or 8 and 16-bit values laned (each element one, zero
+/// extended) or packed (each element the words they're in).
+fn vpmGenericRead(s: *State, vpm: *const [vpm_words]u32) Vec {
+    var out: Vec = undefined;
+    const size = (s.vpm_rd >> 8) & 3;
+    const laned = (s.vpm_rd >> 10) & 1 != 0;
+    for (0..lanes) |i| {
+        const w, const sh = vpmElement(s.vpm_rd, @intCast(i));
+        out[i] = if (size < 2 and laned) (vpm[w] >> sh) & (if (size == 0) @as(u32, 0xff) else 0xffff) else vpm[w];
+    }
+    s.vpm_rd = vpmAdvance(s.vpm_rd);
+    return out;
+}
+
+fn vpmGenericWrite(s: *State, vpm: *[vpm_words]u32, value: Vec) void {
+    const size = (s.vpm_wr >> 8) & 3;
+    const laned = (s.vpm_wr >> 10) & 1 != 0;
+    for (0..lanes) |i| {
+        const w, const sh = vpmElement(s.vpm_wr, @intCast(i));
+        if (size < 2 and laned) {
+            const mask: u32 = (if (size == 0) @as(u32, 0xff) else 0xffff) << sh;
+            vpm[w] = (vpm[w] & ~mask) | ((value[i] << sh) & mask);
+        } else vpm[w] = value[i];
+    }
+    s.vpm_wr = vpmAdvance(s.vpm_wr);
+}
+
+/// A DMA mode's element: its bytes (4, 2 or 1) and bit offset in a VPM word.
+fn dmaElement(modew: u32) struct { u32, u5 } {
+    return switch (modew) {
+        0, 1 => .{ 4, 0 },
+        2, 3 => .{ 2, @intCast((modew & 1) * 16) },
+        else => .{ 1, @intCast((modew & 3) * 8) },
+    };
+}
+
+/// A DMA load (VDR) from `addr`: rows of words (or 16 or 8-bit values) `pitch` bytes apart in
+/// memory, into VPM rows (or columns) `vpitch` apart.
+fn vdrLoad(s: *const State, vpm: *[vpm_words]u32, ram: []const u8, addr: u32) void {
+    const v = s.vdr;
+    const bytes, const sh = dmaElement((v >> 28) & 7);
+    const mpitch = (v >> 24) & 0xf;
+    const pitch: u32 = if (mpitch == 0) s.vdr_pitch else @as(u32, 8) << @intCast(mpitch);
+    const rowlen: u32 = if ((v >> 20) & 0xf == 0) 16 else (v >> 20) & 0xf;
+    const nrows: u32 = if ((v >> 16) & 0xf == 0) 16 else (v >> 16) & 0xf;
+    const vpitch: u32 = if ((v >> 12) & 0xf == 0) 16 else (v >> 12) & 0xf;
+    const vert = (v >> 11) & 1 != 0;
+    const y0 = (v & 0x7ff) >> 4;
+    const x0 = v & 15;
+    const mask = vc_bus.ramMask(ram.len);
+    for (0..nrows) |r_| {
+        const r: u32 = @intCast(r_);
+        for (0..rowlen) |c_| {
+            const c: u32 = @intCast(c_);
+            const m = (addr +% r *% pitch +% c * bytes) & mask;
+            if (m + bytes > ram.len) continue;
+            const val: u32 = switch (bytes) {
+                4 => std.mem.readInt(u32, ram[m..][0..4], .little),
+                2 => std.mem.readInt(u16, ram[m..][0..2], .little),
+                else => ram[m],
+            };
+            const w = if (vert) vpmIndex(y0 + c, x0 + r * vpitch) else vpmIndex(y0 + r * vpitch, x0 + c);
+            if (bytes == 4) vpm[w] = val else {
+                const fmask: u32 = (if (bytes == 2) @as(u32, 0xffff) else 0xff) << sh;
+                vpm[w] = (vpm[w] & ~fmask) | ((val << sh) & fmask);
+            }
+        }
+    }
+}
+
+/// A DMA store (VDW) to `addr`: units (rows, or columns) of words (or 16 or 8-bit values) from
+/// the VPM, each unit packed in memory and the stride after it.
+fn vdwStore(s: *const State, vpm: *const [vpm_words]u32, ram: []u8, addr: u32) void {
+    const v = s.vdw;
+    const bytes, const sh = dmaElement(v & 7);
+    const units: u32 = if ((v >> 23) & 0x7f == 0) 128 else (v >> 23) & 0x7f;
+    const depth: u32 = if ((v >> 16) & 0x7f == 0) 128 else (v >> 16) & 0x7f;
+    const horiz = (v >> 14) & 1 != 0;
+    const base = (v >> 3) & 0x7ff;
+    const y0 = base >> 4;
+    const x0 = base & 15;
+    const stride = s.vdw_stride & 0xffff;
+    const mask = vc_bus.ramMask(ram.len);
+    for (0..units) |u_| {
+        const un: u32 = @intCast(u_);
+        for (0..depth) |d_| {
+            const dp: u32 = @intCast(d_);
+            const w = if (horiz) (@as(usize, y0 + un) * 16 + x0 + dp) % vpm_words else (@as(usize, y0 + dp) * 16 + x0 + un) % vpm_words;
+            const m = (addr +% un *% (depth * bytes + stride) +% dp * bytes) & mask;
+            if (m + bytes > ram.len) continue;
+            const val = vpm[w] >> sh;
+            switch (bytes) {
+                4 => std.mem.writeInt(u32, ram[m..][0..4], val, .little),
+                2 => std.mem.writeInt(u16, ram[m..][0..2], @truncate(val), .little),
+                else => ram[m] = @truncate(val),
+            }
+        }
     }
 }
 
@@ -2084,6 +2287,7 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
             } else s.unif_override = &.{};
         },
         qpu.W.vpm => {
+            if (env.vpm_mem) |vpm| return vpmGenericWrite(s, vpm, value);
             if (@hasField(RType, "vpm_out")) {
                 if (r.vpm_out_len < max_vpm_out) {
                     r.vpm_out[r.vpm_out_len] = value;
@@ -2097,6 +2301,29 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
                 const n: u32 = (v >> 20) & 0xf;
                 s.vpm_read_left = if (n == 0) 16 else n;
             }
+            if (env.vpm_mem != null) {
+                if (file == .a) {
+                    // Read setups: generic (bit 31 clear), the DMA load's, or its extended pitch.
+                    if (v >> 31 == 0) s.vpm_rd = v else if (v >> 28 == 9) s.vdr_pitch = v & 0x1fff else s.vdr = v;
+                } else switch (v >> 30) {
+                    // Write setups: generic, the DMA store's, or its stride.
+                    0 => s.vpm_wr = v,
+                    2 => s.vdw = v,
+                    3 => s.vdw_stride = v,
+                    else => {},
+                }
+            }
+        },
+        qpu.W.vpm_addr => if (env.vpm_mem) |vpm| {
+            if (env.dma_ram) |ram| {
+                if (file == .a) vdrLoad(s, vpm, ram, value[0]) else vdwStore(s, vpm, ram, value[0]);
+            }
+        },
+        qpu.W.mutex_release => if (env.sync) |sync| {
+            if (sync.mutex == env.qpu_number) sync.mutex = null;
+        },
+        qpu.W.host_int => if (env.sync) |sync| {
+            sync.host_int |= @as(u16, 1) << @intCast(env.qpu_number & 15);
         },
         // Written to the elements the condition holds for (the others discarded).
         qpu.W.tlb_color_all => {
