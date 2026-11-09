@@ -30,6 +30,9 @@ pub const Shader = struct {
     too_many_samples: bool = false,
     /// It reads more uniforms than are given to it (`max_uniforms`), so it can't be drawn.
     too_many_uniforms: bool = false,
+    /// It does what can't be run a fragment at a time (branches, rotating vectors, writing r5 or
+    /// moving the uniforms): drawn on the CPU.
+    unsupported: bool = false,
     /// GLSL, multisampled: it writes each sample's colour (tlb_color_ms), so runs once a sample
     /// (`gl_SampleID`), its varyings still at the pixel's middle.
     per_sample: bool = false,
@@ -96,6 +99,15 @@ pub const msl_common =
     \\
     \\static inline float f(uint x) { return as_type<float>(x); }
     \\static inline uint u(float x) { return as_type<uint>(x); }
+    \\// A 16-bit float's bits as a float's (exactly).
+    \\static inline uint q_unhalf(uint h) {
+    \\  uint sign = (h & 0x8000u) << 16;
+    \\  uint e = (h >> 10) & 0x1fu;
+    \\  uint m = h & 0x3ffu;
+    \\  if (e == 0u) { float v = float(m) * f(0x33800000u); return sign | u(v); }
+    \\  if (e == 31u) return sign | 0x7f800000u | (m << 13);
+    \\  return sign | ((e + 112u) << 23) | (m << 13);
+    \\}
     \\
     \\static inline uint unorm8(uint v) {
     \\  float x = f(v);
@@ -113,8 +125,8 @@ pub const msl_common =
     \\
     \\static inline uint unpack(uint v, uint mode, bool flt) {
     \\  switch (mode) {
-    \\  case 1: { int s = int(v << 16) >> 16; return flt ? u(float(s)) : uint(s); }
-    \\  case 2: { int s = int(v) >> 16; return flt ? u(float(s)) : uint(s); }
+    \\  case 1: { int s = int(v << 16) >> 16; return flt ? q_unhalf(v & 0xffffu) : uint(s); }
+    \\  case 2: { int s = int(v) >> 16; return flt ? q_unhalf(v >> 16) : uint(s); }
     \\  case 3: return (v >> 24) * 0x01010101u;
     \\  case 4: case 5: case 6: case 7: {
     \\    uint b = (v >> ((mode - 4) * 8)) & 0xffu;
@@ -316,7 +328,7 @@ pub const msl_common =
     \\  return ((ty * tile_stride + tx) << 12) + (sub << 10) + in_subtile + in_utile;
     \\}
     \\
-;
+++ sfuHelpers("", "static inline ");
 
 /// MSL of the vertex shader all draws share, and the kernels that load the tile buffer from RAM and
 /// store it back (`ls_load`, `ls_store`); compiled after `msl_common`. `LoadStore` is laid out as the
@@ -448,11 +460,99 @@ pub const glsl_vertex_common =
 /// The names of what a vertex shader's vertex is captured as, in `gpu_draw.Vertex`'s order.
 pub const glsl_vertex_captured = [_][*:0]const u8{ "tf_pos", "tf_unit_w", "tf_v0", "tf_v1", "tf_v2", "tf_v3" };
 
+/// Float constants as their bits (`f(0x...u)`), so both languages' compilers take them exactly.
+fn constBits(comptime x: f32) []const u8 {
+    return std.fmt.comptimePrint("f(0x{x}u)", .{@as(u32, @bitCast(x))});
+}
+
+/// The SFU's functions and the 16-bit float conversion as qpu_sim computes them (`sfuRsqrt`,
+/// `sfuExp2`, `sfuLog2`, `halfOf`), in either language: `prec` is what keeps a float operation
+/// rounded on its own (`precise ` in GLSL), `int`/`uint` its integer types.
+fn sfuHelpers(comptime prec: []const u8, comptime fn_prefix: []const u8) []const u8 {
+    comptime var exp2_poly: []const u8 = "  " ++ prec ++ "float p = " ++ constBits(qpu_sim.exp2_coeffs[0]) ++ ";\n";
+    inline for (qpu_sim.exp2_coeffs[1..]) |c| exp2_poly = exp2_poly ++ "  p = p * fr; p = p + " ++ constBits(c) ++ ";\n";
+    comptime var log2_poly: []const u8 = "  " ++ prec ++ "float p = " ++ constBits(qpu_sim.log2_coeffs[0]) ++ ";\n";
+    inline for (qpu_sim.log2_coeffs[1..]) |c| log2_poly = log2_poly ++ "  p = p * y; p = p + " ++ constBits(c) ++ ";\n";
+    return fn_prefix ++ "uint q_rsqrt(uint a) {\n" ++
+        "  " ++ prec ++ "float x = f(a);\n" ++
+        "  if (isnan(x) || x < 0.0) return 0x7fc00000u;\n" ++
+        "  if (isinf(x)) return 0u;\n" ++
+        "  if ((a & 0x7f800000u) == 0u) return 0x7f800000u;\n" ++
+        "  " ++ prec ++ "float y = f(0x5f3759dfu - (a >> 1));\n" ++
+        "  " ++ prec ++ "float hx = x * 0.5;\n" ++
+        "  for (int i = 0; i < 4; i++) { " ++ prec ++ "float t = hx * y; t = t * y; t = 1.5 - t; y = y * t; }\n" ++
+        "  return u(y);\n" ++
+        "}\n" ++
+        fn_prefix ++ "uint q_exp2(uint a) {\n" ++
+        "  " ++ prec ++ "float x = f(a);\n" ++
+        "  if (isnan(x)) return a;\n" ++
+        "  if (x >= 128.0) return 0x7f800000u;\n" ++
+        "  if (x <= -150.0) return 0u;\n" ++
+        "  " ++ prec ++ "float i = floor(x);\n" ++
+        "  " ++ prec ++ "float fr = x - i;\n" ++
+        exp2_poly ++
+        "  int n = int(i);\n" ++
+        "  if (n >= -126) { " ++ prec ++ "float r = p * f(uint(n + 127) << 23); return u(r); }\n" ++
+        "  " ++ prec ++ "float r = (p * f(0x00800000u)) * f(uint(n + 253) << 23);\n" ++
+        "  return u(r);\n" ++
+        "}\n" ++
+        fn_prefix ++ "uint q_log2(uint a) {\n" ++
+        "  " ++ prec ++ "float x = f(a);\n" ++
+        "  if (isnan(x) || x < 0.0) return 0x7fc00000u;\n" ++
+        "  if (isinf(x)) return a;\n" ++
+        "  if ((a & 0x7f800000u) == 0u) return 0xff800000u;\n" ++
+        "  int e = int((a >> 23) & 0xffu) - 127;\n" ++
+        "  " ++ prec ++ "float m = f((a & 0x7fffffu) | 0x3f800000u);\n" ++
+        "  if (m > " ++ constBits(1.41421356) ++ ") { m = m * 0.5; e += 1; }\n" ++
+        "  " ++ prec ++ "float y = m - 1.0;\n" ++
+        log2_poly ++
+        "  p = p * y;\n" ++
+        "  " ++ prec ++ "float r = float(e) + p;\n" ++
+        "  return u(r);\n" ++
+        "}\n" ++
+        // Round to nearest even, in integers.
+        fn_prefix ++ "uint q_half(uint x) {\n" ++
+        "  uint sign = (x >> 16) & 0x8000u;\n" ++
+        "  int ex = int((x >> 23) & 0xffu) - 112;\n" ++
+        "  uint mant = x & 0x7fffffu;\n" ++
+        "  if (((x >> 23) & 0xffu) == 0xffu) return sign | 0x7c00u | (mant != 0u ? 0x200u : 0u);\n" ++
+        "  if (ex >= 31) return sign | 0x7c00u;\n" ++
+        "  if (ex <= 0) {\n" ++
+        "    if (ex < -10) return sign;\n" ++
+        "    uint m = mant | 0x800000u;\n" ++
+        "    uint sh = uint(14 - ex);\n" ++
+        "    uint h = m >> sh;\n" ++
+        "    uint rem = m & ((1u << sh) - 1u);\n" ++
+        "    uint hf = 1u << (sh - 1u);\n" ++
+        "    if (rem > hf || (rem == hf && (h & 1u) != 0u)) h += 1u;\n" ++
+        "    return sign | h;\n" ++
+        "  }\n" ++
+        "  uint h = (uint(ex) << 10) | (mant >> 13);\n" ++
+        "  uint rem = mant & 0x1fffu;\n" ++
+        "  if (rem > 0x1000u || (rem == 0x1000u && (h & 1u) != 0u)) h += 1u;\n" ++
+        "  return sign | h;\n" ++
+        "}\n" ++
+        // Saturating 32-bit add and subtract, and the packs' saturations.
+        fn_prefix ++ "uint q_addsat(uint a, uint b) { uint r = a + b; return ((~(a ^ b) & (a ^ r)) >> 31) != 0u ? ((a >> 31) != 0u ? 0x80000000u : 0x7fffffffu) : r; }\n" ++
+        fn_prefix ++ "uint q_subsat(uint a, uint b) { uint r = a - b; return (((a ^ b) & (a ^ r)) >> 31) != 0u ? ((a >> 31) != 0u ? 0x80000000u : 0x7fffffffu) : r; }\n" ++
+        fn_prefix ++ "uint q_sat16(uint v) { return uint(clamp(int(v), -32768, 32767)) & 0xffffu; }\n" ++
+        fn_prefix ++ "uint q_sat8(uint v) { return uint(clamp(int(v), 0, 255)); }\n";
+}
+
 /// The GLSL helpers the shaders share. The QPU's float arithmetic is `precise`: each operation
 /// rounded on its own, as qpu_sim does, not fused or rearranged.
 const glsl_helpers =
     \\float f(uint x) { return uintBitsToFloat(x); }
     \\uint u(float x) { return floatBitsToUint(x); }
+    \\// A 16-bit float's bits as a float's (exactly).
+    \\uint q_unhalf(uint h) {
+    \\  uint sign = (h & 0x8000u) << 16;
+    \\  uint e = (h >> 10) & 0x1fu;
+    \\  uint m = h & 0x3ffu;
+    \\  if (e == 0u) { float v = float(m) * f(0x33800000u); return sign | u(v); }
+    \\  if (e == 31u) return sign | 0x7f800000u | (m << 13);
+    \\  return sign | ((e + 112u) << 23) | (m << 13);
+    \\}
     \\uint q_fadd(uint a, uint b) { precise float r = f(a) + f(b); return u(r); }
     \\uint q_fsub(uint a, uint b) { precise float r = f(a) - f(b); return u(r); }
     \\uint q_fmul(uint a, uint b) { precise float r = f(a) * f(b); return u(r); }
@@ -494,8 +594,8 @@ const glsl_helpers =
     \\}
     \\
     \\uint unpack(uint v, uint mode, bool flt) {
-    \\  if (mode == 1u) { int s = int(v << 16) >> 16; return flt ? u(float(s)) : uint(s); }
-    \\  if (mode == 2u) { int s = int(v) >> 16; return flt ? u(float(s)) : uint(s); }
+    \\  if (mode == 1u) { int s = int(v << 16) >> 16; return flt ? q_unhalf(v & 0xffffu) : uint(s); }
+    \\  if (mode == 2u) { int s = int(v) >> 16; return flt ? q_unhalf(v >> 16) : uint(s); }
     \\  if (mode == 3u) return (v >> 24) * 0x01010101u;
     \\  if (mode >= 4u && mode <= 7u) {
     \\    uint b = (v >> ((mode - 4u) * 8u)) & 0xffu;
@@ -585,7 +685,7 @@ const glsl_helpers =
     \\  return pack4((sum >> 8) & 0xffu);
     \\}
     \\
-;
+++ sfuHelpers("precise ", "");
 
 /// The start of a GLSL fragment shader's `main`: its inputs (as interpolated for the fragment).
 const glsl_inputs =
@@ -705,7 +805,7 @@ pub fn translateWith(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, la
     }
     try w.writeAll(
         \\  uint r0 = 0u, r1 = 0u, r2 = 0u, r3 = 0u, r4 = 0u, r5 = 0u, pa = 0u, pb = 0u;
-        \\  bool flag_z = false, flag_n = false;
+        \\  bool flag_z = false, flag_n = false, flag_c = false;
         \\  uint tlb_c = 0u;
         \\  bool tlb_w = false;
         \\  uint tmu0_t = 0u, tmu1_t = 0u;
@@ -719,7 +819,10 @@ pub fn translateWith(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, la
     while (ip < decoded.len) : (ip += 1) {
         if (end_at) |e| if (ip > e) break;
         const d = decoded[ip];
-        if (d.sig == .branch) continue;
+        if (d.sig == .branch) {
+            t.notSupported();
+            continue;
+        }
         try w.print("  {{ // {d}\n", .{ip});
 
         if ((d.flags & qpu_sim.DecodedInst.FLAG_FUSED_LINTERP) != 0) {
@@ -730,7 +833,7 @@ pub fn translateWith(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, la
             if (d.waddr_add != d.waddr_mul) {
                 try w.print("    r{d} = u(f(val) - {s});\n", .{ d.waddr_mul - qpu.W.acc0, varying_c });
             }
-            try t.write(d.waddr_add, d.add_file, "val", .always, 0, 0);
+            try t.write(d.waddr_add, d.add_file, "val", .always, 0, 0, true);
             try w.writeAll("  }\n");
             ip += 1;
             continue;
@@ -823,7 +926,7 @@ pub fn translateVertex(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, 
         \\  }
         \\  ra[15] = 0x3f800000u + zero;
         \\  uint r0 = zero, r1 = zero, r2 = zero, r3 = zero, r4 = zero, r5 = zero, pa = zero, pb = zero;
-        \\  bool flag_z = false, flag_n = false;
+        \\  bool flag_z = false, flag_n = false, flag_c = false;
         \\
     );
     var end_at: ?usize = null;
@@ -831,7 +934,10 @@ pub fn translateVertex(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, 
     while (ip < decoded.len) : (ip += 1) {
         if (end_at) |e| if (ip > e) break;
         const d = decoded[ip];
-        if (d.sig == .branch) continue;
+        if (d.sig == .branch) {
+            t.notSupported();
+            continue;
+        }
         if ((d.flags & qpu_sim.DecodedInst.FLAG_FUSED_LINTERP) != 0) t.vertex.unsupported = true;
         try w.print("  {{ // {d}\n", .{ip});
         try t.instruction(d);
@@ -932,7 +1038,17 @@ const Translator = struct {
     /// An instruction's ALU operations and register writes (not its signal's).
     fn instruction(t: *Translator, d: qpu_sim.DecodedInst) !void {
         const w = t.w;
-        if (d.sig == .load_imm) {
+        if (d.rotate != 0) t.notSupported();
+        if (d.sig == .load_imm and (d.limm_mode == 1 or d.limm_mode == 3)) {
+            // Each element's 2 bits (the element as the fragment's X & 15, as qpu_sim's spans of
+            // 16 have it).
+            if (t.stage == .vertex) t.notSupported();
+            const lo = d.imm_or_small & 0xffff;
+            const hi = d.imm_or_small >> 16;
+            try w.print("    uint lane = px & 15u; uint two = ((0x{x}u >> lane) & 1u) | (((0x{x}u >> lane) & 1u) << 1);\n", .{ lo, hi });
+            if (d.limm_mode == 1) try w.writeAll("    if (two >= 2u) two -= 4u;\n");
+            try w.print("    uint add_r = two{s}, mul_r = two{s};\n", .{ t.opaque_zero, t.opaque_zero });
+        } else if (d.sig == .load_imm) {
             try w.print("    uint add_r = 0x{x}u{s}, mul_r = 0x{x}u{s};\n", .{ d.imm_or_small, t.opaque_zero, d.imm_or_small, t.opaque_zero });
         } else {
             if ((d.flags & qpu_sim.DecodedInst.FLAG_FETCH_A) != 0) {
@@ -949,12 +1065,17 @@ const Translator = struct {
             }
 
             const unpacks = (d.flags & qpu_sim.DecodedInst.FLAG_HAS_UNPACK) != 0;
+            var in0: [48]u8 = undefined;
+            var in1: [48]u8 = undefined;
+            const flt_add = (d.flags & qpu_sim.DecodedInst.FLAG_FLT_ADD) != 0;
+            const a0 = mux(&in0, d.mux0, d, unpacks, flt_add);
+            const a1 = mux(&in1, d.mux1, d, unpacks, flt_add);
             try w.writeAll("    uint add_r = ");
-            if (d.add_op != .nop) {
-                const flt = (d.flags & qpu_sim.DecodedInst.FLAG_FLT_ADD) != 0;
-                var in0: [48]u8 = undefined;
-                var in1: [48]u8 = undefined;
-                try addOp(w, t.lang, d.add_op, mux(&in0, d.mux0, d, unpacks, flt), mux(&in1, d.mux1, d, unpacks, flt));
+            if (d.add_pack_a == 8 and (d.add_op == .add or d.add_op == .sub)) {
+                // The 32-bit saturating pack: saturated, not wrapped.
+                try w.print("q_{s}sat({s}, {s})", .{ @tagName(d.add_op), a0, a1 });
+            } else if (d.add_op != .nop) {
+                try addOp(w, t.lang, d.add_op, a0, a1);
             } else {
                 try w.writeAll("0u");
             }
@@ -972,14 +1093,25 @@ const Translator = struct {
             if ((d.flags & qpu_sim.DecodedInst.FLAG_SF) != 0) {
                 const from = if (d.add_op != .nop) "add_r" else "mul_r";
                 try w.print("    flag_z = int({s}) == 0; flag_n = int({s}) < 0;\n", .{ from, from });
+                switch (d.add_op) {
+                    .add => try w.print("    flag_c = add_r < {s};\n", .{a0}),
+                    .sub => try w.print("    flag_c = {s} < {s};\n", .{ a0, a1 }),
+                    else => try w.writeAll("    flag_c = false;\n"),
+                }
             }
             if ((d.flags & qpu_sim.DecodedInst.FLAG_READS_VARY) != 0) {
                 try w.print("    r5 = u({s});\n", .{varying_c});
             }
         }
 
-        try t.write(d.waddr_add, d.add_file, "add_r", d.cond_add, d.add_pack_a, 0);
-        try t.write(d.waddr_mul, d.mul_file, "mul_r", d.cond_mul, d.mul_pack_a, d.mul_pack_m);
+        const imm = d.sig == .load_imm;
+        try t.write(d.waddr_add, d.add_file, "add_r", d.cond_add, if (d.add_pack_a == 8) 0 else d.add_pack_a, 0, !imm and floatResult(d.add_op));
+        try t.write(d.waddr_mul, d.mul_file, "mul_r", d.cond_mul, d.mul_pack_a, d.mul_pack_m, !imm and d.mul_op == .fmul);
+    }
+
+    /// The program does what this translation can't: drawn (or shaded) on the CPU.
+    fn notSupported(t: *Translator) void {
+        if (t.stage == .vertex) t.vertex.unsupported = true else t.shader.unsupported = true;
     }
 
     /// The program reads past the uniforms it is given: it can't be drawn (on the GPU).
@@ -1025,6 +1157,8 @@ const Translator = struct {
                     try w.print("({d}u < vi.n_vpm ? a_in[{d}] : 0u)", .{ k, k });
             },
             qpu.R.elem_qpu => {
+                // The QPU's number (B) reads as 0, as in qpu_sim.
+                if (file == .b) return w.writeAll("0u");
                 if (t.stage == .vertex) t.vertex.unsupported = true;
                 try w.writeAll("(px & 15u)");
             },
@@ -1039,9 +1173,12 @@ const Translator = struct {
         }
     }
 
-    fn write(t: *Translator, waddr: u6, file: qpu_sim.File, val: []const u8, cond: qpu.Cond, a_pack: u4, mul_pack: u4) !void {
+    fn write(t: *Translator, waddr: u6, file: qpu_sim.File, val: []const u8, cond: qpu.Cond, a_pack: u4, mul_pack: u4, float_result: bool) !void {
         if (waddr == qpu.W.nop or cond == .never) return;
         const w = t.w;
+        // r5 written (replicated across a quad or the vector) and the uniforms moved: what a
+        // fragment on its own can't do.
+        if (waddr == qpu.W.acc5 or waddr == qpu.W.uniforms_address) t.notSupported();
         var dst_buf: [8]u8 = undefined;
         const dst: ?[]const u8 = switch (waddr) {
             0...31 => std.fmt.bufPrint(&dst_buf, "{s}[{d}]", .{ if (file == .a) "ra" else "rb", waddr }) catch unreachable,
@@ -1057,12 +1194,13 @@ const Translator = struct {
                 .zc => "!flag_z",
                 .ns => "flag_n",
                 .nc => "!flag_n",
-                .cs, .cc => "false",
+                .cs => "flag_c",
+                .cc => "!flag_c",
             };
             try w.writeAll("    ");
             if (test_expr) |e| try w.print("if ({s}) ", .{e});
             try w.print("{s} = ", .{dv});
-            try pack(w, dv, val, a_pack, mul_pack);
+            try pack(w, dv, val, a_pack, mul_pack, float_result);
             return w.writeAll(";\n");
         }
 
@@ -1092,9 +1230,9 @@ const Translator = struct {
                 try w.print("    r4 = q_recip({s});\n", .{val})
             else
                 try w.print("    r4 = u(1.0f / f({s}));\n", .{val}),
-            qpu.W.sfu_recipsqrt => try w.print("    r4 = u(1.0f / sqrt(f({s})));\n", .{val}),
-            qpu.W.sfu_exp => try w.print("    r4 = u(exp2(f({s})));\n", .{val}),
-            qpu.W.sfu_log => try w.print("    r4 = u(log2(f({s})));\n", .{val}),
+            qpu.W.sfu_recipsqrt => try w.print("    r4 = q_rsqrt({s});\n", .{val}),
+            qpu.W.sfu_exp => try w.print("    r4 = q_exp2({s});\n", .{val}),
+            qpu.W.sfu_log => try w.print("    r4 = q_log2({s});\n", .{val}),
             qpu.W.tmu0_s...qpu.W.tmu1_b => {
                 const unit: usize = if (waddr <= qpu.W.tmu0_b) 0 else 1;
                 const tmu = &t.tmu[unit];
@@ -1218,7 +1356,15 @@ fn mulOp(w: *std.Io.Writer, lang: Language, op: qpu.MulOp, a: []const u8, b: []c
 }
 
 /// `val` packed into `dst` as qpu_sim's `packVec` does.
-fn pack(w: *std.Io.Writer, dst: []const u8, val: []const u8, a_pack: u4, mul_pack: u4) !void {
+/// Whether `op` gives a float (which a 16-bit pack converts to a 16-bit float).
+fn floatResult(op: qpu.AddOp) bool {
+    return switch (op) {
+        .fadd, .fsub, .fmin, .fmax, .fminabs, .fmaxabs, .itof => true,
+        else => false,
+    };
+}
+
+fn pack(w: *std.Io.Writer, dst: []const u8, val: []const u8, a_pack: u4, mul_pack: u4, float_result: bool) !void {
     if (a_pack == 0) {
         const shift = (@as(u32, mul_pack) -% 4) *% 8;
         return switch (mul_pack) {
@@ -1228,11 +1374,25 @@ fn pack(w: *std.Io.Writer, dst: []const u8, val: []const u8, a_pack: u4, mul_pac
         };
     }
     const shift = (@as(u32, a_pack & 7) -% 4) *% 8;
+    // A half: a 16-bit float of a float result, else the integer's low 16 bits (saturated for 9
+    // and 10); a byte: the low 8 bits, or (11 to 15) saturated.
+    var half_buf: [96]u8 = undefined;
+    const half = if (float_result)
+        std.fmt.bufPrint(&half_buf, "q_half({s})", .{val}) catch unreachable
+    else if (a_pack >= 8)
+        std.fmt.bufPrint(&half_buf, "q_sat16({s})", .{val}) catch unreachable
+    else
+        std.fmt.bufPrint(&half_buf, "({s} & 0xffffu)", .{val}) catch unreachable;
+    var byte_buf: [96]u8 = undefined;
+    const byte = if (a_pack >= 8)
+        std.fmt.bufPrint(&byte_buf, "q_sat8({s})", .{val}) catch unreachable
+    else
+        std.fmt.bufPrint(&byte_buf, "({s} & 0xffu)", .{val}) catch unreachable;
     return switch (a_pack) {
-        1, 9 => w.print("({s} & 0xffff0000u) | ({s} & 0xffffu)", .{ dst, val }),
-        2, 10 => w.print("({s} & 0xffffu) | ({s} << 16)", .{ dst, val }),
-        3, 11 => w.print("({s} & 0xffu) * 0x01010101u", .{val}),
-        4, 5, 6, 7, 12, 13, 14, 15 => w.print("({s} & ~(0xffu << {d})) | (({s} & 0xffu) << {d})", .{ dst, shift, val, shift }),
+        1, 9 => w.print("({s} & 0xffff0000u) | {s}", .{ dst, half }),
+        2, 10 => w.print("({s} & 0xffffu) | ({s} << 16)", .{ dst, half }),
+        3, 11 => w.print("{s} * 0x01010101u", .{byte}),
+        4, 5, 6, 7, 12, 13, 14, 15 => w.print("({s} & ~(0xffu << {d})) | ({s} << {d})", .{ dst, shift, byte, shift }),
         else => w.writeAll(val),
     };
 }

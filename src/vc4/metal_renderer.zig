@@ -326,7 +326,7 @@ pub const Renderer = struct {
         defer src.deinit();
         src.writer.writeAll(msl.msl_common) catch return null;
         const shader = msl.translate(&src.writer, decoded, .msl) catch return null;
-        if (shader.too_many_uniforms or (shader.reads_color and !r.framebuffer_fetch)) return null;
+        if (shader.too_many_uniforms or shader.unsupported or (shader.reads_color and !r.framebuffer_fetch)) return null;
 
         const lib = r.compile(src.written()) catch return null;
         defer objc.release(lib);

@@ -42,6 +42,11 @@ pub const Env = struct {
     /// (`tlb_color_in` is then not read).
     tlb_samples_in: ?*const [4]Vec = null,
     tex_cache: ?*[2]TexCache = null,
+    /// Where the program is on the bus: what absolute branches and link addresses are relative
+    /// to.
+    code_addr: u32 = 0,
+    /// Memory uniforms are read from after a write to UNIFORMS_ADDRESS (bus addresses, masked).
+    uniform_memory: []const u8 = &.{},
 };
 
 pub const max_vpm_out = 32;
@@ -81,6 +86,8 @@ pub const Error = error{
     VpmOverflow,
     TmuUnderflow,
     MissingProgramEnd,
+    /// It ran longer than any program here would (a branch looping for ever).
+    TooLong,
 };
 
 const varying_c: f32 = 0.25;
@@ -94,6 +101,9 @@ const State = struct {
     acc: [8]Vec = undefined,
     zero: VecBool = @splat(false),
     neg: VecBool = @splat(false),
+    carry: VecBool = @splat(false),
+    /// Uniforms read from memory since a write to UNIFORMS_ADDRESS.
+    unif_override: ?Uniforms = null,
     vpm_read_left: u32 = 16,
     uniforms_read: usize = 0,
     varyings_read: usize = 0,
@@ -132,14 +142,15 @@ fn unpackVec(v: Vec, mode: u3, float_input: bool) Vec {
     const vu: VecU = v;
     return switch (mode) {
         0 => unreachable,
-        1 => blk: { // 16a
+        // 16a, 16b: a 16-bit float to a float for a float instruction, else a signed integer.
+        1 => blk: {
+            if (float_input) break :blk halfToFloat(@truncate(vu));
             const shifted: VecI = @bitCast(vu << @as(@Vector(lanes, u5), @splat(16)));
-            const sext: VecI = shifted >> @as(@Vector(lanes, u5), @splat(16));
-            break :blk if (float_input) @bitCast(@as(VecF, @floatFromInt(sext))) else @bitCast(sext);
+            break :blk @bitCast(shifted >> @as(@Vector(lanes, u5), @splat(16)));
         },
-        2 => blk: { // 16b
-            const sext: VecI = @as(VecI, @bitCast(vu)) >> @as(@Vector(lanes, u5), @splat(16));
-            break :blk if (float_input) @bitCast(@as(VecF, @floatFromInt(sext))) else @bitCast(sext);
+        2 => blk: {
+            if (float_input) break :blk halfToFloat(@truncate(vu >> @as(@Vector(lanes, u5), @splat(16))));
+            break :blk @bitCast(@as(VecI, @bitCast(vu)) >> @as(@Vector(lanes, u5), @splat(16)));
         },
         3 => (vu >> @as(@Vector(lanes, u5), @splat(24))) *% @as(VecU, @splat(0x01010101)), // 8d_rep
         4, 5, 6, 7 => blk: {
@@ -152,6 +163,146 @@ fn unpackVec(v: Vec, mode: u3, float_input: bool) Vec {
             break :blk bytes;
         },
     };
+}
+
+/// 16-bit floats to 32-bit floats' bits.
+fn halfToFloat(h: @Vector(lanes, u16)) Vec {
+    const hf: @Vector(lanes, f16) = @bitCast(h);
+    const vf: VecF = @floatCast(hf);
+    return @bitCast(vf);
+}
+
+/// 32-bit floats' bits to 16-bit floats, rounded to nearest even (`halfOf`).
+fn floatToHalf(v: VecU) @Vector(lanes, u16) {
+    var out: @Vector(lanes, u16) = undefined;
+    inline for (0..lanes) |i| out[i] = halfOf(v[i]);
+    return out;
+}
+
+/// A 32-bit float's bits as a 16-bit float, rounded to nearest even, in integer arithmetic (as
+/// the GPU translation does it too: its own conversion's rounding isn't defined).
+pub fn halfOf(x: u32) u16 {
+    const sign: u32 = (x >> 16) & 0x8000;
+    const exp: i32 = @as(i32, @intCast((x >> 23) & 0xff)) - 127 + 15;
+    const mant: u32 = x & 0x7fffff;
+    if ((x >> 23) & 0xff == 0xff) return @intCast(sign | 0x7c00 | (if (mant != 0) @as(u32, 0x200) else 0));
+    if (exp >= 31) return @intCast(sign | 0x7c00);
+    if (exp <= 0) {
+        if (exp < -10) return @intCast(sign);
+        const m = mant | 0x800000;
+        const shift: u5 = @intCast(14 - exp);
+        var h = m >> shift;
+        const rem = m & ((@as(u32, 1) << shift) - 1);
+        const half = @as(u32, 1) << (shift - 1);
+        if (rem > half or (rem == half and h & 1 != 0)) h += 1;
+        return @intCast(sign | h);
+    }
+    var h: u32 = @as(u32, @intCast(exp)) << 10 | mant >> 13;
+    const rem = mant & 0x1fff;
+    if (rem > 0x1000 or (rem == 0x1000 and h & 1 != 0)) h += 1;
+    return @intCast(sign | h);
+}
+
+/// The SFU's functions as FauxPi computes them: in float adds and multiplies (each rounded on
+/// its own), so its GPU translation gets the same bits. Denormal inputs count as 0, as GPUs
+/// flush them.
+fn bitsOf(x: f32) u32 {
+    return @bitCast(x);
+}
+
+pub fn sfuRsqrt(x: f32) f32 {
+    if (std.math.isNan(x) or x < 0) return std.math.nan(f32);
+    if (std.math.isInf(x)) return 0;
+    if (bitsOf(x) & 0x7f800000 == 0) return std.math.inf(f32);
+    var y: f32 = @bitCast(@as(u32, 0x5f3759df) - (bitsOf(x) >> 1));
+    const hx = x * 0.5;
+    for (0..4) |_| {
+        var t = hx * y;
+        t = t * y;
+        t = 1.5 - t;
+        y = y * t;
+    }
+    return y;
+}
+
+/// 2^f's polynomial for f in [0, 1): ln 2^k / k!, highest first.
+pub const exp2_coeffs = [_]f32{ 1.5252734e-5, 1.5403530e-4, 1.3333558e-3, 9.6181291e-3, 5.5504109e-2, 2.4022651e-1, 6.9314718e-1, 1.0 };
+
+pub fn sfuExp2(x: f32) f32 {
+    if (std.math.isNan(x)) return x;
+    if (x >= 128) return std.math.inf(f32);
+    if (x <= -150) return 0;
+    const i = @floor(x);
+    const fr = x - i;
+    var p: f32 = exp2_coeffs[0];
+    for (exp2_coeffs[1..]) |c| {
+        p = p * fr;
+        p = p + c;
+    }
+    const n: i32 = @intFromFloat(i);
+    if (n >= -126) return p * @as(f32, @bitCast(@as(u32, @intCast(n + 127)) << 23));
+    const tiny: f32 = @bitCast(@as(u32, 1) << 23);
+    return (p * tiny) * @as(f32, @bitCast(@as(u32, @intCast(n + 126 + 127)) << 23));
+}
+
+/// log2(1 + y)'s polynomial for y in [-0.3, 0.42]: (-1)^(k+1) / (k ln 2), highest first.
+pub const log2_coeffs = blk: {
+    var c: [16]f32 = undefined;
+    for (0..16) |j| {
+        const k: f64 = @floatFromInt(16 - j);
+        const sign: f64 = if ((16 - j) % 2 == 1) 1 else -1;
+        c[j] = @floatCast(sign / (k * std.math.ln2));
+    }
+    break :blk c;
+};
+
+pub fn sfuLog2(x: f32) f32 {
+    if (std.math.isNan(x) or x < 0) return std.math.nan(f32);
+    if (std.math.isInf(x)) return x;
+    if (bitsOf(x) & 0x7f800000 == 0) return -std.math.inf(f32);
+    var e: i32 = @as(i32, @intCast((bitsOf(x) >> 23) & 0xff)) - 127;
+    var m: f32 = @bitCast(bitsOf(x) & 0x7fffff | 0x3f800000);
+    if (m > 1.41421356) {
+        m = m * 0.5;
+        e += 1;
+    }
+    const y = m - 1;
+    var p: f32 = log2_coeffs[0];
+    for (log2_coeffs[1..]) |c| {
+        p = p * y;
+        p = p + c;
+    }
+    p = p * y;
+    return @as(f32, @floatFromInt(e)) + p;
+}
+
+/// The add or sub result `a op b` saturated to a signed 32-bit integer (the 32-bit saturating
+/// pack), from the operation's overflow.
+fn saturate32(op: qpu.AddOp, a: Vec, b: Vec) Vec {
+    const ai: @Vector(lanes, i64) = @as(VecI, @bitCast(a));
+    const bi: @Vector(lanes, i64) = @as(VecI, @bitCast(b));
+    const wide = if (op == .sub) ai - bi else ai + bi;
+    const clamped = @min(@max(wide, @as(@Vector(lanes, i64), @splat(std.math.minInt(i32)))), @as(@Vector(lanes, i64), @splat(std.math.maxInt(i32))));
+    return @bitCast(@as(VecI, @intCast(clamped)));
+}
+
+/// The carry flags of `op` on `a`, `b`: an integer add's carry out, a subtraction's borrow.
+fn carryOf(op: qpu.AddOp, a: Vec, b: Vec) VecBool {
+    const av: VecU = a;
+    const bv: VecU = b;
+    return switch (op) {
+        .add => (av +% bv) < av,
+        .sub => av < bv,
+        else => @splat(false),
+    };
+}
+
+/// `v` rotated up by `n` elements (element 0 to element n).
+fn rotateVec(v: Vec, n: u4) Vec {
+    if (n == 0) return v;
+    var out: Vec = undefined;
+    for (0..lanes) |i| out[(i + n) & 15] = v[i];
+    return out;
 }
 
 inline fn ftoiVec(af: VecF) Vec {
@@ -261,11 +412,12 @@ inline fn condMask(cond: qpu.Cond, s: *const State) VecBool {
         .zc => !s.zero,
         .ns => s.neg,
         .nc => !s.neg,
-        .cs, .cc => @splat(false),
+        .cs => s.carry,
+        .cc => !s.carry,
     };
 }
 
-inline fn packVec(dv: VecU, vv: VecU, a_pack: u4, mul_pack: u4) VecU {
+inline fn packVec(dv: VecU, vv: VecU, a_pack: u4, mul_pack: u4, float_result: bool) VecU {
     if (a_pack == 0) {
         return switch (mul_pack) {
             0 => vv,
@@ -278,14 +430,27 @@ inline fn packVec(dv: VecU, vv: VecU, a_pack: u4, mul_pack: u4) VecU {
             else => vv,
         };
     }
+    // A half: a 16-bit float of a float result, else the integer's low 16 bits (saturated to a
+    // signed 16-bit integer for 9 and 10).
+    const half: VecU = if (float_result) floatToHalf(vv) else if (a_pack >= 8) blk: {
+        const vi: VecI = @bitCast(vv);
+        const c = @min(@max(vi, @as(VecI, @splat(-32768))), @as(VecI, @splat(32767)));
+        break :blk @as(VecU, @bitCast(c)) & @as(VecU, @splat(0xffff));
+    } else vv & @as(VecU, @splat(0xffff));
+    // A byte: the low 8 bits, or (11 to 15) saturated to 0 to 255.
+    const byte: VecU = if (a_pack >= 8) blk: {
+        const vi: VecI = @bitCast(vv);
+        const c: VecI = @min(@max(vi, @as(VecI, @splat(0))), @as(VecI, @splat(255)));
+        break :blk @bitCast(c);
+    } else vv & @as(VecU, @splat(0xff));
     return switch (a_pack) {
-        1, 9 => (dv & @as(VecU, @splat(0xffff0000))) | (vv & @as(VecU, @splat(0x0000ffff))),
-        2, 10 => (dv & @as(VecU, @splat(0x0000ffff))) | (vv << @as(@Vector(lanes, u5), @splat(16))),
-        3, 11 => (vv & @as(VecU, @splat(0xff))) *% @as(VecU, @splat(0x01010101)),
+        1, 9 => (dv & @as(VecU, @splat(0xffff0000))) | half,
+        2, 10 => (dv & @as(VecU, @splat(0x0000ffff))) | (half << @as(@Vector(lanes, u5), @splat(16))),
+        3, 11 => byte *% @as(VecU, @splat(0x01010101)),
         4, 5, 6, 7, 12, 13, 14, 15 => blk: {
             const shift: u5 = @as(u5, @intCast((a_pack & 7) - 4)) * 8;
             const mask: VecU = @splat(@as(u32, 0xff) << shift);
-            break :blk (dv & ~mask) | ((vv & @as(VecU, @splat(0xff))) << @as(@Vector(lanes, u5), @splat(shift)));
+            break :blk (dv & ~mask) | (byte << @as(@Vector(lanes, u5), @splat(shift)));
         },
         else => vv,
     };
@@ -316,6 +481,15 @@ pub const DecodedInst = struct {
     mul_pack_a: u4 = 0,
     mul_pack_m: u4 = 0,
     flags: u8 = 0,
+    /// The mul output's rotation (small immediates 48 to 63): 0 none, 1 to 15, or 16 by r5.
+    rotate: u5 = 0,
+    /// A load immediate's kind (bits 59:57): 0 32-bit, 1 signed 2-bit per element, 3 unsigned,
+    /// 4 a semaphore.
+    limm_mode: u3 = 0,
+    /// A branch's condition, whether relative, the regfile A register added (if any).
+    branch_cond: u4 = 0,
+    branch_rel: bool = false,
+    branch_reg: ?u5 = null,
 
     pub const FLAG_SF: u8 = 1 << 0;
     pub const FLAG_READS_VARY: u8 = 1 << 1;
@@ -330,7 +504,21 @@ pub const DecodedInst = struct {
 pub fn decodeInst(inst: qpu.Inst) DecodedInst {
     const sig = qpu.getSig(inst);
     if (sig == .branch) {
-        return .{ .sig = .branch };
+        const reg = (inst >> 50) & 1 != 0;
+        const ws_b = qpu.getWs(inst);
+        return .{
+            .sig = .branch,
+            .imm_or_small = @truncate(inst),
+            .branch_cond = @truncate(inst >> 52),
+            .branch_rel = (inst >> 51) & 1 != 0,
+            .branch_reg = if (reg) @truncate(inst >> 45) else null,
+            .waddr_add = qpu.getWaddrAdd(inst),
+            .waddr_mul = qpu.getWaddrMul(inst),
+            .cond_add = .always,
+            .cond_mul = .always,
+            .add_file = if (ws_b) .b else .a,
+            .mul_file = if (ws_b) .a else .b,
+        };
     }
 
     const ws = qpu.getWs(inst);
@@ -357,8 +545,8 @@ pub fn decodeInst(inst: qpu.Inst) DecodedInst {
     const waddr_mul_raw = qpu.getWaddrMul(inst);
     const a_pack: u4 = if (!pm) pack else 0;
     const mul_pack: u4 = if (pm) pack else 0;
-    const unpack_r4: u3 = if (pm) unpack_mode else 0;
-    const unpack_a: u3 = if (!pm and raddr_a < 32) unpack_mode else 0;
+    const unpack_r4: u3 = if (pm and sig != .load_imm) unpack_mode else 0;
+    const unpack_a: u3 = if (!pm and raddr_a < 32 and sig != .load_imm) unpack_mode else 0;
 
     var flags: u8 = 0;
     if ((inst & (1 << 45)) != 0) flags |= DecodedInst.FLAG_SF;
@@ -371,6 +559,7 @@ pub fn decodeInst(inst: qpu.Inst) DecodedInst {
     if (isFloatInputMul(mul_op)) flags |= DecodedInst.FLAG_FLT_MUL;
     if (unpack_r4 != 0 or unpack_a != 0) flags |= DecodedInst.FLAG_HAS_UNPACK;
 
+    const limm_mode: u3 = if (sig == .load_imm) @truncate(inst >> 57) else 0;
     return .{
         .imm_or_small = if (sig == .load_imm)
             @truncate(inst)
@@ -378,6 +567,8 @@ pub fn decodeInst(inst: qpu.Inst) DecodedInst {
             smallImm(raddr_b)
         else
             0,
+        .rotate = if (sig == .small_imm and raddr_b >= 48) @intCast(if (raddr_b == 48) 16 else raddr_b - 48) else 0,
+        .limm_mode = limm_mode,
         .sig = sig,
         .add_op = add_op,
         .mul_op = mul_op,
@@ -680,7 +871,9 @@ pub fn analyzeFragmentShader(decoded: []const DecodedInst, uniforms: Uniforms) F
         if (d.waddr_add >= qpu.W.tmu0_s or d.waddr_mul >= qpu.W.tmu0_s) {
             uses_tmu0 = true;
         }
-        if ((d.flags & DecodedInst.FLAG_SF) != 0) {
+        if ((d.flags & DecodedInst.FLAG_SF) != 0 or d.rotate != 0 or d.limm_mode != 0 or
+            d.waddr_add == qpu.W.acc5 or d.waddr_mul == qpu.W.acc5 or d.waddr_add == qpu.W.uniforms_address)
+        {
             can_use_sym = false;
         }
 
@@ -1032,11 +1225,60 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
     var end_at: ?usize = null;
     var loads: usize = 0;
     var ip: usize = 0;
+    // A branch taken: where to, once its three delay slots (the instructions after it) have run.
+    var branch_target: ?usize = null;
+    var branch_from: usize = 0;
+    var steps: usize = 0;
     while (ip < decoded.len) : (ip += 1) {
+        if (branch_target) |t| {
+            if (ip >= branch_from + 4) {
+                ip = t;
+                branch_target = null;
+                if (ip >= decoded.len) break;
+            }
+        }
         if (end_at) |e| if (ip > e) break;
+        steps += 1;
+        if (steps > 1 << 22) return error.TooLong;
         const d = decoded[ip];
         if (@hasField(RType, "instructions")) r.instructions += 1;
-        if (d.sig == .branch) continue;
+        if (d.sig == .branch) {
+            const any = struct {
+                fn f(v: VecBool) bool {
+                    return @reduce(.Or, v);
+                }
+                fn all(v: VecBool) bool {
+                    return @reduce(.And, v);
+                }
+            };
+            const flag = switch (d.branch_cond >> 2) {
+                0 => s.zero,
+                1 => s.neg,
+                else => s.carry,
+            };
+            const taken = switch (d.branch_cond) {
+                15 => true,
+                12, 13, 14 => false,
+                else => switch (d.branch_cond & 3) {
+                    0 => any.all(flag),
+                    1 => any.all(!flag),
+                    2 => any.f(flag),
+                    else => any.f(!flag),
+                },
+            };
+            // The link address (after the delay slots) comes out of both ALUs.
+            const link: u32 = env.code_addr +% @as(u32, @intCast((ip + 4) * 8));
+            try write(RType, &s, r, env, d.waddr_add, d.add_file, splat(link), .always, 0, 0, false);
+            try write(RType, &s, r, env, d.waddr_mul, d.mul_file, splat(link), .always, 0, 0, false);
+            if (taken and branch_target == null) {
+                var target: u32 = d.imm_or_small;
+                if (d.branch_rel) target +%= link;
+                if (d.branch_reg) |rg| target +%= (if ((s.ra_init >> rg) & 1 != 0) s.ra[rg][0] else 0);
+                branch_target = (target -% env.code_addr) / 8;
+                branch_from = ip;
+            }
+            continue;
+        }
 
         if ((d.flags & DecodedInst.FLAG_FUSED_LINTERP) != 0) {
             const val: Vec = if (s.varyings_read < env.varyings.len) blk: {
@@ -1060,7 +1302,7 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                 } else if (d.waddr_add >= qpu.W.acc0 and d.waddr_add <= qpu.W.acc0 + 3) {
                     s.acc[d.waddr_add - qpu.W.acc0] = val;
                 } else {
-                    try write(RType, &s, r, env, d.waddr_add, d.add_file, val, .always, 0, 0);
+                    try write(RType, &s, r, env, d.waddr_add, d.add_file, val, .always, 0, 0, true);
                 }
             }
             if (@hasField(RType, "instructions")) r.instructions += 1;
@@ -1072,9 +1314,22 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
         var mul_result: Vec = undefined;
 
         if (d.sig == .load_imm) {
-            add_result = splat(d.imm_or_small);
+            add_result = switch (d.limm_mode) {
+                // Each element's 2 bits: its low bit at bit n, its high one at bit 16 + n.
+                1, 3 => blk: {
+                    var v: Vec = undefined;
+                    for (0..lanes) |i| {
+                        const two: u32 = (d.imm_or_small >> @intCast(i)) & 1 | ((d.imm_or_small >> @intCast(16 + i)) & 1) << 1;
+                        v[i] = if (d.limm_mode == 1 and two >= 2) two -% 4 else two;
+                    }
+                    break :blk v;
+                },
+                else => splat(d.imm_or_small),
+            };
             mul_result = add_result;
         } else {
+            var add_a: Vec = splat(0);
+            var add_b: Vec = splat(0);
             if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0) {
                 s.acc[6] = try readPort(&s, env, d.raddr_a, .a);
             }
@@ -1086,7 +1341,9 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
 
             if ((d.flags & DecodedInst.FLAG_HAS_UNPACK) == 0) {
                 if (d.add_op != .nop) {
-                    add_result = addOpVec(d.add_op, s.acc[@backingInt(d.mux0)], s.acc[@backingInt(d.mux1)]);
+                    add_a = s.acc[@backingInt(d.mux0)];
+                    add_b = s.acc[@backingInt(d.mux1)];
+                    add_result = addOpVec(d.add_op, add_a, add_b);
                 } else if (d.waddr_add != qpu.W.nop) {
                     add_result = splat(0);
                 }
@@ -1100,6 +1357,8 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                     const flt_add = (d.flags & DecodedInst.FLAG_FLT_ADD) != 0;
                     const in0 = resolveMuxSlow(d.mux0, &s, d.unpack_r4, d.unpack_a, flt_add);
                     const in1 = if (d.mux1 == d.mux0) in0 else resolveMuxSlow(d.mux1, &s, d.unpack_r4, d.unpack_a, flt_add);
+                    add_a = in0;
+                    add_b = in1;
                     add_result = addOpVec(d.add_op, in0, in1);
                 } else if (d.waddr_add != qpu.W.nop) {
                     add_result = splat(0);
@@ -1115,10 +1374,17 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                 }
             }
 
+            if (d.rotate != 0 and d.mul_op != .nop) {
+                const n: u4 = if (d.rotate == 16) @truncate(s.acc[5][0]) else @intCast(d.rotate);
+                mul_result = rotateVec(mul_result, n);
+            }
+            // The 32-bit saturating pack: an add's or sub's result saturated, not wrapped.
+            if (d.add_pack_a == 8 and (d.add_op == .add or d.add_op == .sub)) add_result = saturate32(d.add_op, add_a, add_b);
             if ((d.flags & DecodedInst.FLAG_SF) != 0) {
                 const flags_from: VecI = @bitCast(if (d.add_op != .nop) add_result else mul_result);
                 s.zero = flags_from == @as(VecI, @splat(0));
                 s.neg = flags_from < @as(VecI, @splat(0));
+                s.carry = if (d.add_op != .nop) carryOf(d.add_op, add_a, add_b) else @splat(false);
             }
             if ((d.flags & DecodedInst.FLAG_READS_VARY) != 0) s.acc[5] = splatF(varying_c);
         }
@@ -1137,10 +1403,10 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                 } else if (d.waddr_add >= qpu.W.acc0 and d.waddr_add <= qpu.W.acc0 + 3) {
                     s.acc[d.waddr_add - qpu.W.acc0] = add_result;
                 } else {
-                    try write(RType, &s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0);
+                    try write(RType, &s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0, d.sig != .load_imm and floatResultAdd(d.add_op));
                 }
             } else {
-                try write(RType, &s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0);
+                try write(RType, &s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0, d.sig != .load_imm and floatResultAdd(d.add_op));
             }
         }
         if (d.waddr_mul != qpu.W.nop) {
@@ -1157,10 +1423,10 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                 } else if (d.waddr_mul >= qpu.W.acc0 and d.waddr_mul <= qpu.W.acc0 + 3) {
                     s.acc[d.waddr_mul - qpu.W.acc0] = mul_result;
                 } else {
-                    try write(RType, &s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m);
+                    try write(RType, &s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m, d.sig != .load_imm and d.mul_op == .fmul);
                 }
             } else {
-                try write(RType, &s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m);
+                try write(RType, &s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m, d.sig != .load_imm and d.mul_op == .fmul);
             }
         }
 
@@ -1205,6 +1471,11 @@ fn readPort(s: *State, env: *const Env, raddr: u6, file: File) Error!Vec {
     switch (raddr) {
         qpu.R.nop => return splat(0),
         qpu.R.unif => {
+            if (s.unif_override) |list| {
+                if (list.len == 0) return splat(0);
+                s.unif_override = list[1..];
+                return splat(list[0]);
+            }
             if (s.uniforms_read >= env.uniforms.len) return splat(0);
             defer s.uniforms_read += 1;
             return splat(env.uniforms[s.uniforms_read]);
@@ -1223,7 +1494,9 @@ fn readPort(s: *State, env: *const Env, raddr: u6, file: File) Error!Vec {
             defer s.vpm_words_read += 1;
             return env.vpm_in[s.vpm_words_read];
         },
+        // The element number (A), or the QPU's number (B: which runs it isn't known; 0).
         qpu.R.elem_qpu => {
+            if (file == .b) return splat(0);
             return .{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
         },
         qpu.R.xy_pixel_coord => return if (file == .a) env.frag_x else env.frag_y,
@@ -1310,7 +1583,16 @@ fn sampleTmuVec(
     return texel;
 }
 
-fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6, file: File, value: Vec, cond: qpu.Cond, a_pack: u4, mul_pack: u4) Error!void {
+/// Whether `op` gives a float (which a 16-bit pack converts to a 16-bit float).
+fn floatResultAdd(op: qpu.AddOp) bool {
+    return switch (op) {
+        .fadd, .fsub, .fmin, .fmax, .fminabs, .fmaxabs, .itof => true,
+        else => false,
+    };
+}
+
+fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6, file: File, value_in: Vec, cond: qpu.Cond, a_pack: u4, mul_pack: u4, float_result: bool) Error!void {
+    var value = value_in;
     if (waddr == qpu.W.nop or cond == .never) return;
 
     const dst: ?*Vec = switch (waddr) {
@@ -1335,12 +1617,19 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
             }
         },
         qpu.W.acc0...qpu.W.acc0 + 3 => &s.acc[waddr - qpu.W.acc0],
-        qpu.W.acc5 => &s.acc[5],
+        qpu.W.acc5 => blk: {
+            // Written through regfile A, each quad's first pixel to all four; through B,
+            // element 0 to all.
+            if (file == .a) {
+                for (0..lanes) |i| value[i] = value_in[i & ~@as(usize, 3)];
+            } else value = splat(value_in[0]);
+            break :blk &s.acc[5];
+        },
         else => null,
     };
     if (dst) |d| {
         const dv: VecU = d.*;
-        const packed_vec = packVec(dv, value, a_pack, mul_pack);
+        const packed_vec = packVec(dv, value, a_pack, mul_pack, float_result);
         if (cond == .always) {
             d.* = packed_vec;
         } else {
@@ -1350,6 +1639,14 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
     }
 
     switch (waddr) {
+        qpu.W.uniforms_address => {
+            // Uniforms from here on read from the address in element 0.
+            const mem = env.uniform_memory;
+            if (mem.len >= 4) {
+                const off = (value[0] & vc_bus.ramMask(mem.len)) & ~@as(u32, 3);
+                s.unif_override = if (off < mem.len) std.mem.bytesAsSlice(u32, mem[off .. mem.len / 4 * 4]) else &.{};
+            } else s.unif_override = &.{};
+        },
         qpu.W.vpm => {
             if (@hasField(RType, "vpm_out")) {
                 if (r.vpm_out_len < max_vpm_out) {
@@ -1376,12 +1673,19 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
         qpu.W.tlb_z => r.tlb_z = value,
         qpu.W.sfu_recip, qpu.W.sfu_recipsqrt, qpu.W.sfu_exp, qpu.W.sfu_log => {
             const vf: VecF = @bitCast(value);
-            const res_f: VecF = switch (waddr) {
-                qpu.W.sfu_recip => @as(VecF, @splat(1.0)) / vf,
-                qpu.W.sfu_recipsqrt => @as(VecF, @splat(1.0)) / @sqrt(vf),
-                qpu.W.sfu_exp => @exp2(vf),
-                else => @log2(vf),
-            };
+            var res_f: VecF = undefined;
+            switch (waddr) {
+                qpu.W.sfu_recip => res_f = @as(VecF, @splat(1.0)) / vf,
+                qpu.W.sfu_recipsqrt => inline for (0..lanes) |i| {
+                    res_f[i] = sfuRsqrt(vf[i]);
+                },
+                qpu.W.sfu_exp => inline for (0..lanes) |i| {
+                    res_f[i] = sfuExp2(vf[i]);
+                },
+                else => inline for (0..lanes) |i| {
+                    res_f[i] = sfuLog2(vf[i]);
+                },
+            }
             s.acc[4] = @bitCast(res_f);
         },
         qpu.W.tmu0_s, qpu.W.tmu0_t, qpu.W.tmu0_r, qpu.W.tmu0_b, qpu.W.tmu1_s, qpu.W.tmu1_t, qpu.W.tmu1_r, qpu.W.tmu1_b => {

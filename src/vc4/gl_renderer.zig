@@ -385,7 +385,7 @@ pub const Renderer = struct {
         defer src.deinit();
         src.writer.writeAll(shader.glsl_common) catch return null;
         const sh = shader.translateWith(&src.writer, decoded, .glsl, .{ .multisampled = multisampled }) catch return null;
-        if (sh.too_many_samples or sh.too_many_uniforms) return null;
+        if (sh.too_many_samples or sh.too_many_uniforms or sh.unsupported) return null;
         if (sh.reads_color and gl.TextureBarrier == null) return null;
 
         const frag = r.compileShader(GL_FRAGMENT_SHADER, src.written()) orelse return null;
@@ -1156,7 +1156,7 @@ const RandomKind = enum { float, int };
 /// immediates, writing registers, accumulators, the VPM and (for floats) the reciprocal.
 fn randomVertexInst(r: std.Random, kind: RandomKind) u64 {
     const raddrs = [_]u6{ 0, 1, 2, 3, 4, 5, 15, 15, 32, 32, 48, 48, 48 };
-    const waddrs = [_]u6{ 0, 1, 2, 3, 15, 32, 33, 34, 35, 37, 39, 48, 48, 52 };
+    const waddrs = [_]u6{ 0, 1, 2, 3, 15, 32, 33, 34, 35, 37, 39, 48, 48, 52, 53, 54, 55 };
     const float_add = [_]u5{ 0, 1, 2, 3, 4, 5, 6, 21 };
     const float_mul = [_]u3{ 0, 1 };
     const int_add = [_]u5{ 0, 7, 8, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 30, 31 };
@@ -1164,7 +1164,8 @@ fn randomVertexInst(r: std.Random, kind: RandomKind) u64 {
     const sigs = [_]u4{ 1, 1, 1, 1, 13, 13, 14 };
     const sig = sigs[r.uintLessThan(usize, sigs.len)];
     var i: u64 = @as(u64, sig) << 60;
-    if (kind == .int) {
+    // Unpacks and packs (16-bit floats for float programs, saturations for integer ones).
+    if (kind == .int or r.uintLessThan(u8, 3) == 0) {
         i |= @as(u64, r.int(u3)) << 57; // unpack
         i |= @as(u64, @intFromBool(r.uintLessThan(u8, 3) == 0)) << 56; // pm
         i |= @as(u64, if (r.boolean()) 0 else r.int(u4)) << 52; // pack
@@ -1175,12 +1176,14 @@ fn randomVertexInst(r: std.Random, kind: RandomKind) u64 {
     i |= @as(u64, @intFromBool(r.boolean())) << 44; // ws
     for ([_]u6{ 38, 32 }) |shift| {
         var waddr = waddrs[r.uintLessThan(usize, waddrs.len)];
-        if (kind == .int and waddr == 52) waddr = 48;
+        if (kind == .int and waddr >= 52) waddr = 48;
         i |= @as(u64, waddr) << shift;
     }
     if (sig == 14) {
         const imm: u32 = if (kind == .float) @bitCast(r.float(f32) * 4.0 - 2.0) else r.int(u32);
-        return i | imm;
+        // Sometimes 2-bit values per element (signed or not): shaded on the CPU.
+        if (kind == .int and r.uintLessThan(u8, 8) == 0) return i & ~(@as(u64, 7) << 57) | @as(u64, if (r.boolean()) 1 else 3) << 57 | imm;
+        return i & ~(@as(u64, 7) << 57) | imm;
     }
     const mul: u3 = if (kind == .float) float_mul[r.uintLessThan(usize, float_mul.len)] else int_mul[r.uintLessThan(usize, int_mul.len)];
     const add: u5 = if (kind == .float) float_add[r.uintLessThan(usize, float_add.len)] else int_add[r.uintLessThan(usize, int_add.len)];
@@ -1188,7 +1191,8 @@ fn randomVertexInst(r: std.Random, kind: RandomKind) u64 {
     i |= @as(u64, add) << 24;
     i |= @as(u64, raddrs[r.uintLessThan(usize, raddrs.len)]) << 18;
     // Small immediates: integers, or (for floats) the powers of two.
-    const small: u6 = if (kind == .float) 32 + r.uintLessThan(u6, 16) else r.uintLessThan(u6, 32);
+    // (and, rarely, a vector rotation: shaded on the CPU).
+    const small: u6 = if (r.uintLessThan(u8, 16) == 0) 48 + r.uintLessThan(u6, 16) else if (kind == .float) 32 + r.uintLessThan(u6, 16) else r.uintLessThan(u6, 32);
     i |= @as(u64, if (sig == 13) small else raddrs[r.uintLessThan(usize, raddrs.len)]) << 12;
     i |= r.int(u12);
     return i;
@@ -1200,7 +1204,7 @@ test "random vertex shaders shade on the GPU as qpu_sim shades them" {
     const rand = prng.random();
     var differ: usize = 0;
     var checked: usize = 0;
-    for (0..200) |pi| {
+    for (0..600) |pi| {
         const kind: RandomKind = if (pi % 2 == 0) .float else .int;
         var code: [48]qpu.Inst = undefined;
         const n = 6 + rand.uintLessThan(usize, 30);
@@ -1237,7 +1241,12 @@ test "random vertex shaders shade on the GPU as qpu_sim shades them" {
         const res = qpu_sim.runDecoded(decoded, .{ .uniforms = &unifs, .vpm_in = vpm_in[0..vpm_words] }) catch continue;
         var gpu: [16]Vertex = undefined;
         const vp = [2]f32{ rand.float(f32) * 100, rand.float(f32) * 100 };
-        try r.shadeForTest(prog, &unifs, vpm_words, &inputs, 16, n_var, vp, &gpu);
+        // Programs the GPU can't shade (r5 written, vectors rotated, per-element immediates) are
+        // shaded on the CPU.
+        r.shadeForTest(prog, &unifs, vpm_words, &inputs, 16, n_var, vp, &gpu) catch |err| switch (err) {
+            error.Unsupported => continue,
+            else => return err,
+        };
         const valid_vars = @min(n_var, res.vpm_out_len - 3);
         lanes: for (0..16) |lane| {
             // Only vertices of ordinary numbers: a float program's integers (say, its position's
