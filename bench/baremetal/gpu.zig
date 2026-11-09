@@ -695,6 +695,9 @@ pub const Target = struct {
         tile_lists: ?*const fn (t: *const Target, x: u32, y: u32) u32 = null,
         /// Whether the binner's tile lists are branched to (else just the stores: a clear).
         binned: bool = true,
+        /// Whether it waits for the binning first (on the semaphore its flush increments): the
+        /// first rendering of what was binned only (another would wait for ever).
+        wait: bool = true,
         /// Per tile, before its coordinates (loads) and after its lists (stores other than the
         /// last, which is `store`).
         before: ?*const fn (t: *const Target, cl: *Cl, x: u32, y: u32) void = null,
@@ -707,7 +710,7 @@ pub const Target = struct {
         rcl.clearColors(r.clear_color, r.clear_z, r.clear_vg_mask, r.clear_stencil);
         rcl.renderConfig(r.config);
         const n = t.tiles();
-        if (r.binned) rcl.waitOnSemaphore();
+        if (r.binned and r.wait) rcl.waitOnSemaphore();
         for (0..n[1]) |ty| {
             for (0..n[0]) |tx| {
                 const x: u32 = @intCast(tx);

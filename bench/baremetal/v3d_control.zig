@@ -65,6 +65,7 @@ pub fn control(p: Params, r: *Result) void {
             gpu.resetThreads();
             g.timeouts += 1;
         }
+        g.unwaited = true;
         g.renderTiles(.{ .config = cfg });
         r.add("bin_branches", g.t.checksum());
     }
@@ -80,6 +81,7 @@ pub fn control(p: Params, r: *Result) void {
         }.draw);
         g.rcl.reset();
         g.t.renderList(&g.rcl, .{ .config = cfg });
+        g.unwaited = false;
         const renders = hw.read(reg.rfc);
         const bins = hw.read(reg.bfc);
         hw.write(reg.ct1ca, g.rcl.start());
@@ -121,6 +123,7 @@ pub fn control(p: Params, r: *Result) void {
             gpu.resetThreads();
             g.timeouts += 1;
         }
+        g.unwaited = true;
         g.renderTiles(.{ .config = cfg });
         r.add("extended_list", g.t.checksum());
     }

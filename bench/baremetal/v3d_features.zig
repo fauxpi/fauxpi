@@ -30,6 +30,8 @@ pub const Geo = struct {
     flat: u32,
     unifs: u32,
     timeouts: u64 = 0,
+    /// Binned since the last rendering waited for binning.
+    unwaited: bool = false,
     /// The vertices: x, y, z, w and r, g, b, and a fourth (for depth, or discards).
     pos: []f32,
     col: []f32,
@@ -136,10 +138,15 @@ pub const Geo = struct {
         draws(ctx, g, &g.bcl);
         g.bcl.incrementSemaphore();
         g.bcl.flush();
+        g.unwaited = true;
     }
 
-    /// Renders the tiles binned last (or, `render.binned` false, without them).
-    pub fn renderTiles(g: *Geo, render: gpu.Target.Render) void {
+    /// Renders the tiles binned last (or, `render.binned` false, without them): waiting for the
+    /// binning the first time only (it increments the semaphore once).
+    pub fn renderTiles(g: *Geo, render_in: gpu.Target.Render) void {
+        var render = render_in;
+        render.wait = render.binned and g.unwaited;
+        if (render.wait) g.unwaited = false;
         g.rcl.reset();
         g.t.renderList(&g.rcl, render);
         if (!gpu.run(null, &g.rcl)) g.timeouts += 1;
