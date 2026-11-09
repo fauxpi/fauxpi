@@ -141,6 +141,9 @@ pub const Renderer = struct {
         used: bool = false,
         pipeline: Id = null,
         reads_color: bool = false,
+        /// The textures it samples: their parameters' uniforms.
+        samples: [msl.max_samples]msl.Sample = undefined,
+        sample_count: usize = 0,
     };
 
     pub fn init() Error!Renderer {
@@ -346,6 +349,8 @@ pub const Renderer = struct {
             return null;
         }
         slot.reads_color = shader.reads_color;
+        slot.samples = shader.samples;
+        slot.sample_count = shader.sample_count;
         return slot;
     }
 
@@ -371,6 +376,10 @@ pub const Renderer = struct {
         for (draws, 0..) |d, i| {
             const p = r.program(d.code) orelse return error.Unsupported;
             pipelines[i] = p.pipeline;
+            // Textures the shader can't read as qpu_sim does: the frame on the CPU.
+            for (p.samples[0..p.sample_count]) |sm| {
+                if (!qpu_sim.DecodedTexture.readInShader(d.uniforms[sm.p0], d.uniforms[sm.p1])) return error.Unsupported;
+            }
             if (d.vertex_stage) |vs| {
                 const vp = r.vertexProgram(vs.code) orelse return error.Unsupported;
                 vertex_pipelines[i] = vp.pipeline;

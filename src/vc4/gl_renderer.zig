@@ -700,7 +700,14 @@ pub const Renderer = struct {
         // The shaders first: one OpenGL can't run sends the frame to the CPU.
         var prof_start = profile.now();
         var programs: [gpu_draw.max_draws]*const Program = undefined;
-        for (draws, 0..) |d, i| programs[i] = r.program(d.code, multisampled) orelse return error.Unsupported;
+        for (draws, 0..) |d, i| {
+            const p = r.program(d.code, multisampled) orelse return error.Unsupported;
+            programs[i] = p;
+            // Textures whose lookups aren't blended byte by byte: the frame on the CPU.
+            for (p.shader.samples[0..p.shader.sample_count]) |sm| {
+                if (!qpu_sim.DecodedTexture.blendsBytes(d.uniforms[sm.p0], d.uniforms[sm.p1])) return error.Unsupported;
+            }
+        }
         var vertex_programs: [gpu_draw.max_draws]*const VertexProgram = undefined;
         var vertex_total: u32 = 0;
         var any_reads_color = false;

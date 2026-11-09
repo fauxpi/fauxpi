@@ -40,11 +40,15 @@ pub const Config = struct {
     wrap_t: Wrap = .repeat,
     mip_levels: u4 = 0,
     mip_filter: MipFilter = .none,
+    /// Rows read from the bottom up.
+    flip_y: bool = false,
+    /// ETC1 blocks' rows in the order ETC1 has them (else from the bottom up).
+    etc_flip: bool = false,
 };
 
 pub fn p0(c: Config) u32 {
     std.debug.assert(c.offset & 0xfff == 0);
-    return c.offset | (@as(u32, @backingInt(c.type)) & 0xf) << 4 | c.mip_levels;
+    return c.offset | @as(u32, @intFromBool(c.flip_y)) << 8 | (@as(u32, @backingInt(c.type)) & 0xf) << 4 | c.mip_levels;
 }
 
 pub fn p1(c: Config) u32 {
@@ -62,6 +66,7 @@ pub fn p1(c: Config) u32 {
     };
     return (@as(u32, @backingInt(c.type)) >> 4) << 31 |
         (c.height & 2047) << 20 |
+        @as(u32, @intFromBool(c.etc_flip)) << 19 |
         (c.width & 2047) << 8 |
         mag << 7 |
         min << 4 |
@@ -90,6 +95,8 @@ pub fn decodeConfig(param0: u32, param1: u32) Config {
             3, 5 => .linear,
             else => .none,
         },
+        .flip_y = (param0 >> 8) & 1 != 0,
+        .etc_flip = (param1 >> 19) & 1 != 0,
     };
 }
 

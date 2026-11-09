@@ -115,6 +115,8 @@ const State = struct {
     tmu_params: [2][4]u32 = undefined,
     tmu_coord_t: [2]Vec = undefined,
     tmu_fifo: [2][4]Vec = undefined,
+    /// A lookup's second word (RGBA64's blue and alpha), read after its first.
+    tmu_fifo_second: [2][4]?Vec = @splat(@splat(null)),
     tmu_cached: [2]TexCache = .{ .{}, .{} },
 };
 
@@ -1172,7 +1174,8 @@ pub inline fn runFragmentFast(
             const s_vec: Vec = if (s_var < env.varyings.len) env.varyings[s_var] else splat(0);
             const t_vec: Vec = if (t_var < env.varyings.len) env.varyings[t_var] else splat(0);
             var local_cache: TexCache = .{};
-            const texel = sampleTmuVec(0, p0, p1, s_vec, t_vec, env, &local_cache);
+            var second: ?Vec = null;
+            const texel = sampleTmuVec(0, p0, p1, s_vec, t_vec, env, &local_cache, &second);
             if (fast.tmu_modulate) {
                 return .{ .tlb_color = v8muldVec(texel, @splat(fast.color)) };
             }
@@ -1434,9 +1437,15 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
             .load_tmu0, .load_tmu1 => {
                 const unit: usize = if (d.sig == .load_tmu0) 0 else 1;
                 if (s.tmu_fifo_len[unit] > 0) {
-                    s.acc[4] = s.tmu_fifo[unit][s.tmu_fifo_head[unit]];
-                    s.tmu_fifo_head[unit] +%= 1;
-                    s.tmu_fifo_len[unit] -= 1;
+                    const head = s.tmu_fifo_head[unit];
+                    s.acc[4] = s.tmu_fifo[unit][head];
+                    if (s.tmu_fifo_second[unit][head]) |second| {
+                        s.tmu_fifo[unit][head] = second;
+                        s.tmu_fifo_second[unit][head] = null;
+                    } else {
+                        s.tmu_fifo_head[unit] +%= 1;
+                        s.tmu_fifo_len[unit] -= 1;
+                    }
                 } else {
                     s.acc[4] = splat(0xff000000);
                 }
@@ -1513,7 +1522,9 @@ fn sampleTmuVec(
     t_vec: ?Vec,
     env: *const Env,
     fallback_cache: *TexCache,
+    second: *?Vec,
 ) Vec {
+    second.* = null;
     var memory = if (unit == 0) env.texture_memory else if (env.texture_memory1.len > 0) env.texture_memory1 else env.texture_memory;
     var p0 = p0_in;
     if (env.textures.len > 0) {
@@ -1537,6 +1548,18 @@ fn sampleTmuVec(
     if (!cache_slot.valid) return splat(0xff000000);
     const pt = &cache_slot.pt;
     var texel: Vec = undefined;
+    if (pt.float16 or pt.unblended) {
+        // Words not of bytes (and RGBA64's second).
+        var hi: Vec = undefined;
+        for (0..lanes) |lane| {
+            const tc = if (t_vec) |tv| f(tv[lane]) else 0;
+            const v = pt.sampleWide(memory, f(s_vec[lane]), tc) catch 0xff000000;
+            texel[lane] = @truncate(v);
+            hi[lane] = @truncate(v >> 32);
+        }
+        if (pt.cfg.type == .rgba64) second.* = hi;
+        return texel;
+    }
     if (pt.cfg.mag_filter == .nearest) {
         const p = pt.cfg;
         var prev_wx: u32 = 0xffff_ffff;
@@ -1716,6 +1739,7 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
                 t_opt,
                 env,
                 &s.tmu_cached[unit],
+                &s.tmu_fifo_second[unit][write_idx],
             );
             s.tmu_fifo_len[unit] += 1;
             s.tmu_param_count[unit] = 0;
@@ -1738,7 +1762,17 @@ pub const TexCache = struct {
 const PrecomputedTex = struct {
     cfg: texture.Config,
     base_off: u32,
+    /// Bytes a texel, for the types read a whole number of bytes at a time from tiles
+    /// (`fast`: RGBA8888, RGBX8888, RGBA32R, RGB565, luminance and alpha); 0 for the rest.
     cpp: u32,
+    /// Bits a texel (an ETC1 block's for ETC1), and whether each texel is a whole number of
+    /// bytes of one of the original types (read without decoding).
+    bpp: u32,
+    fast: bool,
+    /// Results aren't 8-bit channels, blended byte by byte: 16-bit floats (blended as floats:
+    /// S16F, RGBA64), or integers (not blended: S8, S16).
+    float16: bool,
+    unblended: bool,
     fw: f32,
     fh: f32,
     uw_shift: u5,
@@ -1749,35 +1783,79 @@ const PrecomputedTex = struct {
     utile_row_stride: u32,
     alpha_or_mask32: u32,
     alpha_or_mask64: u64,
+    /// Raster (not tiled): bytes a row.
+    raster_stride: u32,
     is_small_microtile: bool,
     utiles_per_row: u32,
     tile_w_shift: u5,
     tile_h_shift: u5,
     tiles_per_row: u32,
+    /// The bytes it takes.
+    len: u32,
 
     inline fn init(p: texture.Config, memory_len: usize) Error!PrecomputedTex {
-        const cpp: u32 = switch (p.type) {
-            .rgba8888, .rgbx8888, .rgba32r => 4,
-            .rgb565 => 2,
-            .alpha, .luminance => 1,
-            else => return error.Unsupported,
+        // Bits a texel (ETC1: a 4x4 block's, its texels addressed by block).
+        const bpp: u32 = switch (p.type) {
+            .rgba8888, .rgbx8888, .rgba32r => 32,
+            .rgba4444, .rgba5551, .rgb565, .lumalpha, .s16f, .s16, .yuv422r => 16,
+            .luminance, .alpha, .s8 => 8,
+            .a4 => 4,
+            .bw1, .a1 => 1,
+            .rgba64, .etc1 => 64,
+            _ => return error.Unsupported,
         };
-        const uw_shift: u5 = if (cpp == 4) 2 else 3;
-        const uh_shift: u5 = if (cpp == 1) 3 else 2;
+        const fast = switch (p.type) {
+            .rgba8888, .rgbx8888, .rgba32r, .rgb565, .luminance, .alpha => true,
+            else => false,
+        };
+        const raster = p.type == .rgba32r or p.type == .yuv422r;
+        // A 64-byte microtile: 2x4 texels of 64 bits, 4x4 of 32, 8x4 of 16, 8x8 of 8, 16x8 of 4,
+        // 32x16 of 1.
+        const uw_shift: u5 = switch (bpp) {
+            64 => 1,
+            32 => 2,
+            16, 8 => 3,
+            4 => 4,
+            else => 5,
+        };
+        const uh_shift: u5 = switch (bpp) {
+            64, 32, 16 => 2,
+            8, 4 => 3,
+            else => 4,
+        };
         const uw: u32 = @as(u32, 1) << uw_shift;
         const uh: u32 = @as(u32, 1) << uh_shift;
+        const cpp: u32 = if (fast) bpp / 8 else 0;
         const cpp_shift: u5 = switch (cpp) {
             4 => 2,
             2 => 1,
             else => 0,
         };
+        // The grid of what's addressed: texels, or ETC1's blocks.
+        const gw = if (p.type == .etc1) (p.width + 3) >> 2 else p.width;
+        const gh = if (p.type == .etc1) (p.height + 3) >> 2 else p.height;
         const tile_w_shift: u5 = uw_shift + 3;
         const tile_h_shift: u5 = uh_shift + 3;
         const tile_w: u32 = @as(u32, 1) << tile_w_shift;
+        const tile_h: u32 = @as(u32, 1) << tile_h_shift;
+        const small = gw <= (uw << 2) or gh <= (uh << 2);
+        const utiles_per_row = (gw + uw - 1) >> uw_shift;
+        const tiles_per_row = (gw + tile_w - 1) >> tile_w_shift;
+        const raster_stride = p.width * (bpp / 8);
+        const len: u32 = if (raster)
+            raster_stride * p.height
+        else if (small)
+            utiles_per_row * ((gh + uh - 1) >> uh_shift) * 64
+        else
+            tiles_per_row * ((gh + tile_h - 1) >> tile_h_shift) * 4096;
         return .{
             .cfg = p,
             .base_off = p.offset & vc_bus.ramMask(memory_len),
             .cpp = cpp,
+            .bpp = bpp,
+            .fast = fast and !p.flip_y,
+            .float16 = p.type == .s16f or p.type == .rgba64,
+            .unblended = p.type == .s8 or p.type == .s16,
             .fw = @floatFromInt(p.width),
             .fh = @floatFromInt(p.height),
             .uw_shift = uw_shift,
@@ -1785,37 +1863,41 @@ const PrecomputedTex = struct {
             .uw_mask = uw - 1,
             .uh_mask = uh - 1,
             .cpp_shift = cpp_shift,
-            .utile_row_stride = if (p.type == .rgba32r) (p.width << 2) else (@as(u32, 1) << (uw_shift + cpp_shift)),
+            .utile_row_stride = if (raster) raster_stride else (@as(u32, 1) << (uw_shift + cpp_shift)),
             .alpha_or_mask32 = if (p.type == .rgbx8888) 0xff000000 else 0,
             .alpha_or_mask64 = if (p.type == .rgbx8888) 0xff000000_ff000000 else 0,
-            .is_small_microtile = (p.width <= (uw << 2) or p.height <= (uh << 2)),
-            .utiles_per_row = (p.width + uw - 1) >> uw_shift,
+            .raster_stride = raster_stride,
+            .is_small_microtile = small,
+            .utiles_per_row = utiles_per_row,
             .tile_w_shift = tile_w_shift,
             .tile_h_shift = tile_h_shift,
-            .tiles_per_row = (p.width + tile_w - 1) >> tile_w_shift,
+            .tiles_per_row = tiles_per_row,
+            .len = len,
         };
     }
 
+    /// Where microtile (`ux`, `uy`) is, from the texture's start: LT format (microtiles in rows),
+    /// or T format (4 KiB tiles in rows, alternate rows reversed, of 1 KiB subtiles, of 4x4
+    /// microtiles).
+    inline fn utileOffset(pt: *const PrecomputedTex, ux: u32, uy: u32) u32 {
+        if (pt.is_small_microtile) return (uy * pt.utiles_per_row + ux) << 6;
+        const tile_row = uy >> 3;
+        const tile_col = if ((tile_row & 1) == 0) (ux >> 3) else pt.tiles_per_row - 1 - (ux >> 3);
+        const tile_base = (tile_row * pt.tiles_per_row + tile_col) << 12;
+        const stile_index = (((uy >> 2) & 1) << 1) | ((ux >> 2) & 1);
+        const even_map = [4]u32{ 0, 3, 1, 2 };
+        const odd_map = [4]u32{ 2, 1, 3, 0 };
+        const sub_index = if ((tile_row & 1) == 0) even_map[stile_index] else odd_map[stile_index];
+        return tile_base + (sub_index << 10) + ((((uy & 3) << 2) | (ux & 3)) << 6);
+    }
+
+    /// Where texel (`x`, `y`) of a `fast` type is.
     inline fn texelOffset(pt: *const PrecomputedTex, x: u32, y: u32) u32 {
         if (pt.cfg.type == .rgba32r) {
             return (y * pt.cfg.width + x) << 2;
         }
         const in_utile = (((y & pt.uh_mask) << pt.uw_shift) | (x & pt.uw_mask)) << pt.cpp_shift;
-        if (pt.is_small_microtile) {
-            return (((y >> pt.uh_shift) * pt.utiles_per_row + (x >> pt.uw_shift)) << 6) + in_utile;
-        }
-        const tile_row = y >> pt.tile_h_shift;
-        const tile_col = if ((tile_row & 1) == 0) (x >> pt.tile_w_shift) else pt.tiles_per_row - 1 - (x >> pt.tile_w_shift);
-        const tile_base = (tile_row * pt.tiles_per_row + tile_col) << 12;
-
-        const sub_col = (x >> (pt.uw_shift + 2)) & 1;
-        const sub_row = (y >> (pt.uh_shift + 2)) & 1;
-        const stile_index = (sub_row << 1) | sub_col;
-        const even_map = [4]u32{ 0, 3, 1, 2 };
-        const odd_map = [4]u32{ 2, 1, 3, 0 };
-        const sub_index = if ((tile_row & 1) == 0) even_map[stile_index] else odd_map[stile_index];
-        const utile_in_sub = (((y >> pt.uh_shift) & 3) << 2) | ((x >> pt.uw_shift) & 3);
-        return tile_base + (sub_index << 10) + (utile_in_sub << 6) + in_utile;
+        return pt.utileOffset(x >> pt.uw_shift, y >> pt.uh_shift) + in_utile;
     }
 
     inline fn fetchFromOffset(pt: *const PrecomputedTex, memory: []const u8, offset: u32) Error!u32 {
@@ -1851,50 +1933,153 @@ const PrecomputedTex = struct {
         return .{ pixel.fromRgb565(@truncate(raw)), pixel.fromRgb565(@truncate(raw >> 16)) };
     }
 
+    /// Texel (`x`, `y`) as the TMU returns it (RGBA64: its first word).
     inline fn fetchAt(pt: *const PrecomputedTex, memory: []const u8, x: u32, y: u32) Error!u32 {
-        return pt.fetchFromOffset(memory, pt.base_off + pt.texelOffset(x, y));
+        if (pt.fast) return pt.fetchFromOffset(memory, pt.base_off + pt.texelOffset(x, y));
+        return @truncate(try pt.fetchWide(memory, x, y));
     }
 
-    inline fn sample(pt: *const PrecomputedTex, memory: []const u8, s: f32, t: f32) Error!u32 {
+    /// Texel (`x`, `y`) as the TMU returns it: a word (byte 0 red, or the type's first channel;
+    /// S8, S16 and S16F in the low bits), or RGBA64's two (red and green, then blue and alpha).
+    fn fetchWide(pt: *const PrecomputedTex, memory: []const u8, x: u32, y_in: u32) Error!u64 {
         const p = pt.cfg;
-        if (p.mag_filter == .nearest) {
-            const fx = @floor(s * pt.fw);
-            const fy = @floor(t * pt.fh);
-            const wx: u32 = if (fx >= 0.0 and fx < pt.fw) @intFromFloat(fx) else wrap(fx, p.width, p.wrap_s);
-            const wy: u32 = if (fy >= 0.0 and fy < pt.fh) @intFromFloat(fy) else wrap(fy, p.height, p.wrap_t);
-            return pt.fetchAt(memory, wx, wy);
+        const y = if (p.flip_y) p.height - 1 - y_in else y_in;
+        if (pt.cpp != 0) return try pt.fetchFromOffset(memory, pt.base_off + pt.texelOffset(x, y));
+        switch (p.type) {
+            .yuv422r => {
+                // Y0 U Y1 V, a pair of texels.
+                const off = pt.base_off + y * pt.raster_stride + ((x & ~@as(u32, 1)) << 1);
+                if (off + 4 > memory.len) return error.Unsupported;
+                return yuvToRgb(memory[off + (x & 1) * 2], memory[off + 1], memory[off + 3]);
+            },
+            .etc1 => {
+                const bx = x >> 2;
+                const by = y >> 2;
+                const off = pt.base_off + pt.utileOffset(bx >> 1, by >> 2) + ((((by & 3) << 1) | (bx & 1)) << 3);
+                if (off + 8 > memory.len) return error.Unsupported;
+                const row = if (p.etc_flip) y & 3 else 3 - (y & 3);
+                return etc1Texel(memory[off..][0..8], x & 3, row);
+            },
+            else => {},
         }
+        const i = ((y & pt.uh_mask) << pt.uw_shift) | (x & pt.uw_mask);
+        const bit = i * pt.bpp;
+        const off = pt.base_off + pt.utileOffset(x >> pt.uw_shift, y >> pt.uh_shift) + (bit >> 3);
+        if (off + @max(pt.bpp / 8, 1) > memory.len) return error.Unsupported;
+        switch (pt.bpp) {
+            64 => return std.mem.readInt(u64, memory[off..][0..8], .little),
+            16 => {
+                const v: u32 = std.mem.readInt(u16, memory[off..][0..2], .little);
+                return switch (p.type) {
+                    // The top bits to byte 0.
+                    .rgba4444 => ((v >> 12) | ((v >> 8) & 0xf) << 8 | ((v >> 4) & 0xf) << 16 | (v & 0xf) << 24) * 0x11,
+                    .rgba5551 => @as(u32, expand5(v >> 11)) | @as(u32, expand5((v >> 6) & 0x1f)) << 8 | @as(u32, expand5((v >> 1) & 0x1f)) << 16 | (v & 1) * 0xff000000,
+                    .lumalpha => (v & 0xff) * 0x010101 | (v >> 8) << 24,
+                    else => v,
+                };
+            },
+            8 => return memory[off],
+            4 => return @as(u32, (memory[off] >> @intCast(bit & 7)) & 0xf) * 0x11000000,
+            else => {
+                const set = (memory[off] >> @intCast(bit & 7)) & 1 != 0;
+                return switch (p.type) {
+                    .bw1 => if (set) 0xffffffff else 0xff000000,
+                    else => if (set) 0xff000000 else 0,
+                };
+            },
+        }
+    }
+
+    /// The texels the bilinear filter blends for (`s`, `t`), and their weights in 256ths.
+    const Footprint = struct { x0: u32, x1: u32, y0: u32, y1: u32, fx: u32, fy: u32 };
+
+    inline fn footprint(pt: *const PrecomputedTex, s: f32, t: f32) Footprint {
+        const p = pt.cfg;
         const fx = s * pt.fw - 0.5;
         const fy = t * pt.fh - 0.5;
         const x0 = @floor(fx);
         const y0 = @floor(fy);
-        var wx0: u32 = undefined;
-        var wx1: u32 = undefined;
+        var r: Footprint = undefined;
         if (x0 >= 0.0 and x0 + 1.0 < pt.fw) {
-            wx0 = @intFromFloat(x0);
-            wx1 = wx0 + 1;
+            r.x0 = @intFromFloat(x0);
+            r.x1 = r.x0 + 1;
         } else {
-            wx0 = wrap(x0, p.width, p.wrap_s);
-            wx1 = wrap(x0 + 1.0, p.width, p.wrap_s);
+            r.x0 = wrap(x0, p.width, p.wrap_s);
+            r.x1 = wrap(x0 + 1.0, p.width, p.wrap_s);
         }
-        var wy0: u32 = undefined;
-        var wy1: u32 = undefined;
         if (y0 >= 0.0 and y0 + 1.0 < pt.fh) {
-            wy0 = @intFromFloat(y0);
-            wy1 = wy0 + 1;
+            r.y0 = @intFromFloat(y0);
+            r.y1 = r.y0 + 1;
         } else {
-            wy0 = wrap(y0, p.height, p.wrap_t);
-            wy1 = wrap(y0 + 1.0, p.height, p.wrap_t);
+            r.y0 = wrap(y0, p.height, p.wrap_t);
+            r.y1 = wrap(y0 + 1.0, p.height, p.wrap_t);
         }
+        r.fx = @intFromFloat(@round((fx - x0) * 256.0));
+        r.fy = @intFromFloat(@round((fy - y0) * 256.0));
+        return r;
+    }
 
-        const fx_frac: u32 = @intFromFloat(@round((fx - x0) * 256.0));
-        const fy_frac: u32 = @intFromFloat(@round((fy - y0) * 256.0));
+    inline fn nearestAt(pt: *const PrecomputedTex, s: f32, t: f32) [2]u32 {
+        const p = pt.cfg;
+        const fx = @floor(s * pt.fw);
+        const fy = @floor(t * pt.fh);
+        const wx: u32 = if (fx >= 0.0 and fx < pt.fw) @intFromFloat(fx) else wrap(fx, p.width, p.wrap_s);
+        const wy: u32 = if (fy >= 0.0 and fy < pt.fh) @intFromFloat(fy) else wrap(fy, p.height, p.wrap_t);
+        return .{ wx, wy };
+    }
+
+    /// A lookup of a texture not of bytes: 16-bit floats blended as floats (S16F, RGBA64), or
+    /// integers not blended (S8, S16): its word, or two (RGBA64).
+    fn sampleWide(pt: *const PrecomputedTex, memory: []const u8, s: f32, t: f32) Error!u64 {
+        if (pt.cfg.mag_filter == .nearest or pt.unblended) {
+            const at = pt.nearestAt(s, t);
+            return pt.fetchWide(memory, at[0], at[1]);
+        }
+        const fp = pt.footprint(s, t);
+        const c = [4]u64{
+            try pt.fetchWide(memory, fp.x0, fp.y0),
+            try pt.fetchWide(memory, fp.x1, fp.y0),
+            try pt.fetchWide(memory, fp.x0, fp.y1),
+            try pt.fetchWide(memory, fp.x1, fp.y1),
+        };
+        const ix = 256 - fp.fx;
+        const iy = 256 - fp.fy;
+        const w = blendWeights(fp.fx, fp.fy, ix, iy);
+        const channels: u32 = if (pt.cfg.type == .rgba64) 4 else 1;
+        var out: u64 = 0;
+        for (0..channels) |ch| {
+            const sh: u6 = @intCast(ch * 16);
+            var h: [4]f32 = undefined;
+            for (&h, c) |*hv, cv| hv.* = f(halfToFloatScalar(@truncate(cv >> sh)));
+            const v = ((h[0] * w[0] + h[1] * w[1]) + (h[2] * w[2] + h[3] * w[3])) * (1.0 / 256.0);
+            out |= @as(u64, halfOf(u(v))) << sh;
+        }
+        return out;
+    }
+
+    inline fn sample(pt: *const PrecomputedTex, memory: []const u8, s: f32, t: f32) Error!u32 {
+        const p = pt.cfg;
+        if (!pt.fast) {
+            if (pt.float16 or pt.unblended) return @truncate(try pt.sampleWide(memory, s, t));
+        }
+        if (p.mag_filter == .nearest) {
+            const at = pt.nearestAt(s, t);
+            return pt.fetchAt(memory, at[0], at[1]);
+        }
+        const fp = pt.footprint(s, t);
+        const wx0 = fp.x0;
+        const wx1 = fp.x1;
+        const wy0 = fp.y0;
+        const wy1 = fp.y1;
+        const fx_frac = fp.fx;
+        const fy_frac = fp.fy;
         if (fx_frac == 0 and fy_frac == 0) {
             return pt.fetchAt(memory, wx0, wy0);
         }
 
-        const same_utile_x = (wx1 == wx0 + 1) and (p.type == .rgba32r or (wx0 & pt.uw_mask) != pt.uw_mask);
-        const same_utile_y = (wy1 == wy0 + 1) and (p.type == .rgba32r or (wy0 & pt.uh_mask) != pt.uh_mask);
+        const raster = p.type == .rgba32r;
+        const same_utile_x = pt.fast and (wx1 == wx0 + 1) and (raster or (wx0 & pt.uw_mask) != pt.uw_mask);
+        const same_utile_y = pt.fast and (wy1 == wy0 + 1) and (raster or (wy0 & pt.uh_mask) != pt.uh_mask);
 
         var c00: u32 = undefined;
         var c10: u32 = undefined;
@@ -1959,6 +2144,68 @@ const PrecomputedTex = struct {
     }
 };
 
+/// The bilinear filter's weights (in 256ths, summing to 256) for texels (x0, y0), (x1, y0),
+/// (x0, y1), (x1, y1), the sample `fx`, `fy` 256ths past (x0, y0); `ix`, `iy` 256 less those.
+fn blendWeights(fx: u32, fy: u32, ix: u32, iy: u32) [4]f32 {
+    const w00 = (ix * iy + 128) >> 8;
+    const w10 = (fx * iy + 128) >> 8;
+    const w01 = (ix * fy + 128) >> 8;
+    const w11 = 256 -| (w00 + w10 + w01);
+    return .{ @floatFromInt(w00), @floatFromInt(w10), @floatFromInt(w01), @floatFromInt(w11) };
+}
+
+fn halfToFloatScalar(h: u16) u32 {
+    const hf: f16 = @bitCast(h);
+    return u(@floatCast(hf));
+}
+
+fn expand5(v: u32) u8 {
+    return @intCast((v << 3) | (v >> 2));
+}
+
+/// A YUV (BT.601, video range) texel as RGB, byte 0 red.
+fn yuvToRgb(y: u8, cb: u8, cr: u8) u32 {
+    const c: i32 = @as(i32, y) - 16;
+    const d: i32 = @as(i32, cb) - 128;
+    const e: i32 = @as(i32, cr) - 128;
+    const r = std.math.clamp((298 * c + 409 * e + 128) >> 8, 0, 255);
+    const g = std.math.clamp((298 * c - 100 * d - 208 * e + 128) >> 8, 0, 255);
+    const b = std.math.clamp((298 * c + 516 * d + 128) >> 8, 0, 255);
+    return 0xff000000 | @as(u32, @intCast(b)) << 16 | @as(u32, @intCast(g)) << 8 | @as(u32, @intCast(r));
+}
+
+/// Texel (`x`, `row`) of an ETC1 block (its 8 bytes as ETC1 has them), as RGB, byte 0 red.
+fn etc1Texel(block: *const [8]u8, x: u32, row: u32) u32 {
+    const tables = [8][4]i32{
+        .{ 2, 8, -2, -8 },       .{ 5, 17, -5, -17 },     .{ 9, 29, -9, -29 },     .{ 13, 42, -13, -42 },
+        .{ 18, 60, -18, -60 },   .{ 24, 80, -24, -80 },   .{ 33, 106, -33, -106 }, .{ 47, 183, -47, -183 },
+    };
+    const diff = block[3] & 2 != 0;
+    const flip = block[3] & 1 != 0;
+    const second = if (flip) row >= 2 else x >= 2;
+    var base: [3]i32 = undefined;
+    for (0..3) |ch| {
+        const b: u32 = block[ch];
+        if (diff) {
+            const c1 = b >> 3;
+            const delta: i32 = @as(i32, @intCast(b & 7)) - @as(i32, if (b & 4 != 0) 8 else 0);
+            const c: u32 = if (second) @intCast((@as(i32, @intCast(c1)) + delta) & 31) else c1;
+            base[ch] = @intCast((c << 3) | (c >> 2));
+        } else {
+            const c = if (second) b & 0xf else b >> 4;
+            base[ch] = @intCast(c * 17);
+        }
+    }
+    const table = if (second) (block[3] >> 2) & 7 else block[3] >> 5;
+    const bit: u4 = @intCast(x * 4 + row);
+    const msb = (std.mem.readInt(u16, block[4..6], .big) >> bit) & 1;
+    const lsb = (std.mem.readInt(u16, block[6..8], .big) >> bit) & 1;
+    const m = tables[table][msb * 2 + lsb];
+    var out: u32 = 0xff000000;
+    for (base, 0..) |b, ch| out |= @as(u32, @intCast(std.math.clamp(b + m, 0, 255))) << @intCast(ch * 8);
+    return out;
+}
+
 pub fn sample(memory: []const u8, p0: u32, p1: u32, s: f32, t: f32) Error!u32 {
     return sampleConfig(memory, texture.decodeConfig(p0, p1), s, t);
 }
@@ -1973,14 +2220,33 @@ pub const DecodedTexture = struct {
 
     pub fn of(memory: []const u8, p0: u32, p1: u32) ?DecodedTexture {
         const pt = PrecomputedTex.init(texture.decodeConfig(p0, p1), memory.len) catch return null;
-        const len: usize = if (pt.cfg.type == .rgba32r)
-            @as(usize, pt.cfg.width) * pt.cfg.height * 4
-        else if (pt.is_small_microtile)
-            @as(usize, pt.utiles_per_row) * ((pt.cfg.height + pt.uh_mask) >> pt.uh_shift) * 64
-        else
-            @as(usize, pt.tiles_per_row) * ((pt.cfg.height + (@as(u32, 1) << pt.tile_h_shift) - 1) >> pt.tile_h_shift) * 4096;
-        if (pt.base_off + len > memory.len) return null;
+        // Its texels aren't words of 8-bit channels blended byte by byte.
+        if (pt.float16 or pt.unblended) return null;
+        const len: usize = pt.len;
+        if (@as(usize, pt.base_off) + len > memory.len) return null;
         return .{ .width = pt.cfg.width, .height = pt.cfg.height, .bytes = memory[pt.base_off..][0..len] };
+    }
+
+    /// Whether the TMU's lookups of texture `p0`, `p1` are of words of 8-bit channels, blended
+    /// byte by byte (as the GPU translations blend `decode`'s words): not of S16F, RGBA64, S8
+    /// or S16.
+    pub fn blendsBytes(p0: u32, p1: u32) bool {
+        return switch (texture.decodeConfig(p0, p1).type) {
+            .s16f, .rgba64, .s8, .s16 => false,
+            else => true,
+        };
+    }
+
+    /// Whether the Metal translation's TMU, reading RAM itself, reads texture `p0`, `p1`: of
+    /// the types it decodes (RGBA8888, RGBX8888, RGBA32R, RGB565, luminance, alpha), the right
+    /// way up. Other types are 0xff000000 to it, as to `sample`.
+    pub fn readInShader(p0: u32, p1: u32) bool {
+        const c = texture.decodeConfig(p0, p1);
+        return switch (c.type) {
+            .rgba8888, .rgbx8888, .rgba32r, .rgb565, .luminance, .alpha => !c.flip_y,
+            .rgba4444, .rgba5551, .lumalpha, .etc1, .s16f, .s8, .s16, .bw1, .a4, .a1, .rgba64, .yuv422r => false,
+            _ => true,
+        };
     }
 
     /// Decodes it into `out` (`width * height` words), as `sample` fetches each texel.
@@ -2359,4 +2625,38 @@ test "a texture decoded as the TMU reads it gives what it samples" {
     };
     // Past the end of RAM: none.
     try std.testing.expect(DecodedTexture.of(ram[0..0x1800], p0, p1) == null);
+}
+
+test "TMU decodes every texture type" {
+    var mem: [8192]u8 = @splat(0);
+    const Case = struct { type: texture.Type, bytes: []const u8, texel: u64 };
+    const cases = [_]Case{
+        // The top bits to byte 0.
+        .{ .type = .rgba4444, .bytes = &.{ 0x34, 0x12 }, .texel = 0x44332211 },
+        .{ .type = .rgba5551, .bytes = &.{ 0x01, 0xf8 }, .texel = 0xff0000ff },
+        // Luminance in the low byte, alpha the high.
+        .{ .type = .lumalpha, .bytes = &.{ 0x40, 0x80 }, .texel = 0x80404040 },
+        .{ .type = .s16f, .bytes = &.{ 0x00, 0x3c }, .texel = 0x3c00 },
+        .{ .type = .s8, .bytes = &.{0x9a}, .texel = 0x9a },
+        .{ .type = .s16, .bytes = &.{ 0x34, 0x12 }, .texel = 0x1234 },
+        .{ .type = .bw1, .bytes = &.{0x01}, .texel = 0xffffffff },
+        .{ .type = .a4, .bytes = &.{0x0a}, .texel = 0xaa000000 },
+        .{ .type = .a1, .bytes = &.{0x01}, .texel = 0xff000000 },
+        .{ .type = .rgba64, .bytes = &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, .texel = 0x0807060504030201 },
+        // Y 0x80, U and V 0x80 (grey).
+        .{ .type = .yuv422r, .bytes = &.{ 0x80, 0x80, 0x10, 0x80 }, .texel = 0xff828282 },
+        // Individual colours 0x8 (0x88), table 0, every index 0 (+2).
+        .{ .type = .etc1, .bytes = &.{ 0x88, 0x88, 0x88, 0x00, 0, 0, 0, 0 }, .texel = 0xff8a8a8a },
+    };
+    for (cases) |c| {
+        @memset(&mem, 0);
+        @memcpy(mem[0..c.bytes.len], c.bytes);
+        const pt = try PrecomputedTex.init(.{ .type = c.type, .width = 16, .height = 16, .etc_flip = true }, mem.len);
+        try std.testing.expectEqual(c.texel, try pt.fetchWide(&mem, 0, 0));
+    }
+    // Flipped: row 0 read from the bottom.
+    @memset(&mem, 0);
+    const flipped = try PrecomputedTex.init(.{ .type = .rgba8888, .width = 4, .height = 4, .flip_y = true }, mem.len);
+    std.mem.writeInt(u32, mem[48..52], 0x11223344, .little);
+    try std.testing.expectEqual(@as(u32, 0x11223344), try flipped.fetchAt(&mem, 0, 0));
 }
