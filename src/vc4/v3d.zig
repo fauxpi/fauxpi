@@ -34,6 +34,9 @@ pub const V3d = struct {
         fs_unifs: u32 = 0,
         fs_varyings: u8 = 0,
         shader_rec_addr: u32 = 0,
+        /// Its primitives from this one on, this many at most (a part of it drawn).
+        skip_prims: u32 = 0,
+        max_prims: u32 = std.math.maxInt(u32),
         num_attrs: u4 = 0,
         mode: u8 = 4, // 0 = points, 1 = lines, 2 = line loop, 3 = line strip, 4 = triangles, 5 = strip, 6 = fan
         indexed: bool = false,
@@ -383,6 +386,8 @@ pub const V3d = struct {
     vs_slot_index: std.ArrayList(u32) = .empty,
     vs_gen: u32 = 0,
     overflow_draw_start: usize = 0,
+    /// The triangle of that draw binning stopped at.
+    overflow_tri_start: u32 = 0,
     /// Each 64-pixel tile's triangles (`y * 32 + x`), in draw order: indices
     /// into `shaded_tris`, from `tile_tri_start[t]` to `tile_tri_start[t + 1]`
     /// in `tile_tris`.
@@ -1242,9 +1247,17 @@ pub const V3d = struct {
 
     /// Pre-shades and bins triangles across all draw calls once per frame before tile loop.
     fn prepareDrawsForFrame(self: *V3d, ram: []const u8) void {
+        self.prepareDraws(ram, 0, 0);
+    }
+
+    /// Shades and bins the frame's triangles from draw `first_draw`'s triangle `first_tri` on,
+    /// as many as are at once: where it stops goes in `overflow_draw_start` and
+    /// `overflow_tri_start` (the draws' end if it doesn't).
+    fn prepareDraws(self: *V3d, ram: []const u8, first_draw: usize, first_tri: u32) void {
         self.shaded_tris.clearRetainingCapacity();
         self.prep_fs_insts.clearRetainingCapacity();
         self.overflow_draw_start = self.draws.items.len;
+        self.overflow_tri_start = 0;
         defer self.binTriangles();
         // After the binning (deferred before it, run after it).
         const prof_start = profile.now();
@@ -1255,9 +1268,16 @@ pub const V3d = struct {
             return;
         };
         @memset(self.prep_draws.items, .{});
-        draws: for (self.draws.items, 0..) |draw, draw_idx| {
+        const resumeAt = struct {
+            fn f(v: *V3d, d: usize, t: u32) void {
+                v.overflow_draw_start = d;
+                v.overflow_tri_start = t;
+            }
+        }.f;
+        draws: for (self.draws.items[@min(first_draw, self.draws.items.len)..], @min(first_draw, self.draws.items.len)..) |draw, draw_idx| {
             self.prep_draws.items[draw_idx] = .{};
-            if (numPrims(draw) == 0) continue;
+            const draw_first_tri: u32 = if (draw_idx == first_draw) first_tri else 0;
+            if (numPrims(draw) <= draw_first_tri) continue;
             const src = drawSource(ram, draw) orelse continue;
             const fs_num_varyings = src.fs_num_varyings;
             const fs_code_phys = src.fs_code_phys;
@@ -1271,12 +1291,12 @@ pub const V3d = struct {
             // tiles are (see `overflow_draw_start`).
             self.vs_decoded.clearRetainingCapacity();
             const vs_decoded: []const qpu_sim.DecodedInst = if (gl) |g| decodeProgramAt(ram, g.vs_code_phys, &self.vs_code, &self.vs_decoded) orelse {
-                self.overflow_draw_start = draw_idx;
+                resumeAt(self, draw_idx, draw_first_tri);
                 break;
             } else &.{};
             const fs_inst_start: u32 = @intCast(self.prep_fs_insts.items.len);
             const fs_decoded = decodeProgramAt(ram, fs_code_phys, &self.vs_code, &self.prep_fs_insts) orelse {
-                self.overflow_draw_start = draw_idx;
+                resumeAt(self, draw_idx, draw_first_tri);
                 break;
             };
             if ((gl != null and vs_decoded.len == 0) or fs_decoded.len == 0) continue;
@@ -1293,90 +1313,96 @@ pub const V3d = struct {
                 .valid = true,
             };
 
-            const num_tris = numPrims(draw);
-
-            // Most of a draw's triangles may be culled, or off the
-            // framebuffer: only those kept count.
-            const draw_start = self.shaded_tris.items.len;
-            if (draw_start >= MAX_PREBINNED_TRIS) {
-                self.overflow_draw_start = draw_idx;
-                break;
-            }
-            self.shaded_tris.ensureUnusedCapacity(tri_allocator, @min(num_tris, MAX_PREBINNED_TRIS - draw_start)) catch {
-                self.overflow_draw_start = draw_idx;
-                break;
-            };
-
-            var attr_streams: [8]AttrStream = undefined;
-            const attr_info: AttrInfo = if (gl) |g| decodeAttrStreams(ram, g.rec_phys, draw.num_attrs, g.vs_attr_mask, &attr_streams) else .{ .count = 0, .vpm_words = 0 };
-            const active_attrs = attr_streams[0..attr_info.count];
-            const vpm_words = attr_info.vpm_words;
-            const n_var = @min(@as(usize, fs_num_varyings), 16);
-            const clip_min_x: f32 = @floatFromInt(draw.clip_x);
-            const clip_min_y: f32 = @floatFromInt(draw.clip_y);
-            const clip_max_x: f32 = @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w);
-            const clip_max_y: f32 = @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h);
-
-            // Each triangle's corners, each vertex shaded once (a mesh's triangles share them),
-            // then the triangles kept.
-            // Their clip coordinates too, from the coordinate shader, for the clipper.
-            var cs_attrs: [8]AttrStream = undefined;
-            const cs = if (gl) |g| coordStage(ram, g.rec_phys, draw.num_attrs, &self.vs_code, &self.cs_decoded, &cs_attrs) else null;
-            const has_clip = cs != null or switch (src.vertices) {
-                .nv => |nv| nv.header and nv.clipping,
-                else => false,
-            };
-            const shaded = self.shadeVertices(ram, draw, num_tris, vs_decoded, vs_unifs, active_attrs, vpm_words, n_var, cs, src.vertices, has_clip) orelse {
-                self.overflow_draw_start = draw_idx;
-                break;
-            };
-            for (0..num_tris) |t| {
-                var tri_verts: [3]ShadedVertex = undefined;
-                var tri_clip: [3]ClipVertex = @splat(.{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) });
-                var ok = true;
-                inline for (0..3) |corner| {
-                    const slot = self.vs_corner_slot.items[t * 3 + corner];
-                    ok = ok and self.vs_ok.items[slot];
-                    tri_verts[corner] = shaded[slot];
-                    if (has_clip) tri_clip[corner] = self.vs_clip.items[slot];
+            // Most of a draw's triangles may be culled, or off the framebuffer: only those kept
+            // count. Shaded a window at a time, as many as are room for.
+            var tri0 = draw_first_tri;
+            const total = numPrims(draw);
+            while (tri0 < total) {
+                const draw_start = self.shaded_tris.items.len;
+                if (draw_start + max_clipped > MAX_PREBINNED_TRIS) {
+                    resumeAt(self, draw_idx, tri0);
+                    break :draws;
                 }
-                if (!ok) continue;
+                var part = draw;
+                part.skip_prims +%= tri0;
+                part.max_prims = @intCast(MAX_PREBINNED_TRIS - draw_start);
+                const num_tris = numPrims(part);
+                self.shaded_tris.ensureUnusedCapacity(tri_allocator, num_tris) catch {
+                    resumeAt(self, draw_idx, tri0);
+                    break :draws;
+                };
 
-                var pieces: [max_clipped][3]ShadedVertex = undefined;
-                const n_pieces = primitiveTriangles(draw, tri_verts, tri_clip, n_var, &pieces);
-                for (pieces[0..n_pieces]) |verts| {
-                    const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
-                        (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
-                    if (@abs(area) < 1e-6) continue;
-                    if (isTriangles(draw) and culled(draw.config_b0, area)) continue;
+                var attr_streams: [8]AttrStream = undefined;
+                const attr_info: AttrInfo = if (gl) |g| decodeAttrStreams(ram, g.rec_phys, draw.num_attrs, g.vs_attr_mask, &attr_streams) else .{ .count = 0, .vpm_words = 0 };
+                const active_attrs = attr_streams[0..attr_info.count];
+                const vpm_words = attr_info.vpm_words;
+                const n_var = @min(@as(usize, fs_num_varyings), 16);
+                const clip_min_x: f32 = @floatFromInt(draw.clip_x);
+                const clip_min_y: f32 = @floatFromInt(draw.clip_y);
+                const clip_max_x: f32 = @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w);
+                const clip_max_y: f32 = @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h);
 
-                    const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
-                    const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
-                    const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
-                    const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
-                    if (min_fx >= max_fx or min_fy >= max_fy) continue;
-
-                    if (self.shaded_tris.items.len == MAX_PREBINNED_TRIS) {
-                        // This draw, and those after it, are drawn whole for each tile.
-                        self.shaded_tris.shrinkRetainingCapacity(draw_start);
-                        self.overflow_draw_start = draw_idx;
+                // Each triangle's corners, each vertex shaded once (a mesh's triangles share
+                // them), then the triangles kept; their clip coordinates too, from the
+                // coordinate shader, for the clipper.
+                var cs_attrs: [8]AttrStream = undefined;
+                const cs = if (gl) |g| coordStage(ram, g.rec_phys, draw.num_attrs, &self.vs_code, &self.cs_decoded, &cs_attrs) else null;
+                const has_clip = cs != null or switch (src.vertices) {
+                    .nv => |nv| nv.header and nv.clipping,
+                    else => false,
+                };
+                const shaded = self.shadeVertices(ram, part, num_tris, vs_decoded, vs_unifs, active_attrs, vpm_words, n_var, cs, src.vertices, has_clip) orelse {
+                    resumeAt(self, draw_idx, tri0);
+                    break :draws;
+                };
+                for (0..num_tris) |t| {
+                    if (self.shaded_tris.items.len + max_clipped > MAX_PREBINNED_TRIS) {
+                        resumeAt(self, draw_idx, tri0 + @as(u32, @intCast(t)));
                         break :draws;
                     }
-                    self.shaded_tris.append(tri_allocator, ShadedTriangle.init(
-                        @intCast(draw_idx),
-                        @intFromFloat(min_fx),
-                        @intFromFloat(min_fy),
-                        @intFromFloat(max_fx),
-                        @intFromFloat(max_fy),
-                        area,
-                        verts,
-                        n_var,
-                    )) catch {
-                        self.shaded_tris.shrinkRetainingCapacity(draw_start);
-                        self.overflow_draw_start = draw_idx;
-                        break :draws;
-                    };
+                    var tri_verts: [3]ShadedVertex = undefined;
+                    var tri_clip: [3]ClipVertex = @splat(.{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) });
+                    var ok = true;
+                    inline for (0..3) |corner| {
+                        const slot = self.vs_corner_slot.items[t * 3 + corner];
+                        ok = ok and self.vs_ok.items[slot];
+                        tri_verts[corner] = shaded[slot];
+                        if (has_clip) tri_clip[corner] = self.vs_clip.items[slot];
+                    }
+                    if (!ok) continue;
+
+                    var pieces: [max_clipped][3]ShadedVertex = undefined;
+                    const n_pieces = primitiveTriangles(draw, tri_verts, tri_clip, n_var, &pieces);
+                    const tri_start = self.shaded_tris.items.len;
+                    for (pieces[0..n_pieces]) |verts| {
+                        const area = (verts[1].x - verts[0].x) * (verts[2].y - verts[0].y) -
+                            (verts[1].y - verts[0].y) * (verts[2].x - verts[0].x);
+                        if (@abs(area) < 1e-6) continue;
+                        if (isTriangles(draw) and culled(draw.config_b0, area)) continue;
+
+                        const min_fx = @max(@floor(@min(verts[0].x, @min(verts[1].x, verts[2].x))), clip_min_x);
+                        const min_fy = @max(@floor(@min(verts[0].y, @min(verts[1].y, verts[2].y))), clip_min_y);
+                        const max_fx = @min(@ceil(@max(verts[0].x, @max(verts[1].x, verts[2].x))), clip_max_x);
+                        const max_fy = @min(@ceil(@max(verts[0].y, @max(verts[1].y, verts[2].y))), clip_max_y);
+                        if (min_fx >= max_fx or min_fy >= max_fy) continue;
+
+                        self.shaded_tris.append(tri_allocator, ShadedTriangle.init(
+                            @intCast(draw_idx),
+                            @intFromFloat(min_fx),
+                            @intFromFloat(min_fy),
+                            @intFromFloat(max_fx),
+                            @intFromFloat(max_fy),
+                            area,
+                            verts,
+                            n_var,
+                        )) catch {
+                            self.shaded_tris.shrinkRetainingCapacity(tri_start);
+                            resumeAt(self, draw_idx, tri0 + @as(u32, @intCast(t)));
+                            break :draws;
+                        };
+                    }
                 }
+                tri0 += num_tris;
             }
         }
     }
@@ -1451,7 +1477,8 @@ pub const V3d = struct {
     /// buffer, for an indexed draw), or null if it is past the end of RAM.
     /// A line's ends are its first two corners, and its last corner its second end again; a
     /// point is all three.
-    fn triangleCorner(ram: []const u8, draw: DrawCall, tri: u32, corner: u32) u32 {
+    fn triangleCorner(ram: []const u8, draw: DrawCall, tri_in: u32, corner: u32) u32 {
+        const tri = tri_in +% draw.skip_prims;
         const end = @min(corner, 1);
         const pos: u32 = switch (draw.mode) {
             0 => tri,
@@ -1938,6 +1965,17 @@ pub const V3d = struct {
 
     /// How many points, lines, or triangles `draw` draws.
     fn numPrims(draw: DrawCall) u32 {
+        return @min(allPrims(draw) -| draw.skip_prims, draw.max_prims);
+    }
+
+    /// `draw` from its primitive `first` on; null if it has none from there.
+    fn partOfDraw(draw: DrawCall, first: u32) ?DrawCall {
+        var d = draw;
+        d.skip_prims +%= first;
+        return if (numPrims(d) == 0) null else d;
+    }
+
+    fn allPrims(draw: DrawCall) u32 {
         return switch (draw.mode) {
             0 => draw.count,
             1 => draw.count / 2,
@@ -2128,6 +2166,7 @@ pub const V3d = struct {
         self.shaded_tris.clearRetainingCapacity();
         self.tile_tri_start = @splat(0);
         self.overflow_draw_start = 0;
+        self.overflow_tri_start = 0;
     }
 
     const AttrStream = struct {
@@ -2453,7 +2492,17 @@ pub const V3d = struct {
     }
 
     fn executeTileJob(self: *const V3d, tb: *TileBuffer, ram: []u8, job: TileJob) void {
+        setupTile(tb, ram, job);
         const tile_size = job.tileSize();
+        if (job.has_render) {
+            self.renderDrawsIntoTileBuf(tb, ram, job.tile_x * tile_size, job.tile_y * tile_size, tile_size);
+        }
+        for (job.tile_lists[0..job.n_lists]) |list| self.renderTileList(tb, ram, list, job.tile_x * tile_size, job.tile_y * tile_size, tile_size);
+        storeTile(tb, ram, job);
+    }
+
+    /// The tile buffer as a job's tile starts: cleared, or loaded.
+    fn setupTile(tb: *TileBuffer, ram: []u8, job: TileJob) void {
         tb.ms = job.ms;
         if (job.lazy_load) |ll| {
             tb.lazy_load = ll;
@@ -2472,12 +2521,11 @@ pub const V3d = struct {
         tb.modified = false;
         if (job.zs_load) |l| loadZs(tb, ram, job, l);
         if (job.vg_load) |l| loadVgMask(tb, ram, job, l);
+    }
 
-        if (job.has_render) {
-            self.renderDrawsIntoTileBuf(tb, ram, job.tile_x * tile_size, job.tile_y * tile_size, tile_size);
-        }
-        for (job.tile_lists[0..job.n_lists]) |list| self.renderTileList(tb, ram, list, job.tile_x * tile_size, job.tile_y * tile_size, tile_size);
-
+    /// A job's store of the tile buffer.
+    fn storeTile(tb: *TileBuffer, ram: []u8, job: TileJob) void {
+        const tile_size = job.tileSize();
         switch (job.buffer) {
             2, 3 => {
                 ensureTileMaterializedBuf(tb, ram, true);
@@ -2711,6 +2759,113 @@ pub const V3d = struct {
         }
         const image: TileBuffer = .{ .color = &words, .depth = tb.depth, .stencil = tb.stencil, .vg_mask = tb.vg_mask };
         storeTileFromBuf(&image, ram, job.dst_addr, job.fb_w / 2, job.fb_h / 2, job.tile_x, job.tile_y, out_size, job.tiling, job.ls_format);
+    }
+
+    /// A tile's buffer, kept between passes.
+    const TileStore = struct {
+        color: [64 * 64]u32,
+        depth: [64 * 64]f32,
+        stencil: [64 * 64]u8,
+        vg: [64 * 64]u8,
+    };
+
+    /// Draws a frame with more triangles than are shaded and binned at once, in passes: each
+    /// shades and bins as many as are (from where the last stopped, within a draw if need be)
+    /// and draws them into each tile's buffer, kept between passes; then the tiles' lists, and
+    /// their stores. Tiles drawn again (stored more than once, or in another pass over them)
+    /// are drawn in passes again. False if there isn't the memory (the frame is then drawn as
+    /// usual).
+    fn executeRclInPasses(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
+        var jobs: std.ArrayList(TileJob) = .empty;
+        defer jobs.deinit(tri_allocator);
+        var reader: RclReader = .init(ram, start_bus, end_bus);
+        reader.pool_lo = self.bin_pool_lo;
+        reader.pool_hi = self.bin_pool_hi;
+        reader.binned = self.draws.items.len > 0;
+        while (reader.next(ram)) |job| jobs.append(tri_allocator, job) catch return false;
+        // In groups of distinct tiles, as tiles are drawn otherwise.
+        var first_group = true;
+        var i: usize = 0;
+        while (i < jobs.items.len) {
+            var seen: [64]u64 = @splat(0);
+            var j = i;
+            while (j < jobs.items.len) : (j += 1) {
+                const job = jobs.items[j];
+                if (job.tile_x >= 64 or job.tile_y >= 64) {
+                    if (j == i) j += 1;
+                    break;
+                }
+                const bit = @as(u64, 1) << @intCast(job.tile_x);
+                if (seen[job.tile_y] & bit != 0) break;
+                seen[job.tile_y] |= bit;
+            }
+            if (!self.drawInPasses(ram, jobs.items[i..j], first_group)) return i != 0 or false;
+            first_group = false;
+            i = j;
+        }
+        return true;
+    }
+
+    fn drawInPasses(self: *V3d, ram: []u8, jobs: []const TileJob, prepared: bool) bool {
+        const stores = tri_allocator.alloc(TileStore, jobs.len) catch return false;
+        defer tri_allocator.free(stores);
+        const tbs = tri_allocator.alloc(TileBuffer, jobs.len) catch return false;
+        defer tri_allocator.free(tbs);
+        for (tbs, stores, jobs) |*tb, *st, job| {
+            tb.* = .{ .color = &st.color, .depth = &st.depth, .stencil = &st.stencil, .vg_mask = &st.vg };
+            setupTile(tb, ram, job);
+        }
+        var first_draw: usize = 0;
+        var first_tri: u32 = 0;
+        if (!prepared) self.prepareDraws(ram, 0, 0);
+        while (true) {
+            self.drawPass(ram, jobs, tbs);
+            if (self.overflow_draw_start >= self.draws.items.len) break;
+            // On from where it stopped (none of it drawn: no further).
+            if (self.overflow_draw_start == first_draw and self.overflow_tri_start == first_tri) break;
+            first_draw = self.overflow_draw_start;
+            first_tri = self.overflow_tri_start;
+            self.prepareDraws(ram, first_draw, first_tri);
+        }
+        for (tbs, jobs) |*tb, job| {
+            const tile_size = job.tileSize();
+            for (job.tile_lists[0..job.n_lists]) |list| self.renderTileList(tb, ram, list, job.tile_x * tile_size, job.tile_y * tile_size, tile_size);
+            storeTile(tb, ram, job);
+        }
+        return true;
+    }
+
+    /// The triangles binned drawn into each job's tile (their buffers `tbs`), on several threads.
+    fn drawPass(self: *const V3d, ram: []const u8, jobs: []const TileJob, tbs: []TileBuffer) void {
+        const Ctx = struct {
+            v3d: *const V3d,
+            ram: []const u8,
+            jobs: []const TileJob,
+            tbs: []TileBuffer,
+            next: std.atomic.Value(usize) = .init(0),
+
+            fn run(c: *@This()) void {
+                while (true) {
+                    const k = c.next.fetchAdd(1, .monotonic);
+                    if (k >= c.jobs.len) break;
+                    const job = c.jobs[k];
+                    if (!job.has_render) continue;
+                    const size = job.tileSize();
+                    c.v3d.renderBinnedIntoTileBuf(&c.tbs[k], c.ram, job.tile_x * size, job.tile_y * size, size);
+                }
+            }
+        };
+        var ctx: Ctx = .{ .v3d = self, .ram = ram, .jobs = jobs, .tbs = tbs };
+        var threads: [3]std.Thread = undefined;
+        var spawned: usize = 0;
+        if (jobs.len >= 4) {
+            for (&threads) |*t| {
+                t.* = std.Thread.spawn(.{}, Ctx.run, .{&ctx}) catch break;
+                spawned += 1;
+            }
+        }
+        ctx.run();
+        for (threads[0..spawned]) |t| t.join();
     }
 
     fn flushTileJobs(self: *V3d, ram: []u8, jobs: []const TileJob) void {
@@ -3081,6 +3236,10 @@ pub const V3d = struct {
         defer profile.end(.v3d_cpu_frame, prof_start);
         profile.count(.frames_cpu, 1);
         profile.count(.triangles, self.shaded_tris.items.len);
+        // More triangles than are shaded and binned at once: drawn in passes.
+        if (self.overflow_draw_start < self.draws.items.len) {
+            if (self.executeRclInPasses(ram, start_bus, end_bus)) return;
+        }
 
         var tile_jobs: [1024]TileJob = undefined;
         var tile_jobs_len: usize = 0;
@@ -3867,6 +4026,26 @@ pub const V3d = struct {
         tile_px_y: u32,
         tile_size: u32,
     ) void {
+        self.renderBinnedIntoTileBuf(tb, ram, tile_px_x, tile_px_y, tile_size);
+        // Those past the triangles binned, whole (the first from where binning stopped in it).
+        if (self.overflow_draw_start < self.draws.items.len) {
+            for (self.draws.items[self.overflow_draw_start..], self.overflow_draw_start..) |draw, i| {
+                var d = draw;
+                if (i == self.overflow_draw_start) d = partOfDraw(draw, self.overflow_tri_start) orelse continue;
+                renderDrawIntoTileBuf(tb, ram, d, self.vg_verts.items, tile_px_x, tile_px_y, tile_size);
+            }
+        }
+    }
+
+    /// The triangles binned (`shaded_tris`) drawn into the tile.
+    fn renderBinnedIntoTileBuf(
+        self: *const V3d,
+        tb: *TileBuffer,
+        ram: []const u8,
+        tile_px_x: u32,
+        tile_px_y: u32,
+        tile_size: u32,
+    ) void {
         const tile_end_x = tile_px_x + tile_size;
         const tile_end_y = tile_px_y + tile_size;
 
@@ -3877,7 +4056,7 @@ pub const V3d = struct {
             const t = (tile_px_y >> 6) * 32 + (tile_px_x >> 6);
             break :blk self.tile_tris.items[self.tile_tri_start[t]..self.tile_tri_start[t + 1]];
         } else &.{};
-        if (use_spatial_bin and binned.len == 0 and self.overflow_draw_start >= self.draws.items.len) return;
+        if (use_spatial_bin and binned.len == 0) return;
 
         var cur_draw_idx: ?u32 = null;
         var cur_fs_decoded: []const qpu_sim.DecodedInst = &.{};
@@ -3941,12 +4120,6 @@ pub const V3d = struct {
                     tile_px_y,
                     tile_size,
                 );
-            }
-        }
-
-        if (self.overflow_draw_start < self.draws.items.len) {
-            for (self.draws.items[self.overflow_draw_start..]) |draw| {
-                renderDrawIntoTileBuf(tb, ram, draw, self.vg_verts.items, tile_px_x, tile_px_y, tile_size);
             }
         }
     }
