@@ -30,6 +30,16 @@ pub const Shader = struct {
     too_many_samples: bool = false,
     /// It reads more uniforms than are given to it (`max_uniforms`), so it can't be drawn.
     too_many_uniforms: bool = false,
+    /// GLSL, multisampled: it writes each sample's colour (tlb_color_ms), so runs once a sample
+    /// (`gl_SampleID`), its varyings still at the pixel's middle.
+    per_sample: bool = false,
+};
+
+/// How a fragment shader is translated.
+pub const Options = struct {
+    /// GLSL: drawn into a 4x multisampled tile buffer (`tlb_ms`), whose samples its colour loads
+    /// read in turn, and its writes to tlb_color_ms write in turn.
+    multisampled: bool = false,
 };
 
 /// A texture sampled: the uniforms with its TMU parameters 0 and 1.
@@ -412,6 +422,7 @@ pub const glsl_common =
     \\uniform usampler2D tex[8];
     \\uniform uint tex_ok[8];
     \\uniform usampler2D tlb_tex;
+    \\uniform usampler2DMS tlb_ms;
     \\layout(location = 0) out uint o_color;
     \\
 ++ glsl_helpers;
@@ -576,16 +587,32 @@ const glsl_helpers =
     \\
 ;
 
-/// The start of a GLSL fragment shader's `main`: its inputs, as `translate` reads them.
-const glsl_prologue =
+/// The start of a GLSL fragment shader's `main`: its inputs (as interpolated for the fragment).
+const glsl_inputs =
     \\void main() {
+    \\  float i_inv_w = v_inv_w;
+    \\  vec4 i_v0 = v_v0, i_v1 = v_v1, i_v2 = v_v2, i_v3 = v_v3;
+    \\
+;
+
+/// `glsl_inputs`, run once a sample: interpolated at the pixel's middle all the same, as V3D does.
+const glsl_inputs_centre =
+    \\void main() {
+    \\  float i_inv_w = interpolateAtOffset(v_inv_w, vec2(0.0));
+    \\  vec4 i_v0 = interpolateAtOffset(v_v0, vec2(0.0)), i_v1 = interpolateAtOffset(v_v1, vec2(0.0));
+    \\  vec4 i_v2 = interpolateAtOffset(v_v2, vec2(0.0)), i_v3 = interpolateAtOffset(v_v3, vec2(0.0));
+    \\
+;
+
+/// What follows `glsl_inputs`: the inputs as `translate` reads them.
+const glsl_prologue =
     \\  // Exactly 0 only if every corner's 1/W is exactly 1.
-    \\  float W = v_not_unit_w == 0.0 ? 1.0 : (abs(v_inv_w) > 1e-12 ? 1.0 / v_inv_w : 1.0);
+    \\  float W = v_not_unit_w == 0.0 ? 1.0 : (abs(i_inv_w) > 1e-12 ? 1.0 / i_inv_w : 1.0);
     \\  float V[16] = float[16](
-    \\    v_v0.x * W, v_v0.y * W, v_v0.z * W, v_v0.w * W,
-    \\    v_v1.x * W, v_v1.y * W, v_v1.z * W, v_v1.w * W,
-    \\    v_v2.x * W, v_v2.y * W, v_v2.z * W, v_v2.w * W,
-    \\    v_v3.x * W, v_v3.y * W, v_v3.z * W, v_v3.w * W);
+    \\    i_v0.x * W, i_v0.y * W, i_v0.z * W, i_v0.w * W,
+    \\    i_v1.x * W, i_v1.y * W, i_v1.z * W, i_v1.w * W,
+    \\    i_v2.x * W, i_v2.y * W, i_v2.z * W, i_v2.w * W,
+    \\    i_v3.x * W, i_v3.y * W, i_v3.z * W, i_v3.w * W);
     \\  uint ra[32];
     \\  uint rb[32];
     \\  for (int i = 0; i < 32; ++i) {
@@ -636,15 +663,22 @@ const varying_c = "0.25f";
 /// interpolation pairs it fuses are fused here too) in `lang`: MSL's `fragment_main` (after
 /// `msl_common`), or GLSL's `main` (after `glsl_common`).
 pub fn translate(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, lang: Language) std.Io.Writer.Error!Shader {
-    var t: Translator = .{ .w = w, .lang = lang };
+    return translateWith(w, decoded, lang, .{});
+}
+
+/// `translate`, as `options` say.
+pub fn translateWith(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, lang: Language, options: Options) std.Io.Writer.Error!Shader {
+    var t: Translator = .{ .w = w, .lang = lang, .multisampled = options.multisampled and lang == .glsl };
     // The tile's colour is an input only if the program reads it.
     for (decoded) |d| {
         if (d.sig == .color_load or d.sig == .color_load_end) t.shader.reads_color = true;
+        if (d.waddr_add == qpu.W.tlb_color_ms or d.waddr_mul == qpu.W.tlb_color_ms) t.shader.per_sample = t.multisampled;
     }
 
     if (lang == .glsl) {
+        try w.writeAll(if (t.shader.per_sample) glsl_inputs_centre else glsl_inputs);
         try w.writeAll(glsl_prologue);
-        if (t.shader.reads_color) try w.writeAll("  uint tlb_in = texelFetch(tlb_tex, ivec2(gl_FragCoord.xy), 0).r;\n");
+        if (t.shader.reads_color and !t.multisampled) try w.writeAll("  uint tlb_in = texelFetch(tlb_tex, ivec2(gl_FragCoord.xy), 0).r;\n");
     } else {
         try w.writeAll(
             \\fragment FragOut fragment_main(VOut in [[stage_in]], constant uint* unif [[buffer(0)]],
@@ -717,7 +751,11 @@ pub fn translate(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, lang: 
                 }
             },
             .color_load, .color_load_end => {
-                try w.writeAll("    r4 = tlb_in;\n");
+                // Multisampled, each sample in turn.
+                if (t.multisampled) {
+                    try w.print("    r4 = texelFetch(tlb_ms, ivec2(gl_FragCoord.xy), {d}).r;\n", .{t.color_loads % 4});
+                    t.color_loads += 1;
+                } else try w.writeAll("    r4 = tlb_in;\n");
                 if (d.sig == .color_load_end) end_at = ip + 2;
             },
             .prog_end => end_at = ip + 2,
@@ -876,6 +914,10 @@ const Translator = struct {
     uniforms: usize = 0,
     varyings: usize = 0,
     tmu: [2]Tmu = .{ .{}, .{} },
+    /// GLSL: drawn multisampled (`Options`), and the tile's samples read and written so far.
+    multisampled: bool = false,
+    color_loads: usize = 0,
+    sample_writes: usize = 0,
 
     /// A TMU's parameters written so far (the uniforms they are), and the samples waiting in its
     /// FIFO (`tmuN_fM`).
@@ -1040,7 +1082,12 @@ const Translator = struct {
             }
         }
         switch (waddr) {
-            qpu.W.tlb_color_all, qpu.W.tlb_color_ms => try w.print("    tlb_c = {s}; tlb_w = true;\n", .{val}),
+            // Run once a sample, each sample's colour is the write to it.
+            qpu.W.tlb_color_ms => if (t.shader.per_sample) {
+                try w.print("    if (gl_SampleID == {d}) {{ tlb_c = {s}; tlb_w = true; }}\n", .{ t.sample_writes, val });
+                t.sample_writes += 1;
+            } else try w.print("    tlb_c = {s}; tlb_w = true;\n", .{val}),
+            qpu.W.tlb_color_all => try w.print("    tlb_c = {s}; tlb_w = true;\n", .{val}),
             qpu.W.sfu_recip => if (t.lang == .glsl)
                 try w.print("    r4 = q_recip({s});\n", .{val})
             else

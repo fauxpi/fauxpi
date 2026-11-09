@@ -15,6 +15,8 @@ pub const Shading = enum {
     line,
     /// Points, each its own size, coloured by where in it (red across, green down) and their blue.
     point,
+    /// Blended, in a multisampled frame: each sample blended with its own colour.
+    blended_ms,
 
     /// The varyings the vertex shader gives its fragment shader (as the shader record counts
     /// them): red, green and blue; s and t; red, green, blue and alpha.
@@ -22,7 +24,7 @@ pub const Shading = enum {
         return switch (s) {
             .flat, .line, .point => 3,
             .textured => 2,
-            .blended => 4,
+            .blended, .blended_ms => 4,
         };
     }
 
@@ -45,7 +47,8 @@ pub const Shading = enum {
             .line => colourShader(&.{ null, 0, 1, 2 }),
             .point => colourShader(&.{ 0, 1, null, null, 2 }),
             .textured => textureShader(),
-            .blended => blendShader(),
+            .blended => blendShader(1),
+            .blended_ms => blendShader(4),
         };
     }
 };
@@ -151,8 +154,9 @@ fn textureShader() []const qpu.Inst {
 }
 
 /// A colour (the varyings red, green, blue and alpha) blended over the tile's: src * a +
-/// dst * (1 - a), a byte at a time.
-fn blendShader() []const qpu.Inst {
+/// dst * (1 - a), a byte at a time; of each of a multisampled pixel's `samples` (4), each read and
+/// written in turn.
+fn blendShader(samples: u3) []const qpu.Inst {
     const S = struct {
         var p: qpu.Program(48) = .{};
     };
@@ -170,11 +174,13 @@ fn blendShader() []const qpu.Inst {
         // 1 - alpha, and the tile's colour.
         p.emit(qpu.loadImm(.{ .add_dst = qpu.wr(1), .value = 0xffffffff }) catch break :build);
         p.emit(qpu.alu(.{ .add = .{ .op = .v8subs, .dst = qpu.wr(2), .a = qpu.r(1), .b = qpu.rb(5) }, .sig = .wait_scoreboard }) catch break :build);
-        p.emit(qpu.nop(.color_load));
         p.emit(qpu.alu(.{ .mul = .{ .op = .v8muld, .dst = qpu.wr(0), .a = qpu.ra(4), .b = qpu.rb(5) } }) catch break :build);
-        p.emit(qpu.alu(.{ .mul = .{ .op = .v8muld, .dst = qpu.wr(1), .a = qpu.r(4), .b = qpu.r(2) } }) catch break :build);
-        p.emit(qpu.alu(.{ .add = .{ .op = .v8adds, .dst = qpu.wr(3), .a = qpu.r(0), .b = qpu.r(1) } }) catch break :build);
-        p.emit(qpu.mov(qpu.tlb_color_all, qpu.r(3)) catch break :build);
+        const out: qpu.Dst = if (samples == 1) qpu.tlb_color_all else .{ .periph = qpu.W.tlb_color_ms };
+        for (0..samples) |_| {
+            p.emit(qpu.nop(.color_load));
+            p.emit(qpu.alu(.{ .mul = .{ .op = .v8muld, .dst = qpu.wr(1), .a = qpu.r(4), .b = qpu.r(2) } }) catch break :build);
+            p.emit(qpu.alu(.{ .add = .{ .op = .v8adds, .dst = out, .a = qpu.r(0), .b = qpu.r(1) } }) catch break :build);
+        }
         p.end(.fragment);
         return p.code();
     }

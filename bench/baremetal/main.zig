@@ -153,6 +153,8 @@ const tests = [_]Test{
     .{ .name = "v3d_draws", .run = v3d.draws },
     .{ .name = "v3d_lines", .run = v3d.lines },
     .{ .name = "v3d_points", .run = v3d.points },
+    .{ .name = "v3d_msaa", .run = v3d.msaa },
+    .{ .name = "v3d_msaa_blend", .run = v3d.msaaBlend },
     .{ .name = "hvs_planes", .run = hvs.planes },
 };
 

@@ -229,6 +229,8 @@ pub const V3d = struct {
         tile_size: u32,
         tiling: u2,
         format: u2,
+        /// The tile buffer as it was stored (LOAD_FULL_RES_TILE_BUFFER), not pixels.
+        full_res: bool = false,
     };
 
     scratch: u32 = 0,
@@ -1619,6 +1621,9 @@ pub const V3d = struct {
         lazy_load: ?LazyTileLoad = null,
         loaded_from: ?LazyTileLoad = null,
         modified: bool = false,
+        /// 4x multisampled: the tile is 32 pixels square, each pixel's 4 samples together
+        /// (`(y * 32 + x) * 4 + sample`), in `color` and `depth`.
+        ms: bool = false,
     };
 
     pub const TileJob = struct {
@@ -1633,6 +1638,20 @@ pub const V3d = struct {
         fb_h: u32 = 0,
         tiling: u2 = 0,
         ls_format: u2 = 0,
+        /// 4x multisampled (TILE_RENDERING_MODE_CONFIG): tiles are 32 pixels.
+        ms: bool = false,
+        /// Multisampled, each pixel stored as its samples averaged (decimated 4x), not sample 0.
+        resolve: bool = true,
+        /// Stored as the tile buffer is (STORE_FULL_RES_TILE_BUFFER), its flags: not the colour
+        /// (bit 0), not depth and stencil (bit 1).
+        full_res: ?u4 = null,
+        /// Depth and stencil loaded as the tile buffer holds them (LOAD_FULL_RES_TILE_BUFFER), from
+        /// here.
+        full_res_zs_load: ?u32 = null,
+
+        pub fn tileSize(j: TileJob) u32 {
+            return if (j.ms) 32 else 64;
+        }
     };
 
     const WorkerCtx = struct {
@@ -1660,6 +1679,7 @@ pub const V3d = struct {
         addr: u32,
         tiling: u2,
         format: u2,
+        full_res: bool = false,
     };
 
     inline fn tileBuf(self: *V3d) TileBuffer {
@@ -1710,7 +1730,8 @@ pub const V3d = struct {
     }
 
     fn executeTileJob(self: *const V3d, tb: *TileBuffer, ram: []u8, job: TileJob) void {
-        const tile_size: u32 = 64;
+        const tile_size = job.tileSize();
+        tb.ms = job.ms;
         if (job.lazy_load) |ll| {
             tb.lazy_load = ll;
             tb.loaded_from = ll;
@@ -1723,19 +1744,86 @@ pub const V3d = struct {
         tb.depth_valid = false;
         tb.clear_zs = job.clear_zs;
         tb.modified = false;
+        if (job.full_res_zs_load) |addr| loadFullResDepth(tb, ram, addr);
 
         if (job.has_render) {
             self.renderDrawsIntoTileBuf(tb, ram, job.tile_x * tile_size, job.tile_y * tile_size, tile_size);
         }
 
+        if (job.full_res) |flags| {
+            ensureTileMaterializedBuf(tb, ram, flags & 2 == 0);
+            storeFullRes(tb, ram, job.dst_addr, flags);
+            return;
+        }
         if (!canSkipUnmodifiedStoreBuf(tb, job.dst_addr, job.fb_w, job.fb_h, job.tile_x, job.tile_y, tile_size, job.tiling, job.ls_format)) {
             if (tb.lazy_load) |ll| {
-                tb.lazy_load = null;
-                loadTileIntoBuf(tb, ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
-                tb.color_solid = null;
+                // Not drawn into: stored as loaded, its pixels (each sample of one the same).
+                if (!ll.full_res) {
+                    tb.lazy_load = null;
+                    loadTileIntoBuf(tb, ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
+                    tb.color_solid = null;
+                    storeTileFromBuf(tb, ram, job.dst_addr, job.fb_w, job.fb_h, job.tile_x, job.tile_y, tile_size, job.tiling, job.ls_format);
+                    return;
+                }
+                ensureTileMaterializedBuf(tb, ram, false);
+            }
+            if (tb.ms and tb.color_solid == null) {
+                // Each pixel's samples averaged, or its first.
+                var pixels: [64 * 64]u32 = undefined;
+                var depth: [64 * 64]f32 = undefined;
+                for (pixels[0 .. 32 * 32], 0..) |*px, i| {
+                    const samples = tb.color[i * 4 ..][0..4];
+                    px.* = if (job.resolve) averageSamples(samples.*) else samples[0];
+                }
+                const resolved: TileBuffer = .{ .color = &pixels, .depth = &depth };
+                storeTileFromBuf(&resolved, ram, job.dst_addr, job.fb_w, job.fb_h, job.tile_x, job.tile_y, tile_size, job.tiling, job.ls_format);
+                return;
             }
             storeTileFromBuf(tb, ram, job.dst_addr, job.fb_w, job.fb_h, job.tile_x, job.tile_y, tile_size, job.tiling, job.ls_format);
         }
+    }
+
+    /// A pixel's colour from its 4 samples' (each channel's bytes averaged, rounded).
+    fn averageSamples(samples: [4]u32) u32 {
+        const v: @Vector(4, u32) = samples;
+        var out: u32 = 0;
+        inline for (0..4) |c| {
+            const shift: u5 = c * 8;
+            const sum = @reduce(.Add, (v >> @splat(shift)) & @as(@Vector(4, u32), @splat(0xff)));
+            out |= ((sum + 2) / 4) << shift;
+        }
+        return out;
+    }
+
+    /// The bytes a tile buffer is stored as by STORE_FULL_RES_TILE_BUFFER, and loaded from: each
+    /// of its 64 * 64 entries (pixels, or a multisampled tile's samples), 4 bytes each.
+    const full_res_bytes = 64 * 64 * 4;
+
+    /// Stores the tile buffer as it is at `addr`: its colours (unless `flags` bit 0), or its depths
+    /// (unless bit 1) as 24-bit Z above 8-bit stencil.
+    fn storeFullRes(tb: *const TileBuffer, ram: []u8, addr: u32, flags: u4) void {
+        const base = addr & vc_bus.ramMask(ram.len);
+        if (base + full_res_bytes > ram.len) return;
+        const out = ram[base..][0..full_res_bytes];
+        if (flags & 1 == 0) {
+            @memcpy(out, std.mem.sliceAsBytes(tb.color));
+        } else if (flags & 2 == 0) {
+            for (tb.depth, 0..) |z, i| {
+                const z24: u32 = @intFromFloat(@round(std.math.clamp(z, 0, 1) * 16777215.0));
+                std.mem.writeInt(u32, out[i * 4 ..][0..4], z24 << 8, .little);
+            }
+        }
+    }
+
+    /// Loads depths into the tile buffer as `storeFullRes` stored them at `addr`.
+    fn loadFullResDepth(tb: *TileBuffer, ram: []const u8, addr: u32) void {
+        const base = addr & vc_bus.ramMask(ram.len);
+        if (base + full_res_bytes > ram.len) return;
+        for (tb.depth, 0..) |*z, i| {
+            const word = std.mem.readInt(u32, ram[base + i * 4 ..][0..4], .little);
+            z.* = @as(f32, @floatFromInt(word >> 8)) / 16777215.0;
+        }
+        tb.depth_valid = true;
     }
 
     fn flushTileJobs(self: *V3d, ram: []u8, jobs: []const TileJob) void {
@@ -1797,8 +1885,18 @@ pub const V3d = struct {
         has_tile_coords: bool = false,
         pending_load: ?PendingTileLoad = null,
         cur_lazy_load: ?LazyTileLoad = null,
+        cur_zs_load: ?u32 = null,
+        pending_zs_load: ?u32 = null,
         cur_has_render: bool = false,
         tile_loaded: bool = false,
+
+        fn ms(it: *const RclReader) bool {
+            return it.fb_flags & 1 != 0;
+        }
+
+        fn tileSize(it: *const RclReader) u32 {
+            return if (it.ms()) 32 else 64;
+        }
 
         fn init(ram: []const u8, start_bus: u32, end_bus: u32) RclReader {
             const end = end_bus & vc_bus.ramMask(ram.len);
@@ -1818,6 +1916,8 @@ pub const V3d = struct {
                 .fb_h = it.fb_height,
                 .tiling = tiling,
                 .ls_format = ls_format,
+                .ms = it.ms(),
+                .full_res_zs_load = it.cur_zs_load,
             };
         }
 
@@ -1827,14 +1927,32 @@ pub const V3d = struct {
             it.has_tile_coords = false;
             it.pending_load = null;
             it.cur_lazy_load = null;
+            it.cur_zs_load = null;
+            it.pending_zs_load = null;
             it.cur_has_render = false;
         }
 
         fn startTile(it: *RclReader) void {
             if (!it.tile_loaded) {
                 it.cur_lazy_load = null;
+                it.cur_zs_load = null;
                 it.tile_loaded = true;
             }
+        }
+
+        /// `load`, for the current tile.
+        fn lazyLoad(it: *const RclReader, load: PendingTileLoad) LazyTileLoad {
+            return .{
+                .addr = load.addr,
+                .fb_w = it.fb_width,
+                .fb_h = it.fb_height,
+                .tile_x = it.cur_tile_x,
+                .tile_y = it.cur_tile_y,
+                .tile_size = it.tileSize(),
+                .tiling = load.tiling,
+                .format = load.format,
+                .full_res = load.full_res,
+            };
         }
 
         fn next(it: *RclReader, ram: []const u8) ?TileJob {
@@ -1860,7 +1978,9 @@ pub const V3d = struct {
                         const r_format: u2 = @truncate((it.fb_flags >> 2) & 3);
                         const r_tiling: u2 = @truncate((it.fb_flags >> 6) & 3);
                         const ls_format: u2 = if (r_format == 1) 0 else 2;
-                        const j = it.job(it.fb_addr, r_tiling, ls_format);
+                        var j = it.job(it.fb_addr, r_tiling, ls_format);
+                        // The decimate mode: 4x averages each pixel's samples.
+                        j.resolve = (it.fb_flags >> 4) & 3 == 1;
                         it.endTile();
                         it.pc += 1;
                         return j;
@@ -1877,11 +1997,41 @@ pub const V3d = struct {
                             const ls_format: u2 = @truncate((bits >> 8) & 3);
                             const dst_addr = if ((addr_word & ~@as(u32, 0xf)) != 0) (addr_word & ~@as(u32, 0xf)) else it.fb_addr;
                             j = it.job(dst_addr, ls_tiling, ls_format);
+                            // The decimate mode: 4x averages each pixel's samples, else sample 0.
+                            j.?.resolve = (bits >> 6) & 3 == 1;
                         }
                         // Last store for tile
                         if ((bits & (1 << 15)) == 0) it.endTile();
                         it.pc += 7;
                         if (j) |stored| return stored;
+                    },
+                    26 => { // STORE_FULL_RES_TILE_BUFFER (5 bytes): the tile buffer as it is
+                        if (pc + 5 > end) break;
+                        const word = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
+                        it.startTile();
+                        var j = it.job(word & ~@as(u32, 0xf), 0, 0);
+                        j.full_res = @truncate(word & 3);
+                        // Bit 2: the tile buffer isn't cleared (more stores of it follow).
+                        if (word & 4 == 0) it.endTile();
+                        it.pc += 5;
+                        return j;
+                    },
+                    27 => { // LOAD_FULL_RES_TILE_BUFFER (5 bytes): the tile buffer as it was stored
+                        if (pc + 5 > end) break;
+                        const word = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
+                        const addr = word & ~@as(u32, 0xf);
+                        if (word & 1 == 0) {
+                            const load: PendingTileLoad = .{ .addr = addr, .tiling = 0, .format = 0, .full_res = true };
+                            if (it.has_tile_coords) {
+                                it.cur_lazy_load = it.lazyLoad(load);
+                                it.cur_has_render = false;
+                                it.tile_loaded = true;
+                            } else it.pending_load = load;
+                        }
+                        if (word & 2 == 0) {
+                            if (it.has_tile_coords) it.cur_zs_load = addr else it.pending_zs_load = addr;
+                        }
+                        it.pc += 5;
                     },
                     29 => { // LOAD_TILE_BUFFER_GENERAL (7 bytes)
                         if (pc + 7 > end) break;
@@ -1893,16 +2043,7 @@ pub const V3d = struct {
                             const ls_format: u2 = @truncate((bits >> 8) & 3);
                             const load_addr = addr_word & ~@as(u32, 0xf);
                             if (it.has_tile_coords) {
-                                it.cur_lazy_load = .{
-                                    .addr = load_addr,
-                                    .fb_w = it.fb_width,
-                                    .fb_h = it.fb_height,
-                                    .tile_x = it.cur_tile_x,
-                                    .tile_y = it.cur_tile_y,
-                                    .tile_size = 64,
-                                    .tiling = ls_tiling,
-                                    .format = ls_format,
-                                };
+                                it.cur_lazy_load = it.lazyLoad(.{ .addr = load_addr, .tiling = ls_tiling, .format = ls_format });
                                 it.cur_has_render = false;
                                 it.tile_loaded = true;
                             } else {
@@ -1943,17 +2084,13 @@ pub const V3d = struct {
                         it.cur_tile_y = ram[pc + 2];
                         it.has_tile_coords = true;
                         it.cur_has_render = false;
+                        if (it.pending_zs_load) |a| {
+                            it.cur_zs_load = a;
+                            it.pending_zs_load = null;
+                            it.tile_loaded = true;
+                        }
                         if (it.pending_load) |pl| {
-                            it.cur_lazy_load = .{
-                                .addr = pl.addr,
-                                .fb_w = it.fb_width,
-                                .fb_h = it.fb_height,
-                                .tile_x = it.cur_tile_x,
-                                .tile_y = it.cur_tile_y,
-                                .tile_size = 64,
-                                .tiling = pl.tiling,
-                                .format = pl.format,
-                            };
+                            it.cur_lazy_load = it.lazyLoad(pl);
                             it.tile_loaded = true;
                             it.pending_load = null;
                         } else if (!it.tile_loaded) {
@@ -1993,12 +2130,12 @@ pub const V3d = struct {
 
         var tile_jobs: [1024]TileJob = undefined;
         var tile_jobs_len: usize = 0;
-        var queued_tile_mask: [32]u32 = @splat(0);
+        var queued_tile_mask: [64]u64 = @splat(0);
 
         var reader: RclReader = .init(ram, start_bus, end_bus);
         while (reader.next(ram)) |job| {
-            if (job.tile_x < 32 and job.tile_y < 32) {
-                const bit = @as(u32, 1) << @intCast(job.tile_x);
+            if (job.tile_x < 64 and job.tile_y < 64) {
+                const bit = @as(u64, 1) << @intCast(job.tile_x);
                 if ((queued_tile_mask[job.tile_y] & bit) != 0 or tile_jobs_len >= tile_jobs.len) {
                     self.flushTileJobs(ram, tile_jobs[0..tile_jobs_len]);
                     tile_jobs_len = 0;
@@ -2115,17 +2252,24 @@ pub const V3d = struct {
 
     /// A frame the GPU can draw the same as the CPU: each tile once, all loaded (or cleared) and
     /// stored alike. Its first tile's job, and the tiles.
-    const GpuFrame = struct { first: TileJob, tiles: [32]u32 };
+    /// A frame the GPU can draw: its tiles' jobs all as `first`'s, and which tiles are stored (a
+    /// bit for each in each row of them).
+    const GpuFrame = struct { first: TileJob, tiles: [64]u64 };
 
     fn gpuFrame(ram: []u8, start_bus: u32, end_bus: u32) ?GpuFrame {
         var reader: RclReader = .init(ram, start_bus, end_bus);
         const first = reader.next(ram) orelse return null;
         if (first.fb_w == 0 or first.fb_h == 0 or first.fb_w > 2048 or first.fb_h > 2048) return null;
-        var tiles: [32]u32 = @splat(0);
+        var tiles: [64]u64 = @splat(0);
         var job: ?TileJob = first;
         while (job) |j| : (job = reader.next(ram)) {
-            if (j.tile_x >= 32 or j.tile_y >= 32) return null;
-            const bit = @as(u32, 1) << @intCast(j.tile_x);
+            if (j.tile_x >= 64 or j.tile_y >= 64) return null;
+            // The tile buffer stored or loaded as it is, or multisampled tiles stored as their first
+            // samples, are drawn on the CPU.
+            if (j.full_res != null or j.full_res_zs_load != null or (j.ms and !j.resolve)) return null;
+            if (j.lazy_load) |l| if (l.full_res) return null;
+            if (j.ms != first.ms) return null;
+            const bit = @as(u64, 1) << @intCast(j.tile_x);
             if ((tiles[j.tile_y] & bit) != 0) return null;
             tiles[j.tile_y] |= bit;
             if (j.fb_w != first.fb_w or j.fb_h != first.fb_h or j.clear_color0 != first.clear_color0 or
@@ -2138,7 +2282,7 @@ pub const V3d = struct {
             if (j.lazy_load) |l| {
                 const f = first.lazy_load.?;
                 if (l.addr != f.addr or l.tiling != f.tiling or l.format != f.format or
-                    l.fb_w != f.fb_w or l.fb_h != f.fb_h or l.tile_size != 64 or l.tile_x != j.tile_x or l.tile_y != j.tile_y)
+                    l.fb_w != f.fb_w or l.fb_h != f.fb_h or l.tile_size != first.tileSize() or l.tile_x != j.tile_x or l.tile_y != j.tile_y)
                 {
                     return null;
                 }
@@ -2312,6 +2456,11 @@ pub const V3d = struct {
     /// Draws the frame with Metal, which loads and stores the tiles too.
     fn renderWithMetal(g: *GpuState, ram: []u8, gpu_frame: GpuFrame, vertices: []const gpu_draw.Vertex, draws: []const gpu_draw.Draw, inputs: []const u32, corners: []const u32) bool {
         const first = gpu_frame.first;
+        // Multisampled frames are drawn on the CPU; the others' 64-pixel tiles, 32 a row at most.
+        if (first.ms) return false;
+        var tiles: [32]u32 = undefined;
+        for (&tiles, gpu_frame.tiles[0..32]) |*t, row| t.* = std.math.cast(u32, row) orelse return false;
+        for (gpu_frame.tiles[32..]) |row| if (row != 0) return false;
         const frame: metal_renderer.Frame = .{
             .width = first.fb_w,
             .height = first.fb_h,
@@ -2327,7 +2476,7 @@ pub const V3d = struct {
                 .tiling = first.tiling,
                 .cpp = if (first.ls_format == 1 or first.ls_format == 2) 2 else 4,
             },
-            .tiles = gpu_frame.tiles,
+            .tiles = tiles,
         };
         g.renderer.render(ram, &frame, vertices, draws, inputs, corners) catch return false;
         return true;
@@ -2335,7 +2484,7 @@ pub const V3d = struct {
 
     /// Draws the frame with OpenGL: the tiles listed loaded (or cleared) on the CPU into a buffer
     /// as big as the framebuffer, drawn into, and stored from it.
-    fn renderWithGl(g: *GpuState, ram: []u8, first: TileJob, tiles: *const [32]u32, vertices: []const gpu_draw.Vertex, draws: []const gpu_draw.Draw, inputs: []const u32, corners: []const u32) bool {
+    fn renderWithGl(g: *GpuState, ram: []u8, first: TileJob, tiles: *const [64]u64, vertices: []const gpu_draw.Vertex, draws: []const gpu_draw.Draw, inputs: []const u32, corners: []const u32) bool {
         const w = first.fb_w;
         const h = first.fb_h;
         g.color.resize(std.heap.page_allocator, @as(usize, w) * h) catch return false;
@@ -2343,20 +2492,22 @@ pub const V3d = struct {
         var tile_color: [64 * 64]u32 = undefined;
         var tile_depth: [64 * 64]f32 = undefined;
         var tb: TileBuffer = .{ .color = &tile_color, .depth = &tile_depth };
-        const tiles_w = (w + 63) / 64;
-        const tiles_h = (h + 63) / 64;
+        // 64 pixels square, or 32 multisampled.
+        const size = first.tileSize();
+        const tiles_w = @min((w + size - 1) / size, 64);
+        const tiles_h = @min((h + size - 1) / size, 64);
         const load_start = profile.now();
-        for (0..@min(tiles_h, 32)) |ty| {
-            for (0..@min(tiles_w, 32)) |tx| {
-                if (tiles[ty] & (@as(u32, 1) << @intCast(tx)) == 0) continue;
-                const x0: u32 = @intCast(tx * 64);
-                const y0: u32 = @intCast(ty * 64);
-                const vw = @min(64, w - x0);
-                const vh = @min(64, h - y0);
+        for (0..tiles_h) |ty| {
+            for (0..tiles_w) |tx| {
+                if (tiles[ty] & (@as(u64, 1) << @intCast(tx)) == 0) continue;
+                const x0: u32 = @intCast(tx * size);
+                const y0: u32 = @intCast(ty * size);
+                const vw = @min(size, w - x0);
+                const vh = @min(size, h - y0);
                 if (first.lazy_load) |ll| {
                     @memset(&tile_color, 0);
-                    loadTileIntoBuf(&tb, ram, ll.addr, ll.fb_w, ll.fb_h, @intCast(tx), @intCast(ty), 64, ll.tiling, ll.format);
-                    for (0..vh) |y| @memcpy(color[(y0 + y) * w + x0 ..][0..vw], tile_color[y * 64 ..][0..vw]);
+                    loadTileIntoBuf(&tb, ram, ll.addr, ll.fb_w, ll.fb_h, @intCast(tx), @intCast(ty), size, ll.tiling, ll.format);
+                    for (0..vh) |y| @memcpy(color[(y0 + y) * w + x0 ..][0..vw], tile_color[y * size ..][0..vw]);
                 } else {
                     for (0..vh) |y| @memset(color[(y0 + y) * w + x0 ..][0..vw], first.clear_color0);
                 }
@@ -2365,23 +2516,23 @@ pub const V3d = struct {
 
         profile.end(.gpu_load_tiles, load_start);
 
-        g.renderer.render(ram, w, h, color, first.clear_zs, vertices, draws, inputs, corners) catch |err| {
+        g.renderer.render(ram, w, h, color, first.clear_zs, vertices, draws, inputs, corners, first.ms) catch |err| {
             if (err != error.Unsupported) std.debug.print("fauxpi: V3D on OpenGL: {s}\n", .{@errorName(err)});
             return false;
         };
         const store_start = profile.now();
         defer profile.end(.gpu_store_tiles, store_start);
 
-        for (0..@min(tiles_h, 32)) |ty| {
-            for (0..@min(tiles_w, 32)) |tx| {
-                if (tiles[ty] & (@as(u32, 1) << @intCast(tx)) == 0) continue;
-                const x0: u32 = @intCast(tx * 64);
-                const y0: u32 = @intCast(ty * 64);
-                const vw = @min(64, w - x0);
-                const vh = @min(64, h - y0);
-                for (0..vh) |y| @memcpy(tile_color[y * 64 ..][0..vw], color[(y0 + y) * w + x0 ..][0..vw]);
+        for (0..tiles_h) |ty| {
+            for (0..tiles_w) |tx| {
+                if (tiles[ty] & (@as(u64, 1) << @intCast(tx)) == 0) continue;
+                const x0: u32 = @intCast(tx * size);
+                const y0: u32 = @intCast(ty * size);
+                const vw = @min(size, w - x0);
+                const vh = @min(size, h - y0);
+                for (0..vh) |y| @memcpy(tile_color[y * size ..][0..vw], color[(y0 + y) * w + x0 ..][0..vw]);
                 tb.color_solid = null;
-                storeTileFromBuf(&tb, ram, first.dst_addr, w, h, @intCast(tx), @intCast(ty), 64, first.tiling, first.ls_format);
+                storeTileFromBuf(&tb, ram, first.dst_addr, w, h, @intCast(tx), @intCast(ty), size, first.tiling, first.ls_format);
             }
         }
         return true;
@@ -2717,8 +2868,21 @@ pub const V3d = struct {
         tb.modified = true;
         if (tb.lazy_load) |ll| {
             tb.lazy_load = null;
-            loadTileIntoBuf(tb, ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
             tb.color_solid = null;
+            if (ll.full_res) {
+                const base = ll.addr & vc_bus.ramMask(ram.len);
+                if (base + full_res_bytes <= ram.len) @memcpy(std.mem.sliceAsBytes(tb.color), ram[base..][0..full_res_bytes]);
+            } else {
+                loadTileIntoBuf(tb, ram, ll.addr, ll.fb_w, ll.fb_h, ll.tile_x, ll.tile_y, ll.tile_size, ll.tiling, ll.format);
+                // Multisampled, each pixel loaded into all its samples.
+                if (tb.ms) {
+                    var i: usize = 32 * 32;
+                    while (i > 0) {
+                        i -= 1;
+                        tb.color[i * 4 ..][0..4].* = @splat(tb.color[i]);
+                    }
+                }
+            }
         } else if (tb.color_solid) |c| {
             @memset(tb.color, c);
             tb.color_solid = null;
@@ -2740,7 +2904,9 @@ pub const V3d = struct {
         const tile_end_x = tile_px_x + tile_size;
         const tile_end_y = tile_px_y + tile_size;
 
-        const use_spatial_bin = (tile_size == 64 and (tile_px_x & 63) == 0 and (tile_px_y & 63) == 0 and (tile_px_x >> 6) < 32 and (tile_px_y >> 6) < 32);
+        // The tile in one 64-pixel bin (a multisampled tile is in a quarter of one).
+        const use_spatial_bin = (tile_px_x >> 6) == ((tile_end_x - 1) >> 6) and (tile_px_y >> 6) == ((tile_end_y - 1) >> 6) and
+            (tile_px_x >> 6) < 32 and (tile_px_y >> 6) < 32;
         const binned: []const u32 = if (use_spatial_bin) blk: {
             const t = (tile_px_y >> 6) * 32 + (tile_px_x >> 6);
             break :blk self.tile_tris.items[self.tile_tri_start[t]..self.tile_tri_start[t + 1]];
@@ -2764,7 +2930,7 @@ pub const V3d = struct {
                 }
 
                 const draw = self.draws.items[tri.draw_idx];
-                rasterizeShadedTriangleDecodedInTileBuf(
+                rasterizeInTileBuf(
                     tb,
                     ram,
                     draw,
@@ -2796,7 +2962,7 @@ pub const V3d = struct {
                 }
 
                 const draw = self.draws.items[tri.draw_idx];
-                rasterizeShadedTriangleDecodedInTileBuf(
+                rasterizeInTileBuf(
                     tb,
                     ram,
                     draw,
@@ -2936,7 +3102,7 @@ pub const V3d = struct {
                         p_verts,
                         n_var,
                     );
-                    rasterizeShadedTriangleDecodedInTileBuf(tb, ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
+                    rasterizeInTileBuf(tb, ram, draw, &tri, fs_decoded, fs_unifs, fs_num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
                 }
             }
         }
@@ -2978,6 +3144,204 @@ pub const V3d = struct {
         var tb = self.tileBuf();
         defer self.syncFromTileBuf(&tb);
         rasterizeShadedTriangleDecodedInTileBuf(&tb, ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
+    }
+
+    /// Rasterizes `tri` into the tile (multisampled or not, as `tb` is).
+    inline fn rasterizeInTileBuf(
+        tb: *TileBuffer,
+        ram: []const u8,
+        draw: DrawCall,
+        tri: *const ShadedTriangle,
+        fs_decoded: []const qpu_sim.DecodedInst,
+        fs_unifs: qpu_sim.Uniforms,
+        num_varyings: u8,
+        fast_frag: qpu_sim.FastFragShader,
+        tile_px_x: u32,
+        tile_px_y: u32,
+        tile_size: u32,
+    ) void {
+        if (tb.ms) {
+            rasterizeMsTriangleInTileBuf(tb, ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y);
+        } else {
+            rasterizeShadedTriangleDecodedInTileBuf(tb, ram, draw, tri, fs_decoded, fs_unifs, num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
+        }
+    }
+
+    /// Where a multisampled pixel's samples are, from its top-left corner (the usual 4x pattern, a
+    /// grid turned so no two share a row or column).
+    pub const sample_offsets = [4][2]f32{ .{ 0.375, 0.125 }, .{ 0.875, 0.375 }, .{ 0.125, 0.625 }, .{ 0.625, 0.875 } };
+
+    /// Rasterizes `tri` into a multisampled tile (32 pixels square, at `tile_px_x`, `tile_px_y`):
+    /// each sample it covers, and that passes the depth test, is drawn. The fragment shader runs
+    /// once a pixel (its varyings at the middle), its colour written to all the samples drawn, or
+    /// each sample's (its writes to tlb_color_ms in turn) to its own; colour loads read each
+    /// sample in turn.
+    fn rasterizeMsTriangleInTileBuf(
+        tb: *TileBuffer,
+        ram: []const u8,
+        draw: DrawCall,
+        tri: *const ShadedTriangle,
+        fs_decoded: []const qpu_sim.DecodedInst,
+        fs_unifs: qpu_sim.Uniforms,
+        num_varyings: u8,
+        fast_frag: qpu_sim.FastFragShader,
+        tile_px_x: u32,
+        tile_px_y: u32,
+    ) void {
+        const tile_size = 32;
+        const x_start = @max(tri.min_x, tile_px_x);
+        const y_start = @max(tri.min_y, tile_px_y);
+        const x_end = @min(tri.max_x, tile_px_x + tile_size);
+        const y_end = @min(tri.max_y, tile_px_y + tile_size);
+        if (x_start >= x_end or y_start >= y_end) return;
+
+        const depth_func: u3 = @truncate((draw.config_b1 >> 4) & 7);
+        const z_updates = (draw.config_b1 & 0x80) != 0;
+        const need_depth = (depth_func != 7) or z_updates;
+
+        const n_var = @min(@as(usize, num_varyings), 16);
+        const t = if (tri.setup_valid) tri.* else ShadedTriangle.init(tri.draw_idx, tri.min_x, tri.min_y, tri.max_x, tri.max_y, tri.area, tri.v, n_var);
+        if (t.inv_area <= 0) return;
+
+        var batch: MsBatch = .{};
+        var materialized = false;
+        var py = y_start;
+        while (py < y_end) : (py += 1) {
+            var px = x_start;
+            while (px < x_end) : (px += 1) {
+                // The samples covered, and their depths.
+                var mask: u4 = 0;
+                var zs: [4]f32 = undefined;
+                for (sample_offsets, 0..) |off, si| {
+                    const fx = @as(f32, @floatFromInt(px)) + off[0];
+                    const fy = @as(f32, @floatFromInt(py)) + off[1];
+                    const e0 = t.edge0.eval(t.edge0.dx * (fy - t.edge0.p0y), fx);
+                    const e1 = t.edge1.eval(t.edge1.dx * (fy - t.edge1.p0y), fx);
+                    const e2 = t.edge2.eval(t.edge2.dx * (fy - t.edge2.p0y), fx);
+                    if (!t.edge0.passes(e0) or !t.edge1.passes(e1) or !t.edge2.passes(e2)) continue;
+                    mask |= @as(u4, 1) << @intCast(si);
+                    zs[si] = t.v[2].z + e0 * t.inv_area * t.dz0 + e1 * t.inv_area * t.dz1;
+                }
+                if (mask == 0) continue;
+                if (!materialized) {
+                    ensureTileMaterializedBuf(tb, ram, need_depth);
+                    materialized = true;
+                }
+                const idx = (py - tile_px_y) * tile_size + (px - tile_px_x);
+                if (depth_func != 7) {
+                    for (0..4) |si| {
+                        if (mask & (@as(u4, 1) << @intCast(si)) == 0) continue;
+                        if (!depthPasses(depth_func, zs[si], tb.depth[idx * 4 + si])) mask &= ~(@as(u4, 1) << @intCast(si));
+                    }
+                    if (mask == 0) continue;
+                }
+
+                // The fragment shader's inputs, at the pixel's middle.
+                const fx = @as(f32, @floatFromInt(px)) + 0.5;
+                const fy = @as(f32, @floatFromInt(py)) + 0.5;
+                const w0 = t.edge0.eval(t.edge0.dx * (fy - t.edge0.p0y), fx) * t.inv_area;
+                const w1 = t.edge1.eval(t.edge1.dx * (fy - t.edge1.p0y), fx) * t.inv_area;
+                const inv_w = t.v[2].inv_w + w0 * t.dinvw0 + w1 * t.dinvw1;
+                const w: f32 = if (t.all_unit_w or @abs(inv_w) <= 1e-12) 1 else 1 / inv_w;
+                const lane = batch.len;
+                batch.idx[lane] = idx;
+                batch.mask[lane] = mask;
+                batch.zs[lane] = zs;
+                batch.frag_w[lane] = @bitCast(w);
+                batch.frag_z[lane] = @bitCast(t.v[2].z + w0 * t.dz0 + w1 * t.dz1);
+                batch.frag_x[lane] = px;
+                batch.frag_y[lane] = py;
+                for (0..n_var) |vi| {
+                    const v = t.v[2].persp_varyings[vi] + w0 * t.dvar0[vi] + w1 * t.dvar1[vi];
+                    batch.varyings[vi][lane] = @bitCast(v * w);
+                }
+                for (0..4) |si| batch.samples_in[si][lane] = tb.color[idx * 4 + si];
+                batch.len += 1;
+                if (batch.len == 16) batch.flush(tb, ram, fs_decoded, fs_unifs, n_var, fast_frag, z_updates);
+            }
+        }
+        batch.flush(tb, ram, fs_decoded, fs_unifs, n_var, fast_frag, z_updates);
+    }
+
+    /// Up to 16 multisampled pixels, shaded together.
+    const MsBatch = struct {
+        len: usize = 0,
+        idx: [16]u32 = undefined,
+        /// The samples drawn, and their depths.
+        mask: [16]u4 = undefined,
+        zs: [16][4]f32 = undefined,
+        frag_w: qpu_sim.Vec = qpu_sim.splatF(1),
+        frag_z: qpu_sim.Vec = qpu_sim.splat(0),
+        frag_x: qpu_sim.Vec = qpu_sim.splat(0),
+        frag_y: qpu_sim.Vec = qpu_sim.splat(0),
+        varyings: [16]qpu_sim.Vec = @splat(qpu_sim.splat(0)),
+        samples_in: [4]qpu_sim.Vec = @splat(qpu_sim.splat(0)),
+        tex_cache: [2]qpu_sim.TexCache = .{ .{}, .{} },
+
+        fn flush(
+            b: *MsBatch,
+            tb: *TileBuffer,
+            ram: []const u8,
+            fs_decoded: []const qpu_sim.DecodedInst,
+            fs_unifs: qpu_sim.Uniforms,
+            n_var: usize,
+            fast_frag: qpu_sim.FastFragShader,
+            z_updates: bool,
+        ) void {
+            const count = b.len;
+            if (count == 0) return;
+            b.len = 0;
+            // The lanes past them as the last (their results unused).
+            for (count..16) |lane| {
+                b.frag_w[lane] = b.frag_w[count - 1];
+                b.frag_z[lane] = b.frag_z[count - 1];
+                b.frag_x[lane] = b.frag_x[count - 1];
+                b.frag_y[lane] = b.frag_y[count - 1];
+                for (b.varyings[0..n_var]) |*v| v[lane] = v[count - 1];
+                for (&b.samples_in) |*v| v[lane] = v[count - 1];
+            }
+            const env: qpu_sim.Env = .{
+                .uniforms = fs_unifs,
+                .varyings = b.varyings[0..n_var],
+                .frag_w = b.frag_w,
+                .frag_z = b.frag_z,
+                .frag_x = b.frag_x,
+                .frag_y = b.frag_y,
+                .texture_memory = ram,
+                .tlb_color_in = b.samples_in[0],
+                .tlb_samples_in = &b.samples_in,
+                .tex_cache = &b.tex_cache,
+            };
+            const res = qpu_sim.runFragmentFast(fast_frag, fs_decoded, &env) catch return;
+            if (res.tlb_color == null and res.tlb_samples == 0) return;
+            for (0..count) |lane| {
+                const base = b.idx[lane] * 4;
+                for (0..4) |si| {
+                    if (b.mask[lane] & (@as(u4, 1) << @intCast(si)) == 0) continue;
+                    // Written to each sample in turn, or all at once.
+                    const color = if (res.tlb_samples > 0)
+                        (if (si < res.tlb_samples) res.tlb_color_samples[si][lane] else continue)
+                    else
+                        res.tlb_color.?[lane];
+                    tb.color[base + si] = color;
+                    if (z_updates) tb.depth[base + si] = b.zs[lane][si];
+                }
+            }
+        }
+    };
+
+    /// Whether depth `z` passes `depth_func` (CONFIGURATION_BITS) against the tile buffer's `cur`.
+    fn depthPasses(depth_func: u3, z: f32, cur: f32) bool {
+        return switch (depth_func) {
+            0 => false,
+            1 => z < cur,
+            2 => z == cur,
+            3 => z <= cur,
+            4 => z > cur,
+            5 => z != cur,
+            6 => z >= cur,
+            7 => true,
+        };
     }
 
     fn rasterizeShadedTriangleDecodedInTileBuf(
@@ -4807,4 +5171,132 @@ test "V3D draws fragment shaders that read varyings and drop them on its fast pa
     p.end(.fragment);
     var buf: [32]qpu_sim.DecodedInst = undefined;
     try std.testing.expectEqual(qpu_sim.FastFragKind.none, qpu_sim.analyzeFragmentShader(qpu_sim.decodeProgram(p.code(), &buf), &.{}).kind);
+}
+
+test "V3D draws multisampled frames: each pixel its samples averaged, blended a sample at a time" {
+    var v3d = V3d{};
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 256 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+    // The grid scene's shaders and record at 0x3000 (colours from varyings), and vertices at
+    // 0x2000 of our own: x, y (clip space, 32 pixels to 1 from the middle of a 64-pixel frame), and
+    // white.
+    _ = try writeGridScene(ram);
+    std.mem.writeInt(u32, ram[0x1800..0x1804], @bitCast(@as(f32, 32.0 * 16.0)), .little);
+    std.mem.writeInt(u32, ram[0x1804..0x1808], @bitCast(@as(f32, 32.0 * 16.0)), .little);
+    std.mem.writeInt(u32, ram[0x3024..0x3028], 0x2000, .little);
+    // A triangle left of x = 20.5 (so in pixel 20 its samples 0 and 2, as x 0.375 and 0.125 in it),
+    // then one over the whole frame.
+    const edge = (20.5 - 32.0) / 32.0;
+    const verts = [_]f32{
+        edge, -4, 1, 1, 1, edge, 4,  1, 1, 1, -4, 0, 1, 1, 1,
+        -4,   -4, 1, 1, 1, 4,    -4, 1, 1, 1, 0,  4, 1, 1, 1,
+    };
+    @memcpy(ram[0x2000..][0..@sizeOf(@TypeOf(verts))], std.mem.sliceAsBytes(&verts));
+    // Its fragment shader: the varyings red, green and blue, opaque.
+    var flat: qpu.Program(32) = .{};
+    for (0..3) |i| {
+        const acc: u3 = @intCast(i);
+        flat.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(acc), .a = qpu.vary, .b = qpu.frag_w } }));
+        flat.emit(try qpu.alu(.{ .add = .{ .op = .fadd, .dst = qpu.wr(acc), .a = qpu.r(acc), .b = qpu.r(5) } }));
+    }
+    const one = qpu.smallImmFloat(1.0);
+    flat.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(2), .b = one }, .pack = .{ .mul = .@"8a" } }));
+    flat.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(1), .b = one }, .pack = .{ .mul = .@"8b" } }));
+    flat.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(0), .b = one }, .pack = .{ .mul = .@"8c" } }));
+    flat.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = one, .b = one }, .pack = .{ .mul = .@"8d" } }));
+    flat.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(3)));
+    flat.end(.fragment);
+    @memcpy(ram[0x1400..][0 .. flat.code().len * 8], std.mem.sliceAsBytes(flat.code()));
+    // The second's record at 0x3100: no varyings, and a fragment shader that reads each sample in
+    // turn and writes its red (and alpha) back to it.
+    @memcpy(ram[0x3100..][0..0x30], ram[0x3000..][0..0x30]);
+    ram[0x3103] = 0;
+    std.mem.writeInt(u32, ram[0x3104..0x3108], 0x1600, .little);
+    var fs: qpu.Program(32) = .{};
+    fs.emit(try qpu.loadImm(.{ .add_dst = qpu.wr(1), .value = 0xffff0000 }));
+    for (0..4) |_| {
+        fs.emit(qpu.nop(.color_load));
+        fs.emit(try qpu.alu(.{ .add = .{ .op = .@"and", .dst = .{ .periph = qpu.W.tlb_color_ms }, .a = qpu.r(4), .b = qpu.r(1) } }));
+    }
+    fs.end(.fragment);
+    @memcpy(ram[0x1600..][0 .. fs.code().len * 8], std.mem.sliceAsBytes(fs.code()));
+
+    const Frame = struct {
+        fn bin(v: *V3d, r: []u8, draws: usize) !void {
+            var c: usize = 0x4000;
+            r[c] = 6; // START_TILE_BINNING
+            c += 1;
+            r[c] = 103; // VIEWPORT_OFFSET (32, 32)
+            std.mem.writeInt(u16, r[c + 1 ..][0..2], 32 * 16, .little);
+            std.mem.writeInt(u16, r[c + 3 ..][0..2], 32 * 16, .little);
+            c += 5;
+            for (0..draws) |d| {
+                r[c] = 64; // GL_SHADER_STATE
+                std.mem.writeInt(u32, r[c + 1 ..][0..4], if (d == 0) 0x3001 else 0x3101, .little);
+                c += 5;
+                r[c] = 33; // GL_ARRAY_PRIMITIVE: a triangle
+                r[c + 1] = 4;
+                std.mem.writeInt(u32, r[c + 2 ..][0..4], 3, .little);
+                std.mem.writeInt(u32, r[c + 6 ..][0..4], @intCast(d * 3), .little);
+                c += 10;
+            }
+            r[c] = 4; // FLUSH
+            c += 1;
+            v.write32(0x110, 0x4000, r);
+            v.write32(0x108, @intCast(c), r);
+        }
+
+        /// Renders the frame, 4x multisampled, its samples averaged (`resolve`) or not.
+        fn render(v: *V3d, r: []u8, resolve: bool) void {
+            var c: usize = 0x5000;
+            r[c] = 113; // TILE_RENDERING_MODE_CONFIG: RGBA8888, linear, 4x multisampled
+            std.mem.writeInt(u32, r[c + 1 ..][0..4], 0x10000, .little);
+            std.mem.writeInt(u16, r[c + 5 ..][0..2], 64, .little);
+            std.mem.writeInt(u16, r[c + 7 ..][0..2], 64, .little);
+            std.mem.writeInt(u16, r[c + 9 ..][0..2], 1 << 2 | 1 | @as(u16, if (resolve) 1 << 4 else 0), .little);
+            c += 11;
+            r[c] = 114; // CLEAR_COLORS: black, far
+            @memset(r[c + 1 ..][0..13], 0);
+            std.mem.writeInt(u32, r[c + 1 ..][0..4], 0xff000000, .little);
+            std.mem.writeInt(u32, r[c + 9 ..][0..4], 0x00ffffff, .little);
+            c += 14;
+            // 32-pixel tiles, 2 by 2.
+            for (0..2) |ty| for (0..2) |tx| {
+                r[c] = 115;
+                r[c + 1] = @intCast(tx);
+                r[c + 2] = @intCast(ty);
+                r[c + 3] = 17; // BRANCH_TO_SUB_LIST
+                std.mem.writeInt(u32, r[c + 4 ..][0..4], 0, .little);
+                r[c + 8] = if (tx == 1 and ty == 1) 25 else 24; // STORE_MS_TILE_BUFFER(_AND_EOF)
+                c += 9;
+            };
+            v.write32(0x114, 0x5000, r);
+            v.write32(0x10c, @intCast(c), r);
+        }
+
+        fn pixel(r: []const u8, x: usize, y: usize) u32 {
+            return std.mem.readInt(u32, r[0x10000 + (y * 64 + x) * 4 ..][0..4], .little);
+        }
+    };
+
+    try Frame.bin(&v3d, ram, 1);
+    Frame.render(&v3d, ram, true);
+    for ([_]usize{ 5, 31, 32, 60 }) |y| {
+        try std.testing.expectEqual(@as(u32, 0xffffffff), Frame.pixel(ram, 19, y));
+        // Half its samples white, half black.
+        try std.testing.expectEqual(@as(u32, 0xff808080), Frame.pixel(ram, 20, y));
+        try std.testing.expectEqual(@as(u32, 0xff000000), Frame.pixel(ram, 21, y));
+    }
+    // Not averaged, each pixel is its first sample.
+    Frame.render(&v3d, ram, false);
+    try std.testing.expectEqual(@as(u32, 0xffffffff), Frame.pixel(ram, 20, 31));
+
+    // Each sample read and written in turn: red where it was white.
+    try Frame.bin(&v3d, ram, 2);
+    Frame.render(&v3d, ram, true);
+    try std.testing.expectEqual(@as(u32, 0xffff0000), Frame.pixel(ram, 19, 40));
+    try std.testing.expectEqual(@as(u32, 0xff800000), Frame.pixel(ram, 20, 40));
+    try std.testing.expectEqual(@as(u32, 0xff000000), Frame.pixel(ram, 21, 40));
 }

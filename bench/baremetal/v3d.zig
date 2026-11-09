@@ -150,6 +150,12 @@ const Target = struct {
     rcl: Cl,
     /// The vertex shader's uniforms: clip space to pixels (12.4 fixed point).
     vs_unifs: u32,
+    /// 4x multisampled: tiles are 32 pixels, each pixel's samples averaged as it is stored.
+    msaa: bool = false,
+
+    fn tileSize(t: *const Target) u32 {
+        return if (t.msaa) 32 else 64;
+    }
 
     fn init(p: Params, max_draws: usize) Target {
         // u32s: @min with 2048 alone would be a u12, and multiply as one.
@@ -157,6 +163,8 @@ const Target = struct {
         const h: u32 = @min(p.height, 2048);
         const tiles_w = (w + 63) / 64;
         const tiles_h = (h + 63) / 64;
+        // As many as 32-pixel tiles take, multisampled.
+        const max_tiles = ((w + 31) / 32) * ((h + 31) / 32);
         const tile_alloc = hw.heap.alloc(u8, 16 << 20, 4096);
         hw.write(bpoa, hw.bus(tile_alloc.ptr) + (8 << 20));
         hw.write(bpos, 8 << 20);
@@ -167,15 +175,18 @@ const Target = struct {
             .tiles_h = tiles_h,
             .fb = hw.heap.alloc(u32, w * h, 4096),
             .tile_alloc = tile_alloc,
-            .tile_state = hw.heap.alloc(u8, tiles_w * tiles_h * 48, 16),
+            .tile_state = hw.heap.alloc(u8, max_tiles * 48, 16),
             .bcl = .init(64 + max_draws * 32),
-            .rcl = .init(64 + tiles_w * tiles_h * 16),
+            .rcl = .init(64 + max_tiles * 16),
             .vs_unifs = uniforms(&.{ @bitCast(@as(f32, @floatFromInt(w)) * 8.0), @bitCast(-@as(f32, @floatFromInt(h)) * 8.0) }),
         };
     }
 
     /// Draws `draws` over `clear`, and waits until it is done.
     fn frame(t: *Target, clear_color: u32, list: []const Draw) void {
+        const size = t.tileSize();
+        const tiles_w = (t.width + size - 1) / size;
+        const tiles_h = (t.height + size - 1) / size;
         const bcl = &t.bcl;
         bcl.len = 0;
         // TILE_BINNING_MODE_CONFIG: tile allocation (the lists' first blocks taken as they are
@@ -184,9 +195,9 @@ const Target = struct {
         bcl.word(hw.bus(t.tile_alloc.ptr));
         bcl.word(8 << 20);
         bcl.word(hw.bus(t.tile_state.ptr));
-        bcl.byte(@intCast(t.tiles_w));
-        bcl.byte(@intCast(t.tiles_h));
-        bcl.byte(1 << 2);
+        bcl.byte(@intCast(tiles_w));
+        bcl.byte(@intCast(tiles_h));
+        bcl.byte(1 << 2 | @as(u8, @intFromBool(t.msaa)));
         bcl.byte(6); // START_TILE_BINNING
         bcl.byte(102); // CLIP_WINDOW
         bcl.half(0);
@@ -235,16 +246,17 @@ const Target = struct {
         rcl.word(hw.bus(t.fb.ptr));
         rcl.half(@intCast(t.width));
         rcl.half(@intCast(t.height));
-        rcl.half(1 << 2);
+        // Multisampled: 4x, and each pixel's samples averaged (decimated) as it is stored.
+        rcl.half(if (t.msaa) 1 << 2 | 1 | 1 << 4 else 1 << 2);
         rcl.byte(8); // WAIT_SEMAPHORE: for the binning
-        for (0..t.tiles_h) |ty| {
-            for (0..t.tiles_w) |tx| {
+        for (0..tiles_h) |ty| {
+            for (0..tiles_w) |tx| {
                 rcl.byte(115); // TILE_COORDINATES
                 rcl.byte(@intCast(tx));
                 rcl.byte(@intCast(ty));
                 rcl.byte(17); // BRANCH_TO_SUB_LIST: the tile's list
-                rcl.word(hw.bus(t.tile_alloc.ptr) + @as(u32, @intCast((ty * t.tiles_w + tx) * 32)));
-                const last = ty + 1 == t.tiles_h and tx + 1 == t.tiles_w;
+                rcl.word(hw.bus(t.tile_alloc.ptr) + @as(u32, @intCast((ty * tiles_w + tx) * 32)));
+                const last = ty + 1 == tiles_h and tx + 1 == tiles_w;
                 rcl.byte(if (last) 25 else 24); // STORE_MS_TILE_BUFFER(_AND_EOF)
             }
         }
@@ -387,5 +399,38 @@ pub fn points(p: Params, r: *Result) void {
     for (0..frames) |_| t.frame(0xff000000, &list);
     r.add("frames", frames);
     r.add("points", @as(u64, n) * frames);
+    r.add("checksum", t.checksum());
+}
+
+/// The triangles scene, 4x multisampled: each pixel's samples covered and depth-tested, and averaged.
+pub fn msaa(p: Params, r: *Result) void {
+    var t: Target = .init(p, 1);
+    t.msaa = true;
+    const s: Shaders = .make(.flat);
+    const n: u32 = @intCast(@min(p.amount(20_000), 21_000));
+    const vertices = hw.heap.alloc(f32, n * 3 * 6, 16);
+    scene.triangleVertices(vertices, n);
+    const list = [_]Draw{.{ .record = shaderRecord(s, vertices, t.vs_unifs, uniforms(&.{})), .count = n * 3 }};
+    const frames = p.amount(30);
+    for (0..frames) |_| t.frame(0xff102030, &list);
+    r.add("frames", frames);
+    r.add("triangles", @as(u64, n) * frames);
+    r.add("checksum", t.checksum());
+}
+
+/// The blend scene, 4x multisampled: each sample blended with its own colour, read and written in
+/// turn.
+pub fn msaaBlend(p: Params, r: *Result) void {
+    var t: Target = .init(p, 1);
+    t.msaa = true;
+    const s: Shaders = .make(.blended_ms);
+    const n: u32 = @intCast(@min(p.amount(500), 5000));
+    const vertices = hw.heap.alloc(f32, n * 6 * 7, 16);
+    scene.blendVertices(vertices, n);
+    const list = [_]Draw{.{ .record = shaderRecord(s, vertices, t.vs_unifs, uniforms(&.{})), .count = n * 6 }};
+    const frames = p.amount(30);
+    for (0..frames) |_| t.frame(0xff204060, &list);
+    r.add("frames", frames);
+    r.add("quads", @as(u64, n) * frames);
     r.add("checksum", t.checksum());
 }

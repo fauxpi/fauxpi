@@ -62,6 +62,7 @@ const GL_STREAM_DRAW: GLenum = 0x88E0;
 const GL_FLOAT: GLenum = 0x1406;
 const GL_UNSIGNED_INT: GLenum = 0x1405;
 const GL_TEXTURE_2D: GLenum = 0x0DE1;
+const GL_TEXTURE_2D_MULTISAMPLE: GLenum = 0x9100;
 const GL_TEXTURE0: GLenum = 0x84C0;
 const GL_R32UI: GLint = 0x8236;
 const GL_RED_INTEGER: GLenum = 0x8D94;
@@ -84,8 +85,49 @@ const GL_PACK_ALIGNMENT: GLenum = 0x0D05;
 const GL_NEVER: GLenum = 0x0200;
 const GL_NO_ERROR: GLenum = 0;
 
-/// The texture unit the tile buffer is read from (after those of the textures sampled).
+/// The texture unit the tile buffer is read from (after those of the textures sampled), and the
+/// multisampled one.
 const tlb_unit = shader.max_samples;
+const tlb_ms_unit = tlb_unit + 1;
+
+/// The samples a multisampled tile buffer's pixels have.
+const ms_samples = 4;
+
+/// A vertex shader drawing a triangle over the whole framebuffer, for a pass over each pixel.
+const fullscreen_vertex =
+    \\#version 400 core
+    \\void main() {
+    \\  gl_Position = vec4(float((gl_VertexID & 1) << 2) - 1.0, float((gl_VertexID & 2) << 1) - 1.0, 0.0, 1.0);
+    \\}
+    \\
+;
+
+/// Each pixel of the tile buffer (`tlb_tex`), into all the samples of a multisampled one.
+const expand_fragment =
+    \\#version 400 core
+    \\uniform usampler2D tlb_tex;
+    \\layout(location = 0) out uint o_color;
+    \\void main() {
+    \\  o_color = texelFetch(tlb_tex, ivec2(gl_FragCoord.xy), 0).r;
+    \\}
+    \\
+;
+
+/// Each pixel of a multisampled tile buffer (`tlb_ms`) as its samples averaged, a byte at a time,
+/// rounded (as V3D's decimation, and FauxPi's on the CPU).
+const resolve_fragment =
+    \\#version 400 core
+    \\uniform usampler2DMS tlb_ms;
+    \\layout(location = 0) out uint o_color;
+    \\void main() {
+    \\  ivec2 p = ivec2(gl_FragCoord.xy);
+    \\  uvec4 sum = uvec4(0u);
+    \\  for (int i = 0; i < 4; ++i) sum += (uvec4(texelFetch(tlb_ms, p, i).r) >> uvec4(0u, 8u, 16u, 24u)) & 0xffu;
+    \\  sum = (sum + 2u) / 4u;
+    \\  o_color = sum.x | (sum.y << 8) | (sum.z << 16) | (sum.w << 24);
+    \\}
+    \\
+;
 
 /// OpenGL's functions, as EGL gives them.
 const Gl = struct {
@@ -132,6 +174,7 @@ const Gl = struct {
     BindTexture: *const fn (GLenum, GLuint) callconv(.c) void,
     ActiveTexture: *const fn (GLenum) callconv(.c) void,
     TexImage2D: *const fn (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, ?*const anyopaque) callconv(.c) void,
+    TexImage2DMultisample: *const fn (GLenum, GLsizei, GLint, GLsizei, GLsizei, GLboolean) callconv(.c) void,
     TexSubImage2D: *const fn (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, ?*const anyopaque) callconv(.c) void,
     TexParameteri: *const fn (GLenum, GLenum, GLint) callconv(.c) void,
     PixelStorei: *const fn (GLenum, GLint) callconv(.c) void,
@@ -179,6 +222,16 @@ pub const Renderer = struct {
     depth: GLuint = 0,
     width: u32 = 0,
     height: u32 = 0,
+    /// The multisampled tile buffer (4 samples a pixel), as big as `color`, and its passes: filling
+    /// it from `color`, and averaging it into it (`expand_fragment`, `resolve_fragment`).
+    fbo_ms: GLuint = 0,
+    color_ms: GLuint = 0,
+    depth_ms: GLuint = 0,
+    ms_width: u32 = 0,
+    ms_height: u32 = 0,
+    empty_vao: GLuint = 0,
+    expand_program: GLuint = 0,
+    resolve_program: GLuint = 0,
     programs: [64]Program = @splat(.{}),
     next_program: usize = 0,
     textures: [32]Texture = @splat(.{}),
@@ -192,6 +245,8 @@ pub const Renderer = struct {
     const Program = struct {
         hash: u64 = 0,
         used: bool = false,
+        /// Drawn into a multisampled tile buffer (`shader.Options`).
+        multisampled: bool = false,
         program: GLuint = 0,
         shader: shader.Shader = .{},
         unif: GLint = -1,
@@ -312,16 +367,16 @@ pub const Renderer = struct {
 
     /// The program for a fragment shader, translated and compiled the first time it draws (null if
     /// OpenGL can't draw it).
-    fn program(r: *Renderer, code: []const qpu.Inst) ?*const Program {
+    fn program(r: *Renderer, code: []const qpu.Inst, multisampled: bool) ?*const Program {
         const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(code));
         for (&r.programs) |*p| {
-            if (p.used and p.hash == hash) return if (p.program != 0) p else null;
+            if (p.used and p.hash == hash and p.multisampled == multisampled) return if (p.program != 0) p else null;
         }
         const gl = &r.gl;
         const slot = &r.programs[r.next_program];
         r.next_program = (r.next_program + 1) % r.programs.len;
         if (slot.program != 0) gl.DeleteProgram(slot.program);
-        slot.* = .{ .hash = hash, .used = true };
+        slot.* = .{ .hash = hash, .used = true, .multisampled = multisampled };
 
         var decoded_buf: [gpu_draw.max_program_len]qpu_sim.DecodedInst = undefined;
         if (code.len > decoded_buf.len) return null;
@@ -329,7 +384,7 @@ pub const Renderer = struct {
         var src: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
         defer src.deinit();
         src.writer.writeAll(shader.glsl_common) catch return null;
-        const sh = shader.translate(&src.writer, decoded, .glsl) catch return null;
+        const sh = shader.translateWith(&src.writer, decoded, .glsl, .{ .multisampled = multisampled }) catch return null;
         if (sh.too_many_samples or sh.too_many_uniforms) return null;
         if (sh.reads_color and gl.TextureBarrier == null) return null;
 
@@ -355,9 +410,11 @@ pub const Renderer = struct {
         for (&units, 0..) |*u, i| u.* = @intCast(i);
         gl.Uniform1iv(gl.GetUniformLocation(prog, "tex"), units.len, &units);
         gl.Uniform1i(gl.GetUniformLocation(prog, "tlb_tex"), tlb_unit);
+        gl.Uniform1i(gl.GetUniformLocation(prog, "tlb_ms"), tlb_ms_unit);
         slot.* = .{
             .hash = hash,
             .used = true,
+            .multisampled = multisampled,
             .program = prog,
             .shader = sh,
             .unif = gl.GetUniformLocation(prog, "unif"),
@@ -563,13 +620,73 @@ pub const Renderer = struct {
         r.height = height;
     }
 
+    /// The multisampled tile buffer, `width` by `height`, and its passes.
+    fn useMultisampled(r: *Renderer, width: u32, height: u32) Error!void {
+        const gl = &r.gl;
+        if (r.expand_program == 0) {
+            r.expand_program = r.linkFullscreen(expand_fragment) orelse return error.GlFailed;
+            gl.UseProgram(r.expand_program);
+            gl.Uniform1i(gl.GetUniformLocation(r.expand_program, "tlb_tex"), tlb_unit);
+            r.resolve_program = r.linkFullscreen(resolve_fragment) orelse return error.GlFailed;
+            gl.UseProgram(r.resolve_program);
+            gl.Uniform1i(gl.GetUniformLocation(r.resolve_program, "tlb_ms"), tlb_ms_unit);
+            gl.GenVertexArrays(1, @ptrCast(&r.empty_vao));
+            gl.GenFramebuffers(1, @ptrCast(&r.fbo_ms));
+            gl.GenTextures(1, @ptrCast(&r.color_ms));
+            gl.GenTextures(1, @ptrCast(&r.depth_ms));
+        }
+        if (r.ms_width == width and r.ms_height == height) return;
+        gl.BindTexture(GL_TEXTURE_2D_MULTISAMPLE, r.color_ms);
+        gl.TexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, ms_samples, GL_R32UI, @intCast(width), @intCast(height), 1);
+        gl.BindTexture(GL_TEXTURE_2D_MULTISAMPLE, r.depth_ms);
+        gl.TexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, ms_samples, GL_DEPTH_COMPONENT32F, @intCast(width), @intCast(height), 1);
+        gl.BindFramebuffer(GL_FRAMEBUFFER, r.fbo_ms);
+        gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D_MULTISAMPLE, r.color_ms, 0);
+        gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D_MULTISAMPLE, r.depth_ms, 0);
+        if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) return error.GlFailed;
+        r.ms_width = width;
+        r.ms_height = height;
+    }
+
+    /// A program of `fullscreen_vertex` and `fragment`, or null if it doesn't link.
+    fn linkFullscreen(r: *Renderer, fragment: []const u8) ?GLuint {
+        const gl = &r.gl;
+        const vert = r.compileShader(GL_VERTEX_SHADER, fullscreen_vertex) orelse return null;
+        defer gl.DeleteShader(vert);
+        const frag = r.compileShader(GL_FRAGMENT_SHADER, fragment) orelse return null;
+        defer gl.DeleteShader(frag);
+        const prog = gl.CreateProgram();
+        gl.AttachShader(prog, vert);
+        gl.AttachShader(prog, frag);
+        gl.LinkProgram(prog);
+        var ok: GLint = 0;
+        gl.GetProgramiv(prog, GL_LINK_STATUS, &ok);
+        if (ok == 0) {
+            gl.DeleteProgram(prog);
+            return null;
+        }
+        return prog;
+    }
+
+    /// Runs `prog` (one of `linkFullscreen`'s) over each pixel of the framebuffer bound.
+    fn fullscreenPass(r: *Renderer, prog: GLuint) void {
+        const gl = &r.gl;
+        gl.Disable(GL_SCISSOR_TEST);
+        gl.Disable(GL_DEPTH_TEST);
+        gl.Disable(GL_CULL_FACE);
+        gl.UseProgram(prog);
+        gl.BindVertexArray(r.empty_vao);
+        gl.DrawArrays(GL_TRIANGLES, 0, 3);
+    }
+
     /// Draws `draws` of `vertices` into `color` (`width` by `height`, its rows from the top as V3D
     /// has them: the tile buffer, loaded or cleared), with depth cleared to `clear_z`, and leaves
     /// what was drawn in `color`. Draws with a vertex stage (all of them, or none) shade their
     /// vertices from `inputs` (`vertices` unused), and make triangles of them by `corners`.
     /// `error.Unsupported` (a shader OpenGL can't run) leaves `color` as it was, for the CPU to draw
-    /// the frame.
-    pub fn render(r: *Renderer, ram: []const u8, width: u32, height: u32, color: []u32, clear_z: f32, vertices: []const Vertex, draws: []const Draw, inputs: []const u32, corners: []const u32) Error!void {
+    /// the frame. `multisampled`: each pixel of the tile buffer has 4 samples, each taken from
+    /// `color` and drawn into, then averaged back into it.
+    pub fn render(r: *Renderer, ram: []const u8, width: u32, height: u32, color: []u32, clear_z: f32, vertices: []const Vertex, draws: []const Draw, inputs: []const u32, corners: []const u32, multisampled: bool) Error!void {
         if (draws.len > gpu_draw.max_draws or vertices.len > gpu_draw.max_vertices) return error.Unsupported;
         if (width == 0 or height == 0 or color.len < @as(usize, width) * height) return error.Unsupported;
         const shaded_on_gpu = draws.len > 0 and draws[0].vertex_stage != null;
@@ -583,7 +700,7 @@ pub const Renderer = struct {
         // The shaders first: one OpenGL can't run sends the frame to the CPU.
         var prof_start = profile.now();
         var programs: [gpu_draw.max_draws]*const Program = undefined;
-        for (draws, 0..) |d, i| programs[i] = r.program(d.code) orelse return error.Unsupported;
+        for (draws, 0..) |d, i| programs[i] = r.program(d.code, multisampled) orelse return error.Unsupported;
         var vertex_programs: [gpu_draw.max_draws]*const VertexProgram = undefined;
         var vertex_total: u32 = 0;
         var any_reads_color = false;
@@ -602,6 +719,17 @@ pub const Renderer = struct {
         gl.ActiveTexture(GL_TEXTURE0);
         gl.BindTexture(GL_TEXTURE_2D, r.color);
         gl.TexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, @intCast(width), @intCast(height), GL_RED_INTEGER, GL_UNSIGNED_INT, color.ptr);
+        if (multisampled) {
+            // Each pixel into all its samples, drawn into from then on.
+            try r.useMultisampled(width, height);
+            gl.ActiveTexture(GL_TEXTURE0 + tlb_unit);
+            gl.BindTexture(GL_TEXTURE_2D, r.color);
+            gl.BindFramebuffer(GL_FRAMEBUFFER, r.fbo_ms);
+            r.fullscreenPass(r.expand_program);
+            gl.ActiveTexture(GL_TEXTURE0 + tlb_ms_unit);
+            gl.BindTexture(GL_TEXTURE_2D_MULTISAMPLE, r.color_ms);
+            gl.ActiveTexture(GL_TEXTURE0);
+        }
 
         // The vertices: shaded here, and read back if the layers of triangles reading the tile's
         // colour need them; or as given.
@@ -693,9 +821,11 @@ pub const Renderer = struct {
                 ok[k] = @intFromBool(tex != 0);
             }
             gl.Uniform1uiv(p.tex_ok, ok.len, &ok);
-            gl.ActiveTexture(GL_TEXTURE0 + tlb_unit);
-            gl.BindTexture(GL_TEXTURE_2D, if (p.shader.reads_color) r.color else 0);
-            gl.ActiveTexture(GL_TEXTURE0);
+            if (!multisampled) {
+                gl.ActiveTexture(GL_TEXTURE0 + tlb_unit);
+                gl.BindTexture(GL_TEXTURE_2D, if (p.shader.reads_color) r.color else 0);
+                gl.ActiveTexture(GL_TEXTURE0);
+            }
             gl.DepthFunc(GL_NEVER + @as(GLenum, d.depth_func));
             gl.DepthMask(@intFromBool(d.depth_write));
             gl.Scissor(@intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0));
@@ -712,6 +842,11 @@ pub const Renderer = struct {
             }
         }
 
+        if (multisampled) {
+            // Each pixel's samples averaged.
+            gl.BindFramebuffer(GL_FRAMEBUFFER, r.fbo);
+            r.fullscreenPass(r.resolve_program);
+        }
         profile.end(.gpu_draw, prof_start);
         prof_start = profile.now();
         gl.ReadPixels(0, 0, @intCast(width), @intCast(height), GL_RED_INTEGER, GL_UNSIGNED_INT, color.ptr);

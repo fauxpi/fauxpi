@@ -38,6 +38,9 @@ pub const Env = struct {
     texture_memory1: []const u8 = &.{},
     textures: []const []const u8 = &.{},
     tlb_color_in: Vec = splat(0),
+    /// Multisampled: each sample's colour in the tile buffer, which colour loads read in turn
+    /// (`tlb_color_in` is then not read).
+    tlb_samples_in: ?*const [4]Vec = null,
     tex_cache: ?*[2]TexCache = null,
 };
 
@@ -65,6 +68,9 @@ pub const Result = struct {
 pub const FragResult = struct {
     tlb_color: ?Vec = null,
     tlb_z: ?Vec = null,
+    /// Multisampled: each sample's colour, as written in turn (to tlb_color_ms).
+    tlb_color_samples: [4]Vec = undefined,
+    tlb_samples: usize = 0,
 };
 
 pub const Error = error{
@@ -1024,6 +1030,7 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
     s.rb_init = @as(u32, 1) << qpu.R.frag_payload_zw;
 
     var end_at: ?usize = null;
+    var loads: usize = 0;
     var ip: usize = 0;
     while (ip < decoded.len) : (ip += 1) {
         if (end_at) |e| if (ip > e) break;
@@ -1169,7 +1176,8 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                 }
             },
             .color_load, .color_load_end => {
-                s.acc[4] = env.tlb_color_in;
+                s.acc[4] = if (env.tlb_samples_in) |samples| samples[loads % 4] else env.tlb_color_in;
+                loads += 1;
                 if (@hasField(RType, "color_loads")) r.color_loads += 1;
                 if (d.sig == .color_load_end) end_at = ip + 2;
             },

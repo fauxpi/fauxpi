@@ -146,6 +146,8 @@ const tests = [_]Test{
     .{ .name = "kms_draws", .run = drawsScene },
     .{ .name = "kms_lines", .run = linesScene },
     .{ .name = "kms_points", .run = pointsScene },
+    .{ .name = "kms_msaa", .run = msaaScene },
+    .{ .name = "kms_msaa_blend", .run = msaaBlendScene },
 };
 
 /// The boot: the kernel to init, and the vc4 driver to its device.
@@ -504,6 +506,12 @@ const Job = struct {
     unifs_len: usize = 0,
     handles: [64]u32 = undefined,
     handle_count: u32 = 0,
+    /// 4x multisampled: tiles are 32 pixels, each pixel's samples averaged as it is stored.
+    msaa: bool = false,
+
+    fn tileSize(j: *const Job) u32 {
+        return if (j.msaa) 32 else 64;
+    }
 
     fn byte(j: *Job, v: u8) void {
         j.bcl[j.bcl_len] = v;
@@ -542,18 +550,18 @@ const Job = struct {
         return j.handle_count - 1;
     }
 
-    /// Starts a frame drawn into `target` (`width` by `height`).
-    fn begin(j: *Job, target: u32, width: u32, height: u32) void {
-        j.* = .{};
+    /// Starts a frame drawn into `target` (`width` by `height`), 4x multisampled if `msaa`.
+    fn begin(j: *Job, target: u32, width: u32, height: u32, msaa: bool) void {
+        j.* = .{ .msaa = msaa };
         _ = j.index(target);
-        // TILE_BINNING_MODE_CONFIG: the kernel's memory, the tiles.
+        // TILE_BINNING_MODE_CONFIG: the kernel's memory, the tiles, multisampled or not.
         j.byte(112);
         j.word(0);
         j.word(0);
         j.word(0);
-        j.byte(@intCast((width + 63) / 64));
-        j.byte(@intCast((height + 63) / 64));
-        j.byte(0);
+        j.byte(@intCast((width + j.tileSize() - 1) / j.tileSize()));
+        j.byte(@intCast((height + j.tileSize() - 1) / j.tileSize()));
+        j.byte(@intFromBool(msaa));
         j.byte(6); // START_TILE_BINNING
         j.byte(56); // PRIMITIVE_LIST_FORMAT: 16-bit indices, triangles
         j.byte(0x12);
@@ -657,10 +665,10 @@ const Job = struct {
             .bo_handle_count = j.handle_count,
             .width = @intCast(d.width),
             .height = @intCast(d.height),
-            .max_x_tile = @intCast((d.width + 63) / 64 - 1),
-            .max_y_tile = @intCast((d.height + 63) / 64 - 1),
-            // RGBA8888, linear (what KMS scans out).
-            .color_write = .{ .hindex = 0, .bits = 1 << 2 },
+            .max_x_tile = @intCast((d.width + j.tileSize() - 1) / j.tileSize() - 1),
+            .max_y_tile = @intCast((d.height + j.tileSize() - 1) / j.tileSize() - 1),
+            // RGBA8888, linear (what KMS scans out); multisampled, 4x and averaged as stored.
+            .color_write = .{ .hindex = 0, .bits = if (j.msaa) 1 << 2 | 1 | 1 << 4 else 1 << 2 },
             .clear_color = .{ clear, clear },
             .clear_z = 0xffffff,
             .flags = 1, // use the clear colour
@@ -694,9 +702,14 @@ var job: Job = .{};
 /// Draws frames of `draws` and shows them, as fast as the V3D draws them (a flip when the last
 /// one is done): the frames drawn, and flips.
 fn sceneFrames(d: *Display, frames: usize, clear: u32, comptime drawFn: anytype, ctx: anytype, r: *Result) void {
+    sceneFramesMs(d, frames, clear, false, drawFn, ctx, r);
+}
+
+/// `sceneFrames`, 4x multisampled if `msaa`.
+fn sceneFramesMs(d: *Display, frames: usize, clear: u32, msaa: bool, comptime drawFn: anytype, ctx: anytype, r: *Result) void {
     for (0..frames) |_| {
         const target = d.fbs[d.back].bo.handle;
-        job.begin(target, d.width, d.height);
+        job.begin(target, d.width, d.height, msaa);
         drawFn(&job, d, ctx);
         job.submit(d, target, clear, true);
         d.flip(false);
@@ -711,7 +724,7 @@ fn flips(p: Params, r: *Result) void {
     const frames = p.amount(120);
     for (0..frames) |f| {
         const target = d.fbs[d.back].bo.handle;
-        job.begin(target, d.width, d.height);
+        job.begin(target, d.width, d.height, false);
         job.submit(&d, target, 0xff000000 | @as(u32, @intCast(f * 0x010203 & 0xffffff)), false);
         d.flip(true);
     }
@@ -825,6 +838,36 @@ fn pointsScene(p: Params, r: *Result) void {
         }
     }.f, Ctx{ .s = &s, .v = vertices.handle, .n = n }, r);
     r.add("points", n);
+}
+
+fn msaaScene(p: Params, r: *Result) void {
+    var d: Display = .init();
+    const s: ShaderSet = .make(d.fd, .flat);
+    const n: u32 = @intCast(@min(p.amount(20_000), 21_000));
+    const vertices: Bo = .create(d.fd, n * 3 * 6 * 4);
+    scene.triangleVertices(vertices.floats(), n);
+    const Ctx = struct { s: *const ShaderSet, v: u32, n: u32 };
+    sceneFramesMs(&d, p.amount(30), 0xff102030, true, struct {
+        fn f(j: *Job, dd: *const Display, c: Ctx) void {
+            j.draw(dd, c.s, c.v, 0, c.n * 3, false, null);
+        }
+    }.f, Ctx{ .s = &s, .v = vertices.handle, .n = n }, r);
+    r.add("triangles", n);
+}
+
+fn msaaBlendScene(p: Params, r: *Result) void {
+    var d: Display = .init();
+    const s: ShaderSet = .make(d.fd, .blended_ms);
+    const n: u32 = @intCast(@min(p.amount(500), 5000));
+    const vertices: Bo = .create(d.fd, n * 6 * 7 * 4);
+    scene.blendVertices(vertices.floats(), n);
+    const Ctx = struct { s: *const ShaderSet, v: u32, n: u32 };
+    sceneFramesMs(&d, p.amount(30), 0xff204060, true, struct {
+        fn f(j: *Job, dd: *const Display, c: Ctx) void {
+            j.draw(dd, c.s, c.v, 0, c.n * 6, false, null);
+        }
+    }.f, Ctx{ .s = &s, .v = vertices.handle, .n = n }, r);
+    r.add("quads", n);
 }
 
 pub const panic = std.debug.FullPanic(panicked);
