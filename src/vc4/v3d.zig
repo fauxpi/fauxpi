@@ -22,7 +22,17 @@ pub const V3d = struct {
     pub const INT_OUTOMEM: u32 = 1 << 2;
     pub const INT_SPILLUSE: u32 = 1 << 3;
 
+    /// How a draw's vertices are given: shaded by its vertex shader (GL), shaded already in
+    /// memory (NV), or as screen coordinates (VG).
+    pub const DrawMode = enum { gl, nv, vg };
+
     pub const DrawCall = struct {
+        kind: DrawMode = .gl,
+        /// VG mode: its fragment shader, uniforms and varyings (from its shader record, or one
+        /// inline); its vertices `first_or_offset` on in `vg_verts`.
+        fs_code: u32 = 0,
+        fs_unifs: u32 = 0,
+        fs_varyings: u8 = 0,
         shader_rec_addr: u32 = 0,
         num_attrs: u4 = 0,
         mode: u8 = 4, // 0 = points, 1 = lines, 2 = line loop, 3 = line strip, 4 = triangles, 5 = strip, 6 = fan
@@ -302,6 +312,16 @@ pub const V3d = struct {
     cur_z_offset: f32 = 0,
     cur_line_width: f32 = 1,
     cur_point_size: f32 = 1,
+    /// The mode of the shader state last given, and VG's fragment shader.
+    cur_kind: DrawMode = .gl,
+    cur_fs_code: u32 = 0,
+    cur_fs_unifs: u32 = 0,
+    cur_fs_varyings: u8 = 0,
+    /// VG mode's RHTs' X boundary (RHT_X_BOUNDARY), the frame's VG vertices (each primitive as
+    /// triangles), and the last two vertices of the last VG list (for one continuing it).
+    rht_x_boundary: f32 = 0,
+    vg_verts: std.ArrayList([2]f32) = .empty,
+    vg_last: [2][2]f32 = @splat(.{ 0, 0 }),
     multisample_bin: bool = false,
 
     // Tile buffer (64x64 pixels max per tile)
@@ -732,6 +752,7 @@ pub const V3d = struct {
                 },
                 6 => { // START_TILE_BINNING
                     self.draws.clearRetainingCapacity();
+                    self.vg_verts.clearRetainingCapacity();
                     self.bin_blocks_taken = 0;
                     pc += 1;
                 },
@@ -763,6 +784,7 @@ pub const V3d = struct {
                     {
                         // Only running out of memory loses a draw.
                         self.draws.append(tri_allocator, .{
+                            .kind = if (self.cur_kind == .vg) .gl else self.cur_kind,
                             .shader_rec_addr = self.cur_shader_rec,
                             .num_attrs = self.cur_num_attrs,
                             .mode = mode_byte & 0x0f,
@@ -797,6 +819,7 @@ pub const V3d = struct {
                     const first = std.mem.readInt(u32, ram[pc + 6 ..][0..4], .little);
                     {
                         self.draws.append(tri_allocator, .{
+                            .kind = if (self.cur_kind == .vg) .gl else self.cur_kind,
                             .shader_rec_addr = self.cur_shader_rec,
                             .num_attrs = self.cur_num_attrs,
                             .mode = mode,
@@ -829,7 +852,67 @@ pub const V3d = struct {
                     const n_attr: u4 = @intCast(if ((word & 7) == 0) 8 else (word & 7));
                     self.cur_num_attrs = n_attr;
                     self.cur_shader_rec = word & ~@as(u32, 0xf);
+                    self.cur_kind = .gl;
                     pc += 5;
+                },
+                65 => { // NV_SHADER_STATE (5 bytes): a record of shaded vertices
+                    if (pc + 5 > ram.len) break;
+                    self.cur_shader_rec = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & ~@as(u32, 0xf);
+                    self.cur_num_attrs = 0;
+                    self.cur_kind = .nv;
+                    pc += 5;
+                },
+                66 => { // VG_SHADER_STATE (5 bytes): its record's fragment shader
+                    if (pc + 5 > ram.len) break;
+                    const rec = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & ~@as(u32, 0xf) & vc_bus.ramMask(ram.len);
+                    if (rec + 12 <= ram.len) {
+                        self.cur_fs_varyings = ram[rec + 3];
+                        self.cur_fs_code = std.mem.readInt(u32, ram[rec + 4 ..][0..4], .little);
+                        self.cur_fs_unifs = std.mem.readInt(u32, ram[rec + 8 ..][0..4], .little);
+                    }
+                    self.cur_kind = .vg;
+                    pc += 5;
+                },
+                67 => { // VG_INLINE_SHADER_RECORD (9 bytes): its fragment shader and uniforms
+                    if (pc + 9 > ram.len) break;
+                    self.cur_fs_code = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & ~@as(u32, 7);
+                    self.cur_fs_unifs = std.mem.readInt(u32, ram[pc + 5 ..][0..4], .little);
+                    self.cur_fs_varyings = 0;
+                    self.cur_kind = .vg;
+                    pc += 9;
+                },
+                41 => { // VG_COORDINATE_ARRAY_PRIMITIVES (10 bytes): primitives' coordinates in memory
+                    if (pc + 10 > ram.len) break;
+                    const ty: u4 = @truncate(ram[pc + 1]);
+                    const count = std.mem.readInt(u32, ram[pc + 2 ..][0..4], .little);
+                    const addr = std.mem.readInt(u32, ram[pc + 6 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+                    const n_coords: u64 = switch (ty) {
+                        1 => @as(u64, count) * 2,
+                        3 => @as(u64, count) + 1,
+                        4 => @as(u64, count) * 3,
+                        5, 6 => @as(u64, count) + 2,
+                        else => 0,
+                    };
+                    const n: usize = @intCast(@min(n_coords, (ram.len -| addr) / 4));
+                    self.vgPrimitives(ty, ram[pc + 1] & 0x10 != 0, std.mem.bytesAsSlice(u32, ram[addr..][0 .. n * 4]));
+                    pc += 10;
+                },
+                42 => { // VG_INLINE_PRIMITIVES: coordinates after it, to an escape (padding skipped)
+                    if (pc + 2 > ram.len) break;
+                    const ty: u4 = @truncate(ram[pc + 1]);
+                    const cont = ram[pc + 1] & 0x10 != 0;
+                    var q = pc + 2;
+                    var coords: std.ArrayList(u32) = .empty;
+                    defer coords.deinit(tri_allocator);
+                    while (q + 4 <= ram.len) {
+                        const w = std.mem.readInt(u32, ram[q..][0..4], .little);
+                        q += 4;
+                        if (w == vg_escape) break;
+                        if (w == vg_pad) continue;
+                        coords.append(tri_allocator, w) catch break;
+                    }
+                    self.vgPrimitives(ty, cont, coords.items);
+                    pc = q;
                 },
                 96 => { // CONFIGURATION_BITS (4 bytes)
                     if (pc + 4 > ram.len) break;
@@ -849,7 +932,11 @@ pub const V3d = struct {
                     self.cur_line_width = @bitCast(std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little));
                     pc += 5;
                 },
-                100 => pc += 3, // RHT_X_BOUNDARY
+                100 => { // RHT_X_BOUNDARY (3 bytes): in pixels
+                    if (pc + 3 > ram.len) break;
+                    self.rht_x_boundary = @floatFromInt(@as(i16, @bitCast(std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little))));
+                    pc += 3;
+                },
                 102 => { // CLIP_WINDOW (9 bytes)
                     if (pc + 9 > ram.len) break;
                     self.cur_clip_x = std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little);
@@ -884,6 +971,7 @@ pub const V3d = struct {
                     const flags = ram[pc + 15];
                     self.multisample_bin = (flags & 1) != 0;
                     self.draws.clearRetainingCapacity();
+                    self.vg_verts.clearRetainingCapacity();
                     // The pool after each tile's initial block.
                     const sizes = [4]u32{ 32, 64, 128, 256 };
                     self.bin_initial_block = sizes[(flags >> 3) & 3];
@@ -900,6 +988,77 @@ pub const V3d = struct {
                 else => break,
             }
         }
+    }
+
+    /// VG mode's coordinates' escape (ending inline primitives) and padding (skipped).
+    const vg_escape: u32 = 0xbfff0000;
+    const vg_pad: u32 = 0xbfff0001;
+
+    /// VG primitives of type `ty` (RHTs, an RHT strip, triangles, a strip, a fan) of `coords`
+    /// (Xs and Ys, 12.4 fixed point from the viewport offset), continuing the last list (its last
+    /// two vertices in place of their first two), drawn as a draw of their triangles. An RHT
+    /// is the trapezoid between its edge and the RHT X boundary.
+    fn vgPrimitives(self: *V3d, ty: u4, cont: bool, coords: []align(1) const u32) void {
+        var pts: std.ArrayList([2]f32) = .empty;
+        defer pts.deinit(tri_allocator);
+        pts.ensureTotalCapacity(tri_allocator, coords.len) catch return;
+        for (coords) |w| {
+            const xs: i16 = @bitCast(@as(u16, @truncate(w)));
+            const ys: i16 = @bitCast(@as(u16, @truncate(w >> 16)));
+            pts.appendAssumeCapacity(.{ @as(f32, @floatFromInt(xs)) / 16 + self.cur_vp_x, @as(f32, @floatFromInt(ys)) / 16 + self.cur_vp_y });
+        }
+        const p = pts.items;
+        if (cont) {
+            for (0..@min(2, p.len)) |i| p[i] = self.vg_last[i];
+        }
+        const first = self.vg_verts.items.len;
+        const b = self.rht_x_boundary;
+        const Out = struct {
+            fn tri(v: *V3d, a: [2]f32, bb: [2]f32, c: [2]f32) void {
+                v.vg_verts.appendSlice(tri_allocator, &.{ a, bb, c }) catch {};
+            }
+            fn rht(v: *V3d, a: [2]f32, bb: [2]f32, x: f32) void {
+                tri(v, a, bb, .{ x, bb[1] });
+                tri(v, a, .{ x, bb[1] }, .{ x, a[1] });
+            }
+        };
+        switch (ty) {
+            1 => for (0..p.len / 2) |i| Out.rht(self, p[2 * i], p[2 * i + 1], b),
+            3 => for (1..@max(p.len, 1)) |i| Out.rht(self, p[i - 1], p[i], b),
+            4 => for (0..p.len / 3) |i| Out.tri(self, p[3 * i], p[3 * i + 1], p[3 * i + 2]),
+            5 => for (2..@max(p.len, 2)) |i| {
+                if (i & 1 == 0) Out.tri(self, p[i - 2], p[i - 1], p[i]) else Out.tri(self, p[i - 1], p[i - 2], p[i]);
+            },
+            6 => for (2..@max(p.len, 2)) |i| Out.tri(self, p[0], p[i - 1], p[i]),
+            else => {},
+        }
+        if (p.len >= 2) self.vg_last = if (ty == 6) .{ p[0], p[p.len - 1] } else .{ p[p.len - 2], p[p.len - 1] };
+        const n = self.vg_verts.items.len - first;
+        if (n == 0) return;
+        self.draws.append(tri_allocator, .{
+            .kind = .vg,
+            .fs_code = self.cur_fs_code,
+            .fs_unifs = self.cur_fs_unifs,
+            .fs_varyings = self.cur_fs_varyings,
+            .mode = 4,
+            .count = @intCast(n),
+            .first_or_offset = @intCast(first),
+            .vp_x = self.cur_vp_x,
+            .vp_y = self.cur_vp_y,
+            .clip_x = self.cur_clip_x,
+            .clip_y = self.cur_clip_y,
+            .clip_w = self.cur_clip_w,
+            .clip_h = self.cur_clip_h,
+            .config_b0 = self.cur_cfg0,
+            .config_b1 = self.cur_cfg1,
+            .config_b2 = self.cur_cfg2,
+            .clip_scale_x = self.cur_clip_scale_x,
+            .clip_scale_y = self.cur_clip_scale_y,
+            .z_scale = self.cur_z_scale,
+            .z_offset = self.cur_z_offset,
+            .line_width = self.cur_line_width,
+            .point_size = self.cur_point_size,
+        }) catch {};
     }
 
     /// The length of the QPU program at `phys`: to the instruction that signals its end and the two
@@ -955,30 +1114,29 @@ pub const V3d = struct {
         draws: for (self.draws.items, 0..) |draw, draw_idx| {
             self.prep_draws.items[draw_idx] = .{};
             if (numPrims(draw) == 0) continue;
-            const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
-            if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) continue;
-
-            const fs_num_varyings = ram[rec_phys + 3] +| rasterizerVaryings(draw);
-            const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-            const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-            const vs_attr_mask = ram[rec_phys + 14];
-            const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-            const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+            const src = drawSource(ram, draw) orelse continue;
+            const fs_num_varyings = src.fs_num_varyings;
+            const fs_code_phys = src.fs_code_phys;
+            const fs_unif_phys = src.fs_unif_phys;
+            const gl = switch (src.vertices) {
+                .gl => |g| g,
+                else => null,
+            };
 
             // Running out of memory for a draw's shaders draws it, and those after it, as the
             // tiles are (see `overflow_draw_start`).
             self.vs_decoded.clearRetainingCapacity();
-            const vs_decoded = decodeProgramAt(ram, vs_code_phys, &self.vs_code, &self.vs_decoded) orelse {
+            const vs_decoded: []const qpu_sim.DecodedInst = if (gl) |g| decodeProgramAt(ram, g.vs_code_phys, &self.vs_code, &self.vs_decoded) orelse {
                 self.overflow_draw_start = draw_idx;
                 break;
-            };
+            } else &.{};
             const fs_inst_start: u32 = @intCast(self.prep_fs_insts.items.len);
             const fs_decoded = decodeProgramAt(ram, fs_code_phys, &self.vs_code, &self.prep_fs_insts) orelse {
                 self.overflow_draw_start = draw_idx;
                 break;
             };
-            if (vs_decoded.len == 0 or fs_decoded.len == 0) continue;
-            const vs_unifs = uniformsAt(ram, vs_unif_phys);
+            if ((gl != null and vs_decoded.len == 0) or fs_decoded.len == 0) continue;
+            const vs_unifs = if (gl) |g| uniformsAt(ram, g.vs_unif_phys) else &.{};
             const fast_frag = qpu_sim.analyzeFragmentShader(fs_decoded, uniformsAt(ram, fs_unif_phys));
 
             self.prep_draws.items[draw_idx] = .{
@@ -1006,7 +1164,7 @@ pub const V3d = struct {
             };
 
             var attr_streams: [8]AttrStream = undefined;
-            const attr_info = decodeAttrStreams(ram, rec_phys, draw.num_attrs, vs_attr_mask, &attr_streams);
+            const attr_info: AttrInfo = if (gl) |g| decodeAttrStreams(ram, g.rec_phys, draw.num_attrs, g.vs_attr_mask, &attr_streams) else .{ .count = 0, .vpm_words = 0 };
             const active_attrs = attr_streams[0..attr_info.count];
             const vpm_words = attr_info.vpm_words;
             const n_var = @min(@as(usize, fs_num_varyings), 16);
@@ -1019,8 +1177,12 @@ pub const V3d = struct {
             // then the triangles kept.
             // Their clip coordinates too, from the coordinate shader, for the clipper.
             var cs_attrs: [8]AttrStream = undefined;
-            const cs = coordStage(ram, rec_phys, draw.num_attrs, &self.vs_code, &self.cs_decoded, &cs_attrs);
-            const shaded = self.shadeVertices(ram, draw, num_tris, vs_decoded, vs_unifs, active_attrs, vpm_words, n_var, cs) orelse {
+            const cs = if (gl) |g| coordStage(ram, g.rec_phys, draw.num_attrs, &self.vs_code, &self.cs_decoded, &cs_attrs) else null;
+            const has_clip = cs != null or switch (src.vertices) {
+                .nv => |nv| nv.header and nv.clipping,
+                else => false,
+            };
+            const shaded = self.shadeVertices(ram, draw, num_tris, vs_decoded, vs_unifs, active_attrs, vpm_words, n_var, cs, src.vertices, has_clip) orelse {
                 self.overflow_draw_start = draw_idx;
                 break;
             };
@@ -1032,7 +1194,7 @@ pub const V3d = struct {
                     const slot = self.vs_corner_slot.items[t * 3 + corner];
                     ok = ok and self.vs_ok.items[slot];
                     tri_verts[corner] = shaded[slot];
-                    if (cs != null) tri_clip[corner] = self.vs_clip.items[slot];
+                    if (has_clip) tri_clip[corner] = self.vs_clip.items[slot];
                 }
                 if (!ok) continue;
 
@@ -1072,6 +1234,72 @@ pub const V3d = struct {
                     };
                 }
             }
+        }
+    }
+
+    /// A draw's fragment shader, and where its vertices come from.
+    const DrawSource = struct {
+        fs_code_phys: u32,
+        fs_unif_phys: u32,
+        /// Its varyings, the rasterizer's included.
+        fs_num_varyings: u8,
+        vertices: VertexSource,
+    };
+
+    const VertexSource = union(enum) {
+        /// GL: the shader record's vertex shader (and coordinate shader, for the clipper).
+        gl: struct { rec_phys: u32, vs_attr_mask: u8, vs_code_phys: u32, vs_unif_phys: u32 },
+        /// NV: vertices shaded already.
+        nv: NvSource,
+        /// VG: screen coordinates (`vg_verts`).
+        vg,
+    };
+
+    /// NV mode's vertices: `stride` bytes apart from `base`, each its clip coordinates first (if
+    /// `header`; the clipper's if `clipping`), then as a vertex shader writes them (Xs and Ys,
+    /// Zs, 1/Wc, the point size if its record says, the varyings).
+    const NvSource = struct { base: u32, stride: u32, header: bool, clipping: bool };
+
+    fn drawSource(ram: []const u8, draw: DrawCall) ?DrawSource {
+        const mask = vc_bus.ramMask(ram.len);
+        switch (draw.kind) {
+            .gl => {
+                const rec_phys = draw.shader_rec_addr & mask;
+                if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) return null;
+                return .{
+                    .fs_num_varyings = ram[rec_phys + 3] +| rasterizerVaryings(draw),
+                    .fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & mask,
+                    .fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & mask,
+                    .vertices = .{ .gl = .{
+                        .rec_phys = rec_phys,
+                        .vs_attr_mask = ram[rec_phys + 14],
+                        .vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & mask,
+                        .vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & mask,
+                    } },
+                };
+            },
+            .nv => {
+                const rec = draw.shader_rec_addr & mask;
+                if (rec + 16 > ram.len) return null;
+                const flags = ram[rec];
+                return .{
+                    .fs_num_varyings = ram[rec + 3] +| rasterizerVaryings(draw),
+                    .fs_code_phys = std.mem.readInt(u32, ram[rec + 4 ..][0..4], .little) & mask,
+                    .fs_unif_phys = std.mem.readInt(u32, ram[rec + 8 ..][0..4], .little) & mask,
+                    .vertices = .{ .nv = .{
+                        .base = std.mem.readInt(u32, ram[rec + 12 ..][0..4], .little) & mask,
+                        .stride = ram[rec + 1],
+                        .header = flags & 8 != 0,
+                        .clipping = flags & 4 != 0,
+                    } },
+                };
+            },
+            .vg => return .{
+                .fs_num_varyings = draw.fs_varyings,
+                .fs_code_phys = draw.fs_code & mask,
+                .fs_unif_phys = draw.fs_unifs & mask,
+                .vertices = .vg,
+            },
         }
     }
 
@@ -1120,12 +1348,14 @@ pub const V3d = struct {
         vpm_words: usize,
         n_var: usize,
         cs: ?CoordStage,
+        source: VertexSource,
+        has_clip: bool,
     ) ?[]const ShadedVertex {
         if (!self.collectVertices(ram, draw, num_tris)) return null;
         const unique = self.vs_unique.items;
         self.vs_out.resize(tri_allocator, unique.len) catch return null;
         self.vs_ok.resize(tri_allocator, unique.len) catch return null;
-        if (cs != null) self.vs_clip.resize(tri_allocator, unique.len) catch return null;
+        if (has_clip) self.vs_clip.resize(tri_allocator, unique.len) catch return null;
 
         const job: VertexJob = .{
             .ram = ram,
@@ -1139,7 +1369,9 @@ pub const V3d = struct {
             .out = self.vs_out.items,
             .ok = self.vs_ok.items,
             .cs = cs,
-            .clip = if (cs != null) self.vs_clip.items else &.{},
+            .clip = if (has_clip) self.vs_clip.items else &.{},
+            .source = source,
+            .vg_verts = self.vg_verts.items,
         };
         job.runAll();
         return self.vs_out.items;
@@ -1293,6 +1525,9 @@ pub const V3d = struct {
         /// The coordinate shader, if it is run too: each vertex's clip coordinates into `clip`.
         cs: ?CoordStage = null,
         clip: []ClipVertex = &.{},
+        /// Where the vertices come from: shaded here (GL), or as given (NV, VG).
+        source: VertexSource = .{ .gl = undefined },
+        vg_verts: []const [2]f32 = &.{},
 
         fn runAll(job: *const VertexJob) void {
             runVertexJob(job);
@@ -1303,8 +1538,70 @@ pub const V3d = struct {
             while (b < end_batch) : (b += 1) {
                 const lo = b * 16;
                 const hi = @min(lo + 16, job.indices.len);
+                if (job.source != .gl) {
+                    givenBatch(job, lo, hi);
+                    continue;
+                }
                 if (job.cs) |cs| clipBatch(job, cs, lo, hi);
                 if (job.shade) shadeBatch(job, lo, hi);
+            }
+        }
+
+        /// Vertices `lo` to `hi`, as NV or VG mode gives them.
+        fn givenBatch(job: *const VertexJob, lo: usize, hi: usize) void {
+            const ram = job.ram;
+            const no_clip: ClipVertex = .{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) };
+            for (lo..hi) |i| {
+                const index = job.indices[i];
+                var v: ShadedVertex = .{ .point_size = job.draw.point_size };
+                var c = no_clip;
+                var ok = true;
+                switch (job.source) {
+                    .gl => unreachable,
+                    .vg => {
+                        if (index < job.vg_verts.len) {
+                            v.x = job.vg_verts[index][0];
+                            v.y = job.vg_verts[index][1];
+                        } else ok = false;
+                    },
+                    .nv => |nv| {
+                        const layout: VertexLayout = .of(ram, job.draw, job.n_var);
+                        const words = (if (nv.header) @as(usize, 4) else 0) + layout.first_varying + layout.varyings;
+                        const off: usize = @as(usize, nv.base) + @as(usize, index) * nv.stride;
+                        if (off + words * 4 > ram.len) {
+                            ok = false;
+                        } else {
+                            const w = struct {
+                                fn at(r: []const u8, o: usize, k: usize) u32 {
+                                    return std.mem.readInt(u32, r[o + k * 4 ..][0..4], .little);
+                                }
+                            }.at;
+                            var k: usize = 0;
+                            if (nv.header) {
+                                if (nv.clipping) c = .{ .x = @bitCast(w(ram, off, 0)), .y = @bitCast(w(ram, off, 1)), .z = @bitCast(w(ram, off, 2)), .w = @bitCast(w(ram, off, 3)) };
+                                k = 4;
+                            }
+                            const xy = w(ram, off, k);
+                            const xs: i16 = @bitCast(@as(u16, @truncate(xy)));
+                            const ys: i16 = @bitCast(@as(u16, @truncate(xy >> 16)));
+                            v.x = @as(f32, @floatFromInt(xs)) * (1.0 / 16.0) + job.draw.vp_x;
+                            v.y = @as(f32, @floatFromInt(ys)) * (1.0 / 16.0) + job.draw.vp_y;
+                            v.z = @bitCast(w(ram, off, k + 1));
+                            const raw_inv_w: f32 = @bitCast(w(ram, off, k + 2));
+                            v.inv_w = if (raw_inv_w == 0.0) 1.0 else raw_inv_w;
+                            if (layout.point_size) v.point_size = @bitCast(w(ram, off, k + 3));
+                            for (0..layout.varyings) |vi| {
+                                const raw_v: f32 = @bitCast(w(ram, off, k + layout.first_varying + vi));
+                                v.persp_varyings[layout.skip + vi] = raw_v * v.inv_w;
+                            }
+                        }
+                    },
+                }
+                if (job.out.len > 0) {
+                    job.out[i] = v;
+                    job.ok[i] = ok;
+                }
+                if (job.clip.len > 0) job.clip[i] = c;
             }
         }
 
@@ -1490,7 +1787,7 @@ pub const V3d = struct {
 
     /// Whether the vertex shader writes each point's size (after 1/Wc), as its shader record says.
     fn pointSizeWritten(ram: []const u8, draw: DrawCall) bool {
-        if (draw.mode != 0) return false;
+        if (draw.mode != 0 or draw.kind == .vg) return false;
         const rec = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
         return rec < ram.len and ram[rec] & 2 != 0;
     }
@@ -1695,13 +1992,15 @@ pub const V3d = struct {
         words: u32,
     };
 
+    const AttrInfo = struct { count: usize, vpm_words: usize };
+
     fn decodeAttrStreams(
         ram: []const u8,
         rec_phys: u32,
         num_attrs: u8,
         vs_attr_mask: u8,
         out: *[8]AttrStream,
-    ) struct { count: usize, vpm_words: usize } {
+    ) AttrInfo {
         var count: usize = 0;
         var vpm_words: usize = 0;
         for (0..num_attrs) |ai| {
@@ -2798,7 +3097,7 @@ pub const V3d = struct {
         if (!g.begin(self.draws.items.len)) return false;
         for (self.draws.items) |draw| {
             // Lines and points are drawn from vertices shaded on the CPU, which makes them quads.
-            if (!isTriangles(draw)) return false;
+            if (!isTriangles(draw) or draw.kind != .gl) return false;
             // What prepareDrawsForFrame skips, drawing nothing.
             if (numPrims(draw) == 0) continue;
             const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
@@ -3474,22 +3773,62 @@ pub const V3d = struct {
 
         if (self.overflow_draw_start < self.draws.items.len) {
             for (self.draws.items[self.overflow_draw_start..]) |draw| {
-                renderDrawIntoTileBuf(tb, ram, draw, tile_px_x, tile_px_y, tile_size);
+                renderDrawIntoTileBuf(tb, ram, draw, self.vg_verts.items, tile_px_x, tile_px_y, tile_size);
             }
         }
     }
 
-    fn renderDrawIntoTileBuf(tb: *TileBuffer, ram: []const u8, draw: DrawCall, tile_px_x: u32, tile_px_y: u32, tile_size: u32) void {
-        if (numPrims(draw) == 0) return;
-        const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
-        if (rec_phys + 36 + @as(u32, draw.num_attrs) * 8 > ram.len) return;
+    /// `renderDrawIntoTileBuf` for an NV or VG draw: its vertices as given.
+    fn renderGivenDrawIntoTileBuf(tb: *TileBuffer, ram: []const u8, draw: DrawCall, src: DrawSource, vg_verts: []const [2]f32, tile_px_x: u32, tile_px_y: u32, tile_size: u32) void {
+        var code: std.ArrayList(qpu.Inst) = .empty;
+        defer code.deinit(tri_allocator);
+        var fs_list: std.ArrayList(qpu_sim.DecodedInst) = .empty;
+        defer fs_list.deinit(tri_allocator);
+        const fs_decoded = decodeProgramAt(ram, src.fs_code_phys, &code, &fs_list) orelse return;
+        if (fs_decoded.len == 0) return;
+        const fs_unifs = uniformsAt(ram, src.fs_unif_phys);
+        const fast_frag = qpu_sim.analyzeFragmentShader(fs_decoded, fs_unifs);
+        const n_var = @min(@as(usize, src.fs_num_varyings), 16);
+        const num_tris = numPrims(draw);
+        var tri_idx: u32 = 0;
+        while (tri_idx < num_tris) : (tri_idx += 1) {
+            var indices: [3]u32 = undefined;
+            for (&indices, 0..) |*ix, corner| ix.* = triangleCorner(ram, draw, tri_idx, @intCast(corner));
+            var verts: [3]ShadedVertex = undefined;
+            var ok: [3]bool = undefined;
+            var clip: [3]ClipVertex = undefined;
+            const job: VertexJob = .{ .ram = ram, .draw = draw, .decoded = &.{}, .unifs = &.{}, .attrs = &.{}, .vpm_words = 0, .n_var = n_var, .indices = &indices, .out = &verts, .ok = &ok, .clip = &clip, .source = src.vertices, .vg_verts = vg_verts };
+            job.givenBatch(0, 3);
+            if (!ok[0] or !ok[1] or !ok[2]) continue;
+            var pieces: [max_clipped][3]ShadedVertex = undefined;
+            const n_pieces = primitiveTriangles(draw, verts, clip, n_var, &pieces);
+            for (pieces[0..n_pieces]) |p_verts| {
+                const area = (p_verts[1].x - p_verts[0].x) * (p_verts[2].y - p_verts[0].y) -
+                    (p_verts[1].y - p_verts[0].y) * (p_verts[2].x - p_verts[0].x);
+                if (@abs(area) < 1e-6) continue;
+                if (isTriangles(draw) and culled(draw.config_b0, area)) continue;
+                const min_fx = @max(@floor(@min(p_verts[0].x, @min(p_verts[1].x, p_verts[2].x))), @as(f32, @floatFromInt(draw.clip_x)));
+                const min_fy = @max(@floor(@min(p_verts[0].y, @min(p_verts[1].y, p_verts[2].y))), @as(f32, @floatFromInt(draw.clip_y)));
+                const max_fx = @min(@ceil(@max(p_verts[0].x, @max(p_verts[1].x, p_verts[2].x))), @as(f32, @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w)));
+                const max_fy = @min(@ceil(@max(p_verts[0].y, @max(p_verts[1].y, p_verts[2].y))), @as(f32, @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h)));
+                if (min_fx >= max_fx or min_fy >= max_fy) continue;
+                const tri = ShadedTriangle.init(0, @intFromFloat(min_fx), @intFromFloat(min_fy), @intFromFloat(max_fx), @intFromFloat(max_fy), area, p_verts, n_var);
+                rasterizeInTileBuf(tb, ram, draw, &tri, fs_decoded, fs_unifs, src.fs_num_varyings, fast_frag, tile_px_x, tile_px_y, tile_size);
+            }
+        }
+    }
 
-        const fs_num_varyings = ram[rec_phys + 3] +| rasterizerVaryings(draw);
-        const fs_code_phys = std.mem.readInt(u32, ram[rec_phys + 4 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-        const fs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 8 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-        const vs_attr_mask = ram[rec_phys + 14];
-        const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-        const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+    fn renderDrawIntoTileBuf(tb: *TileBuffer, ram: []const u8, draw: DrawCall, vg_verts: []const [2]f32, tile_px_x: u32, tile_px_y: u32, tile_size: u32) void {
+        if (numPrims(draw) == 0) return;
+        const src = drawSource(ram, draw) orelse return;
+        if (src.vertices != .gl) return renderGivenDrawIntoTileBuf(tb, ram, draw, src, vg_verts, tile_px_x, tile_px_y, tile_size);
+        const rec_phys = src.vertices.gl.rec_phys;
+        const fs_num_varyings = src.fs_num_varyings;
+        const fs_code_phys = src.fs_code_phys;
+        const fs_unif_phys = src.fs_unif_phys;
+        const vs_attr_mask = src.vertices.gl.vs_attr_mask;
+        const vs_code_phys = src.vertices.gl.vs_code_phys;
+        const vs_unif_phys = src.vertices.gl.vs_unif_phys;
 
         // The shaders, however long (this may run on several threads at once).
         var code: std.ArrayList(qpu.Inst) = .empty;
@@ -6216,4 +6555,34 @@ test "V3D control lists branch, call sub-lists, and wait on the semaphore" {
     try std.testing.expect(v3d.rcl_waiting == null);
     try std.testing.expectEqual(@as(u32, 1), v3d.rfc);
     try std.testing.expectEqual(@as(u32, 0), v3d.semaphore);
+}
+
+test "V3D VG primitives become triangles: RHTs to the X boundary, fans continued" {
+    var v3d = V3d{};
+    defer v3d.vg_verts.deinit(V3d.tri_allocator);
+    defer v3d.draws.deinit(V3d.tri_allocator);
+    v3d.cur_vp_x = 100;
+    v3d.cur_vp_y = 50;
+    v3d.rht_x_boundary = 300;
+    const xy = struct {
+        fn f(x: i16, y: i16) u32 {
+            return @as(u32, @as(u16, @bitCast(x * 16))) | @as(u32, @as(u16, @bitCast(y * 16))) << 16;
+        }
+    }.f;
+    // An RHT: the trapezoid from its edge (100,50)-(110,70) to x = 300, as two triangles.
+    v3d.vgPrimitives(1, false, &.{ xy(0, 0), xy(10, 20) });
+    try std.testing.expectEqual(@as(usize, 6), v3d.vg_verts.items.len);
+    try std.testing.expectEqual([2]f32{ 300, 70 }, v3d.vg_verts.items[2]);
+    try std.testing.expectEqual([2]f32{ 300, 50 }, v3d.vg_verts.items[5]);
+    // A fan of two triangles, continued by one more (its first two coordinates the last's centre
+    // and last vertex).
+    v3d.vgPrimitives(6, false, &.{ xy(0, 0), xy(10, 0), xy(10, 10), xy(0, 10) });
+    v3d.vgPrimitives(6, true, &.{ 0, 0, xy(-10, 10) });
+    try std.testing.expectEqual(@as(usize, 6 + 6 + 3), v3d.vg_verts.items.len);
+    const last = v3d.vg_verts.items[12..15];
+    try std.testing.expectEqual([2]f32{ 100, 50 }, last[0]);
+    try std.testing.expectEqual([2]f32{ 100, 60 }, last[1]);
+    try std.testing.expectEqual([2]f32{ 90, 60 }, last[2]);
+    try std.testing.expectEqual(@as(usize, 3), v3d.draws.items.len);
+    try std.testing.expectEqual(V3d.DrawMode.vg, v3d.draws.items[2].kind);
 }
