@@ -261,6 +261,26 @@ pub const V3d = struct {
     srqul: u32 = 0,
     srqcs: u32 = 0,
     vpmbase: u32 = 0,
+    /// Performance counters: their values, sources (PCTRS), and enables (PCTRE).
+    pctr: [16]u32 = @splat(0),
+    pctrs: [16]u5 = @splat(0),
+    pctre: u32 = 0,
+
+    /// The binning thread stopped out of memory (until given overspill: BPOS), where it goes on
+    /// from, and the tile list blocks it still needs.
+    bcl_stalled: bool = false,
+    bcl_resume: u32 = 0,
+    bin_need_blocks: u64 = 0,
+    /// The frame's tile list blocks taken so far, and the tile allocation's block sizes and
+    /// tiles (TILE_BINNING_MODE_CONFIG).
+    bin_blocks_taken: u64 = 0,
+    bin_initial_block: u32 = 32,
+    bin_block: u32 = 32,
+    bin_tiles: u32 = 0,
+    /// The semaphore between the threads (INCREMENT_SEMAPHORE, WAIT_ON_SEMAPHORE), and a
+    /// rendering list waiting on it (its start and end).
+    semaphore: u32 = 0,
+    rcl_waiting: ?[2]u32 = null,
 
     // Binning state collected during BCL execution
     /// The frame's draws, as many as the binner is given (it has no limit).
@@ -364,6 +384,15 @@ pub const V3d = struct {
         self.srqul = 0;
         self.srqcs = 0;
         self.vpmbase = 0;
+        self.pctr = @splat(0);
+        self.pctrs = @splat(0);
+        self.pctre = 0;
+        self.bcl_stalled = false;
+        self.bin_need_blocks = 0;
+        self.bin_blocks_taken = 0;
+        self.bin_tiles = 0;
+        self.semaphore = 0;
+        self.rcl_waiting = null;
         self.draws.clearRetainingCapacity();
         self.cur_shader_rec = 0;
         self.cur_num_attrs = 0;
@@ -408,7 +437,26 @@ pub const V3d = struct {
     }
 
     pub fn irqPending(self: *const V3d) bool {
-        return (self.intctl & self.int_mask) != 0;
+        return (self.intStatus() & self.int_mask) != 0;
+    }
+
+    /// INTCTL: the interrupts raised, and OUTOMEM while the binner has no overspill memory
+    /// (BPOS 0), whatever's cleared.
+    fn intStatus(self: *const V3d) u32 {
+        return self.intctl | (if (self.bpos == 0) INT_OUTOMEM else 0);
+    }
+
+    fn ctStatus(self: *const V3d, cs: u32, running: bool) u32 {
+        const sema: u32 = @min(self.semaphore, 7);
+        return (cs & ~@as(u32, 1 << 5 | 7 << 12)) | @as(u32, @intFromBool(running)) << 5 | sema << 12;
+    }
+
+    /// `n` of performance counter source `src` happened: added to the counters counting it.
+    fn countEvent(self: *V3d, src: u5, n: u64) void {
+        if (self.pctre & (1 << 31) == 0) return;
+        for (&self.pctr, self.pctrs, 0..) |*c, sc, i| {
+            if (sc == src and self.pctre & (@as(u32, 1) << @intCast(i)) != 0) c.* +%= @truncate(n);
+        }
     }
 
     pub fn read32(self: *const V3d, offset: u32) u32 {
@@ -419,11 +467,12 @@ pub const V3d = struct {
             0x010 => self.scratch,
             0x020 => self.l2cactl,
             0x024 => self.slcactl,
-            0x030 => self.intctl,
+            0x030 => self.intStatus(),
             0x034 => self.int_mask,
             0x038 => ~self.int_mask,
-            0x100 => self.ct0cs & ~@as(u32, 1 << 5), // CTRUN=0 (completes synchronously)
-            0x104 => self.ct1cs & ~@as(u32, 1 << 5),
+            // CTRUN while stopped (out of memory, or at the semaphore), else done at once; CTSEMA.
+            0x100 => self.ctStatus(self.ct0cs, self.bcl_stalled),
+            0x104 => self.ctStatus(self.ct1cs, self.rcl_waiting != null),
             0x108 => self.ct0ea,
             0x10c => self.ct1ea,
             0x110 => self.ct0ca,
@@ -444,6 +493,9 @@ pub const V3d = struct {
             0x438 => self.srqul,
             0x43c => self.srqcs,
             0x500 => self.vpmbase,
+            0x670 => 0,
+            0x674 => self.pctre,
+            0x680...0x6fc => if (offset & 4 == 0) self.pctr[(offset - 0x680) / 8] else self.pctrs[(offset - 0x684) / 8],
             0xf00, 0xf04, 0xf08, 0xf0c, 0xf10, 0xf20 => 0,
             else => 0,
         };
@@ -471,23 +523,16 @@ pub const V3d = struct {
                     self.ct1cs = val;
                 }
             },
-            0x108 => { // V3D_CT0EA -> Run Binning Control List (BCL)
+            0x108 => { // V3D_CT0EA -> Run Binning Control List (BCL), to here
                 self.ct0ea = val;
-                if (self.ct0ea > self.ct0ca) {
-                    self.executeBcl(ram, self.ct0ca, self.ct0ea);
-                    self.ct0ca = self.ct0ea;
-                    self.bfc +%= 1;
-                    self.intctl |= INT_FLDONE;
-                }
+                if (!self.bcl_stalled and self.ct0ea != self.ct0ca) self.runBcl(ram, self.ct0ca);
             },
-            0x10c => { // V3D_CT1EA -> Run Rendering Control List (RCL)
+            0x10c => { // V3D_CT1EA -> Run Rendering Control List (RCL), to here
                 self.ct1ea = val;
-                if (self.ct1ea > self.ct1ca) {
-                    self.executeRcl(ram, self.ct1ca, self.ct1ea);
-                    self.ct1ca = self.ct1ea;
-                    self.rfc +%= 1;
-                    self.intctl |= INT_FRDONE;
-                    self.frame_dirty = true;
+                if (self.ct1ea != self.ct1ca and self.rcl_waiting == null) {
+                    // One waiting on the semaphore runs once binning increments it.
+                    self.rcl_waiting = .{ self.ct1ca, self.ct1ea };
+                    self.runWaitingRcl(ram);
                 }
             },
             0x110 => self.ct0ca = val,
@@ -495,7 +540,17 @@ pub const V3d = struct {
             0x134 => self.bfc &= ~val,
             0x138 => self.rfc &= ~val,
             0x308 => self.bpoa = val,
-            0x30c => self.bpos = val,
+            0x30c => {
+                self.bpos = val;
+                // Binning stopped out of memory goes on.
+                if (self.bcl_stalled and val != 0) {
+                    if (self.binAllocate()) {
+                        self.bcl_stalled = false;
+                        self.binFlushed();
+                        self.runBcl(ram, self.bcl_resume);
+                    }
+                }
+            },
             0x310 => self.bxcf = val,
             0x410 => self.sqrsv0 = val,
             0x414 => self.sqrsv1 = val,
@@ -509,33 +564,199 @@ pub const V3d = struct {
             0x438 => self.srqul = val,
             0x43c => self.srqcs = val,
             0x500 => self.vpmbase = val,
+            0x670 => { // PCTRC: counters cleared
+                for (&self.pctr, 0..) |*c, i| {
+                    if (val & (@as(u32, 1) << @intCast(i)) != 0) c.* = 0;
+                }
+            },
+            0x674 => self.pctre = val,
+            0x680...0x6fc => if (offset & 4 == 0) {
+                self.pctr[(offset - 0x680) / 8] = val;
+            } else {
+                self.pctrs[(offset - 0x684) / 8] = @truncate(val);
+            },
             else => {},
         }
+    }
+
+    /// Runs the binning list from `start` to CT0EA (or until it runs out of memory), then a
+    /// rendering list waiting on the semaphore.
+    fn runBcl(self: *V3d, ram: []u8, start: u32) void {
+        self.executeBcl(ram, start, self.ct0ea);
+        if (!self.bcl_stalled) self.ct0ca = self.ct0ea;
+        self.runWaitingRcl(ram);
+    }
+
+    /// Runs the rendering list waiting, if the semaphore lets it: one with as many
+    /// WAIT_ON_SEMAPHOREs as it counts.
+    fn runWaitingRcl(self: *V3d, ram: []u8) void {
+        const r = self.rcl_waiting orelse return;
+        const waits = rclSemaphoreWaits(ram, r[0], r[1]);
+        if (waits > self.semaphore) return;
+        self.semaphore -= waits;
+        self.rcl_waiting = null;
+        self.executeRcl(ram, r[0], r[1]);
+        self.ct1ca = r[1];
+        self.rfc +%= 1;
+        self.intctl |= INT_FRDONE;
+        self.frame_dirty = true;
+    }
+
+    /// The WAIT_ON_SEMAPHOREs in a rendering list from `start` to `end`.
+    fn rclSemaphoreWaits(ram: []const u8, start: u32, end_bus: u32) u32 {
+        var pc = start & vc_bus.ramMask(ram.len);
+        const end = end_bus & vc_bus.ramMask(ram.len);
+        var waits: u32 = 0;
+        var steps: usize = 0;
+        while (pc != end and pc < ram.len and steps < 1 << 22) : (steps += 1) {
+            const size: u32 = switch (ram[pc]) {
+                0 => break,
+                8 => blk: {
+                    waits += 1;
+                    break :blk 1;
+                },
+                1, 4, 5, 18, 24, 25 => 1,
+                16 => {
+                    if (pc + 5 > ram.len) break;
+                    pc = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+                    continue;
+                },
+                17, 26, 27 => 5,
+                28, 29 => 7,
+                113 => 11,
+                114 => 14,
+                115 => 3,
+                else => break,
+            };
+            pc += size;
+        }
+        return waits;
+    }
+
+    /// A flush of the binning list: the memory its tile lists take beyond their initial blocks
+    /// taken from the pool (if it may be too small: counted from the frame binned), then the
+    /// flush counted. False if it ran out of memory.
+    fn binFlush(self: *V3d, ram: []const u8) bool {
+        var prims: u64 = 0;
+        for (self.draws.items) |d| prims += numPrims(d);
+        self.countEvent(1, prims);
+        if (self.bin_tiles != 0 and @as(u64, self.bpcs) + self.bpos < prims * 8 + self.draws.items.len * 8) {
+            self.prepareDrawsForFrame(ram);
+            const total = self.tileListBlocks();
+            self.bin_need_blocks = total -| self.bin_blocks_taken;
+            self.bin_blocks_taken = @max(total, self.bin_blocks_taken);
+        } else self.bin_need_blocks = 0;
+        if (!self.binAllocate()) return false;
+        self.binFlushed();
+        return true;
+    }
+
+    fn binFlushed(self: *V3d) void {
+        self.bfc +%= 1;
+        self.intctl |= INT_FLDONE;
+    }
+
+    /// The tile list blocks past their initial ones the frame binned takes: each tile's list
+    /// some 7 bytes a draw in it (its state and primitive format) and 2 a primitive, in its
+    /// initial block, then more (each ending in a 5-byte branch).
+    fn tileListBlocks(self: *const V3d) u64 {
+        var bytes: [32 * 32]u32 = @splat(1);
+        var last_draw: [32 * 32]u32 = @splat(std.math.maxInt(u32));
+        for (self.bin_pairs.items) |pair| {
+            const draw = self.shaded_tris.items[pair.tri].draw_idx;
+            if (last_draw[pair.tile] != draw) {
+                last_draw[pair.tile] = draw;
+                bytes[pair.tile] += 7;
+            }
+            bytes[pair.tile] += 2;
+        }
+        var blocks: u64 = 0;
+        const first = self.bin_initial_block - 5;
+        const rest = self.bin_block - 5;
+        for (bytes) |b| {
+            if (b > first) blocks += (b - first + rest - 1) / rest;
+        }
+        return blocks;
+    }
+
+    /// Takes the blocks needed from the pool (BPCA, BPCS), then from the overspill (BPOA, BPOS:
+    /// raising SPILLUSE). False if both run out (OUTOMEM is then raised, until more overspill).
+    fn binAllocate(self: *V3d) bool {
+        while (self.bin_need_blocks > 0) {
+            if (self.bpcs >= self.bin_block) {
+                const n = @min(self.bin_need_blocks, self.bpcs / self.bin_block);
+                self.bpcs -= @intCast(n * self.bin_block);
+                self.bpca +%= @intCast(n * self.bin_block);
+                self.bin_need_blocks -= n;
+                continue;
+            }
+            if (self.bpos < self.bin_block) return false;
+            self.bpca = self.bpoa;
+            self.bpcs = self.bpos;
+            self.bpoa = 0;
+            self.bpos = 0;
+            self.intctl |= INT_SPILLUSE;
+        }
+        return true;
     }
 
     fn executeBcl(self: *V3d, ram: []const u8, start_bus: u32, end_bus: u32) void {
         const prof_start = profile.now();
         defer profile.end(.v3d_bin, prof_start);
         var pc = start_bus & vc_bus.ramMask(ram.len);
+        // It runs until its address is the end's (sub-lists may be anywhere).
         const end = end_bus & vc_bus.ramMask(ram.len);
-        if (end > ram.len) return;
+        var returns: [4]u32 = undefined;
+        var depth: usize = 0;
+        var steps: usize = 0;
 
-        while (pc < end) {
+        while (pc != end and pc < ram.len) : (steps += 1) {
+            if (steps > 1 << 26) break;
             const op = ram[pc];
             switch (op) {
                 0 => break, // HALT
-                1, 5, 8, 18 => pc += 1, // NOP, FLUSH_ALL, WAIT_SEMAPHORE, RETURN
-                4, 7 => pc += 1, // FLUSH, INCREMENT_SEMAPHORE
-                6 => { // START_TILE_BINNING
-                    self.draws.clearRetainingCapacity();
+                1, 8 => pc += 1, // NOP, WAIT_ON_SEMAPHORE
+                4, 5 => { // FLUSH, FLUSH_ALL_STATE
+                    pc += 1;
+                    if (!self.binFlush(ram)) {
+                        // Out of memory: stopped, until given more.
+                        self.bcl_stalled = true;
+                        self.bcl_resume = pc;
+                        self.ct0ca = pc;
+                        return;
+                    }
+                },
+                7 => { // INCREMENT_SEMAPHORE
+                    self.semaphore +|= 1;
                     pc += 1;
                 },
-                16, 17 => { // BRANCH / BRANCH_TO_SUB_LIST
-                    if (pc + 5 > end) break;
-                    pc += 5;
+                6 => { // START_TILE_BINNING
+                    self.draws.clearRetainingCapacity();
+                    self.bin_blocks_taken = 0;
+                    pc += 1;
+                },
+                16 => { // BRANCH
+                    if (pc + 5 > ram.len) break;
+                    pc = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+                },
+                17 => { // BRANCH_TO_SUB_LIST: returned from by RETURN_FROM_SUB_LIST
+                    if (pc + 5 > ram.len) break;
+                    if (depth < returns.len) {
+                        returns[depth] = pc + 5;
+                        depth += 1;
+                    }
+                    pc = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+                },
+                18 => { // RETURN_FROM_SUB_LIST
+                    if (depth == 0) {
+                        pc += 1;
+                    } else {
+                        depth -= 1;
+                        pc = returns[depth];
+                    }
                 },
                 32 => { // GL_INDEXED_PRIMITIVE (14 bytes)
-                    if (pc + 14 > end) break;
+                    if (pc + 14 > ram.len) break;
                     const mode_byte = ram[pc + 1];
                     const count = std.mem.readInt(u32, ram[pc + 2 ..][0..4], .little);
                     const index_off = std.mem.readInt(u32, ram[pc + 6 ..][0..4], .little);
@@ -570,7 +791,7 @@ pub const V3d = struct {
                     pc += 14;
                 },
                 33 => { // GL_ARRAY_PRIMITIVE (10 bytes)
-                    if (pc + 10 > end) break;
+                    if (pc + 10 > ram.len) break;
                     const mode = ram[pc + 1] & 0x0f;
                     const count = std.mem.readInt(u32, ram[pc + 2 ..][0..4], .little);
                     const first = std.mem.readInt(u32, ram[pc + 6 ..][0..4], .little);
@@ -603,7 +824,7 @@ pub const V3d = struct {
                 },
                 56 => pc += 2, // PRIMITIVE_LIST_FORMAT
                 64 => { // GL_SHADER_STATE (5 bytes)
-                    if (pc + 5 > end) break;
+                    if (pc + 5 > ram.len) break;
                     const word = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
                     const n_attr: u4 = @intCast(if ((word & 7) == 0) 8 else (word & 7));
                     self.cur_num_attrs = n_attr;
@@ -611,7 +832,7 @@ pub const V3d = struct {
                     pc += 5;
                 },
                 96 => { // CONFIGURATION_BITS (4 bytes)
-                    if (pc + 4 > end) break;
+                    if (pc + 4 > ram.len) break;
                     self.cur_cfg0 = ram[pc + 1];
                     self.cur_cfg1 = ram[pc + 2];
                     self.cur_cfg2 = ram[pc + 3];
@@ -619,18 +840,18 @@ pub const V3d = struct {
                 },
                 97, 101 => pc += 5, // FLAT_SHADE, DEPTH_OFFSET
                 98 => { // POINT_SIZE (5 bytes): a float, in pixels
-                    if (pc + 5 > end) break;
+                    if (pc + 5 > ram.len) break;
                     self.cur_point_size = @bitCast(std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little));
                     pc += 5;
                 },
                 99 => { // LINE_WIDTH (5 bytes): a float, in pixels
-                    if (pc + 5 > end) break;
+                    if (pc + 5 > ram.len) break;
                     self.cur_line_width = @bitCast(std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little));
                     pc += 5;
                 },
                 100 => pc += 3, // RHT_X_BOUNDARY
                 102 => { // CLIP_WINDOW (9 bytes)
-                    if (pc + 9 > end) break;
+                    if (pc + 9 > ram.len) break;
                     self.cur_clip_x = std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little);
                     self.cur_clip_y = std.mem.readInt(u16, ram[pc + 3 ..][0..2], .little);
                     self.cur_clip_w = std.mem.readInt(u16, ram[pc + 5 ..][0..2], .little);
@@ -638,7 +859,7 @@ pub const V3d = struct {
                     pc += 9;
                 },
                 103 => { // VIEWPORT_OFFSET (5 bytes, signed 12.4 fixed point)
-                    if (pc + 5 > end) break;
+                    if (pc + 5 > ram.len) break;
                     const vx: i16 = @bitCast(std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little));
                     const vy: i16 = @bitCast(std.mem.readInt(u16, ram[pc + 3 ..][0..2], .little));
                     self.cur_vp_x = @as(f32, @floatFromInt(vx)) / 16.0;
@@ -647,21 +868,33 @@ pub const V3d = struct {
                 },
                 104 => pc += 9, // Z_CLIPPING
                 105 => { // CLIPPER_XY_SCALING (9 bytes): x and y, in 16ths of a pixel
-                    if (pc + 9 > end) break;
+                    if (pc + 9 > ram.len) break;
                     self.cur_clip_scale_x = @bitCast(std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little));
                     self.cur_clip_scale_y = @bitCast(std.mem.readInt(u32, ram[pc + 5 ..][0..4], .little));
                     pc += 9;
                 },
                 106 => { // CLIPPER_Z_SCALING (9 bytes): scale, then offset
-                    if (pc + 9 > end) break;
+                    if (pc + 9 > ram.len) break;
                     self.cur_z_scale = @bitCast(std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little));
                     self.cur_z_offset = @bitCast(std.mem.readInt(u32, ram[pc + 5 ..][0..4], .little));
                     pc += 9;
                 },
                 112 => { // TILE_BINNING_MODE_CONFIG (16 bytes)
-                    if (pc + 16 > end) break;
-                    self.multisample_bin = (ram[pc + 15] & 1) != 0;
+                    if (pc + 16 > ram.len) break;
+                    const flags = ram[pc + 15];
+                    self.multisample_bin = (flags & 1) != 0;
                     self.draws.clearRetainingCapacity();
+                    // The pool after each tile's initial block.
+                    const sizes = [4]u32{ 32, 64, 128, 256 };
+                    self.bin_initial_block = sizes[(flags >> 3) & 3];
+                    self.bin_block = sizes[(flags >> 5) & 3];
+                    self.bin_tiles = @as(u32, ram[pc + 13]) * ram[pc + 14];
+                    self.bin_blocks_taken = 0;
+                    const pool = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
+                    const pool_size = std.mem.readInt(u32, ram[pc + 5 ..][0..4], .little);
+                    const initial = self.bin_tiles * self.bin_initial_block;
+                    self.bpca = pool +% initial;
+                    self.bpcs = pool_size -| initial;
                     pc += 16;
                 },
                 else => break,
@@ -2100,6 +2333,7 @@ pub const V3d = struct {
         clear_vg_mask: u8 = 0,
         cur_has_render: bool = false,
         tile_loaded: bool = false,
+        steps: usize = 0,
 
         fn ms(it: *const RclReader) bool {
             return it.fb_flags & 1 != 0;
@@ -2182,19 +2416,21 @@ pub const V3d = struct {
         }
 
         fn next(it: *RclReader, ram: []const u8) ?TileJob {
-            while (it.pc < it.end) {
+            // It runs until its address is the end's (branched to anywhere).
+            while (it.pc != it.end and it.pc < ram.len) {
+                it.steps += 1;
+                if (it.steps > 1 << 24) break;
                 const pc = it.pc;
-                const end = it.end;
                 const op = ram[pc];
                 switch (op) {
                     0 => break, // HALT
                     1, 4, 5, 8, 18 => it.pc += 1,
                     16 => { // BRANCH
-                        if (pc + 5 > end) break;
+                        if (pc + 5 > ram.len) break;
                         it.pc = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & vc_bus.ramMask(ram.len);
                     },
                     17 => { // BRANCH_TO_SUB_LIST (executes binned primitives for the current tile)
-                        if (pc + 5 > end) break;
+                        if (pc + 5 > ram.len) break;
                         it.startTile();
                         it.cur_has_render = true;
                         it.pc += 5;
@@ -2212,7 +2448,7 @@ pub const V3d = struct {
                         return j;
                     },
                     28 => { // STORE_TILE_BUFFER_GENERAL (7 bytes)
-                        if (pc + 7 > end) break;
+                        if (pc + 7 > ram.len) break;
                         const bits = std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little);
                         const addr_word = std.mem.readInt(u32, ram[pc + 3 ..][0..4], .little);
                         const buf_kind = bits & 7;
@@ -2235,7 +2471,7 @@ pub const V3d = struct {
                         if (j) |stored| return stored;
                     },
                     26 => { // STORE_FULL_RES_TILE_BUFFER (5 bytes): the tile buffer as it is
-                        if (pc + 5 > end) break;
+                        if (pc + 5 > ram.len) break;
                         const word = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
                         it.startTile();
                         var j = it.job(word & ~@as(u32, 0xf), 0, 0);
@@ -2246,7 +2482,7 @@ pub const V3d = struct {
                         return j;
                     },
                     27 => { // LOAD_FULL_RES_TILE_BUFFER (5 bytes): the tile buffer as it was stored
-                        if (pc + 5 > end) break;
+                        if (pc + 5 > ram.len) break;
                         const word = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
                         const addr = word & ~@as(u32, 0xf);
                         if (word & 1 == 0) {
@@ -2261,7 +2497,7 @@ pub const V3d = struct {
                         it.pc += 5;
                     },
                     29 => { // LOAD_TILE_BUFFER_GENERAL (7 bytes)
-                        if (pc + 7 > end) break;
+                        if (pc + 7 > ram.len) break;
                         const bits = std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little);
                         const addr_word = std.mem.readInt(u32, ram[pc + 3 ..][0..4], .little);
                         const buf_kind = bits & 7;
@@ -2294,7 +2530,7 @@ pub const V3d = struct {
                         it.pc += 7;
                     },
                     113 => { // TILE_RENDERING_MODE_CONFIG (11 bytes)
-                        if (pc + 11 > end) break;
+                        if (pc + 11 > ram.len) break;
                         it.fb_addr = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
                         it.fb_width = std.mem.readInt(u16, ram[pc + 5 ..][0..2], .little);
                         it.fb_height = std.mem.readInt(u16, ram[pc + 7 ..][0..2], .little);
@@ -2302,7 +2538,7 @@ pub const V3d = struct {
                         it.pc += 11;
                     },
                     114 => { // CLEAR_COLORS (14 bytes)
-                        if (pc + 14 > end) break;
+                        if (pc + 14 > ram.len) break;
                         const raw_c0 = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
                         const zs_raw = std.mem.readInt(u32, ram[pc + 9 ..][0..4], .little);
                         const zs_word = zs_raw & 0x00FFFFFF;
@@ -2320,7 +2556,7 @@ pub const V3d = struct {
                         it.pc += 14;
                     },
                     115 => { // TILE_COORDINATES (3 bytes)
-                        if (pc + 3 > end) break;
+                        if (pc + 3 > ram.len) break;
                         // Sent again between a tile's stores (the tile buffer kept): the same tile,
                         // still drawn.
                         if (it.has_tile_coords and ram[pc + 1] == it.cur_tile_x and ram[pc + 2] == it.cur_tile_y) {
@@ -5949,4 +6185,35 @@ test "V3D stencil setups test and update stencils" {
     // A write mask word after: the front's 0xf0.
     const masked = S.of(&.{ front, 0x00f0 }, false).?;
     try std.testing.expectEqual(@as(u8, 0x0e), masked.apply(masked.zpass, 0xfe));
+}
+
+test "V3D control lists branch, call sub-lists, and wait on the semaphore" {
+    var v3d = V3d{};
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+
+    // Rendering list first: tile coordinates, then a wait (it runs once binning increments).
+    @memcpy(ram[0x3000..][0..4], &[_]u8{ 115, 0, 0, 8 });
+    v3d.write32(0x114, 0x3000, ram); // CT1CA
+    v3d.write32(0x10c, 0x3004, ram); // CT1EA
+    try std.testing.expect(v3d.rcl_waiting != null);
+    try std.testing.expectEqual(@as(u32, 1 << 5), v3d.read32(0x104) & (1 << 5));
+    try std.testing.expectEqual(@as(u32, 0), v3d.rfc);
+
+    // Binning list: a sub-list (incrementing the semaphore, nested once), then a branch to a
+    // flush, where it ends.
+    @memcpy(ram[0x1000..][0..10], &[_]u8{ 17, 0x00, 0x20, 0, 0, 16, 0x00, 0x28, 0, 0 });
+    @memcpy(ram[0x2000..][0..6], &[_]u8{ 17, 0x00, 0x24, 0, 0, 18 });
+    @memcpy(ram[0x2400..][0..2], &[_]u8{ 7, 18 });
+    ram[0x2800] = 4;
+    v3d.write32(0x110, 0x1000, ram); // CT0CA
+    v3d.write32(0x108, 0x2801, ram); // CT0EA
+    try std.testing.expectEqual(@as(u32, 1), v3d.bfc);
+    try std.testing.expectEqual(@as(u32, 0x2801), v3d.ct0ca);
+    // The rendering list ran, the semaphore taken.
+    try std.testing.expect(v3d.rcl_waiting == null);
+    try std.testing.expectEqual(@as(u32, 1), v3d.rfc);
+    try std.testing.expectEqual(@as(u32, 0), v3d.semaphore);
 }
