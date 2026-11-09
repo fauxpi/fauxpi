@@ -2151,9 +2151,10 @@ fn sampleTmuFull(memory: []const u8, cfg: texture.Config, cube: bool, extra: Tex
     }
     var out: Vec = undefined;
     var hi: Vec = undefined;
+    var levels: Levels = .{ .memory = memory, .cfg = cfg, .extra = extra };
     for (0..lanes) |lane| {
         const border: u64 = if (req.r) |rv| (if (cube) 0 else rv[lane]) else 0;
-        const v = sampleLod(memory, cfg, extra, cfg.offset +% face[lane] *% extra.cube_stride, s[lane], t[lane], lod[lane], border);
+        const v = sampleLod(&levels, face[lane], s[lane], t[lane], lod[lane], border);
         out[lane] = @truncate(v);
         hi[lane] = @truncate(v >> 32);
     }
@@ -2161,23 +2162,45 @@ fn sampleTmuFull(memory: []const u8, cfg: texture.Config, cube: bool, extra: Tex
     return out;
 }
 
+/// A texture's levels (of each cube face), each laid out once for a lookup's elements.
+const Levels = struct {
+    memory: []const u8,
+    cfg: texture.Config,
+    extra: TexExtra,
+    pts: [6][16]?PrecomputedTex = @splat(@splat(null)),
+
+    fn get(l: *Levels, face: u32, level: u32) ?PrecomputedTex {
+        const fc = @min(face, 5);
+        const lv = @min(level, 15);
+        if (l.pts[fc][lv]) |pt| return pt;
+        const base = l.cfg.offset +% fc *% l.extra.cube_stride;
+        const lc = levelConfig(l.cfg, base, lv, l.memory.len);
+        var pt = PrecomputedTex.init(lc, l.memory.len) catch return null;
+        const e = l.extra;
+        if (e.child_w != 0) pt.setChild(e.child_w >> @intCast(lv), e.child_h >> @intCast(lv), e.child_x >> @intCast(lv), e.child_y >> @intCast(lv));
+        l.pts[fc][lv] = pt;
+        return pt;
+    }
+};
+
 /// A lookup at level of detail `lod` (magnified at 0 or less).
-fn sampleLod(memory: []const u8, cfg: texture.Config, extra: TexExtra, base: u32, s: f32, t: f32, lod: f32, border: u64) u64 {
-    if (!(lod > 0)) return sampleLevel(memory, cfg, extra, base, 0, cfg.mag_filter, s, t, border);
+fn sampleLod(levels: *Levels, face: u32, s: f32, t: f32, lod: f32, border: u64) u64 {
+    const cfg = levels.cfg;
+    if (!(lod > 0)) return sampleLevel(levels, face, 0, cfg.mag_filter, s, t, border);
     const mipmapped = cfg.mip_filter != .none and cfg.mip_levels > 0;
-    if (!mipmapped) return sampleLevel(memory, cfg, extra, base, 0, cfg.min_filter, s, t, border);
+    if (!mipmapped) return sampleLevel(levels, face, 0, cfg.min_filter, s, t, border);
     const top: f32 = @floatFromInt(cfg.mip_levels);
     if (cfg.mip_filter == .nearest) {
         const l: u32 = @intFromFloat(@min(@floor(lod + 0.5), top));
-        return sampleLevel(memory, cfg, extra, base, l, cfg.min_filter, s, t, border);
+        return sampleLevel(levels, face, l, cfg.min_filter, s, t, border);
     }
     const l0 = @floor(lod);
-    if (l0 >= top) return sampleLevel(memory, cfg, extra, base, cfg.mip_levels, cfg.min_filter, s, t, border);
+    if (l0 >= top) return sampleLevel(levels, face, cfg.mip_levels, cfg.min_filter, s, t, border);
     const frac: u32 = @intFromFloat(@round((lod - l0) * 256.0));
     const level: u32 = @intFromFloat(l0);
-    const a = sampleLevel(memory, cfg, extra, base, level, cfg.min_filter, s, t, border);
+    const a = sampleLevel(levels, face, level, cfg.min_filter, s, t, border);
     if (frac == 0) return a;
-    const b = sampleLevel(memory, cfg, extra, base, level + 1, cfg.min_filter, s, t, border);
+    const b = sampleLevel(levels, face, level + 1, cfg.min_filter, s, t, border);
     return blendLevels(cfg.type, a, b, frac);
 }
 
@@ -2212,12 +2235,11 @@ fn blendLevels(ty: texture.Type, a: u64, b: u64, frac: u32) u64 {
 }
 
 /// A lookup of level `level` with `filter`.
-fn sampleLevel(memory: []const u8, cfg: texture.Config, extra: TexExtra, base: u32, level: u32, filter: texture.Filter, s: f32, t: f32, border: u64) u64 {
-    var lc = levelConfig(cfg, base, level, memory.len);
-    lc.mag_filter = filter;
-    var pt = PrecomputedTex.init(lc, memory.len) catch return 0xff000000;
-    if (extra.child_w != 0) pt.setChild(extra.child_w >> @intCast(level), extra.child_h >> @intCast(level), extra.child_x >> @intCast(level), extra.child_y >> @intCast(level));
+fn sampleLevel(levels: *Levels, face: u32, level: u32, filter: texture.Filter, s: f32, t: f32, border: u64) u64 {
+    var pt = levels.get(face, level) orelse return 0xff000000;
+    pt.cfg.mag_filter = filter;
     pt.border = border;
+    const memory = levels.memory;
     if (pt.float16 or pt.unblended) return pt.sampleWide(memory, s, t) catch 0xff000000;
     return pt.sample(memory, s, t) catch 0xff000000;
 }
