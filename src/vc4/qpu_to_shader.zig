@@ -787,7 +787,7 @@ pub fn translateWith(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, la
     // The stencil test, the samples drawn, Z from the shader, and the coverage and facing:
     // left to qpu_sim.
     const tlb = qpu_sim.tlbUse(decoded);
-    if (tlb.stencil or tlb.ms_flags or tlb.shader_z or tlb.reads_flags) t.shader.unsupported = true;
+    if (tlb.stencil or tlb.ms_flags or tlb.shader_z or tlb.reads_flags or tlb.vg_mask) t.shader.unsupported = true;
 
     if (lang == .glsl) {
         try w.writeAll(if (t.shader.per_sample) glsl_inputs_centre else glsl_inputs);

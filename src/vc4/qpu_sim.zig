@@ -38,6 +38,8 @@ pub const Env = struct {
     /// (regfile B): 1 where the primitive faces back.
     ms_mask: Vec = splat(0xf),
     rev_flag: Vec = splat(0),
+    /// What an alpha-mask load reads: each fragment's VG mask.
+    alpha_mask_in: Vec = splat(0),
     texture_memory: []const u8 = &.{},
     texture_memory1: []const u8 = &.{},
     textures: []const []const u8 = &.{},
@@ -94,6 +96,9 @@ pub const FragResult = struct {
     /// The TLB_STENCIL_SETUP words written (element 0's), in turn.
     stencil_setups: [3]u32 = @splat(0),
     stencil_count: usize = 0,
+    /// The VG mask written (TLB_ALPHA_MASK: bits 7:0), and where.
+    alpha_mask: Vec = splat(0),
+    alpha_mask_mask: u16 = 0,
 };
 
 /// The lanes `cond` holds for.
@@ -752,9 +757,11 @@ pub const TlbUse = struct {
     conditional: bool = false,
     /// Reads MS_FLAGS or REV_FLAG.
     reads_flags: bool = false,
+    /// Reads or writes the VG mask.
+    vg_mask: bool = false,
 
     pub fn any(t: TlbUse) bool {
-        return t.stencil or t.ms_flags or t.shader_z or t.conditional or t.reads_flags;
+        return t.stencil or t.ms_flags or t.shader_z or t.conditional or t.reads_flags or t.vg_mask;
     }
 };
 
@@ -762,6 +769,7 @@ pub fn tlbUse(decoded: []const DecodedInst) TlbUse {
     var t: TlbUse = .{};
     for (decoded) |d| {
         if (d.sig == .branch) continue;
+        if (d.sig == .alpha_mask_load) t.vg_mask = true;
         if (d.raddr_a == qpu.R.ms_rev_flags or (d.raddr_b == qpu.R.ms_rev_flags and d.sig != .small_imm and d.sig != .load_imm)) {
             if (d.sig != .load_imm) t.reads_flags = true;
         }
@@ -781,6 +789,7 @@ fn tlbWrite(t: *TlbUse, waddr: u6, cond: qpu.Cond, z_payload: bool) void {
     switch (waddr) {
         qpu.W.tlb_stencil_setup => t.stencil = true,
         qpu.W.ms_flags => t.ms_flags = true,
+        qpu.W.tlb_alpha_mask => t.vg_mask = true,
         qpu.W.tlb_z => {
             if (!z_payload) t.shader_z = true;
             if (cond != .always) t.conditional = true;
@@ -1572,6 +1581,7 @@ fn executeDecoded(comptime RType: type, decoded: []const DecodedInst, env: *cons
                     s.acc[4] = splat(0xff000000);
                 }
             },
+            .alpha_mask_load => s.acc[4] = env.alpha_mask_in,
             .color_load, .color_load_end => {
                 s.acc[4] = if (env.tlb_samples_in) |samples| samples[loads % 4] else env.tlb_color_in;
                 loads += 1;
@@ -2115,6 +2125,11 @@ fn write(comptime RType: type, s: *State, r: *RType, env: *const Env, waddr: u6,
             const m = laneBits(cond, s);
             r.ms_flags = mergeLanes(r.ms_flags, value, m);
             r.ms_flags_mask |= m;
+        },
+        qpu.W.tlb_alpha_mask => if (@hasField(RType, "alpha_mask")) {
+            const m = laneBits(cond, s);
+            r.alpha_mask = mergeLanes(r.alpha_mask, value, m);
+            r.alpha_mask_mask |= m;
         },
         qpu.W.tlb_stencil_setup => if (@hasField(RType, "stencil_setups")) {
             if (r.stencil_count < r.stencil_setups.len) r.stencil_setups[r.stencil_count] = value[0];

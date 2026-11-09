@@ -288,10 +288,13 @@ pub const V3d = struct {
     tile_color: [64 * 64]u32 = @splat(0),
     tile_depth: [64 * 64]f32 = @splat(1.0),
     tile_stencil: [64 * 64]u8 = @splat(0),
+    tile_vg_mask: [64 * 64]u8 = @splat(0),
     tile_color_solid: ?u32 = null,
     tile_depth_valid: bool = false,
     tile_clear_zs: f32 = 1.0,
     tile_clear_stencil: u8 = 0,
+    tile_clear_vg_mask: u8 = 0,
+    tile_vg_valid: bool = false,
     lazy_load: ?LazyTileLoad = null,
     loaded_from: ?LazyTileLoad = null,
     tile_modified: bool = false,
@@ -386,6 +389,8 @@ pub const V3d = struct {
         self.tile_depth_valid = false;
         self.tile_clear_zs = 1.0;
         self.tile_clear_stencil = 0;
+        self.tile_clear_vg_mask = 0;
+        self.tile_vg_valid = false;
         self.lazy_load = null;
         self.loaded_from = null;
         self.tile_modified = false;
@@ -1624,10 +1629,14 @@ pub const V3d = struct {
         depth: *[64 * 64]f32,
         /// Each pixel's (or sample's) stencil, valid with `depth`.
         stencil: *[64 * 64]u8,
+        /// Each pixel's VG (alpha) mask, if `vg_valid` (else the clear value).
+        vg_mask: *[64 * 64]u8,
+        vg_valid: bool = false,
         color_solid: ?u32 = null,
         depth_valid: bool = false,
         clear_zs: f32 = 1.0,
         clear_stencil: u8 = 0,
+        clear_vg_mask: u8 = 0,
         lazy_load: ?LazyTileLoad = null,
         loaded_from: ?LazyTileLoad = null,
         modified: bool = false,
@@ -1642,8 +1651,19 @@ pub const V3d = struct {
         clear_color0: u32,
         clear_zs: f32,
         clear_stencil: u8 = 0,
+        clear_vg_mask: u8 = 0,
         lazy_load: ?LazyTileLoad = null,
         has_render: bool = false,
+        /// What's stored (STORE_TILE_BUFFER_GENERAL's buffer): colour (1), depth and stencil (2),
+        /// depth (3), the VG mask (4), or all of it as it is (5, less what `dump_flags` leaves
+        /// out: bit 0 colour, 1 depth and stencil, 2 the VG mask).
+        buffer: u3 = 1,
+        dump_flags: u3 = 0,
+        /// Colour stores' decimation: 0 the first sample, 1 4x, 2 16x.
+        decimate: u2 = 0,
+        /// Depth and stencil, and the VG mask, loaded first.
+        zs_load: ?GeneralLoad = null,
+        vg_load: ?GeneralLoad = null,
         dst_addr: u32 = 0,
         fb_w: u32 = 0,
         fb_h: u32 = 0,
@@ -1656,9 +1676,6 @@ pub const V3d = struct {
         /// Stored as the tile buffer is (STORE_FULL_RES_TILE_BUFFER), its flags: not the colour
         /// (bit 0), not depth and stencil (bit 1).
         full_res: ?u4 = null,
-        /// Depth and stencil loaded as the tile buffer holds them (LOAD_FULL_RES_TILE_BUFFER), from
-        /// here.
-        full_res_zs_load: ?u32 = null,
 
         pub fn tileSize(j: TileJob) u32 {
             return if (j.ms) 32 else 64;
@@ -1675,10 +1692,12 @@ pub const V3d = struct {
             var color_buf: [64 * 64]u32 = undefined;
             var depth_buf: [64 * 64]f32 = undefined;
             var stencil_buf: [64 * 64]u8 = undefined;
+            var vg_buf: [64 * 64]u8 = undefined;
             var tb = TileBuffer{
                 .color = &color_buf,
                 .depth = &depth_buf,
                 .stencil = &stencil_buf,
+                .vg_mask = &vg_buf,
             };
             while (true) {
                 const idx = ctx.next_idx.fetchAdd(1, .monotonic);
@@ -1687,6 +1706,10 @@ pub const V3d = struct {
             }
         }
     };
+
+    /// A load of depth and stencil (`kind` 2, or 3 depth alone; or 5 as the tile buffer holds
+    /// them), or of the VG mask (4; or 5 as the tile buffer holds it).
+    pub const GeneralLoad = struct { addr: u32, tiling: u2 = 0, kind: u3 };
 
     const PendingTileLoad = struct {
         addr: u32,
@@ -1700,10 +1723,13 @@ pub const V3d = struct {
             .color = &self.tile_color,
             .depth = &self.tile_depth,
             .stencil = &self.tile_stencil,
+            .vg_mask = &self.tile_vg_mask,
+            .vg_valid = self.tile_vg_valid,
             .color_solid = self.tile_color_solid,
             .depth_valid = self.tile_depth_valid,
             .clear_zs = self.tile_clear_zs,
             .clear_stencil = self.tile_clear_stencil,
+            .clear_vg_mask = self.tile_clear_vg_mask,
             .lazy_load = self.lazy_load,
             .loaded_from = self.loaded_from,
             .modified = self.tile_modified,
@@ -1715,6 +1741,8 @@ pub const V3d = struct {
         self.tile_depth_valid = tb.depth_valid;
         self.tile_clear_zs = tb.clear_zs;
         self.tile_clear_stencil = tb.clear_stencil;
+        self.tile_clear_vg_mask = tb.clear_vg_mask;
+        self.tile_vg_valid = tb.vg_valid;
         self.lazy_load = tb.lazy_load;
         self.loaded_from = tb.loaded_from;
         self.tile_modified = tb.modified;
@@ -1760,11 +1788,39 @@ pub const V3d = struct {
         tb.depth_valid = false;
         tb.clear_zs = job.clear_zs;
         tb.clear_stencil = job.clear_stencil;
+        tb.clear_vg_mask = job.clear_vg_mask;
+        tb.vg_valid = false;
         tb.modified = false;
-        if (job.full_res_zs_load) |addr| loadFullResDepth(tb, ram, addr);
+        if (job.zs_load) |l| loadZs(tb, ram, job, l);
+        if (job.vg_load) |l| loadVgMask(tb, ram, job, l);
 
         if (job.has_render) {
             self.renderDrawsIntoTileBuf(tb, ram, job.tile_x * tile_size, job.tile_y * tile_size, tile_size);
+        }
+
+        switch (job.buffer) {
+            2, 3 => {
+                ensureTileMaterializedBuf(tb, ram, true);
+                storeZs(tb, ram, job, job.buffer == 3);
+                return;
+            },
+            4 => {
+                ensureVgMask(tb);
+                storeVgMask(tb, ram, job);
+                return;
+            },
+            5 => {
+                ensureTileMaterializedBuf(tb, ram, true);
+                ensureVgMask(tb);
+                storeDump(tb, ram, job.dst_addr, job.dump_flags);
+                return;
+            },
+            else => {},
+        }
+        if (job.decimate != 0 and (job.decimate == 2 or !tb.ms)) {
+            ensureTileMaterializedBuf(tb, ram, false);
+            storeDecimated(tb, ram, job);
+            return;
         }
 
         if (job.full_res) |flags| {
@@ -1792,7 +1848,7 @@ pub const V3d = struct {
                     const samples = tb.color[i * 4 ..][0..4];
                     px.* = if (job.resolve) averageSamples(samples.*) else samples[0];
                 }
-                const resolved: TileBuffer = .{ .color = &pixels, .depth = &depth, .stencil = tb.stencil };
+                const resolved: TileBuffer = .{ .color = &pixels, .depth = &depth, .stencil = tb.stencil, .vg_mask = tb.vg_mask };
                 storeTileFromBuf(&resolved, ram, job.dst_addr, job.fb_w, job.fb_h, job.tile_x, job.tile_y, tile_size, job.tiling, job.ls_format);
                 return;
             }
@@ -1842,6 +1898,139 @@ pub const V3d = struct {
             st.* = @truncate(word);
         }
         tb.depth_valid = true;
+    }
+
+    /// Each pixel's depth and stencil (its first sample's) as a word: depth in bits 31:8, the
+    /// stencil (unless `z_only`) in bits 7:0.
+    fn zsWord(tb: *const TileBuffer, i: usize, z_only: bool) u32 {
+        const z24: u32 = @intFromFloat(@round(std.math.clamp(tb.depth[i], 0, 1) * 16777215.0));
+        return z24 << 8 | (if (z_only) 0 else tb.stencil[i]);
+    }
+
+    /// The tile's depths and stencils stored (STORE_TILE_BUFFER_GENERAL's depth and stencil, or
+    /// depth alone): an image of words, as colour images are laid out.
+    fn storeZs(tb: *const TileBuffer, ram: []u8, job: TileJob, z_only: bool) void {
+        const size = job.tileSize();
+        const spp: usize = if (tb.ms) 4 else 1;
+        var words: [64 * 64]u32 = undefined;
+        for (0..size * size) |i| words[i] = zsWord(tb, i * spp, z_only);
+        const image: TileBuffer = .{ .color = &words, .depth = tb.depth, .stencil = tb.stencil, .vg_mask = tb.vg_mask };
+        storeTileFromBuf(&image, ram, job.dst_addr, job.fb_w, job.fb_h, job.tile_x, job.tile_y, size, job.tiling, 0);
+    }
+
+    /// Depths and stencils loaded from an image as `storeZs` stores it (or, `kind` 5, as
+    /// `storeDump` dumps them).
+    fn loadZs(tb: *TileBuffer, ram: []const u8, job: TileJob, l: GeneralLoad) void {
+        if (l.kind == 5) {
+            loadFullResDepth(tb, ram, l.addr);
+            return;
+        }
+        const size = job.tileSize();
+        var words: [64 * 64]u32 = undefined;
+        var image: TileBuffer = .{ .color = &words, .depth = tb.depth, .stencil = tb.stencil, .vg_mask = tb.vg_mask };
+        @memset(&words, 0);
+        loadTileIntoBuf(&image, ram, l.addr, job.fb_w, job.fb_h, job.tile_x, job.tile_y, size, l.tiling, 0);
+        const spp: usize = if (tb.ms) 4 else 1;
+        for (0..size * size) |i| {
+            for (0..spp) |si| {
+                tb.depth[i * spp + si] = @as(f32, @floatFromInt(words[i] >> 8)) / 16777215.0;
+                tb.stencil[i * spp + si] = if (l.kind == 3) tb.clear_stencil else @truncate(words[i]);
+            }
+        }
+        tb.depth_valid = true;
+    }
+
+    fn ensureVgMask(tb: *TileBuffer) void {
+        if (tb.vg_valid) return;
+        @memset(tb.vg_mask, tb.clear_vg_mask);
+        tb.vg_valid = true;
+    }
+
+    /// Where pixel (`x`, `y`) of a `w` by `h` image of bytes is, laid out as `tiling` says.
+    fn byteImageOffset(tiling: u2, w: u32, h: u32, x: u32, y: u32) u32 {
+        return if (tiling == 0) y * w + x else texture.texelOffsetOf(.a8, w, h, x, y);
+    }
+
+    /// The tile's VG mask stored: an image of bytes.
+    fn storeVgMask(tb: *const TileBuffer, ram: []u8, job: TileJob) void {
+        const size = job.tileSize();
+        const base = job.dst_addr & vc_bus.ramMask(ram.len);
+        const x0 = job.tile_x * size;
+        const y0 = job.tile_y * size;
+        for (0..size) |ty| {
+            for (0..size) |tx| {
+                const x = x0 + @as(u32, @intCast(tx));
+                const y = y0 + @as(u32, @intCast(ty));
+                if (x >= job.fb_w or y >= job.fb_h) continue;
+                const off = base + byteImageOffset(job.tiling, job.fb_w, job.fb_h, x, y);
+                if (off < ram.len) ram[off] = tb.vg_mask[ty * size + tx];
+            }
+        }
+    }
+
+    fn loadVgMask(tb: *TileBuffer, ram: []const u8, job: TileJob, l: GeneralLoad) void {
+        const size = job.tileSize();
+        if (l.kind == 5) {
+            const base = l.addr & vc_bus.ramMask(ram.len);
+            if (base + tb.vg_mask.len <= ram.len) @memcpy(tb.vg_mask, ram[base..][0..tb.vg_mask.len]);
+            tb.vg_valid = true;
+            return;
+        }
+        ensureVgMask(tb);
+        const base = l.addr & vc_bus.ramMask(ram.len);
+        const x0 = job.tile_x * size;
+        const y0 = job.tile_y * size;
+        for (0..size) |ty| {
+            for (0..size) |tx| {
+                const x = x0 + @as(u32, @intCast(tx));
+                const y = y0 + @as(u32, @intCast(ty));
+                if (x >= job.fb_w or y >= job.fb_h) continue;
+                const off = base + byteImageOffset(l.tiling, job.fb_w, job.fb_h, x, y);
+                if (off < ram.len) tb.vg_mask[ty * size + tx] = ram[off];
+            }
+        }
+    }
+
+    /// The whole tile buffer as it is (STORE_TILE_BUFFER_GENERAL's full dump), at `addr`: its
+    /// colour (16 KiB, as STORE_FULL_RES_TILE_BUFFER stores it), then its depths and stencils
+    /// (16 KiB, likewise), then its VG mask (4 KiB, a byte a pixel); less those `flags` leave out.
+    const dump_zs_offset = full_res_bytes;
+    const dump_vg_offset = 2 * full_res_bytes;
+
+    fn storeDump(tb: *const TileBuffer, ram: []u8, addr: u32, flags: u3) void {
+        if (flags & 1 == 0) storeFullRes(tb, ram, addr, 2);
+        if (flags & 2 == 0) storeFullRes(tb, ram, addr +% dump_zs_offset, 1);
+        if (flags & 4 == 0) {
+            const base = (addr +% dump_vg_offset) & vc_bus.ramMask(ram.len);
+            if (base + tb.vg_mask.len <= ram.len) @memcpy(ram[base..][0..tb.vg_mask.len], tb.vg_mask);
+        }
+    }
+
+    /// The tile's colour decimated (STORE_TILE_BUFFER_GENERAL's decimate modes): each 2x2 pixels
+    /// averaged (4x, not multisampled), or each 2x2 pixels' samples (16x, multisampled), into an
+    /// image half the framebuffer's size each way.
+    fn storeDecimated(tb: *const TileBuffer, ram: []u8, job: TileJob) void {
+        const size = job.tileSize();
+        const out_size = size / 2;
+        var words: [64 * 64]u32 = undefined;
+        const spp: usize = if (tb.ms) 4 else 1;
+        for (0..out_size) |oy| {
+            for (0..out_size) |ox| {
+                var sum: @Vector(4, u32) = @splat(0);
+                for (0..4) |k| {
+                    const i = (oy * 2 + k / 2) * size + ox * 2 + k % 2;
+                    for (0..spp) |si| {
+                        const c: @Vector(4, u8) = @bitCast(tb.color[i * spp + si]);
+                        sum += @as(@Vector(4, u32), c);
+                    }
+                }
+                const n: u32 = @intCast(4 * spp);
+                const avg = (sum + @as(@Vector(4, u32), @splat(n / 2))) / @as(@Vector(4, u32), @splat(n));
+                words[oy * out_size + ox] = @bitCast(@as(@Vector(4, u8), @truncate(avg)));
+            }
+        }
+        const image: TileBuffer = .{ .color = &words, .depth = tb.depth, .stencil = tb.stencil, .vg_mask = tb.vg_mask };
+        storeTileFromBuf(&image, ram, job.dst_addr, job.fb_w / 2, job.fb_h / 2, job.tile_x, job.tile_y, out_size, job.tiling, job.ls_format);
     }
 
     fn flushTileJobs(self: *V3d, ram: []u8, jobs: []const TileJob) void {
@@ -1904,8 +2093,11 @@ pub const V3d = struct {
         has_tile_coords: bool = false,
         pending_load: ?PendingTileLoad = null,
         cur_lazy_load: ?LazyTileLoad = null,
-        cur_zs_load: ?u32 = null,
-        pending_zs_load: ?u32 = null,
+        cur_zs_load: ?GeneralLoad = null,
+        pending_zs_load: ?GeneralLoad = null,
+        cur_vg_load: ?GeneralLoad = null,
+        pending_vg_load: ?GeneralLoad = null,
+        clear_vg_mask: u8 = 0,
         cur_has_render: bool = false,
         tile_loaded: bool = false,
 
@@ -1937,7 +2129,9 @@ pub const V3d = struct {
                 .tiling = tiling,
                 .ls_format = ls_format,
                 .ms = it.ms(),
-                .full_res_zs_load = it.cur_zs_load,
+                .clear_vg_mask = it.clear_vg_mask,
+                .zs_load = it.cur_zs_load,
+                .vg_load = it.cur_vg_load,
             };
         }
 
@@ -1949,6 +2143,8 @@ pub const V3d = struct {
             it.cur_lazy_load = null;
             it.cur_zs_load = null;
             it.pending_zs_load = null;
+            it.cur_vg_load = null;
+            it.pending_vg_load = null;
             it.cur_has_render = false;
         }
 
@@ -1956,8 +2152,18 @@ pub const V3d = struct {
             if (!it.tile_loaded) {
                 it.cur_lazy_load = null;
                 it.cur_zs_load = null;
+                it.cur_vg_load = null;
                 it.tile_loaded = true;
             }
+        }
+
+        /// Depth and stencil loaded, into this tile or the next.
+        fn zsLoad(it: *RclReader, l: GeneralLoad) void {
+            if (it.has_tile_coords) it.cur_zs_load = l else it.pending_zs_load = l;
+        }
+
+        fn vgLoad(it: *RclReader, l: GeneralLoad) void {
+            if (it.has_tile_coords) it.cur_vg_load = l else it.pending_vg_load = l;
         }
 
         /// `load`, for the current tile.
@@ -2011,13 +2217,16 @@ pub const V3d = struct {
                         const addr_word = std.mem.readInt(u32, ram[pc + 3 ..][0..4], .little);
                         const buf_kind = bits & 7;
                         var j: ?TileJob = null;
-                        if (buf_kind == 1) { // Color buffer store
+                        if (buf_kind >= 1 and buf_kind <= 5) {
                             it.startTile();
                             const ls_tiling: u2 = @truncate((bits >> 4) & 3);
                             const ls_format: u2 = @truncate((bits >> 8) & 3);
                             const dst_addr = if ((addr_word & ~@as(u32, 0xf)) != 0) (addr_word & ~@as(u32, 0xf)) else it.fb_addr;
                             j = it.job(dst_addr, ls_tiling, ls_format);
+                            j.?.buffer = @intCast(buf_kind);
+                            j.?.dump_flags = @truncate(addr_word);
                             // The decimate mode: 4x averages each pixel's samples, else sample 0.
+                            j.?.decimate = @truncate(bits >> 6);
                             j.?.resolve = (bits >> 6) & 3 == 1;
                         }
                         // The tile's last store clears its colour (bit 13 keeps it, for stores after).
@@ -2048,9 +2257,7 @@ pub const V3d = struct {
                                 it.tile_loaded = true;
                             } else it.pending_load = load;
                         }
-                        if (word & 2 == 0) {
-                            if (it.has_tile_coords) it.cur_zs_load = addr else it.pending_zs_load = addr;
-                        }
+                        if (word & 2 == 0) it.zsLoad(.{ .addr = addr, .kind = 5 });
                         it.pc += 5;
                     },
                     29 => { // LOAD_TILE_BUFFER_GENERAL (7 bytes)
@@ -2058,20 +2265,30 @@ pub const V3d = struct {
                         const bits = std.mem.readInt(u16, ram[pc + 1 ..][0..2], .little);
                         const addr_word = std.mem.readInt(u32, ram[pc + 3 ..][0..4], .little);
                         const buf_kind = bits & 7;
-                        if (buf_kind == 1) { // Load color buffer from memory into tile buffer
+                        const ls_tiling_g: u2 = @truncate((bits >> 4) & 3);
+                        const load_addr_g = addr_word & ~@as(u32, 0xf);
+                        switch (buf_kind) {
+                            2, 3 => it.zsLoad(.{ .addr = load_addr_g, .tiling = ls_tiling_g, .kind = @intCast(buf_kind) }),
+                            4 => it.vgLoad(.{ .addr = load_addr_g, .tiling = ls_tiling_g, .kind = 4 }),
+                            5 => {
+                                // All of it, as a full dump has it, less what bits 0 to 2 leave out.
+                                if (addr_word & 2 == 0) it.zsLoad(.{ .addr = load_addr_g +% dump_zs_offset, .kind = 5 });
+                                if (addr_word & 4 == 0) it.vgLoad(.{ .addr = load_addr_g +% dump_vg_offset, .kind = 5 });
+                            },
+                            else => {},
+                        }
+                        if (buf_kind == 1 or (buf_kind == 5 and addr_word & 1 == 0)) { // Load color buffer from memory into tile buffer
                             const ls_tiling: u2 = @truncate((bits >> 4) & 3);
                             const ls_format: u2 = @truncate((bits >> 8) & 3);
                             const load_addr = addr_word & ~@as(u32, 0xf);
+                            const full = buf_kind == 5;
+                            const load: PendingTileLoad = .{ .addr = load_addr, .tiling = ls_tiling, .format = ls_format, .full_res = full };
                             if (it.has_tile_coords) {
-                                it.cur_lazy_load = it.lazyLoad(.{ .addr = load_addr, .tiling = ls_tiling, .format = ls_format });
+                                it.cur_lazy_load = it.lazyLoad(load);
                                 it.cur_has_render = false;
                                 it.tile_loaded = true;
                             } else {
-                                it.pending_load = .{
-                                    .addr = load_addr,
-                                    .tiling = ls_tiling,
-                                    .format = ls_format,
-                                };
+                                it.pending_load = load;
                             }
                         }
                         it.pc += 7;
@@ -2090,7 +2307,9 @@ pub const V3d = struct {
                         const zs_raw = std.mem.readInt(u32, ram[pc + 9 ..][0..4], .little);
                         const zs_word = zs_raw & 0x00FFFFFF;
                         it.clear_zs = @as(f32, @floatFromInt(zs_word)) / 16777215.0;
-                        it.clear_stencil = @truncate(zs_raw >> 24);
+                        // The VG mask in the top byte; the stencil after.
+                        it.clear_vg_mask = @truncate(zs_raw >> 24);
+                        it.clear_stencil = ram[pc + 13];
                         // Note: for RGB565 render targets, kernel/userspace packs TWO RGB565 pixels in clear_color0
                         const r_format: u2 = @truncate((it.fb_flags >> 2) & 3);
                         if (r_format == 0 or r_format == 2) {
@@ -2115,6 +2334,11 @@ pub const V3d = struct {
                         if (it.pending_zs_load) |a| {
                             it.cur_zs_load = a;
                             it.pending_zs_load = null;
+                            it.tile_loaded = true;
+                        }
+                        if (it.pending_vg_load) |a| {
+                            it.cur_vg_load = a;
+                            it.pending_vg_load = null;
                             it.tile_loaded = true;
                         }
                         if (it.pending_load) |pl| {
@@ -2294,7 +2518,8 @@ pub const V3d = struct {
             if (j.tile_x >= 64 or j.tile_y >= 64) return null;
             // The tile buffer stored or loaded as it is, or multisampled tiles stored as their first
             // samples, are drawn on the CPU.
-            if (j.full_res != null or j.full_res_zs_load != null or (j.ms and !j.resolve)) return null;
+            if (j.full_res != null or j.zs_load != null or j.vg_load != null or j.buffer != 1 or (j.ms and !j.resolve)) return null;
+            if (j.decimate == 2 or (j.decimate == 1 and !j.ms)) return null;
             if (j.lazy_load) |l| if (l.full_res) return null;
             if (j.ms != first.ms) return null;
             const bit = @as(u64, 1) << @intCast(j.tile_x);
@@ -2520,7 +2745,8 @@ pub const V3d = struct {
         var tile_color: [64 * 64]u32 = undefined;
         var tile_depth: [64 * 64]f32 = undefined;
         var tile_stencil: [64 * 64]u8 = undefined;
-        var tb: TileBuffer = .{ .color = &tile_color, .depth = &tile_depth, .stencil = &tile_stencil };
+        var tile_vg: [64 * 64]u8 = undefined;
+        var tb: TileBuffer = .{ .color = &tile_color, .depth = &tile_depth, .stencil = &tile_stencil, .vg_mask = &tile_vg };
         // 64 pixels square, or 32 multisampled.
         const size = first.tileSize();
         const tiles_w = @min((w + size - 1) / size, 64);
@@ -2714,6 +2940,7 @@ pub const V3d = struct {
             .color = @constCast(&self.tile_color),
             .depth = @constCast(&self.tile_depth),
             .stencil = @constCast(&self.tile_stencil),
+            .vg_mask = @constCast(&self.tile_vg_mask),
             .color_solid = self.tile_color_solid,
             .depth_valid = self.tile_depth_valid,
             .clear_zs = self.tile_clear_zs,
@@ -3265,6 +3492,7 @@ pub const V3d = struct {
                 if (masks[0] | masks[1] | masks[2] | masks[3] == 0) continue;
                 if (!materialized) {
                     ensureTileMaterializedBuf(tb, ram, true);
+                    ensureVgMask(tb);
                     materialized = true;
                 }
                 // The quad's pixels, covered or not, their inputs at their middles.
@@ -3287,6 +3515,7 @@ pub const V3d = struct {
                     batch.frag_x[lane] = px;
                     batch.frag_y[lane] = py;
                     batch.ms_mask[lane] = if (tb.ms) masks[i] else (if (masks[i] != 0) 0xf else 0);
+                    batch.alpha_mask[lane] = tb.vg_mask[idx];
                     for (0..n_var) |vi| {
                         const v = t.v[2].persp_varyings[vi] + w0 * t.dvar0[vi] + w1 * t.dvar1[vi];
                         batch.varyings[vi][lane] = @bitCast(v * w);
@@ -3316,6 +3545,7 @@ pub const V3d = struct {
         frag_x: qpu_sim.Vec = qpu_sim.splat(0),
         frag_y: qpu_sim.Vec = qpu_sim.splat(0),
         ms_mask: qpu_sim.Vec = qpu_sim.splat(0),
+        alpha_mask: qpu_sim.Vec = qpu_sim.splat(0),
         varyings: [16]qpu_sim.Vec = @splat(qpu_sim.splat(0)),
         samples_in: [4]qpu_sim.Vec = @splat(qpu_sim.splat(0)),
         tex_cache: [2]qpu_sim.TexCache = .{ .{}, .{} },
@@ -3341,6 +3571,7 @@ pub const V3d = struct {
                 b.frag_x[lane] = b.frag_x[from];
                 b.frag_y[lane] = b.frag_y[from];
                 b.ms_mask[lane] = 0;
+                b.alpha_mask[lane] = b.alpha_mask[from];
                 for (b.varyings[0..n_var]) |*v| v[lane] = v[from];
                 for (&b.samples_in) |*v| v[lane] = v[from];
             }
@@ -3353,6 +3584,7 @@ pub const V3d = struct {
                 .frag_y = b.frag_y,
                 .ms_mask = b.ms_mask,
                 .rev_flag = qpu_sim.splat(@intFromBool(b.back)),
+                .alpha_mask_in = b.alpha_mask,
                 .texture_memory = ram,
                 .tlb_color_in = b.samples_in[0],
                 .tlb_samples_in = if (tb.ms) &b.samples_in else null,
@@ -3363,6 +3595,8 @@ pub const V3d = struct {
             const spp: u32 = if (tb.ms) 4 else 1;
             for (0..count) |lane| {
                 const bit = @as(u16, 1) << @intCast(lane);
+                // The VG mask written where covered.
+                if (res.alpha_mask_mask & bit != 0 and b.mask[lane] != 0) tb.vg_mask[b.idx[lane]] = @truncate(res.alpha_mask[lane]);
                 const color_written = res.tlb_color_mask & bit != 0;
                 const z_written = res.tlb_z_mask & bit != 0;
                 // Neither written: discarded.
