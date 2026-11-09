@@ -287,6 +287,10 @@ pub const V3d = struct {
     bin_initial_block: u32 = 32,
     bin_block: u32 = 32,
     bin_tiles: u32 = 0,
+    /// Where the binner's tile lists are (the tile allocation pool): a rendering list's
+    /// sub-lists there are the frame binned, others tile lists written otherwise.
+    bin_pool_lo: u32 = 0,
+    bin_pool_hi: u32 = 0,
     /// The semaphore between the threads (INCREMENT_SEMAPHORE, WAIT_ON_SEMAPHORE), and a
     /// rendering list waiting on it (its start and end).
     semaphore: u32 = 0,
@@ -980,6 +984,8 @@ pub const V3d = struct {
                     self.bin_blocks_taken = 0;
                     const pool = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little);
                     const pool_size = std.mem.readInt(u32, ram[pc + 5 ..][0..4], .little);
+                    self.bin_pool_lo = pool & vc_bus.ramMask(ram.len);
+                    self.bin_pool_hi = self.bin_pool_lo +| pool_size;
                     const initial = self.bin_tiles * self.bin_initial_block;
                     self.bpca = pool +% initial;
                     self.bpcs = pool_size -| initial;
@@ -2196,6 +2202,9 @@ pub const V3d = struct {
         /// Depth and stencil, and the VG mask, loaded first.
         zs_load: ?GeneralLoad = null,
         vg_load: ?GeneralLoad = null,
+        /// Tile lists (not the binner's) rendered, after the frame binned (if `has_render`).
+        tile_lists: [4]u32 = undefined,
+        n_lists: u8 = 0,
         dst_addr: u32 = 0,
         fb_w: u32 = 0,
         fb_h: u32 = 0,
@@ -2329,6 +2338,7 @@ pub const V3d = struct {
         if (job.has_render) {
             self.renderDrawsIntoTileBuf(tb, ram, job.tile_x * tile_size, job.tile_y * tile_size, tile_size);
         }
+        for (job.tile_lists[0..job.n_lists]) |list| self.renderTileList(tb, ram, list, job.tile_x * tile_size, job.tile_y * tile_size, tile_size);
 
         switch (job.buffer) {
             2, 3 => {
@@ -2633,6 +2643,13 @@ pub const V3d = struct {
         cur_has_render: bool = false,
         tile_loaded: bool = false,
         steps: usize = 0,
+        /// The binner's pool (`bin_pool_lo`, `bin_pool_hi`), and the tile's other tile lists.
+        pool_lo: u32 = 0,
+        pool_hi: u32 = 0,
+        /// Draws were binned.
+        binned: bool = false,
+        cur_lists: [4]u32 = undefined,
+        cur_n_lists: u8 = 0,
 
         fn ms(it: *const RclReader) bool {
             return it.fb_flags & 1 != 0;
@@ -2665,6 +2682,8 @@ pub const V3d = struct {
                 .clear_vg_mask = it.clear_vg_mask,
                 .zs_load = it.cur_zs_load,
                 .vg_load = it.cur_vg_load,
+                .tile_lists = it.cur_lists,
+                .n_lists = it.cur_n_lists,
             };
         }
 
@@ -2679,6 +2698,7 @@ pub const V3d = struct {
             it.cur_vg_load = null;
             it.pending_vg_load = null;
             it.cur_has_render = false;
+            it.cur_n_lists = 0;
         }
 
         fn startTile(it: *RclReader) void {
@@ -2728,10 +2748,18 @@ pub const V3d = struct {
                         if (pc + 5 > ram.len) break;
                         it.pc = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & vc_bus.ramMask(ram.len);
                     },
-                    17 => { // BRANCH_TO_SUB_LIST (executes binned primitives for the current tile)
+                    17 => { // BRANCH_TO_SUB_LIST: the tile's list, of the frame binned or another
                         if (pc + 5 > ram.len) break;
                         it.startTile();
-                        it.cur_has_render = true;
+                        const target = std.mem.readInt(u32, ram[pc + 1 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+                        // With no pool (binning not set up), it's the frame binned, if one was.
+                        const no_pool = it.pool_hi == it.pool_lo;
+                        if ((no_pool and it.binned) or (!no_pool and target >= it.pool_lo and target < it.pool_hi)) {
+                            it.cur_has_render = true;
+                        } else if (it.cur_n_lists < it.cur_lists.len) {
+                            it.cur_lists[it.cur_n_lists] = target;
+                            it.cur_n_lists += 1;
+                        }
                         it.pc += 5;
                     },
                     24, 25 => { // STORE_MS_TILE_BUFFER / STORE_MS_TILE_BUFFER_AND_EOF (1 byte)
@@ -2866,6 +2894,7 @@ pub const V3d = struct {
                         it.cur_tile_y = ram[pc + 2];
                         it.has_tile_coords = true;
                         it.cur_has_render = false;
+                        it.cur_n_lists = 0;
                         if (it.pending_zs_load) |a| {
                             it.cur_zs_load = a;
                             it.pending_zs_load = null;
@@ -2920,6 +2949,9 @@ pub const V3d = struct {
         var queued_tile_mask: [64]u64 = @splat(0);
 
         var reader: RclReader = .init(ram, start_bus, end_bus);
+        reader.pool_lo = self.bin_pool_lo;
+        reader.pool_hi = self.bin_pool_hi;
+        reader.binned = self.draws.items.len > 0;
         while (reader.next(ram)) |job| {
             if (job.tile_x < 64 and job.tile_y < 64) {
                 const bit = @as(u64, 1) << @intCast(job.tile_x);
@@ -3043,8 +3075,11 @@ pub const V3d = struct {
     /// bit for each in each row of them).
     const GpuFrame = struct { first: TileJob, tiles: [64]u64 };
 
-    fn gpuFrame(ram: []u8, start_bus: u32, end_bus: u32) ?GpuFrame {
+    fn gpuFrame(self: *const V3d, ram: []u8, start_bus: u32, end_bus: u32) ?GpuFrame {
         var reader: RclReader = .init(ram, start_bus, end_bus);
+        reader.pool_lo = self.bin_pool_lo;
+        reader.pool_hi = self.bin_pool_hi;
+        reader.binned = self.draws.items.len > 0;
         const first = reader.next(ram) orelse return null;
         if (first.fb_w == 0 or first.fb_h == 0 or first.fb_w > 2048 or first.fb_h > 2048) return null;
         var tiles: [64]u64 = @splat(0);
@@ -3053,7 +3088,7 @@ pub const V3d = struct {
             if (j.tile_x >= 64 or j.tile_y >= 64) return null;
             // The tile buffer stored or loaded as it is, or multisampled tiles stored as their first
             // samples, are drawn on the CPU.
-            if (j.full_res != null or j.zs_load != null or j.vg_load != null or j.buffer != 1 or (j.ms and !j.resolve)) return null;
+            if (j.full_res != null or j.zs_load != null or j.vg_load != null or j.buffer != 1 or j.n_lists != 0 or (j.ms and !j.resolve)) return null;
             if (j.decimate == 2 or (j.decimate == 1 and !j.ms)) return null;
             if (j.lazy_load) |l| if (l.full_res) return null;
             if (j.ms != first.ms) return null;
@@ -3087,7 +3122,7 @@ pub const V3d = struct {
     /// run all its shaders the same as qpu_sim.
     fn renderWithGpuVertices(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
         const g = self.gpuState() orelse return false;
-        const frame = gpuFrame(ram, start_bus, end_bus) orelse return false;
+        const frame = self.gpuFrame(ram, start_bus, end_bus) orelse return false;
         // Without triangles, the CPU loads and stores the tiles as fast.
         if (!frame.first.has_render) return false;
         g.inputs.clearRetainingCapacity();
@@ -3185,7 +3220,7 @@ pub const V3d = struct {
     fn renderWithGpu(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
         const g = self.gpuState() orelse return false;
         if (self.overflow_draw_start < self.draws.items.len) return false;
-        const gpu_frame = gpuFrame(ram, start_bus, end_bus) orelse return false;
+        const gpu_frame = self.gpuFrame(ram, start_bus, end_bus) orelse return false;
         const first = gpu_frame.first;
         const tiles = gpu_frame.tiles;
 
@@ -3777,6 +3812,471 @@ pub const V3d = struct {
             }
         }
     }
+
+    /// A draw's shaders, loaded for a tile list's primitives (which name their vertices): its
+    /// fragment shader, and its vertex (and coordinate) shader, for GL mode.
+    const ListShaders = struct {
+        code: std.ArrayList(qpu.Inst) = .empty,
+        vs_list: std.ArrayList(qpu_sim.DecodedInst) = .empty,
+        fs_list: std.ArrayList(qpu_sim.DecodedInst) = .empty,
+        cs_list: std.ArrayList(qpu_sim.DecodedInst) = .empty,
+        attrs: [8]AttrStream = undefined,
+        cs_attrs: [8]AttrStream = undefined,
+        src: DrawSource = undefined,
+        fs: []const qpu_sim.DecodedInst = &.{},
+        fs_unifs: qpu_sim.Uniforms = &.{},
+        fast_frag: qpu_sim.FastFragShader = .{},
+        vs: []const qpu_sim.DecodedInst = &.{},
+        vs_unifs: qpu_sim.Uniforms = &.{},
+        n_attrs: usize = 0,
+        vpm_words: usize = 0,
+        cs: ?CoordStage = null,
+        loaded: bool = false,
+
+        fn deinit(l: *ListShaders) void {
+            l.code.deinit(tri_allocator);
+            l.vs_list.deinit(tri_allocator);
+            l.fs_list.deinit(tri_allocator);
+            l.cs_list.deinit(tri_allocator);
+        }
+
+        fn load(l: *ListShaders, ram: []const u8, draw: DrawCall) bool {
+            l.loaded = false;
+            l.src = drawSource(ram, draw) orelse return false;
+            l.vs_list.clearRetainingCapacity();
+            l.fs_list.clearRetainingCapacity();
+            l.cs_list.clearRetainingCapacity();
+            l.fs = decodeProgramAt(ram, l.src.fs_code_phys, &l.code, &l.fs_list) orelse return false;
+            if (l.fs.len == 0) return false;
+            l.fs_unifs = uniformsAt(ram, l.src.fs_unif_phys);
+            l.fast_frag = qpu_sim.analyzeFragmentShader(l.fs, l.fs_unifs);
+            switch (l.src.vertices) {
+                .gl => |g| {
+                    l.vs = decodeProgramAt(ram, g.vs_code_phys, &l.code, &l.vs_list) orelse return false;
+                    if (l.vs.len == 0) return false;
+                    l.vs_unifs = uniformsAt(ram, g.vs_unif_phys);
+                    const info = decodeAttrStreams(ram, g.rec_phys, draw.num_attrs, g.vs_attr_mask, &l.attrs);
+                    l.n_attrs = info.count;
+                    l.vpm_words = info.vpm_words;
+                    l.cs = coordStage(ram, g.rec_phys, draw.num_attrs, &l.code, &l.cs_list, &l.cs_attrs);
+                },
+                else => {},
+            }
+            l.loaded = true;
+            return true;
+        }
+
+        /// Vertices `indices` of `draw` (up to 16), shaded or as given, and their clip
+        /// coordinates. False if one can't be.
+        fn vertices(l: *const ListShaders, ram: []const u8, draw: DrawCall, vg_verts: []const [2]f32, indices: []const u32, out: []ShadedVertex, clip: []ClipVertex) bool {
+            var ok: [16]bool = @splat(false);
+            @memset(clip, .{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) });
+            const n_var = @min(@as(usize, l.src.fs_num_varyings), 16);
+            const job: VertexJob = .{
+                .ram = ram,
+                .draw = draw,
+                .decoded = l.vs,
+                .unifs = l.vs_unifs,
+                .attrs = l.attrs[0..l.n_attrs],
+                .vpm_words = l.vpm_words,
+                .n_var = n_var,
+                .indices = indices,
+                .out = out,
+                .ok = ok[0..indices.len],
+                .cs = l.cs,
+                .clip = clip,
+                .source = l.src.vertices,
+                .vg_verts = vg_verts,
+            };
+            job.run(0, 1);
+            for (ok[0..indices.len]) |o| if (!o) return false;
+            return true;
+        }
+    };
+
+    /// Renders the tile list at `addr` (not the binner's: written otherwise) into the tile: its
+    /// state (shader states, the primitive list format, configuration, clip window, viewport,
+    /// sizes; from the frame binned's at first), branches and sub-lists, primitives (drawn as
+    /// draws are), compressed primitive lists (each coding, and their relative branches), and
+    /// clipped primitives (vertices of the next replaced by those given).
+    fn renderTileList(self: *const V3d, tb: *TileBuffer, ram: []const u8, addr: u32, tile_px_x: u32, tile_px_y: u32, tile_size: u32) void {
+        const mask = vc_bus.ramMask(ram.len);
+        var draw: DrawCall = .{
+            .kind = self.cur_kind,
+            .fs_code = self.cur_fs_code,
+            .fs_unifs = self.cur_fs_unifs,
+            .fs_varyings = self.cur_fs_varyings,
+            .shader_rec_addr = self.cur_shader_rec,
+            .num_attrs = self.cur_num_attrs,
+            .vp_x = self.cur_vp_x,
+            .vp_y = self.cur_vp_y,
+            .clip_x = self.cur_clip_x,
+            .clip_y = self.cur_clip_y,
+            .clip_w = self.cur_clip_w,
+            .clip_h = self.cur_clip_h,
+            .config_b0 = self.cur_cfg0,
+            .config_b1 = self.cur_cfg1,
+            .config_b2 = self.cur_cfg2,
+            .clip_scale_x = self.cur_clip_scale_x,
+            .clip_scale_y = self.cur_clip_scale_y,
+            .z_scale = self.cur_z_scale,
+            .z_offset = self.cur_z_offset,
+            .line_width = self.cur_line_width,
+            .point_size = self.cur_point_size,
+        };
+        var list: TileListCtx = .{ .v3d = self, .tb = tb, .ram = ram, .tile_px_x = tile_px_x, .tile_px_y = tile_px_y, .tile_size = tile_size, .rht_x = self.rht_x_boundary };
+        defer list.shaders.deinit();
+        var pc = addr & mask;
+        var returns: [4]u32 = undefined;
+        var depth: usize = 0;
+        var steps: usize = 0;
+        while (pc < ram.len and steps < 1 << 20) : (steps += 1) {
+            const op = ram[pc];
+            const word = struct {
+                fn at(r: []const u8, o: u32) u32 {
+                    return if (o + 4 <= r.len) std.mem.readInt(u32, r[o..][0..4], .little) else 0;
+                }
+            }.at;
+            switch (op) {
+                0 => return, // HALT
+                1 => pc += 1,
+                16 => pc = word(ram, pc + 1) & mask,
+                17 => {
+                    if (depth < returns.len) {
+                        returns[depth] = pc + 5;
+                        depth += 1;
+                    }
+                    pc = word(ram, pc + 1) & mask;
+                },
+                18 => {
+                    if (depth == 0) return;
+                    depth -= 1;
+                    pc = returns[depth];
+                },
+                32, 33 => { // Primitives, as a draw's
+                    var d = draw;
+                    d.mode = ram[pc + 1] & 0x0f;
+                    d.count = word(ram, pc + 2);
+                    if (op == 32) {
+                        d.indexed = true;
+                        d.u16_indices = ram[pc + 1] & 0x10 != 0;
+                        d.index_buffer_addr = word(ram, pc + 6);
+                    } else d.first_or_offset = word(ram, pc + 6);
+                    renderDrawIntoTileBuf(tb, ram, d, self.vg_verts.items, tile_px_x, tile_px_y, tile_size);
+                    pc += if (op == 32) 14 else 10;
+                },
+                48 => pc = list.compressed(&draw, pc + 1, null),
+                49 => { // CLIPPED_PRIMITIVE: then a compressed list
+                    const w = word(ram, pc + 1);
+                    pc = list.compressed(&draw, pc + 5, .{ .data = w & ~@as(u32, 7) & mask, .which = @truncate(w) });
+                },
+                56 => {
+                    list.list_type = @truncate(ram[pc + 1]);
+                    list.xy = (ram[pc + 1] >> 4) == 3;
+                    pc += 2;
+                },
+                64 => {
+                    const w = word(ram, pc + 1);
+                    draw.kind = .gl;
+                    draw.shader_rec_addr = w & ~@as(u32, 0xf);
+                    draw.num_attrs = @intCast(if ((w & 7) == 0) 8 else (w & 7));
+                    list.shaders.loaded = false;
+                    pc += 5;
+                },
+                65 => {
+                    draw.kind = .nv;
+                    draw.shader_rec_addr = word(ram, pc + 1) & ~@as(u32, 0xf);
+                    list.shaders.loaded = false;
+                    pc += 5;
+                },
+                66 => {
+                    const rec = word(ram, pc + 1) & ~@as(u32, 0xf) & mask;
+                    draw.kind = .vg;
+                    if (rec + 12 <= ram.len) {
+                        draw.fs_varyings = ram[rec + 3];
+                        draw.fs_code = word(ram, rec + 4);
+                        draw.fs_unifs = word(ram, rec + 8);
+                    }
+                    list.shaders.loaded = false;
+                    pc += 5;
+                },
+                67 => {
+                    draw.kind = .vg;
+                    draw.fs_code = word(ram, pc + 1) & ~@as(u32, 7);
+                    draw.fs_unifs = word(ram, pc + 5);
+                    draw.fs_varyings = 0;
+                    list.shaders.loaded = false;
+                    pc += 9;
+                },
+                96 => {
+                    draw.config_b0 = ram[pc + 1];
+                    draw.config_b1 = ram[pc + 2];
+                    draw.config_b2 = ram[pc + 3];
+                    pc += 4;
+                },
+                97, 101, 104 => pc += if (op == 104) 9 else 5,
+                98 => {
+                    draw.point_size = @bitCast(word(ram, pc + 1));
+                    pc += 5;
+                },
+                99 => {
+                    draw.line_width = @bitCast(word(ram, pc + 1));
+                    pc += 5;
+                },
+                100 => {
+                    list.rht_x = @floatFromInt(@as(i16, @bitCast(@as(u16, @truncate(word(ram, pc + 1))))));
+                    pc += 3;
+                },
+                102 => {
+                    draw.clip_x = @truncate(word(ram, pc + 1));
+                    draw.clip_y = @truncate(word(ram, pc + 1) >> 16);
+                    draw.clip_w = @truncate(word(ram, pc + 5));
+                    draw.clip_h = @truncate(word(ram, pc + 5) >> 16);
+                    pc += 9;
+                },
+                103 => {
+                    const w = word(ram, pc + 1);
+                    draw.vp_x = @as(f32, @floatFromInt(@as(i16, @bitCast(@as(u16, @truncate(w)))))) / 16.0;
+                    draw.vp_y = @as(f32, @floatFromInt(@as(i16, @bitCast(@as(u16, @truncate(w >> 16)))))) / 16.0;
+                    pc += 5;
+                },
+                105, 106 => {
+                    if (op == 105) {
+                        draw.clip_scale_x = @bitCast(word(ram, pc + 1));
+                        draw.clip_scale_y = @bitCast(word(ram, pc + 5));
+                    } else {
+                        draw.z_scale = @bitCast(word(ram, pc + 1));
+                        draw.z_offset = @bitCast(word(ram, pc + 5));
+                    }
+                    pc += 9;
+                },
+                else => return,
+            }
+        }
+    }
+
+    /// Vertices of the next primitive replaced by clipped vertex data (CLIPPED_PRIMITIVE): those
+    /// whose bits `which` has, from `data`, each as a vertex shader writes it.
+    const ClippedPrimitive = struct { data: u32, which: u3 };
+
+    /// A tile list being rendered: its primitive list format, and its draws' shaders.
+    const TileListCtx = struct {
+        v3d: *const V3d,
+        tb: *TileBuffer,
+        ram: []const u8,
+        tile_px_x: u32,
+        tile_px_y: u32,
+        tile_size: u32,
+        rht_x: f32,
+        /// Points (0), lines (1), triangles (2) or RHTs (3); of indices, or XY coordinates.
+        list_type: u4 = 2,
+        xy: bool = false,
+        shaders: ListShaders = .{},
+
+        /// The corners a triangle shares with the last one (its coding 0's bits 1:0).
+        const shared_edges = [3][2]usize{ .{ 2, 1 }, .{ 0, 2 }, .{ 1, 0 } };
+
+        /// Renders the compressed primitive list at `start` (to its escape), the first primitive
+        /// clipped as `clipped` says; where the list goes on after it.
+        fn compressed(l: *TileListCtx, draw: *const DrawCall, start: u32, clipped_in: ?ClippedPrimitive) u32 {
+            const ram = l.ram;
+            var clipped = clipped_in;
+            var q = start;
+            var last: [3]u32 = @splat(0);
+            var last_xy: [3][2]f32 = @splat(.{ 0, 0 });
+            const corners: usize = switch (l.list_type) {
+                0 => 1,
+                1, 3 => 2,
+                else => 3,
+            };
+            const half = struct {
+                fn at(r: []const u8, o: u32) u32 {
+                    return if (o + 2 <= r.len) std.mem.readInt(u16, r[o..][0..2], .little) else 0;
+                }
+            }.at;
+            const sx6 = struct {
+                fn f(v: u32) i32 {
+                    return @as(i6, @bitCast(@as(u6, @truncate(v))));
+                }
+            }.f;
+            var steps: usize = 0;
+            while (q < ram.len and steps < 1 << 20) : (steps += 1) {
+                const b0: u32 = ram[q];
+                var idx: [3]u32 = last;
+                var xy: [3][2]f32 = last_xy;
+                // Escapes: the end, absolute vertices, a relative branch.
+                if (b0 >= 0x80 and b0 <= 0x83) {
+                    switch (b0) {
+                        0x80 => return q + 1,
+                        0x81 => {
+                            if (l.xy) {
+                                for (0..corners) |k| xy[k] = xyOf(draw.*, std.mem.readInt(u32, ram[@min(q + 1 + @as(u32, @intCast(k)) * 4, ram.len - 4)..][0..4], .little));
+                                q += 1 + @as(u32, @intCast(corners)) * 4;
+                            } else {
+                                for (0..corners) |k| idx[k] = half(ram, q + 1 + @as(u32, @intCast(k)) * 2);
+                                q += 1 + @as(u32, @intCast(corners)) * 2;
+                            }
+                        },
+                        0x82 => {
+                            q = (q & ~@as(u32, 31)) +% half(ram, q + 1) * 32;
+                            continue;
+                        },
+                        else => return q + 1,
+                    }
+                } else if (l.xy) {
+                    // Relative: sharing two corners (bits 1:0), the third moved (whole pixels).
+                    const h = half(ram, q);
+                    const share = h & 3;
+                    const dx: f32 = @floatFromInt(@as(i7, @bitCast(@as(u7, @truncate(h >> 2)))));
+                    const dy: f32 = @floatFromInt(@as(i7, @bitCast(@as(u7, @truncate(h >> 9)))));
+                    const prev = last_xy[corners - 1];
+                    if (corners == 3) {
+                        const keep = shared_edges[@min(share, 2)];
+                        xy = .{ last_xy[keep[0]], last_xy[keep[1]], .{ prev[0] + dx, prev[1] + dy } };
+                    } else {
+                        xy[0] = last_xy[corners - 1];
+                        xy[corners - 1] = .{ prev[0] + dx, prev[1] + dy };
+                    }
+                    q += 2;
+                } else switch (l.list_type) {
+                    0 => { // Points: on by 6 or 14 bits.
+                        if (b0 & 3 == 3) {
+                            const h = half(ram, q);
+                            idx[0] = @bitCast(@as(i32, @bitCast(last[0])) +% @as(i14, @bitCast(@as(u14, @truncate(h >> 2)))));
+                            q += 2;
+                        } else {
+                            idx[0] = @bitCast(@as(i32, @bitCast(last[0])) +% sx6(b0 >> 2));
+                            q += 1;
+                        }
+                    },
+                    1, 3 => { // Lines: sharing an end, two deltas, or absolute and a delta.
+                        if (b0 & 3 == 3) {
+                            const h = half(ram, q);
+                            idx[0] = @bitCast(@as(i32, @bitCast(last[0])) +% @as(i4, @bitCast(@as(u4, @truncate(h >> 4)))));
+                            idx[1] = @bitCast(@as(i32, @bitCast(last[1])) +% @as(i4, @bitCast(@as(u4, @truncate(h >> 8)))));
+                            q += 2;
+                        } else if (b0 & 3 == 2) {
+                            idx[0] = half(ram, q + 1);
+                            idx[1] = @bitCast(@as(i32, @bitCast(idx[0])) +% sx6(b0 >> 2));
+                            q += 3;
+                        } else {
+                            idx[0] = if (b0 & 3 == 0) last[1] else last[0];
+                            idx[1] = @bitCast(@as(i32, @bitCast(last[1])) +% sx6(b0 >> 2));
+                            q += 1;
+                        }
+                    },
+                    else => { // Triangles: sharing an edge, three deltas, or absolute and two.
+                        if (b0 & 3 != 3) {
+                            const keep = shared_edges[b0 & 3];
+                            idx = .{ last[keep[0]], last[keep[1]], @bitCast(@as(i32, @bitCast(last[2])) +% sx6(b0 >> 2)) };
+                            q += 1;
+                        } else if ((b0 >> 2) & 3 == 3) {
+                            const h = half(ram, q);
+                            const first = half(ram, q + 2);
+                            idx = .{ first, @bitCast(@as(i32, @bitCast(first)) +% sx6(h >> 4)), @bitCast(@as(i32, @bitCast(first)) +% sx6(h >> 10)) };
+                            q += 4;
+                        } else {
+                            const h = half(ram, q);
+                            for (0..3) |k| idx[k] = @bitCast(@as(i32, @bitCast(last[k])) +% @as(i4, @bitCast(@as(u4, @truncate(h >> @intCast(4 + k * 4))))));
+                            q += 2;
+                        }
+                    },
+                }
+                last = idx;
+                last_xy = xy;
+                l.primitive(draw, idx[0..corners], xy[0..corners], clipped);
+                clipped = null;
+            }
+            return q;
+        }
+
+        /// An XY list's coordinate: Xs and Ys (12.4 fixed point) from the viewport offset.
+        fn xyOf(draw: DrawCall, w: u32) [2]f32 {
+            const xs: i16 = @bitCast(@as(u16, @truncate(w)));
+            const ys: i16 = @bitCast(@as(u16, @truncate(w >> 16)));
+            return .{ @as(f32, @floatFromInt(xs)) / 16 + draw.vp_x, @as(f32, @floatFromInt(ys)) / 16 + draw.vp_y };
+        }
+
+        /// One primitive of a compressed list: its vertices' indices (or XY coordinates).
+        fn primitive(l: *TileListCtx, draw_in: *const DrawCall, idx: []const u32, xy: []const [2]f32, clipped: ?ClippedPrimitive) void {
+            var draw = draw_in.*;
+            draw.mode = switch (l.list_type) {
+                0 => 0,
+                1 => 1,
+                else => 4,
+            };
+            if (!l.shaders.loaded and !l.shaders.load(l.ram, draw)) return;
+            const n_var = @min(@as(usize, l.shaders.src.fs_num_varyings), 16);
+            var verts: [3]ShadedVertex = @splat(.{});
+            var clip: [3]ClipVertex = @splat(.{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) });
+            if (l.xy) {
+                for (xy, 0..) |p, k| verts[k] = .{ .x = p[0], .y = p[1], .point_size = draw.point_size };
+            } else if (!l.shaders.vertices(l.ram, draw, l.v3d.vg_verts.items, idx, verts[0..idx.len], clip[0..idx.len])) return;
+            if (clipped) |c| {
+                // Each clipped vertex's data, in turn, as a vertex shader writes it.
+                const layout: VertexLayout = .of(l.ram, draw, n_var);
+                const words = layout.first_varying + layout.varyings;
+                var off = c.data;
+                for (0..idx.len) |k| {
+                    if (c.which & (@as(u3, 1) << @intCast(k)) == 0) continue;
+                    if (off + words * 4 > l.ram.len) return;
+                    const w = struct {
+                        fn at(r: []const u8, o: usize) u32 {
+                            return std.mem.readInt(u32, r[o..][0..4], .little);
+                        }
+                    }.at;
+                    const p = xyOf(draw, w(l.ram, off));
+                    var v: ShadedVertex = .{ .x = p[0], .y = p[1], .point_size = draw.point_size };
+                    v.z = @bitCast(w(l.ram, off + 4));
+                    const iw: f32 = @bitCast(w(l.ram, off + 8));
+                    v.inv_w = if (iw == 0) 1 else iw;
+                    for (0..layout.varyings) |vi| v.persp_varyings[layout.skip + vi] = @as(f32, @bitCast(w(l.ram, off + (layout.first_varying + vi) * 4))) * v.inv_w;
+                    verts[k] = v;
+                    clip[k].w = std.math.nan(f32);
+                    off += @intCast(words * 4);
+                }
+            }
+            switch (l.list_type) {
+                0 => {
+                    verts[1] = verts[0];
+                    verts[2] = verts[0];
+                },
+                1 => verts[2] = verts[1],
+                3 => {
+                    // An RHT: the trapezoid between its edge and the X boundary.
+                    const a = verts[0];
+                    const b = verts[1];
+                    var bb = b;
+                    bb.x = l.rht_x;
+                    var ba = a;
+                    ba.x = l.rht_x;
+                    l.triangle(draw, .{ a, b, bb }, @splat(.{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) }), n_var);
+                    l.triangle(draw, .{ a, bb, ba }, @splat(.{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) }), n_var);
+                    return;
+                },
+                else => {},
+            }
+            l.triangle(draw, verts, clip, n_var);
+        }
+
+        fn triangle(l: *TileListCtx, draw: DrawCall, verts: [3]ShadedVertex, clip: [3]ClipVertex, n_var: usize) void {
+            var pieces: [max_clipped][3]ShadedVertex = undefined;
+            const n_pieces = primitiveTriangles(draw, verts, clip, n_var, &pieces);
+            for (pieces[0..n_pieces]) |p_verts| {
+                const area = (p_verts[1].x - p_verts[0].x) * (p_verts[2].y - p_verts[0].y) -
+                    (p_verts[1].y - p_verts[0].y) * (p_verts[2].x - p_verts[0].x);
+                if (@abs(area) < 1e-6) continue;
+                if (isTriangles(draw) and culled(draw.config_b0, area)) continue;
+                const min_fx = @max(@floor(@min(p_verts[0].x, @min(p_verts[1].x, p_verts[2].x))), @as(f32, @floatFromInt(draw.clip_x)));
+                const min_fy = @max(@floor(@min(p_verts[0].y, @min(p_verts[1].y, p_verts[2].y))), @as(f32, @floatFromInt(draw.clip_y)));
+                const max_fx = @min(@ceil(@max(p_verts[0].x, @max(p_verts[1].x, p_verts[2].x))), @as(f32, @floatFromInt(@as(u32, draw.clip_x) + draw.clip_w)));
+                const max_fy = @min(@ceil(@max(p_verts[0].y, @max(p_verts[1].y, p_verts[2].y))), @as(f32, @floatFromInt(@as(u32, draw.clip_y) + draw.clip_h)));
+                if (min_fx >= max_fx or min_fy >= max_fy) continue;
+                const tri = ShadedTriangle.init(0, @intFromFloat(min_fx), @intFromFloat(min_fy), @intFromFloat(max_fx), @intFromFloat(max_fy), area, p_verts, n_var);
+                rasterizeInTileBuf(l.tb, l.ram, draw, &tri, l.shaders.fs, l.shaders.fs_unifs, l.shaders.src.fs_num_varyings, l.shaders.fast_frag, l.tile_px_x, l.tile_px_y, l.tile_size);
+            }
+        }
+    };
 
     /// `renderDrawIntoTileBuf` for an NV or VG draw: its vertices as given.
     fn renderGivenDrawIntoTileBuf(tb: *TileBuffer, ram: []const u8, draw: DrawCall, src: DrawSource, vg_verts: []const [2]f32, tile_px_x: u32, tile_px_y: u32, tile_size: u32) void {
@@ -6585,4 +7085,61 @@ test "V3D VG primitives become triangles: RHTs to the X boundary, fans continued
     try std.testing.expectEqual([2]f32{ 90, 60 }, last[2]);
     try std.testing.expectEqual(@as(usize, 3), v3d.draws.items.len);
     try std.testing.expectEqual(V3d.DrawMode.vg, v3d.draws.items[2].kind);
+}
+
+test "V3D renders tile lists written by hand: XY lists, relative codes and branches" {
+    const v3d = V3d{};
+    const gpa = std.testing.allocator;
+    const ram = try gpa.alloc(u8, 64 * 1024);
+    defer gpa.free(ram);
+    @memset(ram, 0);
+    // A fragment shader writing its uniform's colour.
+    var fs: qpu.Program(8) = .{};
+    fs.emit(try qpu.mov(qpu.tlb_color_all, qpu.unif));
+    fs.end(.fragment);
+    @memcpy(ram[0x1000..][0 .. fs.code().len * 8], std.mem.sliceAsBytes(fs.code()));
+    std.mem.writeInt(u32, ram[0x1800..][0..4], 0xff00ff00, .little);
+    const xy = struct {
+        fn f(x: i16, y: i16) u32 {
+            return @as(u32, @as(u16, @bitCast(x * 16))) | @as(u32, @as(u16, @bitCast(y * 16))) << 16;
+        }
+    }.f;
+    // Format XY triangles, an inline VG shader record, then a compressed list: an absolute
+    // triangle, a branch to the next 32-byte block, a relative one (sharing two corners), the end.
+    var list: [64]u8 = @splat(0);
+    var n: usize = 0;
+    for ([_]u8{ 56, 2 | 3 << 4, 67 }) |b| {
+        list[n] = b;
+        n += 1;
+    }
+    std.mem.writeInt(u32, list[n..][0..4], 0x1000, .little);
+    std.mem.writeInt(u32, list[n + 4 ..][0..4], 0x1800, .little);
+    n += 8;
+    list[n] = 48;
+    list[n + 1] = 0x81;
+    std.mem.writeInt(u32, list[n + 2 ..][0..4], xy(2, 2), .little);
+    std.mem.writeInt(u32, list[n + 6 ..][0..4], xy(20, 2), .little);
+    std.mem.writeInt(u32, list[n + 10 ..][0..4], xy(2, 20), .little);
+    n += 14;
+    // At 0x2000 + n: the branch, one block (32 bytes) on from its block.
+    list[n] = 0x82;
+    std.mem.writeInt(u16, list[n + 1 ..][0..2], 1, .little);
+    @memcpy(ram[0x2000..][0..list.len], &list);
+    // The rest, at 0x2020: a triangle sharing (2, 1) of the last, its third 20 pixels right and
+    // 10 down from the last's third; the end; HALT.
+    const h: u16 = 0 | (20 & 0x7f) << 2 | (10 & 0x7f) << 9;
+    std.mem.writeInt(u16, ram[0x2020..][0..2], h, .little);
+    ram[0x2022] = 0x80;
+    ram[0x2023] = 0;
+
+    var color: [64 * 64]u32 = @splat(0xff000000);
+    var depth: [64 * 64]f32 = @splat(1);
+    var stencil: [64 * 64]u8 = @splat(0);
+    var vg: [64 * 64]u8 = @splat(0);
+    var tb: V3d.TileBuffer = .{ .color = &color, .depth = &depth, .stencil = &stencil, .vg_mask = &vg, .depth_valid = true };
+    v3d.renderTileList(&tb, ram, 0x2000, 0, 0, 64);
+    // Inside the first triangle, and the second (corners (2,20), (20,2), (22,30)).
+    try std.testing.expectEqual(@as(u32, 0xff00ff00), color[5 * 64 + 5]);
+    try std.testing.expectEqual(@as(u32, 0xff00ff00), color[20 * 64 + 16]);
+    try std.testing.expectEqual(@as(u32, 0xff000000), color[40 * 64 + 40]);
 }
