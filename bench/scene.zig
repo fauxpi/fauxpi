@@ -11,34 +11,51 @@ pub const Shading = enum {
     flat,
     textured,
     blended,
+    /// Lines in flat colours.
+    line,
+    /// Points, each its own size, coloured by where in it (red across, green down) and their blue.
+    point,
 
-    /// The varyings its fragment shader takes: red, green and blue; s and t; red, green, blue
-    /// and alpha.
+    /// The varyings the vertex shader gives its fragment shader (as the shader record counts
+    /// them): red, green and blue; s and t; red, green, blue and alpha.
     pub fn varyings(s: Shading) u8 {
         return switch (s) {
-            .flat => 3,
+            .flat, .line, .point => 3,
             .textured => 2,
             .blended => 4,
         };
     }
 
-    /// A vertex's words: x, y, z and the varyings.
+    /// Whether its vertex shader writes each point's size (from the vertex's fourth word), as its
+    /// shader record says.
+    pub fn pointSize(s: Shading) bool {
+        return s == .point;
+    }
+
+    /// A vertex's words: x, y, z, a point's size, and the varyings.
     pub fn words(s: Shading) u8 {
-        return 3 + s.varyings();
+        return 3 + @as(u8, @intFromBool(s.pointSize())) + s.varyings();
     }
 
     pub fn fragmentShader(s: Shading) []const qpu.Inst {
         return switch (s) {
-            .flat => flatShader(),
+            // A line's first varying is the rasterizer's, its coordinate along it; a point's
+            // first two its coordinates across it (s and t), then the vertex shader's.
+            .flat => colourShader(&.{ 0, 1, 2 }),
+            .line => colourShader(&.{ null, 0, 1, 2 }),
+            .point => colourShader(&.{ 0, 1, null, null, 2 }),
             .textured => textureShader(),
             .blended => blendShader(),
         };
     }
 };
 
-/// The vertex shader (or, `coordinates`, the coordinate shader binning uses): x and y scaled to
-/// pixels (by the uniforms) and packed as 12.4 fixed point, z, 1/W of 1, then the varyings as given.
-pub fn vertexShader(words: u8, coordinates: bool) []const qpu.Inst {
+/// The vertex shader for `shading` (or, `coordinates`, the coordinate shader binning uses): x and y
+/// scaled to pixels (by the uniforms) and packed as 12.4 fixed point, z, 1/W of 1, the point's
+/// size if it writes one, then the varyings as given.
+pub fn vertexShader(shading: Shading, coordinates: bool) []const qpu.Inst {
+    const words = shading.words();
+    const first_varying: usize = if (shading.pointSize()) 4 else 3;
     const S = struct {
         var p: qpu.Program(64) = .{};
     };
@@ -47,7 +64,7 @@ pub fn vertexShader(words: u8, coordinates: bool) []const qpu.Inst {
     build: {
         p.emit(qpu.loadImm(.{ .add_dst = qpu.vpm_write_setup, .value = 0x00001a00 }) catch break :build);
         p.emit(qpu.loadImm(.{ .add_dst = qpu.vpm_read_setup, .value = (@as(u32, words) << 20) | 0x1a00 }) catch break :build);
-        // x, y, z into r0, r1, ra3; the varyings into ra4...
+        // x, y, z into r0, r1, ra3; the rest (a point's size, the varyings) into ra4...
         p.emit(qpu.mov(qpu.wr(0), qpu.vpm_read) catch break :build);
         p.emit(qpu.mov(qpu.wr(1), qpu.vpm_read) catch break :build);
         p.emit(qpu.mov(qpu.wa(3), qpu.vpm_read) catch break :build);
@@ -66,8 +83,9 @@ pub fn vertexShader(words: u8, coordinates: bool) []const qpu.Inst {
         p.emit(qpu.mov(qpu.vpm_write, qpu.ra(1)) catch break :build);
         p.emit(qpu.mov(qpu.vpm_write, qpu.ra(3)) catch break :build);
         p.emit(qpu.loadImm(.{ .add_dst = qpu.vpm_write, .value = @bitCast(@as(f32, 1.0)) }) catch break :build);
+        if (shading.pointSize()) p.emit(qpu.mov(qpu.vpm_write, qpu.ra(4)) catch break :build);
         if (!coordinates) {
-            for (3..words) |k| p.emit(qpu.mov(qpu.vpm_write, qpu.ra(@intCast(4 + k - 3))) catch break :build);
+            for (first_varying..words) |k| p.emit(qpu.mov(qpu.vpm_write, qpu.ra(@intCast(4 + k - 3))) catch break :build);
         }
         p.end(.vertex);
         return p.code();
@@ -84,15 +102,20 @@ fn interpolate(p: anytype, n: u3) qpu.EncodeError!void {
     }
 }
 
-/// A colour: the varyings red, green and blue, opaque.
-fn flatShader() []const qpu.Inst {
+/// An opaque colour, its red, green and blue in r0, r1 and r2: the varyings, each interpolated
+/// into the accumulator `dsts` gives it, or read and dropped (null).
+fn colourShader(dsts: []const ?u3) []const qpu.Inst {
     const S = struct {
         var p: qpu.Program(32) = .{};
     };
     const p = &S.p;
     p.* = .{};
     build: {
-        interpolate(p, 3) catch break :build;
+        for (dsts) |dst| {
+            const acc = dst orelse 3;
+            p.emit(qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(acc), .a = qpu.vary, .b = qpu.frag_w } }) catch break :build);
+            if (dst != null) p.emit(qpu.alu(.{ .add = .{ .op = .fadd, .dst = qpu.wr(acc), .a = qpu.r(acc), .b = qpu.r(5) } }) catch break :build);
+        }
         const one = qpu.smallImmFloat(1.0);
         p.emit(qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(2), .b = one }, .pack = .{ .mul = .@"8a" } }) catch break :build);
         p.emit(qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(3), .a = qpu.r(1), .b = one }, .pack = .{ .mul = .@"8b" } }) catch break :build);
@@ -275,4 +298,41 @@ pub fn drawQuad(out: []f32, i: u32) void {
     const x = rand(&seed) * 1.9 - 1;
     const y = rand(&seed) * 1.9 - 1;
     quad(out, x, y, x + 0.1, y + 0.1, 0.5, &.{ rand(&seed), rand(&seed), rand(&seed) }, null);
+}
+
+/// `n` flat-coloured lines (`n * 2 * 6` floats), most short and scattered, and one in 64 far past
+/// the screen's edges, where the clipper cuts it.
+pub fn lineVertices(out: []f32, n: u32) void {
+    var seed: u32 = 6;
+    for (0..n) |i| {
+        const cx = rand(&seed) * 2 - 1;
+        const cy = rand(&seed) * 2 - 1;
+        const angle = rand(&seed) * 2 * std.math.pi;
+        const half: f32 = if (i % 64 == 0) 16 else 0.02 + rand(&seed) * 0.2;
+        const colour = [3]f32{ rand(&seed), rand(&seed), rand(&seed) };
+        const v = out[i * 12 ..][0..12];
+        for ([2]f32{ -1, 1 }, 0..) |side, k| {
+            v[k * 6 + 0] = cx + side * half * @cos(angle);
+            v[k * 6 + 1] = cy + side * half * @sin(angle);
+            v[k * 6 + 2] = 0.5;
+            @memcpy(v[k * 6 + 3 ..][0..3], &colour);
+        }
+    }
+}
+
+/// How wide the lines scenes' lines are, in pixels (LINE_WIDTH).
+pub const line_width: f32 = 2;
+
+/// `n` points, scattered, from 1 to 16 pixels wide (`n * 7` floats: x, y, z, size, then red, green
+/// and blue).
+pub fn pointVertices(out: []f32, n: u32) void {
+    var seed: u32 = 7;
+    for (0..n) |i| {
+        const v = out[i * 7 ..][0..7];
+        v[0] = rand(&seed) * 2 - 1;
+        v[1] = rand(&seed) * 2 - 1;
+        v[2] = 0.5;
+        v[3] = 1 + @floor(rand(&seed) * 16);
+        for (v[4..7]) |*c| c.* = rand(&seed);
+    }
 }

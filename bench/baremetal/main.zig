@@ -151,6 +151,8 @@ const tests = [_]Test{
     .{ .name = "v3d_texture", .run = v3d.texture },
     .{ .name = "v3d_blend", .run = v3d.blend },
     .{ .name = "v3d_draws", .run = v3d.draws },
+    .{ .name = "v3d_lines", .run = v3d.lines },
+    .{ .name = "v3d_points", .run = v3d.points },
     .{ .name = "hvs_planes", .run = hvs.planes },
 };
 

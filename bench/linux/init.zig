@@ -144,6 +144,8 @@ const tests = [_]Test{
     .{ .name = "kms_texture", .run = textureScene },
     .{ .name = "kms_blend", .run = blendScene },
     .{ .name = "kms_draws", .run = drawsScene },
+    .{ .name = "kms_lines", .run = linesScene },
+    .{ .name = "kms_points", .run = pointsScene },
 };
 
 /// The boot: the kernel to init, and the vc4 driver to its device.
@@ -557,8 +559,13 @@ const Job = struct {
         j.byte(0x12);
     }
 
-    /// A draw of `count` vertices (triangles) from `first`, of `vertices` shaded as `s` says.
+    /// A draw of `count` vertices from `first`, of `vertices` shaded as `s` says: triangles, or
+    /// (`mode`) 0 points or 1 lines.
     fn draw(j: *Job, d: *const Display, sh: *const ShaderSet, vertices: u32, first: u32, count: u32, depth_test: bool, texture: ?u32) void {
+        j.drawMode(d, sh, vertices, 4, first, count, depth_test, texture);
+    }
+
+    fn drawMode(j: *Job, d: *const Display, sh: *const ShaderSet, vertices: u32, mode: u8, first: u32, count: u32, depth_test: bool, texture: ?u32) void {
         // CLIP_WINDOW, CONFIGURATION_BITS, VIEWPORT_OFFSET, CLIPPER_XY_SCALING and _Z_.
         j.byte(102);
         j.half(0);
@@ -578,6 +585,8 @@ const Job = struct {
         j.byte(106);
         j.word(@bitCast(@as(f32, 0.5)));
         j.word(@bitCast(@as(f32, 0.5)));
+        j.byte(99); // LINE_WIDTH
+        j.word(@bitCast(scene.line_width));
 
         // The shader record: the buffers (as indices), then the record, the code and uniform
         // addresses the kernel's.
@@ -586,7 +595,8 @@ const Job = struct {
         j.recWord(j.index(sh.vs));
         j.recWord(j.index(sh.cs));
         j.recWord(j.index(vertices));
-        j.recHalf(1 | 4); // single-threaded fragment shader, clipping
+        // Single-threaded fragment shader, the vertex shader writing points' sizes, clipping.
+        j.recHalf(if (sh.point_size) 1 | 2 | 4 else 1 | 4);
         j.recByte(0);
         j.recByte(sh.varyings);
         j.recWord(0);
@@ -622,8 +632,8 @@ const Job = struct {
 
         j.byte(64); // GL_SHADER_STATE: the next record, 1 attribute
         j.word(1);
-        j.byte(33); // GL_ARRAY_PRIMITIVE: triangles
-        j.byte(4);
+        j.byte(33); // GL_ARRAY_PRIMITIVE
+        j.byte(mode);
         j.word(count);
         j.word(first);
     }
@@ -668,13 +678,14 @@ const ShaderSet = struct {
     fs: u32,
     words: u8,
     varyings: u8,
+    point_size: bool,
 
     fn make(fd: i32, shading: scene.Shading) ShaderSet {
         // Each copied before the next is made (they share the encoder's buffers).
-        const vs = shaderBo(fd, scene.vertexShader(shading.words(), false));
-        const cs = shaderBo(fd, scene.vertexShader(shading.words(), true));
+        const vs = shaderBo(fd, scene.vertexShader(shading, false));
+        const cs = shaderBo(fd, scene.vertexShader(shading, true));
         const fs = shaderBo(fd, shading.fragmentShader());
-        return .{ .vs = vs, .cs = cs, .fs = fs, .words = shading.words(), .varyings = shading.varyings() };
+        return .{ .vs = vs, .cs = cs, .fs = fs, .words = shading.words(), .varyings = shading.varyings(), .point_size = shading.pointSize() };
     }
 };
 
@@ -784,6 +795,36 @@ fn drawsScene(p: Params, r: *Result) void {
         }
     }.f, Ctx{ .s = &s, .v = vertices.handle, .n = n }, r);
     r.add("draws", n);
+}
+
+fn linesScene(p: Params, r: *Result) void {
+    var d: Display = .init();
+    const s: ShaderSet = .make(d.fd, .line);
+    const n: u32 = @intCast(@min(p.amount(10_000), 20_000));
+    const vertices: Bo = .create(d.fd, n * 2 * 6 * 4);
+    scene.lineVertices(vertices.floats(), n);
+    const Ctx = struct { s: *const ShaderSet, v: u32, n: u32 };
+    sceneFrames(&d, p.amount(30), 0xff000000, struct {
+        fn f(j: *Job, dd: *const Display, c: Ctx) void {
+            j.drawMode(dd, c.s, c.v, 1, 0, c.n * 2, false, null);
+        }
+    }.f, Ctx{ .s = &s, .v = vertices.handle, .n = n }, r);
+    r.add("lines", n);
+}
+
+fn pointsScene(p: Params, r: *Result) void {
+    var d: Display = .init();
+    const s: ShaderSet = .make(d.fd, .point);
+    const n: u32 = @intCast(@min(p.amount(10_000), 20_000));
+    const vertices: Bo = .create(d.fd, n * 7 * 4);
+    scene.pointVertices(vertices.floats(), n);
+    const Ctx = struct { s: *const ShaderSet, v: u32, n: u32 };
+    sceneFrames(&d, p.amount(30), 0xff000000, struct {
+        fn f(j: *Job, dd: *const Display, c: Ctx) void {
+            j.drawMode(dd, c.s, c.v, 0, 0, c.n, false, null);
+        }
+    }.f, Ctx{ .s = &s, .v = vertices.handle, .n = n }, r);
+    r.add("points", n);
 }
 
 pub const panic = std.debug.FullPanic(panicked);

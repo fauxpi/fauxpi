@@ -20,6 +20,8 @@ pub const all = [_]Test{
     .{ .name = "v3d_texture", .about = "V3D: 2,000 bilinear-textured quads a frame" },
     .{ .name = "v3d_blend", .about = "V3D: 500 translucent quads a frame, blended in the shader" },
     .{ .name = "v3d_draws", .about = "V3D: 1,000 draws of a quad each, a frame" },
+    .{ .name = "v3d_lines", .about = "V3D: 10,000 lines 2 pixels wide a frame, some clipped" },
+    .{ .name = "v3d_points", .about = "V3D: 10,000 points 1 to 16 pixels wide a frame, sized by the vertex shader" },
     .{ .name = "hvs_planes", .about = "the HVS composing 10 planes, moving, 60 times a second" },
 };
 
@@ -33,4 +35,6 @@ pub const linux = [_]Test{
     .{ .name = "kms_texture", .about = "vc4: 2,000 bilinear-textured quads a frame" },
     .{ .name = "kms_blend", .about = "vc4: 500 translucent quads a frame, blended in the shader" },
     .{ .name = "kms_draws", .about = "vc4: 1,000 draws of a quad each, a frame" },
+    .{ .name = "kms_lines", .about = "vc4: 10,000 lines 2 pixels wide a frame, some clipped" },
+    .{ .name = "kms_points", .about = "vc4: 10,000 points 1 to 16 pixels wide a frame, sized by the vertex shader" },
 };

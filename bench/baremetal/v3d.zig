@@ -79,14 +79,16 @@ const Shaders = struct {
     fs: u32,
     words: u8,
     varyings: u8,
+    point_size: bool,
 
     fn make(shading: scene.Shading) Shaders {
         return .{
-            .vs = upload(scene.vertexShader(shading.words(), false)),
-            .cs = upload(scene.vertexShader(shading.words(), true)),
+            .vs = upload(scene.vertexShader(shading, false)),
+            .cs = upload(scene.vertexShader(shading, true)),
             .fs = upload(shading.fragmentShader()),
             .words = shading.words(),
             .varyings = shading.varyings(),
+            .point_size = shading.pointSize(),
         };
     }
 };
@@ -94,6 +96,8 @@ const Shaders = struct {
 /// A draw: `count` vertices (3 a triangle) of `vertices`, shaded so.
 const Draw = struct {
     record: u32,
+    /// What the vertices draw: 0 points, 1 lines, 4 triangles.
+    mode: u8 = 4,
     first: u32 = 0,
     count: u32,
     /// The configuration bits: drawing both faces, and the depth test.
@@ -106,8 +110,8 @@ fn shaderRecord(s: Shaders, vertices: []const f32, vs_unifs: u32, fs_unifs: u32)
     const rec = hw.heap.alloc(u8, 36 + 8, 16);
     var c: Cl = .{ .buf = rec };
     const stride = @as(u8, s.words) * 4;
-    // Flags: the fragment shader single-threaded.
-    c.half(1);
+    // Flags: the fragment shader single-threaded; the vertex shader writing points' sizes.
+    c.half(if (s.point_size) 1 | 2 else 1);
     c.byte(0);
     c.byte(s.varyings);
     c.word(s.fs);
@@ -198,6 +202,8 @@ const Target = struct {
         bcl.byte(106); // CLIPPER_Z_SCALING
         bcl.float(0.5);
         bcl.float(0.5);
+        bcl.byte(99); // LINE_WIDTH
+        bcl.float(scene.line_width);
         var depth: ?bool = null;
         for (list) |d| {
             if (depth != d.depth_test) {
@@ -210,8 +216,8 @@ const Target = struct {
             }
             bcl.byte(64); // GL_SHADER_STATE: the record, with 1 attribute
             bcl.word(d.record | 1);
-            bcl.byte(33); // GL_ARRAY_PRIMITIVE: triangles
-            bcl.byte(4);
+            bcl.byte(33); // GL_ARRAY_PRIMITIVE
+            bcl.byte(d.mode);
             bcl.word(d.count);
             bcl.word(d.first);
         }
@@ -351,5 +357,35 @@ pub fn draws(p: Params, r: *Result) void {
     for (0..frames) |_| t.frame(0xff000000, list);
     r.add("frames", frames);
     r.add("draws", @as(u64, n) * frames);
+    r.add("checksum", t.checksum());
+}
+
+/// Lines, a pixel or two wide, some clipped: vertex shading, and drawing each as a quad.
+pub fn lines(p: Params, r: *Result) void {
+    var t: Target = .init(p, 1);
+    const s: Shaders = .make(.line);
+    const n: u32 = @intCast(@min(p.amount(10_000), 20_000));
+    const vertices = hw.heap.alloc(f32, n * 2 * 6, 16);
+    scene.lineVertices(vertices, n);
+    const list = [_]Draw{.{ .record = shaderRecord(s, vertices, t.vs_unifs, uniforms(&.{})), .mode = 1, .count = n * 2 }};
+    const frames = p.amount(30);
+    for (0..frames) |_| t.frame(0xff000000, &list);
+    r.add("frames", frames);
+    r.add("lines", @as(u64, n) * frames);
+    r.add("checksum", t.checksum());
+}
+
+/// Points, each its own size, coloured by their coordinates across them.
+pub fn points(p: Params, r: *Result) void {
+    var t: Target = .init(p, 1);
+    const s: Shaders = .make(.point);
+    const n: u32 = @intCast(@min(p.amount(10_000), 20_000));
+    const vertices = hw.heap.alloc(f32, n * 7, 16);
+    scene.pointVertices(vertices, n);
+    const list = [_]Draw{.{ .record = shaderRecord(s, vertices, t.vs_unifs, uniforms(&.{})), .mode = 0, .count = n }};
+    const frames = p.amount(30);
+    for (0..frames) |_| t.frame(0xff000000, &list);
+    r.add("frames", frames);
+    r.add("points", @as(u64, n) * frames);
     r.add("checksum", t.checksum());
 }
