@@ -39,6 +39,19 @@ pub const VertexStage = struct {
     vp_y: f32,
 };
 
+/// A draw's coordinate shader, run on the GPU for its vertices' clip coordinates: given its
+/// vertices' VPM words (`count` of them, from word `first_input` of the inputs, `input_stride`
+/// apart), into the clip coordinates from `first_vertex`.
+pub const ClipStage = struct {
+    code: []const qpu.Inst,
+    uniforms: *const [shader.max_uniforms]u32,
+    vpm_words: u32,
+    first_input: u32,
+    input_stride: u32,
+    first_vertex: u32,
+    count: u32,
+};
+
 /// A run of triangles drawn with one fragment shader: `vertex_count` vertices from `first_vertex`,
 /// each 3 a triangle or, with `vertex_stage`, shaded on the GPU and made triangles of by its corners.
 pub const Draw = struct {

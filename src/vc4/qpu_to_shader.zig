@@ -984,6 +984,16 @@ pub const VertexShader = struct {
 /// `glsl_vertex_common`) gives it to transform feedback; MSL's `vertex_shade` kernel (after
 /// `msl_common` and `msl_shared_functions`) shades `VertexInfo`'s vertices.
 pub fn translateVertex(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, lang: Language) std.Io.Writer.Error!VertexShader {
+    return translateVertexStage(w, decoded, lang, false);
+}
+
+/// A coordinate shader translated (GLSL): each vertex's clip coordinates (its first four VPM
+/// words, as floats) captured in `tf_pos`, for the clipper.
+pub fn translateCoordinates(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst) std.Io.Writer.Error!VertexShader {
+    return translateVertexStage(w, decoded, .glsl, true);
+}
+
+fn translateVertexStage(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, lang: Language, clip: bool) std.Io.Writer.Error!VertexShader {
     var t: Translator = .{ .w = w, .lang = lang, .stage = .vertex, .opaque_zero = " + zero" };
     // The registers start as qpu_sim's do (ra15 and rb15 a fragment's W, 1, and Z, 0), from a zero
     // the compiler doesn't know is 0 (a vertex's number is never 2^31 or more).
@@ -1035,6 +1045,21 @@ pub fn translateVertex(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, 
     if (end_at == null) t.vertex.unsupported = true;
     t.vertex.outputs = t.vpm_writes;
     if (t.vpm_writes < 3) t.vertex.unsupported = true;
+    if (clip) {
+        if (t.vpm_writes < 4) t.vertex.unsupported = true;
+        try w.writeAll(
+            \\  tf_pos = vec4(f(vo[0]), f(vo[1]), f(vo[2]), f(vo[3]));
+            \\  tf_unit_w = uvec4(0u);
+            \\  tf_v0 = vec4(0.0);
+            \\  tf_v1 = vec4(0.0);
+            \\  tf_v2 = vec4(0.0);
+            \\  tf_v3 = vec4(0.0);
+            \\  gl_Position = vec4(0.0);
+            \\}
+            \\
+        );
+        return t.vertex;
+    }
     // The vertex, as V3D's position words give it: x and y in 12.4 fixed point, z, and 1/W (taken
     // as 1 if 0); the varyings multiplied by 1/W.
     if (lang == .msl) {

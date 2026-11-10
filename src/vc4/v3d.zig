@@ -3302,6 +3302,19 @@ pub const V3d = struct {
         /// OpenGL, shading vertices itself: the frame's vertices' VPM words and triangles' corners.
         inputs: std.ArrayList(u32) = .empty,
         corners: std.ArrayList(u32) = .empty,
+        /// OpenGL, clip coordinates found on the GPU: the draws waiting for them, their vertices
+        /// and corners, their coordinate shaders' code, VPM words and stages, and the clip
+        /// coordinates.
+        pending: std.ArrayList(PendingDraw) = .empty,
+        unique: std.ArrayList(u32) = .empty,
+        slots: std.ArrayList(u32) = .empty,
+        cs_code: std.ArrayList(qpu.Inst) = .empty,
+        /// Each clip stage's code: where it is in `cs_code`, and how long.
+        cs_code_at: std.ArrayList([2]usize) = .empty,
+        cs_inputs: std.ArrayList(u32) = .empty,
+        clip_stages: std.ArrayList(gpu_draw.ClipStage) = .empty,
+        clip_out: std.ArrayList([4]f32) = .empty,
+        clip_ok: std.ArrayList(bool) = .empty,
 
         /// Starts a frame of up to `max_draws` draws: false if there isn't the memory.
         fn begin(g: *GpuState, max_draws: usize) bool {
@@ -3309,7 +3322,8 @@ pub const V3d = struct {
             g.uniforms.clearRetainingCapacity();
             g.code.clearRetainingCapacity();
             g.draws.ensureTotalCapacity(tri_allocator, max_draws) catch return false;
-            g.uniforms.ensureTotalCapacity(tri_allocator, 2 * max_draws) catch return false;
+            // Each draw's vertex, fragment and coordinate shaders'.
+            g.uniforms.ensureTotalCapacity(tri_allocator, 3 * max_draws) catch return false;
             return true;
         }
 
@@ -3515,6 +3529,28 @@ pub const V3d = struct {
         return false;
     }
 
+    /// A draw of a frame shaded on the GPU whose triangles wait for their clip coordinates.
+    const PendingDraw = struct {
+        draw: DrawCall,
+        rec_phys: u32,
+        num_tris: u32,
+        lines_points: bool,
+        vs_code_phys: u32,
+        vs_unif_phys: u32,
+        fs_num_varyings: u8,
+        attrs: [8]AttrStream,
+        n_attrs: usize,
+        vpm_words: u32,
+        /// Its vertices (`unique`) and corners' slots (`slots`), and its draw (in `draws`).
+        unique_off: u32,
+        unique_len: u32,
+        slots_off: u32,
+        draw_idx: usize,
+        /// Its coordinate shader (if it has one): on the GPU (`clip_stages`), or not.
+        has_cs: bool,
+        clip_stage: ?usize,
+    };
+
     fn renderWithGpuVertices(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
         const g = self.gpuState() orelse return false;
         const frame = self.gpuFrame(ram, start_bus, end_bus) orelse return false;
@@ -3522,19 +3558,26 @@ pub const V3d = struct {
         if (!frame.first.has_render) return rejected(.gpu_vertices_no_triangles);
         g.inputs.clearRetainingCapacity();
         g.corners.clearRetainingCapacity();
+        g.pending.clearRetainingCapacity();
+        g.unique.clearRetainingCapacity();
+        g.slots.clearRetainingCapacity();
+        g.cs_code.clearRetainingCapacity();
+        g.cs_code_at.clearRetainingCapacity();
+        g.cs_inputs.clearRetainingCapacity();
+        g.clip_stages.clearRetainingCapacity();
+        // OpenGL finds clip coordinates on the GPU; Metal draws frames needing them clipped
+        // from vertices shaded on the CPU.
+        const gl_clip = !metal_renderer.supported;
         var n_draws: usize = 0;
         var vertex_total: u32 = 0;
-        // Triangles the clipper cuts: their pieces' corners, shaded and clipped here, after the
-        // vertices shaded on the GPU (their corners marked until how many those are is known).
-        var n_clipped: u32 = 0;
-        const clipped_mark: u32 = 1 << 31;
+        var clip_total: u32 = 0;
         if (!g.begin(self.draws.items.len)) return false;
         for (self.draws.items) |draw| {
             if (draw.kind != .gl) return rejected(.gpu_vertices_not_triangles);
             // Lines and points: made quads on the CPU (Metal: the frame drawn from vertices
             // shaded on the CPU).
             const lines_points = !isTriangles(draw);
-            if (lines_points and metal_renderer.supported) return rejected(.gpu_vertices_not_triangles);
+            if (lines_points and !gl_clip) return rejected(.gpu_vertices_not_triangles);
             // What prepareDrawsForFrame skips, drawing nothing.
             if (numPrims(draw) == 0) continue;
             const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
@@ -3555,10 +3598,29 @@ pub const V3d = struct {
             const fs_unifs = g.addUniforms(ram, fs_unif_phys);
             const vs_unifs = g.addUniforms(ram, vs_unif_phys);
 
-            var attr_streams: [8]AttrStream = undefined;
-            const attr_info = decodeAttrStreams(ram, rec_phys, draw.num_attrs, vs_attr_mask, &attr_streams);
-            const attrs = attr_streams[0..attr_info.count];
+            var pd: PendingDraw = .{
+                .draw = draw,
+                .rec_phys = rec_phys,
+                .num_tris = num_tris,
+                .lines_points = lines_points,
+                .vs_code_phys = vs_code_phys,
+                .vs_unif_phys = vs_unif_phys,
+                .fs_num_varyings = fs_num_varyings,
+                .attrs = undefined,
+                .n_attrs = 0,
+                .vpm_words = 0,
+                .unique_off = 0,
+                .unique_len = 0,
+                .slots_off = 0,
+                .draw_idx = g.draws.items.len,
+                .has_cs = false,
+                .clip_stage = null,
+            };
+            const attr_info = decodeAttrStreams(ram, rec_phys, draw.num_attrs, vs_attr_mask, &pd.attrs);
+            pd.n_attrs = attr_info.count;
+            const attrs = pd.attrs[0..pd.n_attrs];
             const vpm_words: u32 = @intCast(attr_info.vpm_words);
+            pd.vpm_words = vpm_words;
             const stride: u32 = @max((vpm_words + 3) / 4 * 4, 4);
 
             const prof_start = profile.now();
@@ -3566,33 +3628,57 @@ pub const V3d = struct {
             if (!self.collectVertices(ram, draw, num_tris)) return false;
             const unique = self.vs_unique.items;
             if (vertex_total + unique.len > max_gpu_vertices) return rejected(.gpu_vertices_too_many);
-            // Triangles the clipper cuts: shaded and clipped here (Metal: the frame drawn from
-            // vertices shaded on the CPU, which clips).
-            const clip_start = profile.now();
-            const clips = self.needsClipping(ram, draw, rec_phys, num_tris);
-            profile.end(.gpu_clip_test, clip_start);
-            if (clips and metal_renderer.supported) return rejected(.gpu_vertices_clipped);
+            if (!gl_clip) {
+                // Metal: the clip test here.
+                const clip_start = profile.now();
+                const clips = self.needsClipping(ram, draw, rec_phys, num_tris);
+                profile.end(.gpu_clip_test, clip_start);
+                if (clips) return rejected(.gpu_vertices_clipped);
+            }
             // Each vertex's VPM words, as qpu_sim is given them.
             const first_input: u32 = @intCast(g.inputs.items.len);
             g.inputs.resize(tri_allocator, first_input + unique.len * stride) catch return false;
-            const in = g.inputs.items[first_input..];
-            var b: usize = 0;
-            while (b < unique.len) : (b += 16) {
-                const lanes = @min(16, unique.len - b);
-                var vpm_in: [32]qpu_sim.Vec = undefined;
-                populateBatchVpmIn(ram, attrs, unique[b..][0..lanes], &vpm_in);
-                for (0..lanes) |lane| {
-                    const words = in[(b + lane) * stride ..][0..stride];
-                    for (words, 0..) |*word, k| word.* = if (k < vpm_words) vpm_in[k][lane] else 0;
+            gatherVpmWords(ram, attrs, unique, vpm_words, stride, g.inputs.items[first_input..]);
+            if (gl_clip) {
+                // Its vertices and corners kept, and its coordinate shader's VPM words gathered.
+                pd.unique_off = @intCast(g.unique.items.len);
+                pd.unique_len = @intCast(unique.len);
+                pd.slots_off = @intCast(g.slots.items.len);
+                g.unique.appendSlice(tri_allocator, unique) catch return false;
+                g.slots.appendSlice(tri_allocator, self.vs_corner_slot.items) catch return false;
+                const cs_attr_mask = ram[rec_phys + 26];
+                const cs_code_phys = std.mem.readInt(u32, ram[rec_phys + 28 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+                const cs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 32 ..][0..4], .little) & vc_bus.ramMask(ram.len);
+                const cs_len = programLen(ram, cs_code_phys);
+                pd.has_cs = cs_len > 0;
+                if (cs_len > 0 and cs_len <= gpu_draw.max_program_len) {
+                    var cs_attrs: [8]AttrStream = undefined;
+                    const cs_info = decodeAttrStreams(ram, rec_phys, draw.num_attrs, cs_attr_mask, &cs_attrs);
+                    const cs_words: u32 = @intCast(cs_info.vpm_words);
+                    const cs_stride: u32 = @max((cs_words + 3) / 4 * 4, 4);
+                    const at = g.cs_code.items.len;
+                    g.cs_code.resize(tri_allocator, at + cs_len) catch return false;
+                    _ = readProgram(ram, cs_code_phys, g.cs_code.items[at..]).?;
+                    const cs_first: u32 = @intCast(g.cs_inputs.items.len);
+                    g.cs_inputs.resize(tri_allocator, cs_first + unique.len * cs_stride) catch return false;
+                    gatherVpmWords(ram, cs_attrs[0..cs_info.count], unique, cs_words, cs_stride, g.cs_inputs.items[cs_first..]);
+                    pd.clip_stage = g.clip_stages.items.len;
+                    // Its code, set from `cs_code` once all are read (and it no longer moves).
+                    g.cs_code_at.append(tri_allocator, .{ at, cs_len }) catch return false;
+                    g.clip_stages.append(tri_allocator, .{
+                        .code = &.{},
+                        .uniforms = g.addUniforms(ram, cs_unif_phys),
+                        .vpm_words = cs_words,
+                        .first_input = cs_first,
+                        .input_stride = cs_stride,
+                        .first_vertex = clip_total,
+                        .count = @intCast(unique.len),
+                    }) catch return false;
+                    clip_total += @intCast(unique.len);
                 }
-            }
-            const first_corner: u32 = @intCast(g.corners.items.len);
-            if (!clips and !lines_points) {
-                g.corners.appendSlice(tri_allocator, self.vs_corner_slot.items) catch return false;
+                g.pending.append(tri_allocator, pd) catch return false;
             } else {
-                const cpu_start = profile.now();
-                defer profile.end(.gpu_cpu_primitives, cpu_start);
-                n_clipped = self.clipOnCpu(g, ram, draw, num_tris, vs_code_phys, vs_unif_phys, attrs, vpm_words, fs_num_varyings, n_clipped, clipped_mark, lines_points) orelse return rejected(.gpu_vertices_clipped);
+                g.corners.appendSlice(tri_allocator, self.vs_corner_slot.items) catch return false;
             }
 
             g.draws.appendAssumeCapacity(.{
@@ -3604,8 +3690,8 @@ pub const V3d = struct {
                     .vpm_words = vpm_words,
                     .first_input = first_input,
                     .input_stride = stride,
-                    .first_corner = first_corner,
-                    .corner_count = @intCast(g.corners.items.len - first_corner),
+                    .first_corner = 0,
+                    .corner_count = @intCast(self.vs_corner_slot.items.len),
                     // Lines' and points' quads are drawn facing either way.
                     .cull = if (lines_points) 3 else draw.config_b0 & 7,
                     .vp_x = draw.vp_x,
@@ -3621,15 +3707,79 @@ pub const V3d = struct {
                 .clip_w = draw.clip_w,
                 .clip_h = draw.clip_h,
             });
+            if (!gl_clip) g.draws.items[g.draws.items.len - 1].vertex_stage.?.first_corner = @intCast(g.corners.items.len - self.vs_corner_slot.items.len);
             n_draws += 1;
             vertex_total += @intCast(unique.len);
         }
         if (n_draws == 0) return false;
-        // The clipped pieces' corners: after the vertices shaded on the GPU.
-        for (g.draws.items) |d| {
-            const vs = d.vertex_stage.?;
-            for (g.corners.items[vs.first_corner..][0..vs.corner_count]) |*c| {
-                if (c.* & clipped_mark != 0) c.* = vertex_total + (c.* & ~clipped_mark) - d.first_vertex;
+
+        // Triangles the clipper cuts (and lines and points): their pieces' corners, made here,
+        // after the vertices shaded on the GPU (their corners marked until how many those are
+        // is known).
+        var n_clipped: u32 = 0;
+        const clipped_mark: u32 = 1 << 31;
+        if (gl_clip) {
+            // The coordinate shaders' code, then their clip coordinates, on the GPU.
+            for (g.clip_stages.items, g.cs_code_at.items) |*st, at| st.code = g.cs_code.items[at[0]..][0..at[1]];
+            g.clip_out.resize(tri_allocator, clip_total) catch return false;
+            g.clip_ok.resize(tri_allocator, g.clip_stages.items.len) catch return false;
+            @memset(g.clip_ok.items, false);
+            if (clip_total > 0) {
+                const clip_start = profile.now();
+                defer profile.end(.gpu_clip_test, clip_start);
+                if (comptime @hasDecl(GpuRenderer, "clipCoords")) {
+                    g.renderer.clipCoords(g.clip_stages.items, g.cs_inputs.items, g.clip_out.items, g.clip_ok.items) catch @memset(g.clip_ok.items, false);
+                }
+            }
+            for (g.pending.items) |pd| {
+                const unique = g.unique.items[pd.unique_off..][0..pd.unique_len];
+                const slots = g.slots.items[pd.slots_off..][0 .. pd.num_tris * 3];
+                // Its vertices, corners, and clip coordinates (the GPU's, or found here) as
+                // `clipOnCpu` takes them.
+                self.vs_unique.clearRetainingCapacity();
+                self.vs_unique.appendSlice(tri_allocator, unique) catch return false;
+                self.vs_corner_slot.clearRetainingCapacity();
+                self.vs_corner_slot.appendSlice(tri_allocator, slots) catch return false;
+                var clips = false;
+                self.vs_clip_ok = false;
+                if (pd.clip_stage) |k| if (g.clip_ok.items[k]) {
+                    const st = g.clip_stages.items[k];
+                    self.vs_clip.resize(tri_allocator, unique.len) catch return false;
+                    for (self.vs_clip.items, g.clip_out.items[st.first_vertex..][0..unique.len]) |*c, v| c.* = .{ .x = v[0], .y = v[1], .z = v[2], .w = v[3] };
+                    self.vs_clip_ok = true;
+                    for (0..pd.num_tris) |t| {
+                        var c: [3]ClipVertex = undefined;
+                        for (&c, 0..) |*v, corner| v.* = self.vs_clip.items[slots[t * 3 + corner]];
+                        if (needsClip(pd.draw, c)) {
+                            clips = true;
+                            break;
+                        }
+                    }
+                };
+                if (pd.has_cs and !self.vs_clip_ok) {
+                    // Not on the GPU: found here.
+                    const clip_start = profile.now();
+                    clips = self.needsClipping(ram, pd.draw, pd.rec_phys, pd.num_tris);
+                    profile.end(.gpu_clip_test, clip_start);
+                }
+                const first_corner: u32 = @intCast(g.corners.items.len);
+                if (!clips and !pd.lines_points) {
+                    g.corners.appendSlice(tri_allocator, slots) catch return false;
+                } else {
+                    const cpu_start = profile.now();
+                    defer profile.end(.gpu_cpu_primitives, cpu_start);
+                    n_clipped = self.clipOnCpu(g, ram, pd.draw, pd.num_tris, pd.vs_code_phys, pd.vs_unif_phys, pd.attrs[0..pd.n_attrs], pd.vpm_words, pd.fs_num_varyings, n_clipped, clipped_mark, pd.lines_points) orelse return rejected(.gpu_vertices_clipped);
+                }
+                const vs = &g.draws.items[pd.draw_idx].vertex_stage.?;
+                vs.first_corner = first_corner;
+                vs.corner_count = @intCast(g.corners.items.len - first_corner);
+            }
+            // The clipped pieces' corners: after the vertices shaded on the GPU.
+            for (g.draws.items) |d| {
+                const vs = d.vertex_stage.?;
+                for (g.corners.items[vs.first_corner..][0..vs.corner_count]) |*c| {
+                    if (c.* & clipped_mark != 0) c.* = vertex_total + (c.* & ~clipped_mark) - d.first_vertex;
+                }
             }
         }
         const draws = g.end();
@@ -3639,6 +3789,21 @@ pub const V3d = struct {
             renderWithGl(g, ram, frame.first, &frame.tiles, g.vertices[0..n_clipped], draws, g.inputs.items, g.corners.items);
         return drawn or rejected(.gpu_vertices_render);
     }
+
+    /// Vertices' (`unique`) VPM words as qpu_sim is given them: `words` of each, `stride` apart.
+    fn gatherVpmWords(ram: []const u8, attrs: []const AttrStream, unique: []const u32, words: u32, stride: u32, out: []u32) void {
+        var b: usize = 0;
+        while (b < unique.len) : (b += 16) {
+            const lanes = @min(16, unique.len - b);
+            var vpm_in: [32]qpu_sim.Vec = undefined;
+            populateBatchVpmIn(ram, attrs, unique[b..][0..lanes], &vpm_in);
+            for (0..lanes) |lane| {
+                const w = out[(b + lane) * stride ..][0..stride];
+                for (w, 0..) |*word, k| word.* = if (k < words) vpm_in[k][lane] else 0;
+            }
+        }
+    }
+
 
     fn renderWithGpu(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
         const g = self.gpuState() orelse return false;

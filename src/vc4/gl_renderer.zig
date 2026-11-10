@@ -213,6 +213,8 @@ pub const Renderer = struct {
     /// What vertex shaders shade the frame's vertices from: their VPM words.
     input_vao: GLuint = 0,
     inputs: GLuint = 0,
+    /// Where coordinate shaders capture clip coordinates (`clipCoords`).
+    clip_buf: GLuint = 0,
     vertex_programs: [32]VertexProgram = @splat(.{}),
     next_vertex_program: usize = 0,
     /// The frame's triangles' vertices (in `ebo`), and its shaded vertices read back.
@@ -501,7 +503,17 @@ pub const Renderer = struct {
     /// The program shading a vertex shader's vertices, translated and compiled the first time it
     /// shades (null if OpenGL can't shade them as qpu_sim does).
     fn vertexProgram(r: *Renderer, code: []const qpu.Inst) ?*const VertexProgram {
-        const hash = std.hash.Wyhash.hash(1, std.mem.sliceAsBytes(code));
+        return r.vertexStageProgram(code, false);
+    }
+
+    /// A coordinate shader's program (`shader.translateCoordinates`): each vertex's clip
+    /// coordinates captured.
+    fn clipProgram(r: *Renderer, code: []const qpu.Inst) ?*const VertexProgram {
+        return r.vertexStageProgram(code, true);
+    }
+
+    fn vertexStageProgram(r: *Renderer, code: []const qpu.Inst, clip: bool) ?*const VertexProgram {
+        const hash = std.hash.Wyhash.hash(if (clip) 2 else 1, std.mem.sliceAsBytes(code));
         for (&r.vertex_programs) |*p| {
             if (p.used and p.hash == hash) return if (p.program != 0) p else null;
         }
@@ -517,14 +529,17 @@ pub const Renderer = struct {
         var src: std.Io.Writer.Allocating = .init(std.heap.smp_allocator);
         defer src.deinit();
         src.writer.writeAll(shader.glsl_vertex_common) catch return null;
-        const vs = shader.translateVertex(&src.writer, decoded, .glsl) catch return null;
+        const vs = (if (clip) shader.translateCoordinates(&src.writer, decoded) else shader.translateVertex(&src.writer, decoded, .glsl)) catch return null;
         if (vs.unsupported) return null;
 
         const sh = r.compileShader(GL_VERTEX_SHADER, src.written()) orelse return null;
         defer gl.DeleteShader(sh);
         const prog = gl.CreateProgram();
         gl.AttachShader(prog, sh);
-        gl.TransformFeedbackVaryings(prog, shader.glsl_vertex_captured.len, &shader.glsl_vertex_captured, GL_INTERLEAVED_ATTRIBS);
+        if (clip) {
+            const captured = [_][*:0]const u8{"tf_pos"};
+            gl.TransformFeedbackVaryings(prog, captured.len, &captured, GL_INTERLEAVED_ATTRIBS);
+        } else gl.TransformFeedbackVaryings(prog, shader.glsl_vertex_captured.len, &shader.glsl_vertex_captured, GL_INTERLEAVED_ATTRIBS);
         gl.LinkProgram(prog);
         var ok: GLint = 0;
         gl.GetProgramiv(prog, GL_LINK_STATUS, &ok);
@@ -549,6 +564,52 @@ pub const Renderer = struct {
     }
 
     /// Shades the vertices of `draws` with a vertex stage, from `inputs`, into the vertex buffer.
+    /// Runs draws' coordinate shaders (`stages`, given `inputs`) for their vertices' clip
+    /// coordinates, `total` of them, into `out`; each stage's `ok` if it could be (else its
+    /// vertices' are the CPU's to find).
+    pub fn clipCoords(r: *Renderer, stages: []const gpu_draw.ClipStage, inputs: []const u32, out: [][4]f32, ok: []bool) Error!void {
+        if (r.makeCurrent(r.dpy, null, null, r.ctx) == 0) return error.GlFailed;
+        defer _ = r.makeCurrent(r.dpy, null, null, null);
+        const gl = &r.gl;
+        if (r.clip_buf == 0) gl.GenBuffers(1, @ptrCast(&r.clip_buf));
+        gl.BindBuffer(GL_ARRAY_BUFFER, r.clip_buf);
+        gl.BufferData(GL_ARRAY_BUFFER, @intCast(out.len * 16), null, GL_STREAM_DRAW);
+        gl.BindVertexArray(r.input_vao);
+        gl.BindBuffer(GL_ARRAY_BUFFER, r.inputs);
+        gl.BufferData(GL_ARRAY_BUFFER, @intCast(inputs.len * 4), inputs.ptr, GL_STREAM_DRAW);
+        gl.Enable(GL_RASTERIZER_DISCARD);
+        for (stages, ok) |st, *o| {
+            o.* = false;
+            if (st.count == 0) continue;
+            const p = r.clipProgram(st.code) orelse continue;
+            o.* = true;
+            gl.UseProgram(p.program);
+            gl.Uniform1uiv(p.unif, shader.max_uniforms, st.uniforms);
+            gl.Uniform1ui(p.n_vpm, st.vpm_words);
+            gl.Uniform1ui(p.n_var, 0);
+            gl.Uniform2f(p.vp, 0, 0);
+            const stride: GLsizei = @intCast(@max(st.input_stride, 4) * 4);
+            for (0..8) |i| {
+                const loc: GLuint = @intCast(i);
+                if (i * 4 < st.vpm_words) {
+                    gl.VertexAttribIPointer(loc, 4, GL_UNSIGNED_INT, stride, @ptrFromInt((@as(usize, st.first_input) + i * 4) * 4));
+                    gl.EnableVertexAttribArray(loc);
+                } else {
+                    gl.DisableVertexAttribArray(loc);
+                }
+            }
+            gl.BindBufferRange(GL_TRANSFORM_FEEDBACK_BUFFER, 0, r.clip_buf, @intCast(@as(usize, st.first_vertex) * 16), @intCast(@as(usize, st.count) * 16));
+            gl.BeginTransformFeedback(GL_POINTS);
+            gl.DrawArrays(GL_POINTS, 0, @intCast(st.count));
+            gl.EndTransformFeedback();
+        }
+        gl.Disable(GL_RASTERIZER_DISCARD);
+        gl.BindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0);
+        gl.BindBuffer(GL_ARRAY_BUFFER, r.clip_buf);
+        gl.GetBufferSubData(GL_ARRAY_BUFFER, 0, @intCast(out.len * 16), out.ptr);
+        if (gl.GetError() != GL_NO_ERROR) return error.GlFailed;
+    }
+
     fn shadeVertices(r: *Renderer, draws: []const Draw, programs: []const *const VertexProgram, inputs: []const u32, vertex_total: u32, extra: []const Vertex) void {
         const gl = &r.gl;
         gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
