@@ -3811,7 +3811,6 @@ pub const V3d = struct {
         }
     }
 
-
     fn renderWithGpu(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
         const g = self.gpuState() orelse return false;
         if (self.overflow_draw_start < self.draws.items.len) return false;

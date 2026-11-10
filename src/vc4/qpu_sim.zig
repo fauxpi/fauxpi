@@ -141,7 +141,6 @@ pub fn z24Of(z: Vec) Vec {
     return z24;
 }
 
-
 pub const Error = error{
     Unsupported,
     UniformUnderflow,
@@ -1427,245 +1426,245 @@ pub const Machine = struct {
 
     /// Runs (at most `slice` more instructions) until the program ends, or it waits.
     pub fn run(m: *Machine, comptime RType: type, decoded: []const DecodedInst, env: *const Env, r: *RType, slice: usize) Error!Stop {
-    const s = &m.s;
-    const until = m.steps +| slice;
-    while (m.ip < decoded.len) : (m.ip += 1) {
-        if (m.branch_target) |t| {
-            if (m.ip >= m.branch_from + 4) {
-                m.ip = t;
-                m.branch_target = null;
-                if (m.ip >= decoded.len) break;
-            }
-        }
-        if (m.end_at) |e| if (m.ip > e) return .ended;
-        const d = decoded[m.ip];
-        if (waits(d, env)) return .waiting;
-        if (m.steps >= until) return .slice;
-        m.steps += 1;
-        if (m.steps > env.max_steps) return error.TooLong;
-        if (@hasField(RType, "instructions")) r.instructions += 1;
-        if (d.sig == .branch) {
-            const any = struct {
-                fn f(v: VecBool) bool {
-                    return @reduce(.Or, v);
-                }
-                fn all(v: VecBool) bool {
-                    return @reduce(.And, v);
-                }
-            };
-            const flag = switch (d.branch_cond >> 2) {
-                0 => s.zero,
-                1 => s.neg,
-                else => s.carry,
-            };
-            const taken = switch (d.branch_cond) {
-                15 => true,
-                12, 13, 14 => false,
-                else => switch (d.branch_cond & 3) {
-                    0 => any.all(flag),
-                    1 => any.all(!flag),
-                    2 => any.f(flag),
-                    else => any.f(!flag),
-                },
-            };
-            // The link address (after the delay slots) comes out of both ALUs.
-            const link: u32 = env.code_addr +% @as(u32, @intCast((m.ip + 4) * 8));
-            try write(RType, s, r, env, d.waddr_add, d.add_file, splat(link), .always, 0, 0, false);
-            try write(RType, s, r, env, d.waddr_mul, d.mul_file, splat(link), .always, 0, 0, false);
-            if (taken and m.branch_target == null) {
-                var target: u32 = d.imm_or_small;
-                if (d.branch_rel) target +%= link;
-                if (d.branch_reg) |rg| target +%= (if ((s.ra_init >> rg) & 1 != 0) s.ra[rg][0] else 0);
-                m.branch_target = (target -% env.code_addr) / 8;
-                m.branch_from = m.ip;
-            }
-            continue;
-        }
-
-        if ((d.flags & DecodedInst.FLAG_FUSED_LINTERP) != 0) {
-            const val: Vec = if (s.varyings_read < env.varyings.len) blk: {
-                defer s.varyings_read += 1;
-                break :blk env.varyings[s.varyings_read];
-            } else splat(0);
-            s.acc[5] = splatF(varying_c);
-            if (d.waddr_add != d.waddr_mul) {
-                s.acc[d.waddr_mul - qpu.W.acc0] = @bitCast(@as(VecF, @bitCast(val)) - @as(VecF, @splat(varying_c)));
-            }
-            if (d.waddr_add != qpu.W.nop) {
-                if (d.waddr_add < 32) {
-                    const bit = @as(u32, 1) << @intCast(d.waddr_add);
-                    if (d.add_file == .a) {
-                        s.ra_init |= bit;
-                        s.ra[d.waddr_add] = val;
-                    } else {
-                        s.rb_init |= bit;
-                        s.rb[d.waddr_add] = val;
-                    }
-                } else if (d.waddr_add >= qpu.W.acc0 and d.waddr_add <= qpu.W.acc0 + 3) {
-                    s.acc[d.waddr_add - qpu.W.acc0] = val;
-                } else {
-                    try write(RType, s, r, env, d.waddr_add, d.add_file, val, .always, 0, 0, true);
+        const s = &m.s;
+        const until = m.steps +| slice;
+        while (m.ip < decoded.len) : (m.ip += 1) {
+            if (m.branch_target) |t| {
+                if (m.ip >= m.branch_from + 4) {
+                    m.ip = t;
+                    m.branch_target = null;
+                    if (m.ip >= decoded.len) break;
                 }
             }
+            if (m.end_at) |e| if (m.ip > e) return .ended;
+            const d = decoded[m.ip];
+            if (waits(d, env)) return .waiting;
+            if (m.steps >= until) return .slice;
+            m.steps += 1;
+            if (m.steps > env.max_steps) return error.TooLong;
             if (@hasField(RType, "instructions")) r.instructions += 1;
-            m.ip += 1;
-            continue;
-        }
-
-        var add_result: Vec = undefined;
-        var mul_result: Vec = undefined;
-
-        if (d.sig == .load_imm) {
-            // A semaphore counted up, or down (Machine.waits held it back at 0).
-            if (d.limm_mode == 4) if (env.sync) |sync| {
-                const n = d.imm_or_small & 15;
-                if ((d.imm_or_small >> 4) & 1 != 0) sync.sema[n] -|= 1 else sync.sema[n] +|= 1;
-            };
-            add_result = switch (d.limm_mode) {
-                // Each element's 2 bits: its low bit at bit n, its high one at bit 16 + n.
-                1, 3 => blk: {
-                    var v: Vec = undefined;
-                    for (0..lanes) |i| {
-                        const two: u32 = (d.imm_or_small >> @intCast(i)) & 1 | ((d.imm_or_small >> @intCast(16 + i)) & 1) << 1;
-                        v[i] = if (d.limm_mode == 1 and two >= 2) two -% 4 else two;
+            if (d.sig == .branch) {
+                const any = struct {
+                    fn f(v: VecBool) bool {
+                        return @reduce(.Or, v);
                     }
-                    break :blk v;
-                },
-                else => splat(d.imm_or_small),
-            };
-            mul_result = add_result;
-        } else {
-            var add_a: Vec = splat(0);
-            var add_b: Vec = splat(0);
-            if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0) {
-                s.acc[6] = try readPort(s, env, d.raddr_a, .a);
-            }
-            if (d.sig == .small_imm) {
-                s.acc[7] = splat(d.imm_or_small);
-            } else if ((d.flags & DecodedInst.FLAG_FETCH_B) != 0) {
-                s.acc[7] = try readPort(s, env, d.raddr_b, .b);
+                    fn all(v: VecBool) bool {
+                        return @reduce(.And, v);
+                    }
+                };
+                const flag = switch (d.branch_cond >> 2) {
+                    0 => s.zero,
+                    1 => s.neg,
+                    else => s.carry,
+                };
+                const taken = switch (d.branch_cond) {
+                    15 => true,
+                    12, 13, 14 => false,
+                    else => switch (d.branch_cond & 3) {
+                        0 => any.all(flag),
+                        1 => any.all(!flag),
+                        2 => any.f(flag),
+                        else => any.f(!flag),
+                    },
+                };
+                // The link address (after the delay slots) comes out of both ALUs.
+                const link: u32 = env.code_addr +% @as(u32, @intCast((m.ip + 4) * 8));
+                try write(RType, s, r, env, d.waddr_add, d.add_file, splat(link), .always, 0, 0, false);
+                try write(RType, s, r, env, d.waddr_mul, d.mul_file, splat(link), .always, 0, 0, false);
+                if (taken and m.branch_target == null) {
+                    var target: u32 = d.imm_or_small;
+                    if (d.branch_rel) target +%= link;
+                    if (d.branch_reg) |rg| target +%= (if ((s.ra_init >> rg) & 1 != 0) s.ra[rg][0] else 0);
+                    m.branch_target = (target -% env.code_addr) / 8;
+                    m.branch_from = m.ip;
+                }
+                continue;
             }
 
-            if ((d.flags & DecodedInst.FLAG_HAS_UNPACK) == 0) {
-                if (d.add_op != .nop) {
-                    add_a = s.acc[@backingInt(d.mux0)];
-                    add_b = s.acc[@backingInt(d.mux1)];
-                    add_result = addOpVec(d.add_op, add_a, add_b);
-                } else if (d.waddr_add != qpu.W.nop) {
-                    add_result = splat(0);
+            if ((d.flags & DecodedInst.FLAG_FUSED_LINTERP) != 0) {
+                const val: Vec = if (s.varyings_read < env.varyings.len) blk: {
+                    defer s.varyings_read += 1;
+                    break :blk env.varyings[s.varyings_read];
+                } else splat(0);
+                s.acc[5] = splatF(varying_c);
+                if (d.waddr_add != d.waddr_mul) {
+                    s.acc[d.waddr_mul - qpu.W.acc0] = @bitCast(@as(VecF, @bitCast(val)) - @as(VecF, @splat(varying_c)));
                 }
-                if (d.mul_op != .nop) {
-                    mul_result = mulOpVec(d.mul_op, s.acc[@backingInt(d.mux2)], s.acc[@backingInt(d.mux3)]);
-                } else if (d.waddr_mul != qpu.W.nop or (d.flags & DecodedInst.FLAG_SF) != 0) {
-                    mul_result = splat(0);
-                }
-            } else {
-                if (d.add_op != .nop) {
-                    const flt_add = (d.flags & DecodedInst.FLAG_FLT_ADD) != 0;
-                    const in0 = resolveMuxSlow(d.mux0, s, d.unpack_r4, d.unpack_a, flt_add);
-                    const in1 = if (d.mux1 == d.mux0) in0 else resolveMuxSlow(d.mux1, s, d.unpack_r4, d.unpack_a, flt_add);
-                    add_a = in0;
-                    add_b = in1;
-                    add_result = addOpVec(d.add_op, in0, in1);
-                } else if (d.waddr_add != qpu.W.nop) {
-                    add_result = splat(0);
-                }
-
-                if (d.mul_op != .nop) {
-                    const flt_mul = (d.flags & DecodedInst.FLAG_FLT_MUL) != 0;
-                    const in2 = resolveMuxSlow(d.mux2, s, d.unpack_r4, d.unpack_a, flt_mul);
-                    const in3 = if (d.mux3 == d.mux2) in2 else resolveMuxSlow(d.mux3, s, d.unpack_r4, d.unpack_a, flt_mul);
-                    mul_result = mulOpVec(d.mul_op, in2, in3);
-                } else if (d.waddr_mul != qpu.W.nop or (d.flags & DecodedInst.FLAG_SF) != 0) {
-                    mul_result = splat(0);
-                }
-            }
-
-            if (d.rotate != 0 and d.mul_op != .nop) {
-                const n: u4 = if (d.rotate == 16) @truncate(s.acc[5][0]) else @intCast(d.rotate);
-                mul_result = rotateVec(mul_result, n);
-            }
-            // The 32-bit saturating pack: an add's or sub's result saturated, not wrapped.
-            if (d.add_pack_a == 8 and (d.add_op == .add or d.add_op == .sub)) add_result = saturate32(d.add_op, add_a, add_b);
-            if ((d.flags & DecodedInst.FLAG_SF) != 0) {
-                const flags_from: VecI = @bitCast(if (d.add_op != .nop) add_result else mul_result);
-                s.zero = flags_from == @as(VecI, @splat(0));
-                s.neg = flags_from < @as(VecI, @splat(0));
-                s.carry = if (d.add_op != .nop) carryOf(d.add_op, add_a, add_b) else @splat(false);
-            }
-            if ((d.flags & DecodedInst.FLAG_READS_VARY) != 0) s.acc[5] = splatF(varying_c);
-        }
-
-        if (d.waddr_add != qpu.W.nop) {
-            if (d.cond_add == .always and d.add_pack_a == 0) {
-                if (d.waddr_add < 32) {
-                    const bit = @as(u32, 1) << @intCast(d.waddr_add);
-                    if (d.add_file == .a) {
-                        s.ra_init |= bit;
-                        s.ra[d.waddr_add] = add_result;
+                if (d.waddr_add != qpu.W.nop) {
+                    if (d.waddr_add < 32) {
+                        const bit = @as(u32, 1) << @intCast(d.waddr_add);
+                        if (d.add_file == .a) {
+                            s.ra_init |= bit;
+                            s.ra[d.waddr_add] = val;
+                        } else {
+                            s.rb_init |= bit;
+                            s.rb[d.waddr_add] = val;
+                        }
+                    } else if (d.waddr_add >= qpu.W.acc0 and d.waddr_add <= qpu.W.acc0 + 3) {
+                        s.acc[d.waddr_add - qpu.W.acc0] = val;
                     } else {
-                        s.rb_init |= bit;
-                        s.rb[d.waddr_add] = add_result;
+                        try write(RType, s, r, env, d.waddr_add, d.add_file, val, .always, 0, 0, true);
                     }
-                } else if (d.waddr_add >= qpu.W.acc0 and d.waddr_add <= qpu.W.acc0 + 3) {
-                    s.acc[d.waddr_add - qpu.W.acc0] = add_result;
+                }
+                if (@hasField(RType, "instructions")) r.instructions += 1;
+                m.ip += 1;
+                continue;
+            }
+
+            var add_result: Vec = undefined;
+            var mul_result: Vec = undefined;
+
+            if (d.sig == .load_imm) {
+                // A semaphore counted up, or down (Machine.waits held it back at 0).
+                if (d.limm_mode == 4) if (env.sync) |sync| {
+                    const n = d.imm_or_small & 15;
+                    if ((d.imm_or_small >> 4) & 1 != 0) sync.sema[n] -|= 1 else sync.sema[n] +|= 1;
+                };
+                add_result = switch (d.limm_mode) {
+                    // Each element's 2 bits: its low bit at bit n, its high one at bit 16 + n.
+                    1, 3 => blk: {
+                        var v: Vec = undefined;
+                        for (0..lanes) |i| {
+                            const two: u32 = (d.imm_or_small >> @intCast(i)) & 1 | ((d.imm_or_small >> @intCast(16 + i)) & 1) << 1;
+                            v[i] = if (d.limm_mode == 1 and two >= 2) two -% 4 else two;
+                        }
+                        break :blk v;
+                    },
+                    else => splat(d.imm_or_small),
+                };
+                mul_result = add_result;
+            } else {
+                var add_a: Vec = splat(0);
+                var add_b: Vec = splat(0);
+                if ((d.flags & DecodedInst.FLAG_FETCH_A) != 0) {
+                    s.acc[6] = try readPort(s, env, d.raddr_a, .a);
+                }
+                if (d.sig == .small_imm) {
+                    s.acc[7] = splat(d.imm_or_small);
+                } else if ((d.flags & DecodedInst.FLAG_FETCH_B) != 0) {
+                    s.acc[7] = try readPort(s, env, d.raddr_b, .b);
+                }
+
+                if ((d.flags & DecodedInst.FLAG_HAS_UNPACK) == 0) {
+                    if (d.add_op != .nop) {
+                        add_a = s.acc[@backingInt(d.mux0)];
+                        add_b = s.acc[@backingInt(d.mux1)];
+                        add_result = addOpVec(d.add_op, add_a, add_b);
+                    } else if (d.waddr_add != qpu.W.nop) {
+                        add_result = splat(0);
+                    }
+                    if (d.mul_op != .nop) {
+                        mul_result = mulOpVec(d.mul_op, s.acc[@backingInt(d.mux2)], s.acc[@backingInt(d.mux3)]);
+                    } else if (d.waddr_mul != qpu.W.nop or (d.flags & DecodedInst.FLAG_SF) != 0) {
+                        mul_result = splat(0);
+                    }
+                } else {
+                    if (d.add_op != .nop) {
+                        const flt_add = (d.flags & DecodedInst.FLAG_FLT_ADD) != 0;
+                        const in0 = resolveMuxSlow(d.mux0, s, d.unpack_r4, d.unpack_a, flt_add);
+                        const in1 = if (d.mux1 == d.mux0) in0 else resolveMuxSlow(d.mux1, s, d.unpack_r4, d.unpack_a, flt_add);
+                        add_a = in0;
+                        add_b = in1;
+                        add_result = addOpVec(d.add_op, in0, in1);
+                    } else if (d.waddr_add != qpu.W.nop) {
+                        add_result = splat(0);
+                    }
+
+                    if (d.mul_op != .nop) {
+                        const flt_mul = (d.flags & DecodedInst.FLAG_FLT_MUL) != 0;
+                        const in2 = resolveMuxSlow(d.mux2, s, d.unpack_r4, d.unpack_a, flt_mul);
+                        const in3 = if (d.mux3 == d.mux2) in2 else resolveMuxSlow(d.mux3, s, d.unpack_r4, d.unpack_a, flt_mul);
+                        mul_result = mulOpVec(d.mul_op, in2, in3);
+                    } else if (d.waddr_mul != qpu.W.nop or (d.flags & DecodedInst.FLAG_SF) != 0) {
+                        mul_result = splat(0);
+                    }
+                }
+
+                if (d.rotate != 0 and d.mul_op != .nop) {
+                    const n: u4 = if (d.rotate == 16) @truncate(s.acc[5][0]) else @intCast(d.rotate);
+                    mul_result = rotateVec(mul_result, n);
+                }
+                // The 32-bit saturating pack: an add's or sub's result saturated, not wrapped.
+                if (d.add_pack_a == 8 and (d.add_op == .add or d.add_op == .sub)) add_result = saturate32(d.add_op, add_a, add_b);
+                if ((d.flags & DecodedInst.FLAG_SF) != 0) {
+                    const flags_from: VecI = @bitCast(if (d.add_op != .nop) add_result else mul_result);
+                    s.zero = flags_from == @as(VecI, @splat(0));
+                    s.neg = flags_from < @as(VecI, @splat(0));
+                    s.carry = if (d.add_op != .nop) carryOf(d.add_op, add_a, add_b) else @splat(false);
+                }
+                if ((d.flags & DecodedInst.FLAG_READS_VARY) != 0) s.acc[5] = splatF(varying_c);
+            }
+
+            if (d.waddr_add != qpu.W.nop) {
+                if (d.cond_add == .always and d.add_pack_a == 0) {
+                    if (d.waddr_add < 32) {
+                        const bit = @as(u32, 1) << @intCast(d.waddr_add);
+                        if (d.add_file == .a) {
+                            s.ra_init |= bit;
+                            s.ra[d.waddr_add] = add_result;
+                        } else {
+                            s.rb_init |= bit;
+                            s.rb[d.waddr_add] = add_result;
+                        }
+                    } else if (d.waddr_add >= qpu.W.acc0 and d.waddr_add <= qpu.W.acc0 + 3) {
+                        s.acc[d.waddr_add - qpu.W.acc0] = add_result;
+                    } else {
+                        try write(RType, s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0, d.sig != .load_imm and floatResultAdd(d.add_op));
+                    }
                 } else {
                     try write(RType, s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0, d.sig != .load_imm and floatResultAdd(d.add_op));
                 }
-            } else {
-                try write(RType, s, r, env, d.waddr_add, d.add_file, add_result, d.cond_add, d.add_pack_a, 0, d.sig != .load_imm and floatResultAdd(d.add_op));
             }
-        }
-        if (d.waddr_mul != qpu.W.nop) {
-            if (d.cond_mul == .always and d.mul_pack_a == 0 and d.mul_pack_m == 0) {
-                if (d.waddr_mul < 32) {
-                    const bit = @as(u32, 1) << @intCast(d.waddr_mul);
-                    if (d.mul_file == .a) {
-                        s.ra_init |= bit;
-                        s.ra[d.waddr_mul] = mul_result;
+            if (d.waddr_mul != qpu.W.nop) {
+                if (d.cond_mul == .always and d.mul_pack_a == 0 and d.mul_pack_m == 0) {
+                    if (d.waddr_mul < 32) {
+                        const bit = @as(u32, 1) << @intCast(d.waddr_mul);
+                        if (d.mul_file == .a) {
+                            s.ra_init |= bit;
+                            s.ra[d.waddr_mul] = mul_result;
+                        } else {
+                            s.rb_init |= bit;
+                            s.rb[d.waddr_mul] = mul_result;
+                        }
+                    } else if (d.waddr_mul >= qpu.W.acc0 and d.waddr_mul <= qpu.W.acc0 + 3) {
+                        s.acc[d.waddr_mul - qpu.W.acc0] = mul_result;
                     } else {
-                        s.rb_init |= bit;
-                        s.rb[d.waddr_mul] = mul_result;
+                        try write(RType, s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m, d.sig != .load_imm and d.mul_op == .fmul);
                     }
-                } else if (d.waddr_mul >= qpu.W.acc0 and d.waddr_mul <= qpu.W.acc0 + 3) {
-                    s.acc[d.waddr_mul - qpu.W.acc0] = mul_result;
                 } else {
                     try write(RType, s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m, d.sig != .load_imm and d.mul_op == .fmul);
                 }
-            } else {
-                try write(RType, s, r, env, d.waddr_mul, d.mul_file, mul_result, d.cond_mul, d.mul_pack_a, d.mul_pack_m, d.sig != .load_imm and d.mul_op == .fmul);
+            }
+
+            switch (d.sig) {
+                .load_tmu0, .load_tmu1 => {
+                    const unit: usize = if (d.sig == .load_tmu0) 0 else 1;
+                    if (s.tmu_fifo_len[unit] > 0) {
+                        const head = s.tmu_fifo_head[unit];
+                        s.acc[4] = s.tmu_fifo[unit][head];
+                        if (s.tmu_fifo_second[unit][head]) |second| {
+                            s.tmu_fifo[unit][head] = second;
+                            s.tmu_fifo_second[unit][head] = null;
+                        } else {
+                            s.tmu_fifo_head[unit] +%= 1;
+                            s.tmu_fifo_len[unit] -= 1;
+                        }
+                    } else {
+                        s.acc[4] = splat(0xff000000);
+                    }
+                },
+                .alpha_mask_load => s.acc[4] = env.alpha_mask_in,
+                .color_load, .color_load_end => {
+                    s.acc[4] = if (env.tlb_samples_in) |samples| samples[m.loads % 4] else env.tlb_color_in;
+                    m.loads += 1;
+                    if (@hasField(RType, "color_loads")) r.color_loads += 1;
+                    if (d.sig == .color_load_end) m.end_at = m.ip + 2;
+                },
+                .prog_end => m.end_at = m.ip + 2,
+                else => {},
             }
         }
-
-        switch (d.sig) {
-            .load_tmu0, .load_tmu1 => {
-                const unit: usize = if (d.sig == .load_tmu0) 0 else 1;
-                if (s.tmu_fifo_len[unit] > 0) {
-                    const head = s.tmu_fifo_head[unit];
-                    s.acc[4] = s.tmu_fifo[unit][head];
-                    if (s.tmu_fifo_second[unit][head]) |second| {
-                        s.tmu_fifo[unit][head] = second;
-                        s.tmu_fifo_second[unit][head] = null;
-                    } else {
-                        s.tmu_fifo_head[unit] +%= 1;
-                        s.tmu_fifo_len[unit] -= 1;
-                    }
-                } else {
-                    s.acc[4] = splat(0xff000000);
-                }
-            },
-            .alpha_mask_load => s.acc[4] = env.alpha_mask_in,
-            .color_load, .color_load_end => {
-                s.acc[4] = if (env.tlb_samples_in) |samples| samples[m.loads % 4] else env.tlb_color_in;
-                m.loads += 1;
-                if (@hasField(RType, "color_loads")) r.color_loads += 1;
-                if (d.sig == .color_load_end) m.end_at = m.ip + 2;
-            },
-            .prog_end => m.end_at = m.ip + 2,
-            else => {},
-        }
-    }
-    return .ended;
+        return .ended;
     }
 };
 
@@ -2913,8 +2912,8 @@ fn yuvToRgb(y: u8, cb: u8, cr: u8) u32 {
 /// Texel (`x`, `row`) of an ETC1 block (its 8 bytes as ETC1 has them), as RGB, byte 0 red.
 fn etc1Texel(block: *const [8]u8, x: u32, row: u32) u32 {
     const tables = [8][4]i32{
-        .{ 2, 8, -2, -8 },       .{ 5, 17, -5, -17 },     .{ 9, 29, -9, -29 },     .{ 13, 42, -13, -42 },
-        .{ 18, 60, -18, -60 },   .{ 24, 80, -24, -80 },   .{ 33, 106, -33, -106 }, .{ 47, 183, -47, -183 },
+        .{ 2, 8, -2, -8 },     .{ 5, 17, -5, -17 },   .{ 9, 29, -9, -29 },     .{ 13, 42, -13, -42 },
+        .{ 18, 60, -18, -60 }, .{ 24, 80, -24, -80 }, .{ 33, 106, -33, -106 }, .{ 47, 183, -47, -183 },
     };
     const diff = block[3] & 2 != 0;
     const flip = block[3] & 1 != 0;
