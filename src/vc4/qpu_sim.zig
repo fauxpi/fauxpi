@@ -2974,9 +2974,10 @@ pub const DecodedTexture = struct {
     }
 
     /// Whether the OpenGL translation's TMU samples texture `p0`, `p1` (given s and t alone) as
-    /// `sample` does: blended byte by byte, its level of detail not mattering, not a cube map.
+    /// `sample` does: blended byte by byte, not a cube map (its levels of detail from 2x2 quads'
+    /// derivatives, as qpu_sim's).
     pub fn sampledOnGpu(p0: u32, p1: u32) bool {
-        return blendsBytes(p0, p1) and !needsLod(texture.decodeConfig(p0, p1)) and (p0 >> 9) & 1 == 0;
+        return blendsBytes(p0, p1) and (p0 >> 9) & 1 == 0;
     }
 
     /// Whether the Metal translation's TMU, reading RAM itself, reads texture `p0`, `p1`: of
@@ -2991,6 +2992,45 @@ pub const DecodedTexture = struct {
             .rgba4444, .rgba5551, .lumalpha, .etc1, .s16f, .s8, .s16, .bw1, .a4, .a1, .rgba64, .yuv422r => false,
             _ => true,
         };
+    }
+
+    /// The mipmap levels below level 0 sampled (by a mipmap filter): 0 if none.
+    pub fn mipLevels(p0: u32, p1: u32) u32 {
+        const c = texture.decodeConfig(p0, p1);
+        return if (c.mip_filter != .none) c.mip_levels else 0;
+    }
+
+    /// The bytes of RAM all its levels are read from (they lie before level 0), or null.
+    pub fn allLevels(memory: []const u8, p0: u32, p1: u32) ?[]const u8 {
+        const c = texture.decodeConfig(p0, p1);
+        const top = mipLevels(p0, p1);
+        const pt0 = PrecomputedTex.init(c, memory.len) catch return null;
+        const lowest = PrecomputedTex.init(levelConfig(c, c.offset, top, memory.len), memory.len) catch return null;
+        const lo: usize = lowest.base_off;
+        const hi: usize = @as(usize, pt0.base_off) + pt0.len;
+        if (lo > hi or hi > memory.len) return null;
+        return memory[lo..hi];
+    }
+
+    /// Level `level`'s size.
+    pub fn levelSize(memory: []const u8, p0: u32, p1: u32, level: u32) [2]u32 {
+        const c = texture.decodeConfig(p0, p1);
+        const l = levelConfig(c, c.offset, level, memory.len);
+        return .{ l.width, l.height };
+    }
+
+    /// Decodes level `level` into `out` (its size's words), as `sample` fetches each texel.
+    pub fn decodeLevel(memory: []const u8, p0: u32, p1: u32, level: u32, out: []u32) bool {
+        const c = texture.decodeConfig(p0, p1);
+        const pt = PrecomputedTex.init(levelConfig(c, c.offset, level, memory.len), memory.len) catch return false;
+        const w = pt.cfg.width;
+        if (out.len < @as(usize, w) * pt.cfg.height) return false;
+        for (0..pt.cfg.height) |y| {
+            for (0..w) |x| {
+                out[y * w + x] = pt.fetchAt(memory, @intCast(x), @intCast(y)) catch return false;
+            }
+        }
+        return true;
     }
 
     /// Decodes it into `out` (`width * height` words), as `sample` fetches each texel.

@@ -71,6 +71,8 @@ const GL_DEPTH_COMPONENT: GLenum = 0x1902;
 const GL_TEXTURE_MIN_FILTER: GLenum = 0x2801;
 const GL_TEXTURE_MAG_FILTER: GLenum = 0x2800;
 const GL_NEAREST: GLint = 0x2600;
+const GL_TEXTURE_BASE_LEVEL: GLenum = 0x813C;
+const GL_TEXTURE_MAX_LEVEL: GLenum = 0x813D;
 const GL_FRAMEBUFFER: GLenum = 0x8D40;
 const GL_COLOR_ATTACHMENT0: GLenum = 0x8CE0;
 const GL_DEPTH_ATTACHMENT: GLenum = 0x8D00;
@@ -280,6 +282,8 @@ pub const Renderer = struct {
         tex: GLuint = 0,
         width: u32 = 0,
         height: u32 = 0,
+        /// The mipmap levels below level 0 in it.
+        levels: u32 = 0,
     };
 
     /// Parameter 1's filter and wrap bits.
@@ -450,7 +454,8 @@ pub const Renderer = struct {
             e.ok = false;
             return null;
         };
-        const hash = std.hash.Wyhash.hash(0, dt.bytes);
+        const levels = qpu_sim.DecodedTexture.mipLevels(p0, p1);
+        const hash = std.hash.Wyhash.hash(0, if (levels > 0) qpu_sim.DecodedTexture.allLevels(ram, p0, p1) orelse dt.bytes else dt.bytes);
         if (e.ok and e.hash == hash) return e.tex;
         e.ok = false;
         if (dt.width == 0 or dt.height == 0) return null;
@@ -462,7 +467,23 @@ pub const Renderer = struct {
         const gl = &r.gl;
         if (e.tex == 0) gl.GenTextures(1, @ptrCast(&e.tex));
         gl.BindTexture(GL_TEXTURE_2D, e.tex);
-        if (e.width != dt.width or e.height != dt.height) {
+        if (levels > 0 or e.levels > 0) {
+            // Each level, decoded as the TMU reads it.
+            gl.TexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, @intCast(dt.width), @intCast(dt.height), 0, GL_RED_INTEGER, GL_UNSIGNED_INT, r.texels.items.ptr);
+            for (1..levels + 1) |l| {
+                const size = qpu_sim.DecodedTexture.levelSize(ram, p0, p1, @intCast(l));
+                r.texels.resize(std.heap.smp_allocator, @as(usize, size[0]) * size[1]) catch return null;
+                if (!qpu_sim.DecodedTexture.decodeLevel(ram, p0, p1, @intCast(l), r.texels.items)) return null;
+                gl.TexImage2D(GL_TEXTURE_2D, @intCast(l), GL_R32UI, @intCast(size[0]), @intCast(size[1]), 0, GL_RED_INTEGER, GL_UNSIGNED_INT, r.texels.items.ptr);
+            }
+            gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+            gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, @intCast(levels));
+            gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            e.width = dt.width;
+            e.height = dt.height;
+            e.levels = levels;
+        } else if (e.width != dt.width or e.height != dt.height) {
             gl.TexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, @intCast(dt.width), @intCast(dt.height), 0, GL_RED_INTEGER, GL_UNSIGNED_INT, r.texels.items.ptr);
             gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1297,4 +1318,94 @@ test "random vertex shaders shade on the GPU as qpu_sim shades them" {
     };
     // Enough vertices compared to mean something.
     try std.testing.expect(checked > 10000);
+}
+
+test "mipmapped textures sample on the GPU as qpu_sim samples them" {
+    var r = Renderer.init() catch return error.SkipZigTest;
+    const texture = @import("texture.zig");
+    const size = 128;
+    // s and t (varyings 0 and 1) to TMU 0, its texel out.
+    var fs: qpu.Program(16) = .{};
+    for (0..2) |i| {
+        const acc: u3 = @intCast(i);
+        fs.emit(try qpu.alu(.{ .mul = .{ .op = .fmul, .dst = qpu.wr(acc), .a = qpu.vary, .b = qpu.frag_w } }));
+        fs.emit(try qpu.alu(.{ .add = .{ .op = .fadd, .dst = qpu.wr(acc), .a = qpu.r(acc), .b = qpu.r(5) } }));
+    }
+    fs.emit(try qpu.mov(.{ .periph = qpu.W.tmu0_t }, qpu.r(1)));
+    fs.emit(try qpu.mov(.{ .periph = qpu.W.tmu0_s }, qpu.r(0)));
+    fs.emit(qpu.nop(.load_tmu0));
+    fs.emit(try qpu.mov(qpu.tlb_color_all, qpu.r(4)));
+    fs.end(.fragment);
+
+    // A 256 square texture of random texels, its 8 levels before it (as Blocks' tiles: nearest
+    // texels, levels blended).
+    const ram = try std.testing.allocator.alloc(u8, 1 << 20);
+    defer std.testing.allocator.free(ram);
+    var prng = std.Random.DefaultPrng.init(5);
+    prng.random().bytes(ram);
+    const cfg: texture.Config = .{ .offset = 0x80000, .width = 256, .height = 256, .mip_levels = 8, .min_filter = .nearest, .mag_filter = .linear, .mip_filter = .linear };
+    var unifs: [shader.max_uniforms]u32 = @splat(0);
+    unifs[0] = texture.p0(cfg);
+    unifs[1] = texture.p1(cfg);
+
+    // Bands of the frame, each at its own scale (texels a pixel), the last in perspective (its
+    // right side 5 times as far).
+    const scales = [4]f32{ 0.7, 2.6, 5.3, 3 };
+    var verts: [24]Vertex = undefined;
+    for (scales, 0..) |sc, b| {
+        const y0: f32 = @floatFromInt(b * 32);
+        const persp = b == 3;
+        const corner = struct {
+            fn f(x: f32, y: f32, scale: f32, perspective: bool) Vertex {
+                const iw: f32 = if (perspective) 1 - 0.8 * x / size else 1;
+                var v: Vertex = .{ .x = x, .y = y, .z = 0, .inv_w = iw, .unit_w = @intFromBool(!perspective), .varyings = @splat(0) };
+                // As 1/W multiplies them: linear across the band, s and t then divided by 1/W.
+                v.varyings[0] = if (perspective) x * scale / 256 * 0.2 else x * scale / 256;
+                v.varyings[1] = y * scale / 256;
+                return v;
+            }
+        }.f;
+        const q = [4]Vertex{ corner(0, y0, sc, persp), corner(size, y0, sc, persp), corner(0, y0 + 32, sc, persp), corner(size, y0 + 32, sc, persp) };
+        for ([6]usize{ 0, 1, 2, 1, 3, 2 }, 0..) |k, i| verts[b * 6 + i] = q[k];
+    }
+    const draws = [1]Draw{.{ .first_vertex = 0, .vertex_count = verts.len, .code = fs.code(), .uniforms = &unifs, .num_varyings = 2, .depth_func = 7, .depth_write = false, .clip_x = 0, .clip_y = 0, .clip_w = size, .clip_h = size }};
+    var color: [size * size]u32 = @splat(0);
+    try r.render(ram, size, size, &color, 1, &verts, &draws, &.{}, &.{}, false);
+
+    // qpu_sim, 2x2 quads at a time, given the varyings as interpolated.
+    var decoded: [16]qpu_sim.DecodedInst = undefined;
+    const code = qpu_sim.decodeProgram(fs.code(), &decoded);
+    var differ: usize = 0;
+    var band_differ: [4]usize = @splat(0);
+    var y: usize = 0;
+    while (y < size) : (y += 2) {
+        var x: usize = 0;
+        while (x < size) : (x += 8) {
+            var s: qpu_sim.Vec = undefined;
+            var t: qpu_sim.Vec = undefined;
+            for (0..16) |lane| {
+                const px: f32 = @as(f32, @floatFromInt(x + (lane >> 2) * 2 + (lane & 1))) + 0.5;
+                const py: f32 = @as(f32, @floatFromInt(y + ((lane >> 1) & 1))) + 0.5;
+                const band = @as(usize, @intFromFloat(py)) / 32;
+                const sc = scales[band];
+                const iw: f32 = if (band == 3) 1 - 0.8 * px / size else 1;
+                s[lane] = @bitCast((if (band == 3) px * sc / 256 * 0.2 else px * sc / 256) / iw);
+                t[lane] = @bitCast(py * sc / 256 / iw);
+            }
+            const res = try qpu_sim.runFragmentDecoded(code, &.{ .uniforms = &unifs, .varyings = &.{ s, t }, .texture_memory = ram });
+            for (0..16) |lane| {
+                const px = x + (lane >> 2) * 2 + (lane & 1);
+                const py = y + ((lane >> 1) & 1);
+                if (res.tlb_color.?[lane] != color[py * size + px]) {
+                    differ += 1;
+                    band_differ[py / 32] += 1;
+                }
+            }
+        }
+    }
+    // The same, but where the GPU's perspective interpolation differs from the CPU's in the last
+    // bits: a few texels (nearest ones) at the edges between texels.
+    for (band_differ[0..3]) |n| try std.testing.expectEqual(@as(usize, 0), n);
+    try std.testing.expect(band_differ[3] * 100 < 32 * size);
+    try std.testing.expectEqual(differ, band_differ[3]);
 }

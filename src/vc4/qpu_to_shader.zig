@@ -423,6 +423,15 @@ pub const msl_shared_functions =
 /// texel, so sampling it only wraps and filters.
 pub const glsl_common =
     \\#version 400 core
+    \\#extension GL_ARB_derivative_control : enable
+    \\#define Q_FRAGMENT 1
+    \\#ifdef GL_ARB_derivative_control
+    \\#define Q_DFDX dFdxFine
+    \\#define Q_DFDY dFdyFine
+    \\#else
+    \\#define Q_DFDX dFdx
+    \\#define Q_DFDY dFdy
+    \\#endif
     \\noperspective in float v_inv_w;
     \\noperspective in float v_not_unit_w;
     \\noperspective in vec4 v_v0;
@@ -634,28 +643,22 @@ const glsl_helpers =
     \\  return uint(clamp(i, 0, n - 1));
     \\}
     \\
-    \\uint texel(usampler2D t, uint x, uint y) {
+    \\uint texel(usampler2D t, int lvl, uint x, uint y) {
     \\  if (((x | y) & 0x80000000u) != 0u) return 0u;
-    \\  return texelFetch(t, ivec2(x, y), 0).r;
+    \\  return texelFetch(t, ivec2(x, y), lvl).r;
     \\}
     \\
-    \\// The TMU sampling texture `t` (decoded from RAM; `ok` if it could be), as qpu_sim does.
-    \\uint tmu_sample(usampler2D t, uint ok, uint p0, uint p1, float s, float tc) {
-    \\  if (ok == 0u) return 0xff000000u;
-    \\  uint w = (p1 >> 8) & 2047u;
-    \\  uint h = (p1 >> 20) & 2047u;
-    \\  uint width = w == 0u ? 2048u : w;
-    \\  uint height = h == 0u ? 2048u : h;
+    \\// One level of texture `t` (`width` by `height`) sampled, nearest or bilinear, as qpu_sim's
+    \\// PrecomputedTex.sample does.
+    \\uint tmu_level(usampler2D t, int lvl, uint width, uint height, uint wrap_s, uint wrap_t, bool nearest, float s, float tc) {
     \\  float fw = float(width);
     \\  float fh = float(height);
-    \\  uint wrap_s = p1 & 3u;
-    \\  uint wrap_t = (p1 >> 2) & 3u;
-    \\  if (((p1 >> 7) & 1u) != 0u) {
+    \\  if (nearest) {
     \\    float fx = floor(s * fw);
     \\    float fy = floor(tc * fh);
     \\    uint wx = (fx >= 0.0 && fx < fw) ? uint(fx) : tex_wrap(fx, width, wrap_s);
     \\    uint wy = (fy >= 0.0 && fy < fh) ? uint(fy) : tex_wrap(fy, height, wrap_t);
-    \\    return texel(t, wx, wy);
+    \\    return texel(t, lvl, wx, wy);
     \\  }
     \\  float fx = s * fw - 0.5;
     \\  float fy = tc * fh - 0.5;
@@ -678,11 +681,11 @@ const glsl_helpers =
     \\  }
     \\  uint fxf = uint(floor((fx - x0) * 256.0 + 0.5));
     \\  uint fyf = uint(floor((fy - y0) * 256.0 + 0.5));
-    \\  uint c00 = texel(t, wx0, wy0);
+    \\  uint c00 = texel(t, lvl, wx0, wy0);
     \\  if (fxf == 0u && fyf == 0u) return c00;
-    \\  uint c10 = texel(t, wx1, wy0);
-    \\  uint c01 = texel(t, wx0, wy1);
-    \\  uint c11 = texel(t, wx1, wy1);
+    \\  uint c10 = texel(t, lvl, wx1, wy0);
+    \\  uint c01 = texel(t, lvl, wx0, wy1);
+    \\  uint c11 = texel(t, lvl, wx1, wy1);
     \\  if (c00 == c10 && c00 == c01 && c00 == c11) return c00;
     \\  uint ix = 256u - fxf;
     \\  uint iy = 256u - fyf;
@@ -693,6 +696,73 @@ const glsl_helpers =
     \\  uint w11 = ws >= 256u ? 0u : 256u - ws;
     \\  uvec4 sum = bytes(c00) * w00 + bytes(c10) * w10 + bytes(c01) * w01 + bytes(c11) * w11 + 128u;
     \\  return pack4((sum >> 8) & 0xffu);
+    \\}
+    \\
+    \\uint q_log2(uint a);
+    \\
+    \\// A level's size: level 0's, then halves of it rounded up to a power of two (qpu_sim's
+    \\// levelConfig).
+    \\uint tex_pot(uint v) {
+    \\  uint p = 1u;
+    \\  while (p < v && p < 2048u) p <<= 1;
+    \\  return p;
+    \\}
+    \\uint tex_level_size(uint size, uint l) { return l == 0u ? size : max(tex_pot(size) >> l, 1u); }
+    \\
+    \\// The TMU sampling texture `t` (decoded from RAM, each level; `ok` if it could be), as
+    \\// qpu_sim does: its level of detail from the coordinates' differences across 2x2 quads
+    \\// (fragment shaders only), choosing the magnifying or minifying filter and the mipmap levels.
+    \\uint tmu_sample(usampler2D t, uint ok, uint p0, uint p1, float s, float tc) {
+    \\  uint w = (p1 >> 8) & 2047u;
+    \\  uint h = (p1 >> 20) & 2047u;
+    \\  uint width = w == 0u ? 2048u : w;
+    \\  uint height = h == 0u ? 2048u : h;
+    \\  precise float st = s * float(width);
+    \\  precise float tt = tc * float(height);
+    \\#ifdef Q_FRAGMENT
+    \\  precise float dsx = Q_DFDX(st);
+    \\  precise float dtx = Q_DFDX(tt);
+    \\  precise float dsy = Q_DFDY(st);
+    \\  precise float dty = Q_DFDY(tt);
+    \\#else
+    \\  float dsx = 0.0, dtx = 0.0, dsy = 0.0, dty = 0.0;
+    \\#endif
+    \\  if (ok == 0u) return 0xff000000u;
+    \\  uint wrap_s = p1 & 3u;
+    \\  uint wrap_t = (p1 >> 2) & 3u;
+    \\  uint mips = p0 & 15u;
+    \\  uint minc = (p1 >> 4) & 7u;
+    \\  bool mag_nearest = ((p1 >> 7) & 1u) != 0u;
+    \\  bool min_nearest = minc == 1u || minc == 2u || minc == 3u;
+    \\  uint mipf = (minc == 2u || minc == 4u) ? 1u : ((minc == 3u || minc == 5u) ? 2u : 0u);
+    \\  if (mipf == 0u) mips = 0u;
+    \\  if (min_nearest == mag_nearest && mips == 0u) return tmu_level(t, 0, width, height, wrap_s, wrap_t, mag_nearest, s, tc);
+    \\  precise float rx = dsx * dsx + dtx * dtx;
+    \\  precise float ry = dsy * dsy + dty * dty;
+    \\  float rho2 = max(rx, ry);
+    \\  float lod = (rho2 > 0.0 && !isinf(rho2)) ? 0.5 * f(q_log2(u(rho2))) : (rho2 > 0.0 ? 32.0 : -32.0);
+    \\  if (!(lod > 0.0)) return tmu_level(t, 0, width, height, wrap_s, wrap_t, mag_nearest, s, tc);
+    \\  if (mips == 0u) return tmu_level(t, 0, width, height, wrap_s, wrap_t, min_nearest, s, tc);
+    \\  float top = float(mips);
+    \\  uint l0;
+    \\  uint frac = 0u;
+    \\  if (mipf == 1u) {
+    \\    l0 = uint(min(floor(lod + 0.5), top));
+    \\  } else {
+    \\    float fl = floor(lod);
+    \\    if (fl >= top) {
+    \\      l0 = mips;
+    \\    } else {
+    \\      l0 = uint(fl);
+    \\      frac = uint(floor((lod - fl) * 256.0 + 0.5));
+    \\    }
+    \\  }
+    \\  uint a = tmu_level(t, int(l0), tex_level_size(width, l0), tex_level_size(height, l0), wrap_s, wrap_t, min_nearest, s, tc);
+    \\  if (frac == 0u) return a;
+    \\  uint l1 = l0 + 1u;
+    \\  uint b = tmu_level(t, int(l1), tex_level_size(width, l1), tex_level_size(height, l1), wrap_s, wrap_t, min_nearest, s, tc);
+    \\  uvec4 mix = (bytes(a) * (256u - frac) + bytes(b) * frac + 128u) >> 8;
+    \\  return pack4(mix & 0xffu);
     \\}
     \\
 ++ sfuHelpers("precise ", "");
