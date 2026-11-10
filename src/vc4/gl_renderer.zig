@@ -447,7 +447,7 @@ pub const Renderer = struct {
         }
         const e = found orelse blk: {
             // Its OpenGL texture is kept, for the next decoded into it.
-            oldest.* = .{ .p0 = p0, .p1 = k1, .used = true, .tex = oldest.tex, .width = oldest.width, .height = oldest.height };
+            oldest.* = .{ .p0 = p0, .p1 = k1, .used = true, .tex = oldest.tex, .width = oldest.width, .height = oldest.height, .levels = oldest.levels };
             break :blk oldest;
         };
         if (e.checked == r.frame) return if (e.ok) e.tex else null;
@@ -488,6 +488,8 @@ pub const Renderer = struct {
             e.levels = levels;
         } else if (e.width != dt.width or e.height != dt.height) {
             gl.TexImage2D(GL_TEXTURE_2D, 0, GL_R32UI, @intCast(dt.width), @intCast(dt.height), 0, GL_RED_INTEGER, GL_UNSIGNED_INT, r.texels.items.ptr);
+            gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_BASE_LEVEL, 0);
+            gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
             gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             e.width = dt.width;
