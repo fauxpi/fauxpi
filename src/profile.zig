@@ -27,6 +27,8 @@ pub const Stage = enum {
     /// Of gathering them: whether the clipper cuts triangles (their clip coordinates, from the
     /// coordinate shader), and the primitives made on the CPU (lines, points, and triangles cut).
     gpu_clip_test,
+    /// Of the clip test on the GPU: waiting for the clip coordinates and reading them.
+    gpu_clip_read_back,
     gpu_cpu_primitives,
     gpu_shade_vertices,
     /// Of shading them: the vertices read back, for the layers (`gpu_layers`) of triangles
@@ -64,6 +66,11 @@ pub const Counter = enum {
     /// Primitives of frames shaded on the GPU made on the CPU instead (lines, points, triangles
     /// the clipper cuts).
     cpu_primitives,
+    /// Of those: lines and points, triangles behind the near plane, and those only past the guard
+    /// band.
+    cpu_lines_points,
+    cpu_near,
+    cpu_guard_band,
 };
 
 pub var enabled: bool = false;

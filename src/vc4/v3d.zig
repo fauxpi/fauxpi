@@ -3464,6 +3464,13 @@ pub const V3d = struct {
             if (!here) continue;
             here_set.set(t);
             n_here += 1;
+            if (all) {
+                profile.count(.cpu_lines_points, 1);
+            } else {
+                var near = false;
+                for (slots) |sl| near = near or !(self.vs_clip.items[sl].w >= clip_min_w);
+                profile.count(if (near) .cpu_near else .cpu_guard_band, 1);
+            }
             for (slots) |sl| {
                 const got = slot_of.getOrPut(tri_allocator, sl) catch return null;
                 if (!got.found_existing) {

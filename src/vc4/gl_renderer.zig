@@ -607,6 +607,8 @@ pub const Renderer = struct {
         }
         gl.Disable(GL_RASTERIZER_DISCARD);
         gl.BindBufferBase(GL_TRANSFORM_FEEDBACK_BUFFER, 0, 0);
+        const rb_start = profile.now();
+        defer profile.end(.gpu_clip_read_back, rb_start);
         gl.BindBuffer(GL_ARRAY_BUFFER, r.clip_buf);
         gl.GetBufferSubData(GL_ARRAY_BUFFER, 0, @intCast(out.len * 16), out.ptr);
         if (gl.GetError() != GL_NO_ERROR) return error.GlFailed;
