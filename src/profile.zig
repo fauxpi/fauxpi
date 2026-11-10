@@ -29,6 +29,10 @@ pub const Stage = enum {
     gpu_clip_test,
     gpu_cpu_primitives,
     gpu_shade_vertices,
+    /// Of shading them: the vertices read back, for the layers (`gpu_layers`) of triangles
+    /// reading the tile's colour, each layer's triangles not overlapping.
+    gpu_vertex_read_back,
+    gpu_layers,
     gpu_draw,
     gpu_read_back,
     /// Textures decoded from RAM (and uploaded).

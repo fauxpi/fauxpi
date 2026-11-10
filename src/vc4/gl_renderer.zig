@@ -831,8 +831,10 @@ pub const Renderer = struct {
             if (any_reads_color) {
                 const all = vertex_total + vertices.len;
                 r.shaded.resize(std.heap.smp_allocator, all) catch return error.Unsupported;
+                const rb_start = profile.now();
                 gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
                 gl.GetBufferSubData(GL_ARRAY_BUFFER, 0, @intCast(all * @sizeOf(Vertex)), r.shaded.items.ptr);
+                profile.end(.gpu_vertex_read_back, rb_start);
                 drawn = r.shaded.items;
             }
             profile.end(.gpu_shade_vertices, prof_start);
@@ -857,7 +859,9 @@ pub const Renderer = struct {
                 // clipped are after all those shaded on the GPU).
                 const tris_vertices = if (shaded_on_gpu) drawn[d.first_vertex..] else drawn[d.first_vertex..][0 .. d.vertex_count / 3 * 3];
                 const cull: u8 = if (d.vertex_stage) |vs| vs.cull else 3;
+                const layers_start = profile.now();
                 r.layers.build(width, height, tris_vertices, draw_corners, cull, d.first_vertex) catch return error.Unsupported;
+                profile.end(.gpu_layers, layers_start);
                 r.indices.appendSlice(std.heap.smp_allocator, r.layers.order.items) catch return error.Unsupported;
                 for (r.layers.start.items) |st| r.layer_starts.append(std.heap.smp_allocator, base + st) catch return error.Unsupported;
                 profile.count(.layers, r.layers.start.items.len -| 1);
