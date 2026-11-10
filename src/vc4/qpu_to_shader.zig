@@ -51,420 +51,22 @@ pub const Sample = struct { p0: usize, p1: usize };
 /// MSL shared by the shaders: the vertex a triangle's corner is drawn from, what a fragment is
 /// given, and the helpers the fragment shaders and kernels use. `Vertex` and `DrawInfo` are laid out
 /// as the structs of the same names in `metal_renderer.zig`.
-pub const msl_common =
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\// Each QPU operation rounded on its own, as qpu_sim's are: no multiply-adds fused.
-    \\#pragma clang fp contract(off)
-    \\
-    \\struct Vertex {
-    \\  float x, y, z, inv_w;
-    \\  uint unit_w, pad0, pad1, pad2;
-    \\  float4 v0, v1, v2, v3;
-    \\};
-    \\
-    \\struct VOut {
-    \\  float4 pos [[position]];
-    \\  float inv_w [[center_no_perspective]];
-    \\  float not_unit_w [[center_no_perspective]];
-    \\  float4 v0 [[center_no_perspective]];
-    \\  float4 v1 [[center_no_perspective]];
-    \\  float4 v2 [[center_no_perspective]];
-    \\  float4 v3 [[center_no_perspective]];
-    \\};
-    \\
-    \\struct DrawInfo {
-    \\  uint n_var;
-    \\  uint ram_len;
-    \\  uint ram_mask;
-    \\  uint pad;
-    \\};
-    \\
-    \\struct FragOut {
-    \\  uint color [[color(0)]];
-    \\};
-    \\
-    \\// What a vertex shader's kernel shades: `count` vertices, each given `n_vpm` VPM words (from word
-    \\// first_input, `stride` words apart), into verts from first_vertex.
-    \\struct VertexInfo {
-    \\  uint n_vpm;
-    \\  uint n_var;
-    \\  uint first_input;
-    \\  uint stride;
-    \\  uint count;
-    \\  uint first_vertex;
-    \\  float vp_x;
-    \\  float vp_y;
-    \\};
-    \\
-    \\static inline float f(uint x) { return as_type<float>(x); }
-    \\static inline uint u(float x) { return as_type<uint>(x); }
-    \\// A 16-bit float's bits as a float's (exactly).
-    \\static inline uint q_unhalf(uint h) {
-    \\  uint sign = (h & 0x8000u) << 16;
-    \\  uint e = (h >> 10) & 0x1fu;
-    \\  uint m = h & 0x3ffu;
-    \\  if (e == 0u) { float v = float(m) * f(0x33800000u); return sign | u(v); }
-    \\  if (e == 31u) return sign | 0x7f800000u | (m << 13);
-    \\  return sign | ((e + 112u) << 23) | (m << 13);
-    \\}
-    \\
-    \\static inline uint unorm8(uint v) {
-    \\  float x = f(v);
-    \\  if (isnan(x)) x = 0.0f;
-    \\  x = min(max(x, 0.0f), 1.0f);
-    \\  return uint(round(x * 255.0f));
-    \\}
-    \\
-    \\static inline uint ftoi(uint v) {
-    \\  float x = f(v);
-    \\  if (isnan(x)) x = 0.0f;
-    \\  x = min(max(x, -2147483648.0f), 2147483520.0f);
-    \\  return uint(int(x));
-    \\}
-    \\
-    \\static inline uint unpack(uint v, uint mode, bool flt) {
-    \\  switch (mode) {
-    \\  case 1: { int s = int(v << 16) >> 16; return flt ? q_unhalf(v & 0xffffu) : uint(s); }
-    \\  case 2: { int s = int(v) >> 16; return flt ? q_unhalf(v >> 16) : uint(s); }
-    \\  case 3: return (v >> 24) * 0x01010101u;
-    \\  case 4: case 5: case 6: case 7: {
-    \\    uint b = (v >> ((mode - 4) * 8)) & 0xffu;
-    \\    return flt ? u(float(b) * (1.0f / 255.0f)) : b;
-    \\  }
-    \\  default: return v;
-    \\  }
-    \\}
-    \\
-    \\static inline uint ror(uint a, uint b) {
-    \\  uint s = b & 31u;
-    \\  return (a >> s) | (a << ((32u - s) & 31u));
-    \\}
-    \\static inline uint v8adds(uint a, uint b) { return as_type<uint>(addsat(as_type<uchar4>(a), as_type<uchar4>(b))); }
-    \\static inline uint v8subs(uint a, uint b) { return as_type<uint>(subsat(as_type<uchar4>(a), as_type<uchar4>(b))); }
-    \\static inline uint v8min(uint a, uint b) { return as_type<uint>(min(as_type<uchar4>(a), as_type<uchar4>(b))); }
-    \\static inline uint v8max(uint a, uint b) { return as_type<uint>(max(as_type<uchar4>(a), as_type<uchar4>(b))); }
-    \\static inline uint v8muld(uint a, uint b) {
-    \\  uint4 p = uint4(as_type<uchar4>(a)) * uint4(as_type<uchar4>(b)) + 127u;
-    \\  uint4 d = (p + 1u + (p >> 8)) >> 8;
-    \\  return as_type<uint>(uchar4(d & 0xffu));
-    \\}
-    \\
-    \\// The TMU (qpu_sim's PrecomputedTex), reading textures from the guest's RAM.
-    \\struct Tex {
-    \\  uint type, base, cpp, width, height;
-    \\  float fw, fh;
-    \\  uint uw_shift, uh_shift, uw_mask, uh_mask, cpp_shift, alpha_or;
-    \\  bool small;
-    \\  uint utiles_per_row, tile_w_shift, tile_h_shift, tiles_per_row;
-    \\  uint wrap_s, wrap_t;
-    \\  bool nearest;
-    \\};
-    \\
-    \\static inline bool tex_init(uint p0, uint p1, uint ram_mask, thread Tex& t) {
-    \\  t.type = ((p0 >> 4) & 0xfu) | ((p1 >> 31) << 4);
-    \\  switch (t.type) {
-    \\  case 0: case 1: case 16: t.cpp = 4; break;
-    \\  case 4: t.cpp = 2; break;
-    \\  case 5: case 6: t.cpp = 1; break;
-    \\  default: return false;
-    \\  }
-    \\  uint w = (p1 >> 8) & 2047u;
-    \\  uint h = (p1 >> 20) & 2047u;
-    \\  t.width = w == 0 ? 2048u : w;
-    \\  t.height = h == 0 ? 2048u : h;
-    \\  t.base = (p0 & 0xfffff000u) & ram_mask;
-    \\  t.fw = float(t.width);
-    \\  t.fh = float(t.height);
-    \\  t.nearest = ((p1 >> 7) & 1u) != 0;
-    \\  t.wrap_s = p1 & 3u;
-    \\  t.wrap_t = (p1 >> 2) & 3u;
-    \\  t.uw_shift = t.cpp == 4 ? 2u : 3u;
-    \\  t.uh_shift = t.cpp == 1 ? 3u : 2u;
-    \\  uint uw = 1u << t.uw_shift;
-    \\  uint uh = 1u << t.uh_shift;
-    \\  t.uw_mask = uw - 1;
-    \\  t.uh_mask = uh - 1;
-    \\  t.cpp_shift = t.cpp == 4 ? 2u : (t.cpp == 2 ? 1u : 0u);
-    \\  t.alpha_or = t.type == 1 ? 0xff000000u : 0u;
-    \\  t.small = t.width <= (uw << 2) || t.height <= (uh << 2);
-    \\  t.utiles_per_row = (t.width + uw - 1) >> t.uw_shift;
-    \\  t.tile_w_shift = t.uw_shift + 3;
-    \\  t.tile_h_shift = t.uh_shift + 3;
-    \\  t.tiles_per_row = (t.width + (1u << t.tile_w_shift) - 1) >> t.tile_w_shift;
-    \\  return true;
-    \\}
-    \\
-    \\static inline uint tex_offset(thread const Tex& t, uint x, uint y) {
-    \\  if (t.type == 16) return (y * t.width + x) << 2;
-    \\  uint in_utile = (((y & t.uh_mask) << t.uw_shift) | (x & t.uw_mask)) << t.cpp_shift;
-    \\  if (t.small) return (((y >> t.uh_shift) * t.utiles_per_row + (x >> t.uw_shift)) << 6) + in_utile;
-    \\  uint tile_row = y >> t.tile_h_shift;
-    \\  uint tile_col = (tile_row & 1) == 0 ? (x >> t.tile_w_shift) : t.tiles_per_row - 1 - (x >> t.tile_w_shift);
-    \\  uint tile_base = (tile_row * t.tiles_per_row + tile_col) << 12;
-    \\  uint stile = (((y >> (t.uh_shift + 2)) & 1) << 1) | ((x >> (t.uw_shift + 2)) & 1);
-    \\  const uint even_map[4] = {0, 3, 1, 2};
-    \\  const uint odd_map[4] = {2, 1, 3, 0};
-    \\  uint sub = (tile_row & 1) == 0 ? even_map[stile] : odd_map[stile];
-    \\  uint utile_in_sub = (((y >> t.uh_shift) & 3) << 2) | ((x >> t.uw_shift) & 3);
-    \\  return tile_base + (sub << 10) + (utile_in_sub << 6) + in_utile;
-    \\}
-    \\
-    \\static inline uint rgb565(uint p) {
-    \\  uint b = p >> 11;
-    \\  uint g = (p >> 5) & 0x3fu;
-    \\  uint r = p & 0x1fu;
-    \\  return 0xff000000u | ((r << 3) | (r >> 2)) << 16 | ((g << 2) | (g >> 4)) << 8 | ((b << 3) | (b >> 2));
-    \\}
-    \\
-    \\static inline uint to_rgb565(uint argb) {
-    \\  uint r = (argb >> 16) & 0xffu;
-    \\  uint g = (argb >> 8) & 0xffu;
-    \\  uint b = argb & 0xffu;
-    \\  return ((b * 31 + 127) / 255) << 11 | ((g * 63 + 127) / 255) << 5 | (r * 31 + 127) / 255;
-    \\}
-    \\
-    \\static inline bool tex_fetch(device const uchar* ram, uint ram_len, thread const Tex& t, uint x, uint y, thread uint& out) {
-    \\  uint off = t.base + tex_offset(t, x, y);
-    \\  if (ulong(off) + t.cpp > ram_len) return false;
-    \\  if (t.cpp == 4) {
-    \\    out = *(device const uint*)(ram + off) | t.alpha_or;
-    \\  } else if (t.cpp == 1) {
-    \\    uint l = ram[off];
-    \\    out = t.type == 5 ? (0xff000000u | (l * 0x010101u)) : (l << 24);
-    \\  } else {
-    \\    out = rgb565(*(device const ushort*)(ram + off));
-    \\  }
-    \\  return true;
-    \\}
-    \\
-    \\static inline uint tex_wrap(float c, uint size, uint mode) {
-    \\  int n = int(max(size, 1u));
-    \\  int i = isnan(c) ? 0 : int(clamp(c, -1e9f, 1e9f));
-    \\  if (mode == 0) {
-    \\    int m = i % n;
-    \\    return uint(m < 0 ? m + n : m);
-    \\  }
-    \\  return uint(clamp(i, 0, n - 1));
-    \\}
-    \\
-    \\static inline uint tmu_sample(device const uchar* ram, constant DrawInfo& di, uint p0, uint p1, float s, float tc) {
-    \\  Tex t;
-    \\  if (!tex_init(p0, p1, di.ram_mask, t)) return 0xff000000u;
-    \\  uint c00;
-    \\  if (t.nearest) {
-    \\    float fx = floor(s * t.fw);
-    \\    float fy = floor(tc * t.fh);
-    \\    uint wx = (fx >= 0.0f && fx < t.fw) ? uint(fx) : tex_wrap(fx, t.width, t.wrap_s);
-    \\    uint wy = (fy >= 0.0f && fy < t.fh) ? uint(fy) : tex_wrap(fy, t.height, t.wrap_t);
-    \\    return tex_fetch(ram, di.ram_len, t, wx, wy, c00) ? c00 : 0xff000000u;
-    \\  }
-    \\  float fx = s * t.fw - 0.5f;
-    \\  float fy = tc * t.fh - 0.5f;
-    \\  float x0 = floor(fx);
-    \\  float y0 = floor(fy);
-    \\  uint wx0, wx1, wy0, wy1;
-    \\  if (x0 >= 0.0f && x0 + 1.0f < t.fw) {
-    \\    wx0 = uint(x0);
-    \\    wx1 = wx0 + 1;
-    \\  } else {
-    \\    wx0 = tex_wrap(x0, t.width, t.wrap_s);
-    \\    wx1 = tex_wrap(x0 + 1.0f, t.width, t.wrap_s);
-    \\  }
-    \\  if (y0 >= 0.0f && y0 + 1.0f < t.fh) {
-    \\    wy0 = uint(y0);
-    \\    wy1 = wy0 + 1;
-    \\  } else {
-    \\    wy0 = tex_wrap(y0, t.height, t.wrap_t);
-    \\    wy1 = tex_wrap(y0 + 1.0f, t.height, t.wrap_t);
-    \\  }
-    \\  uint fxf = uint(round((fx - x0) * 256.0f));
-    \\  uint fyf = uint(round((fy - y0) * 256.0f));
-    \\  if (!tex_fetch(ram, di.ram_len, t, wx0, wy0, c00)) return 0xff000000u;
-    \\  if (fxf == 0 && fyf == 0) return c00;
-    \\  uint c10, c01, c11;
-    \\  if (!tex_fetch(ram, di.ram_len, t, wx1, wy0, c10)) return 0xff000000u;
-    \\  if (!tex_fetch(ram, di.ram_len, t, wx0, wy1, c01)) return 0xff000000u;
-    \\  if (!tex_fetch(ram, di.ram_len, t, wx1, wy1, c11)) return 0xff000000u;
-    \\  if (c00 == c10 && c00 == c01 && c00 == c11) return c00;
-    \\  uint ix = 256 - fxf;
-    \\  uint iy = 256 - fyf;
-    \\  uint w00 = (ix * iy + 128) >> 8;
-    \\  uint w10 = (fxf * iy + 128) >> 8;
-    \\  uint w01 = (ix * fyf + 128) >> 8;
-    \\  uint ws = w00 + w10 + w01;
-    \\  uint w11 = ws >= 256 ? 0u : 256 - ws;
-    \\  uint4 sum = uint4(as_type<uchar4>(c00)) * w00 + uint4(as_type<uchar4>(c10)) * w10 +
-    \\    uint4(as_type<uchar4>(c01)) * w01 + uint4(as_type<uchar4>(c11)) * w11 + 128u;
-    \\  return as_type<uint>(uchar4((sum >> 8) & 0xffu));
-    \\}
-    \\
-    \\// Where a pixel of a framebuffer is in RAM (texture.texelOffsetOf), for 32 bpp or 16 bpp.
-    \\static inline uint fb_offset(uint cpp, uint width, uint height, uint x, uint y) {
-    \\  uint uw_shift = cpp == 4 ? 2u : 3u;
-    \\  uint uh_shift = 2u;
-    \\  uint uw = 1u << uw_shift;
-    \\  uint uh = 1u << uh_shift;
-    \\  uint cpp_shift = cpp == 4 ? 2u : 1u;
-    \\  uint in_utile = (((y & (uh - 1)) << uw_shift) | (x & (uw - 1))) << cpp_shift;
-    \\  if (width <= (uw << 2) || height <= (uh << 2)) {
-    \\    uint row_stride = ((width + uw - 1) & ~(uw - 1)) << cpp_shift;
-    \\    return (y & ~(uh - 1)) * row_stride + ((x >> uw_shift) << 6) + in_utile;
-    \\  }
-    \\  uint tile_w = uw << 3;
-    \\  uint utile_stride = ((width + tile_w - 1) & ~(tile_w - 1)) >> uw_shift;
-    \\  uint utile_x = x >> uw_shift;
-    \\  uint utile_y = y >> uh_shift;
-    \\  uint in_subtile = (((utile_y & 3) << 2) | (utile_x & 3)) << 6;
-    \\  uint tile_stride = utile_stride >> 3;
-    \\  uint tx = (utile_x & ~3u) >> 3;
-    \\  uint ty = (utile_y & ~3u) >> 3;
-    \\  bool odd_row = (ty & 1) != 0;
-    \\  if (odd_row) tx = tile_stride - tx - 1;
-    \\  uint stile = (((utile_y >> 2) & 1) << 1) | ((utile_x >> 2) & 1);
-    \\  const uint odd_map[4] = {2, 1, 3, 0};
-    \\  const uint even_map[4] = {0, 3, 1, 2};
-    \\  uint sub = odd_row ? odd_map[stile] : even_map[stile];
-    \\  return ((ty * tile_stride + tx) << 12) + (sub << 10) + in_subtile + in_utile;
-    \\}
-    \\
-++ sfuHelpers("", "static inline ");
+pub const msl_common = @embedFile("shaders/common.metal") ++ sfuHelpers("", "static inline ");
 
 /// MSL of the vertex shader all draws share, and the kernels that load the tile buffer from RAM and
 /// store it back (`ls_load`, `ls_store`); compiled after `msl_common`. `LoadStore` is laid out as the
 /// struct of the same name in `metal_renderer.zig`.
-pub const msl_shared_functions =
-    \\vertex VOut vertex_main(uint vid [[vertex_id]], device const Vertex* verts [[buffer(0)]],
-    \\    constant float2& fb [[buffer(1)]]) {
-    \\  Vertex v = verts[vid];
-    \\  VOut o;
-    \\  o.pos = float4(v.x / fb.x * 2.0f - 1.0f, 1.0f - v.y / fb.y * 2.0f, v.z, 1.0f);
-    \\  o.inv_w = v.inv_w;
-    \\  o.not_unit_w = v.unit_w != 0u ? 0.0f : 1.0f;
-    \\  o.v0 = v.v0;
-    \\  o.v1 = v.v1;
-    \\  o.v2 = v.v2;
-    \\  o.v3 = v.v3;
-    \\  return o;
-    \\}
-    \\
-    \\struct LoadStore {
-    \\  uint base;
-    \\  uint fb_w;
-    \\  uint fb_h;
-    \\  uint tiling;
-    \\  uint cpp;
-    \\  uint ram_len;
-    \\  uint pad0, pad1;
-    \\  uint tiles[32];
-    \\};
-    \\
-    \\static inline bool ls_pixel(constant LoadStore& ls, uint2 p, thread uint& off) {
-    \\  if (p.x >= ls.fb_w || p.y >= ls.fb_h) return false;
-    \\  if (((ls.tiles[p.y >> 6] >> (p.x >> 6)) & 1u) == 0) return false;
-    \\  uint rel = ls.tiling == 0 ? (p.y * ls.fb_w + p.x) * ls.cpp : fb_offset(ls.cpp, ls.fb_w, ls.fb_h, p.x, p.y);
-    \\  off = ls.base + rel;
-    \\  return ulong(off) + ls.cpp <= ls.ram_len;
-    \\}
-    \\
-    \\kernel void ls_load(texture2d<uint, access::write> tile [[texture(0)]], device const uchar* ram [[buffer(0)]],
-    \\    constant LoadStore& ls [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
-    \\  uint off;
-    \\  if (!ls_pixel(ls, p, off)) return;
-    \\  uint c = ls.cpp == 4 ? *(device const uint*)(ram + off) : rgb565(*(device const ushort*)(ram + off));
-    \\  tile.write(uint4(c, 0, 0, 0), p);
-    \\}
-    \\
-    \\kernel void ls_store(texture2d<uint, access::read> tile [[texture(0)]], device uchar* ram [[buffer(0)]],
-    \\    constant LoadStore& ls [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
-    \\  uint off;
-    \\  if (!ls_pixel(ls, p, off)) return;
-    \\  uint c = tile.read(p).r;
-    \\  if (ls.cpp == 4) {
-    \\    *(device uint*)(ram + off) = c;
-    \\  } else {
-    \\    *(device ushort*)(ram + off) = ushort(to_rgb565(c));
-    \\  }
-    \\}
-    \\
-    \\
-    \\// A draw's triangles' corners (its vertices, from first_vertex), and V3D's configuration bits 0
-    \\// to 2: which triangles are drawn.
-    \\struct CullInfo {
-    \\  uint first_corner;
-    \\  uint triangles;
-    \\  uint first_vertex;
-    \\  uint cull;
-    \\};
-    \\
-    \\// Each triangle's corners as drawn, or the first three times (drawing nothing) if V3D doesn't
-    \\// draw it: facing the way it isn't drawing, or with no area (as the CPU path decides).
-    \\kernel void cull_triangles(device const uint* corners [[buffer(0)]], device const Vertex* verts [[buffer(1)]],
-    \\    device uint* indices [[buffer(2)]], constant CullInfo& ci [[buffer(3)]], uint t [[thread_position_in_grid]]) {
-    \\  if (t >= ci.triangles) return;
-    \\  uint c0 = ci.first_vertex + corners[ci.first_corner + t * 3];
-    \\  uint c1 = ci.first_vertex + corners[ci.first_corner + t * 3 + 1];
-    \\  uint c2 = ci.first_vertex + corners[ci.first_corner + t * 3 + 2];
-    \\  Vertex v0 = verts[c0], v1 = verts[c1], v2 = verts[c2];
-    \\  float a = (v1.x - v0.x) * (v2.y - v0.y);
-    \\  float b = (v1.y - v0.y) * (v2.x - v0.x);
-    \\  float area = a - b;
-    \\  bool forward = (ci.cull & 4u) != 0u ? area < 0.0f : area > 0.0f;
-    \\  bool drawn = fabs(area) >= 1e-6f && ((forward ? ci.cull & 1u : ci.cull & 2u) != 0u);
-    \\  indices[ci.first_corner + t * 3] = c0;
-    \\  indices[ci.first_corner + t * 3 + 1] = drawn ? c1 : c0;
-    \\  indices[ci.first_corner + t * 3 + 2] = drawn ? c2 : c0;
-    \\}
-;
+pub const msl_shared_functions = @embedFile("shaders/shared_functions.metal");
 
 /// GLSL shared by the fragment shaders: what a fragment is given (the varyings, the draw's uniforms,
 /// the textures it samples, decoded, and the tile buffer it reads), and the helpers the shaders use,
 /// as `msl_common`'s do. Each texture sampled is decoded as the TMU reads it (`qpu_sim`), 32 bits a
 /// texel, so sampling it only wraps and filters.
-pub const glsl_common =
-    \\#version 400 core
-    \\#extension GL_ARB_derivative_control : enable
-    \\#define Q_FRAGMENT 1
-    \\#ifdef GL_ARB_derivative_control
-    \\#define Q_DFDX dFdxFine
-    \\#define Q_DFDY dFdyFine
-    \\#else
-    \\#define Q_DFDX dFdx
-    \\#define Q_DFDY dFdy
-    \\#endif
-    \\noperspective in float v_inv_w;
-    \\noperspective in float v_not_unit_w;
-    \\noperspective in vec4 v_v0;
-    \\noperspective in vec4 v_v1;
-    \\noperspective in vec4 v_v2;
-    \\noperspective in vec4 v_v3;
-    \\uniform uint unif[128];
-    \\uniform uint n_var;
-    \\uniform usampler2D tex[8];
-    \\uniform uint tex_ok[8];
-    \\uniform usampler2D tlb_tex;
-    \\uniform usampler2DMS tlb_ms;
-    \\layout(location = 0) out uint o_color;
-    \\
-++ glsl_helpers;
+pub const glsl_common = @embedFile("shaders/fragment_common.glsl") ++ glsl_helpers;
 
 /// GLSL shared by the vertex shaders: a vertex's VPM words (`a_in`, `n_vpm` of them), the draw's
 /// uniforms, and what is captured of the vertex (as `gpu_draw.Vertex`), then the helpers.
-pub const glsl_vertex_common =
-    \\#version 400 core
-    \\layout(location = 0) in uvec4 a_in[8];
-    \\uniform uint unif[128];
-    \\uniform uint n_vpm;
-    \\uniform uint n_var;
-    \\uniform vec2 vp;
-    \\out vec4 tf_pos;
-    \\flat out uvec4 tf_unit_w;
-    \\out vec4 tf_v0;
-    \\out vec4 tf_v1;
-    \\out vec4 tf_v2;
-    \\out vec4 tf_v3;
-    \\
-++ glsl_helpers;
+pub const glsl_vertex_common = @embedFile("shaders/vertex_common.glsl") ++ glsl_helpers;
 
 /// The names of what a vertex shader's vertex is captured as, in `gpu_draw.Vertex`'s order.
 pub const glsl_vertex_captured = [_][*:0]const u8{ "tf_pos", "tf_unit_w", "tf_v0", "tf_v1", "tf_v2", "tf_v3" };
@@ -550,290 +152,21 @@ fn sfuHelpers(comptime prec: []const u8, comptime fn_prefix: []const u8) []const
 
 /// The GLSL helpers the shaders share. The QPU's float arithmetic is `precise`: each operation
 /// rounded on its own, as qpu_sim does, not fused or rearranged.
-const glsl_helpers =
-    \\float f(uint x) { return uintBitsToFloat(x); }
-    \\uint u(float x) { return floatBitsToUint(x); }
-    \\// A 16-bit float's bits as a float's (exactly).
-    \\uint q_unhalf(uint h) {
-    \\  uint sign = (h & 0x8000u) << 16;
-    \\  uint e = (h >> 10) & 0x1fu;
-    \\  uint m = h & 0x3ffu;
-    \\  if (e == 0u) { float v = float(m) * f(0x33800000u); return sign | u(v); }
-    \\  if (e == 31u) return sign | 0x7f800000u | (m << 13);
-    \\  return sign | ((e + 112u) << 23) | (m << 13);
-    \\}
-    \\uint q_fadd(uint a, uint b) { precise float r = f(a) + f(b); return u(r); }
-    \\uint q_fsub(uint a, uint b) { precise float r = f(a) - f(b); return u(r); }
-    \\uint q_fmul(uint a, uint b) { precise float r = f(a) * f(b); return u(r); }
-    \\// 1/x rounded as dividing is (a GPU's reciprocal is only nearly), by a step of Newton's method.
-    \\uint q_recip(uint a) {
-    \\  precise float x = f(a);
-    \\  precise float r = 1.0 / x;
-    \\  if (isinf(r) || r == 0.0 || isnan(r)) return u(r);
-    \\  precise float e = fma(-x, r, 1.0);
-    \\  precise float r2 = fma(e, r, r);
-    \\  return u(r2);
-    \\}
-    \\float fmin(float a, float b) { return min(a, b); }
-    \\float fmax(float a, float b) { return max(a, b); }
-    \\float fabs(float a) { return abs(a); }
-    \\uint clz(uint x) {
-    \\  if (x == 0u) return 32u;
-    \\  uint n = 0u;
-    \\  if ((x & 0xffff0000u) == 0u) { n += 16u; x <<= 16; }
-    \\  if ((x & 0xff000000u) == 0u) { n += 8u; x <<= 8; }
-    \\  if ((x & 0xf0000000u) == 0u) { n += 4u; x <<= 4; }
-    \\  if ((x & 0xc0000000u) == 0u) { n += 2u; x <<= 2; }
-    \\  if ((x & 0x80000000u) == 0u) n += 1u;
-    \\  return n;
-    \\}
-    \\
-    \\uint unorm8(uint v) {
-    \\  float x = f(v);
-    \\  if (isnan(x)) x = 0.0;
-    \\  x = min(max(x, 0.0), 1.0);
-    \\  return uint(floor(x * 255.0 + 0.5));
-    \\}
-    \\
-    \\uint ftoi(uint v) {
-    \\  float x = f(v);
-    \\  if (isnan(x)) x = 0.0;
-    \\  x = min(max(x, -2147483648.0), 2147483520.0);
-    \\  return uint(int(x));
-    \\}
-    \\
-    \\uint unpack(uint v, uint mode, bool flt) {
-    \\  if (mode == 1u) { int s = int(v << 16) >> 16; return flt ? q_unhalf(v & 0xffffu) : uint(s); }
-    \\  if (mode == 2u) { int s = int(v) >> 16; return flt ? q_unhalf(v >> 16) : uint(s); }
-    \\  if (mode == 3u) return (v >> 24) * 0x01010101u;
-    \\  if (mode >= 4u && mode <= 7u) {
-    \\    uint b = (v >> ((mode - 4u) * 8u)) & 0xffu;
-    \\    return flt ? u(float(b) * (1.0 / 255.0)) : b;
-    \\  }
-    \\  return v;
-    \\}
-    \\
-    \\uint ror(uint a, uint b) {
-    \\  uint s = b & 31u;
-    \\  return (a >> s) | (a << ((32u - s) & 31u));
-    \\}
-    \\uvec4 bytes(uint a) { return uvec4(a & 0xffu, (a >> 8) & 0xffu, (a >> 16) & 0xffu, a >> 24); }
-    \\uint pack4(uvec4 b) { return b.x | (b.y << 8) | (b.z << 16) | (b.w << 24); }
-    \\uint v8adds(uint a, uint b) { return pack4(min(bytes(a) + bytes(b), uvec4(255u))); }
-    \\uint v8subs(uint a, uint b) { return pack4(uvec4(max(ivec4(bytes(a)) - ivec4(bytes(b)), ivec4(0)))); }
-    \\uint v8min(uint a, uint b) { return pack4(min(bytes(a), bytes(b))); }
-    \\uint v8max(uint a, uint b) { return pack4(max(bytes(a), bytes(b))); }
-    \\uint v8muld(uint a, uint b) {
-    \\  uvec4 p = bytes(a) * bytes(b) + 127u;
-    \\  return pack4(((p + 1u + (p >> 8)) >> 8) & 0xffu);
-    \\}
-    \\
-    \\// The TMU's wrapping (qpu_sim's wrap): repeat, clamp to the edge, mirror, or the border
-    \\// (0x80000000: the border colour, 0 with no r coordinate).
-    \\uint tex_wrap(float c, uint size, uint mode) {
-    \\  int n = int(max(size, 1u));
-    \\  int i = isnan(c) ? 0 : int(clamp(c, -1e9, 1e9));
-    \\  if (mode == 0u) return uint(i >= 0 ? i % n : (n - 1) - ((-i - 1) % n));
-    \\  if (mode == 2u) {
-    \\    int p = 2 * n;
-    \\    int m = i >= 0 ? i % p : (p - 1) - ((-i - 1) % p);
-    \\    return uint(m < n ? m : p - 1 - m);
-    \\  }
-    \\  if (mode == 3u) return (i < 0 || i >= n) ? 0x80000000u : uint(i);
-    \\  return uint(clamp(i, 0, n - 1));
-    \\}
-    \\
-    \\uint texel(usampler2D t, int lvl, uint x, uint y) {
-    \\  if (((x | y) & 0x80000000u) != 0u) return 0u;
-    \\  return texelFetch(t, ivec2(x, y), lvl).r;
-    \\}
-    \\
-    \\// One level of texture `t` (`width` by `height`) sampled, nearest or bilinear, as qpu_sim's
-    \\// PrecomputedTex.sample does.
-    \\uint tmu_level(usampler2D t, int lvl, uint width, uint height, uint wrap_s, uint wrap_t, bool nearest, float s, float tc) {
-    \\  float fw = float(width);
-    \\  float fh = float(height);
-    \\  if (nearest) {
-    \\    float fx = floor(s * fw);
-    \\    float fy = floor(tc * fh);
-    \\    uint wx = (fx >= 0.0 && fx < fw) ? uint(fx) : tex_wrap(fx, width, wrap_s);
-    \\    uint wy = (fy >= 0.0 && fy < fh) ? uint(fy) : tex_wrap(fy, height, wrap_t);
-    \\    return texel(t, lvl, wx, wy);
-    \\  }
-    \\  float fx = s * fw - 0.5;
-    \\  float fy = tc * fh - 0.5;
-    \\  float x0 = floor(fx);
-    \\  float y0 = floor(fy);
-    \\  uint wx0, wx1, wy0, wy1;
-    \\  if (x0 >= 0.0 && x0 + 1.0 < fw) {
-    \\    wx0 = uint(x0);
-    \\    wx1 = wx0 + 1u;
-    \\  } else {
-    \\    wx0 = tex_wrap(x0, width, wrap_s);
-    \\    wx1 = tex_wrap(x0 + 1.0, width, wrap_s);
-    \\  }
-    \\  if (y0 >= 0.0 && y0 + 1.0 < fh) {
-    \\    wy0 = uint(y0);
-    \\    wy1 = wy0 + 1u;
-    \\  } else {
-    \\    wy0 = tex_wrap(y0, height, wrap_t);
-    \\    wy1 = tex_wrap(y0 + 1.0, height, wrap_t);
-    \\  }
-    \\  uint fxf = uint(floor((fx - x0) * 256.0 + 0.5));
-    \\  uint fyf = uint(floor((fy - y0) * 256.0 + 0.5));
-    \\  uint c00 = texel(t, lvl, wx0, wy0);
-    \\  if (fxf == 0u && fyf == 0u) return c00;
-    \\  uint c10 = texel(t, lvl, wx1, wy0);
-    \\  uint c01 = texel(t, lvl, wx0, wy1);
-    \\  uint c11 = texel(t, lvl, wx1, wy1);
-    \\  if (c00 == c10 && c00 == c01 && c00 == c11) return c00;
-    \\  uint ix = 256u - fxf;
-    \\  uint iy = 256u - fyf;
-    \\  uint w00 = (ix * iy + 128u) >> 8;
-    \\  uint w10 = (fxf * iy + 128u) >> 8;
-    \\  uint w01 = (ix * fyf + 128u) >> 8;
-    \\  uint ws = w00 + w10 + w01;
-    \\  uint w11 = ws >= 256u ? 0u : 256u - ws;
-    \\  uvec4 sum = bytes(c00) * w00 + bytes(c10) * w10 + bytes(c01) * w01 + bytes(c11) * w11 + 128u;
-    \\  return pack4((sum >> 8) & 0xffu);
-    \\}
-    \\
-    \\uint q_log2(uint a);
-    \\
-    \\// A level's size: level 0's, then halves of it rounded up to a power of two (qpu_sim's
-    \\// levelConfig).
-    \\uint tex_pot(uint v) {
-    \\  uint p = 1u;
-    \\  while (p < v && p < 2048u) p <<= 1;
-    \\  return p;
-    \\}
-    \\uint tex_level_size(uint size, uint l) { return l == 0u ? size : max(tex_pot(size) >> l, 1u); }
-    \\
-    \\// The TMU sampling texture `t` (decoded from RAM, each level; `ok` if it could be), as
-    \\// qpu_sim does: its level of detail from the coordinates' differences across 2x2 quads
-    \\// (fragment shaders only), choosing the magnifying or minifying filter and the mipmap levels.
-    \\uint tmu_sample(usampler2D t, uint ok, uint p0, uint p1, float s, float tc) {
-    \\  uint w = (p1 >> 8) & 2047u;
-    \\  uint h = (p1 >> 20) & 2047u;
-    \\  uint width = w == 0u ? 2048u : w;
-    \\  uint height = h == 0u ? 2048u : h;
-    \\  precise float st = s * float(width);
-    \\  precise float tt = tc * float(height);
-    \\#ifdef Q_FRAGMENT
-    \\  precise float dsx = Q_DFDX(st);
-    \\  precise float dtx = Q_DFDX(tt);
-    \\  precise float dsy = Q_DFDY(st);
-    \\  precise float dty = Q_DFDY(tt);
-    \\#else
-    \\  float dsx = 0.0, dtx = 0.0, dsy = 0.0, dty = 0.0;
-    \\#endif
-    \\  if (ok == 0u) return 0xff000000u;
-    \\  uint wrap_s = p1 & 3u;
-    \\  uint wrap_t = (p1 >> 2) & 3u;
-    \\  uint mips = p0 & 15u;
-    \\  uint minc = (p1 >> 4) & 7u;
-    \\  bool mag_nearest = ((p1 >> 7) & 1u) != 0u;
-    \\  bool min_nearest = minc == 1u || minc == 2u || minc == 3u;
-    \\  uint mipf = (minc == 2u || minc == 4u) ? 1u : ((minc == 3u || minc == 5u) ? 2u : 0u);
-    \\  if (mipf == 0u) mips = 0u;
-    \\  if (min_nearest == mag_nearest && mips == 0u) return tmu_level(t, 0, width, height, wrap_s, wrap_t, mag_nearest, s, tc);
-    \\  precise float rx = dsx * dsx + dtx * dtx;
-    \\  precise float ry = dsy * dsy + dty * dty;
-    \\  float rho2 = max(rx, ry);
-    \\  float lod = (rho2 > 0.0 && !isinf(rho2)) ? 0.5 * f(q_log2(u(rho2))) : (rho2 > 0.0 ? 32.0 : -32.0);
-    \\  if (!(lod > 0.0)) return tmu_level(t, 0, width, height, wrap_s, wrap_t, mag_nearest, s, tc);
-    \\  if (mips == 0u) return tmu_level(t, 0, width, height, wrap_s, wrap_t, min_nearest, s, tc);
-    \\  float top = float(mips);
-    \\  uint l0;
-    \\  uint frac = 0u;
-    \\  if (mipf == 1u) {
-    \\    l0 = uint(min(floor(lod + 0.5), top));
-    \\  } else {
-    \\    float fl = floor(lod);
-    \\    if (fl >= top) {
-    \\      l0 = mips;
-    \\    } else {
-    \\      l0 = uint(fl);
-    \\      frac = uint(floor((lod - fl) * 256.0 + 0.5));
-    \\    }
-    \\  }
-    \\  uint a = tmu_level(t, int(l0), tex_level_size(width, l0), tex_level_size(height, l0), wrap_s, wrap_t, min_nearest, s, tc);
-    \\  if (frac == 0u) return a;
-    \\  uint l1 = l0 + 1u;
-    \\  uint b = tmu_level(t, int(l1), tex_level_size(width, l1), tex_level_size(height, l1), wrap_s, wrap_t, min_nearest, s, tc);
-    \\  uvec4 mix = (bytes(a) * (256u - frac) + bytes(b) * frac + 128u) >> 8;
-    \\  return pack4(mix & 0xffu);
-    \\}
-    \\
-++ sfuHelpers("precise ", "");
+const glsl_helpers = @embedFile("shaders/helpers.glsl") ++ sfuHelpers("precise ", "");
 
 /// The start of a GLSL fragment shader's `main`: its inputs (as interpolated for the fragment).
-const glsl_inputs =
-    \\void main() {
-    \\  float i_inv_w = v_inv_w;
-    \\  vec4 i_v0 = v_v0, i_v1 = v_v1, i_v2 = v_v2, i_v3 = v_v3;
-    \\
-;
+const glsl_inputs = @embedFile("shaders/fragment_inputs.glsl");
 
 /// `glsl_inputs`, run once a sample: interpolated at the pixel's middle all the same, as V3D does.
-const glsl_inputs_centre =
-    \\void main() {
-    \\  float i_inv_w = interpolateAtOffset(v_inv_w, vec2(0.0));
-    \\  vec4 i_v0 = interpolateAtOffset(v_v0, vec2(0.0)), i_v1 = interpolateAtOffset(v_v1, vec2(0.0));
-    \\  vec4 i_v2 = interpolateAtOffset(v_v2, vec2(0.0)), i_v3 = interpolateAtOffset(v_v3, vec2(0.0));
-    \\
-;
+const glsl_inputs_centre = @embedFile("shaders/fragment_inputs_centre.glsl");
 
 /// What follows `glsl_inputs`: the inputs as `translate` reads them.
-const glsl_prologue =
-    \\  // Exactly 0 only if every corner's 1/W is exactly 1.
-    \\  float W = v_not_unit_w == 0.0 ? 1.0 : (abs(i_inv_w) > 1e-12 ? 1.0 / i_inv_w : 1.0);
-    \\  float V[16] = float[16](
-    \\    i_v0.x * W, i_v0.y * W, i_v0.z * W, i_v0.w * W,
-    \\    i_v1.x * W, i_v1.y * W, i_v1.z * W, i_v1.w * W,
-    \\    i_v2.x * W, i_v2.y * W, i_v2.z * W, i_v2.w * W,
-    \\    i_v3.x * W, i_v3.y * W, i_v3.z * W, i_v3.w * W);
-    \\  uint ra[32];
-    \\  uint rb[32];
-    \\  for (int i = 0; i < 32; ++i) {
-    \\    ra[i] = 0u;
-    \\    rb[i] = 0u;
-    \\  }
-    \\  ra[15] = u(W);
-    \\  rb[15] = uint(floor(clamp(gl_FragCoord.z, 0.0, 1.0) * 16777215.0 + 0.5));
-    \\  uint px = uint(gl_FragCoord.x), py = uint(gl_FragCoord.y);
-    \\
-;
+const glsl_prologue = @embedFile("shaders/fragment_prologue.glsl");
 
 /// The GLSL vertex shader all draws share: a corner (`gl_renderer.Vertex`) where it is in the
 /// framebuffer (`fb` pixels big; its rows up from the bottom of the GL framebuffer, as in RAM), and
 /// what the fragments get.
-pub const glsl_vertex =
-    \\#version 400 core
-    \\layout(location = 0) in vec4 a_pos;
-    \\layout(location = 1) in uint a_unit_w;
-    \\layout(location = 2) in vec4 a_v0;
-    \\layout(location = 3) in vec4 a_v1;
-    \\layout(location = 4) in vec4 a_v2;
-    \\layout(location = 5) in vec4 a_v3;
-    \\uniform vec2 fb;
-    \\noperspective out float v_inv_w;
-    \\noperspective out float v_not_unit_w;
-    \\noperspective out vec4 v_v0;
-    \\noperspective out vec4 v_v1;
-    \\noperspective out vec4 v_v2;
-    \\noperspective out vec4 v_v3;
-    \\void main() {
-    \\  gl_Position = vec4(a_pos.x / fb.x * 2.0 - 1.0, a_pos.y / fb.y * 2.0 - 1.0, a_pos.z * 2.0 - 1.0, 1.0);
-    \\  v_inv_w = a_pos.w;
-    \\  v_not_unit_w = a_unit_w != 0u ? 0.0 : 1.0;
-    \\  v_v0 = a_v0;
-    \\  v_v1 = a_v1;
-    \\  v_v2 = a_v2;
-    \\  v_v3 = a_v3;
-    \\}
-    \\
-;
+pub const glsl_vertex = @embedFile("shaders/draw_vertex.glsl");
 
 /// The varying interpolation `qpu_sim` stands for: `fmul acc, vary, frag_w` then `fadd dst, acc, r5`
 /// gives back the varying, with `r5` the constant it reads as.
@@ -864,39 +197,11 @@ pub fn translateWith(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, la
         try w.writeAll(glsl_prologue);
         if (t.shader.reads_color and !t.multisampled) try w.writeAll("  uint tlb_in = texelFetch(tlb_tex, ivec2(gl_FragCoord.xy), 0).r;\n");
     } else {
-        try w.writeAll(
-            \\fragment FragOut fragment_main(VOut in [[stage_in]], constant uint* unif [[buffer(0)]],
-            \\    device const uchar* ram [[buffer(1)]], constant DrawInfo& di [[buffer(2)]]
-        );
+        try w.writeAll(@embedFile("shaders/fragment_main.metal"));
         if (t.shader.reads_color) try w.writeAll(",\n    uint tlb_in [[color(0)]]");
-        try w.writeAll(
-            \\) {
-            \\  // Exactly 0 only if every corner's 1/W is exactly 1.
-            \\  float W = in.not_unit_w == 0.0f ? 1.0f : (fabs(in.inv_w) > 1e-12f ? 1.0f / in.inv_w : 1.0f);
-            \\  float V[16] = {
-            \\    in.v0.x * W, in.v0.y * W, in.v0.z * W, in.v0.w * W,
-            \\    in.v1.x * W, in.v1.y * W, in.v1.z * W, in.v1.w * W,
-            \\    in.v2.x * W, in.v2.y * W, in.v2.z * W, in.v2.w * W,
-            \\    in.v3.x * W, in.v3.y * W, in.v3.z * W, in.v3.w * W,
-            \\  };
-            \\  uint ra[32] = {};
-            \\  uint rb[32] = {};
-            \\  ra[15] = u(W);
-            \\  rb[15] = uint(floor(clamp(in.pos.z, 0.0f, 1.0f) * 16777215.0f + 0.5f));
-            \\  uint px = uint(in.pos.x), py = uint(in.pos.y);
-            \\
-        );
+        try w.writeAll(@embedFile("shaders/fragment_prologue.metal"));
     }
-    try w.writeAll(
-        \\  uint r0 = 0u, r1 = 0u, r2 = 0u, r3 = 0u, r4 = 0u, r5 = 0u, pa = 0u, pb = 0u;
-        \\  bool flag_z = false, flag_n = false, flag_c = false;
-        \\  uint tlb_c = 0u;
-        \\  bool tlb_w = false;
-        \\  uint tmu0_t = 0u, tmu1_t = 0u;
-        \\  uint tmu0_f0 = 0u, tmu0_f1 = 0u, tmu0_f2 = 0u, tmu0_f3 = 0u;
-        \\  uint tmu1_f0 = 0u, tmu1_f1 = 0u, tmu1_f2 = 0u, tmu1_f3 = 0u;
-        \\
-    );
+    try w.writeAll(@embedFile("shaders/fragment_registers.inc"));
 
     var end_at: ?usize = null;
     var ip: usize = 0;
@@ -956,16 +261,9 @@ pub fn translateWith(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst, la
     if (end_at == null) try w.print("  {s};\n", .{discard});
     try w.print("  if (!tlb_w) {s};\n", .{discard});
     try w.writeAll(if (lang == .glsl)
-        \\  o_color = tlb_c;
-        \\}
-        \\
+        @embedFile("shaders/fragment_end.glsl")
     else
-        \\  FragOut o;
-        \\  o.color = tlb_c;
-        \\  return o;
-        \\}
-        \\
-    );
+        @embedFile("shaders/fragment_end.metal"));
     return t.shader;
 }
 
@@ -998,31 +296,10 @@ fn translateVertexStage(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst,
     // The registers start as qpu_sim's do (ra15 and rb15 a fragment's W, 1, and Z, 0), from a zero
     // the compiler doesn't know is 0 (a vertex's number is never 2^31 or more).
     try w.writeAll(if (lang == .glsl)
-        \\void main() {
-        \\  uint zero = uint(gl_VertexID) >> 31;
-        \\
+        @embedFile("shaders/vertex_stage_main.glsl")
     else
-        \\kernel void vertex_shade(device const uint* inputs [[buffer(0)]], device Vertex* verts [[buffer(1)]],
-        \\    constant uint* unif [[buffer(2)]], constant VertexInfo& vi [[buffer(3)]], uint vid [[thread_position_in_grid]]) {
-        \\  if (vid >= vi.count) return;
-        \\  device const uint* a_in = inputs + vi.first_input + vid * vi.stride;
-        \\  uint zero = vid >> 31;
-        \\
-    );
-    try w.writeAll(
-        \\  uint ra[32];
-        \\  uint rb[32];
-        \\  uint vo[32];
-        \\  for (int i = 0; i < 32; ++i) {
-        \\    ra[i] = zero;
-        \\    rb[i] = zero;
-        \\    vo[i] = zero;
-        \\  }
-        \\  ra[15] = 0x3f800000u + zero;
-        \\  uint r0 = zero, r1 = zero, r2 = zero, r3 = zero, r4 = zero, r5 = zero, pa = zero, pb = zero;
-        \\  bool flag_z = false, flag_n = false, flag_c = false;
-        \\
-    );
+        @embedFile("shaders/vertex_stage_main.metal"));
+    try w.writeAll(@embedFile("shaders/vertex_stage_registers.inc"));
     var end_at: ?usize = null;
     var ip: usize = 0;
     while (ip < decoded.len) : (ip += 1) {
@@ -1047,69 +324,20 @@ fn translateVertexStage(w: *std.Io.Writer, decoded: []const qpu_sim.DecodedInst,
     if (t.vpm_writes < 3) t.vertex.unsupported = true;
     if (clip) {
         if (t.vpm_writes < 4) t.vertex.unsupported = true;
-        try w.writeAll(
-            \\  tf_pos = vec4(f(vo[0]), f(vo[1]), f(vo[2]), f(vo[3]));
-            \\  tf_unit_w = uvec4(0u);
-            \\  tf_v0 = vec4(0.0);
-            \\  tf_v1 = vec4(0.0);
-            \\  tf_v2 = vec4(0.0);
-            \\  tf_v3 = vec4(0.0);
-            \\  gl_Position = vec4(0.0);
-            \\}
-            \\
-        );
+        try w.writeAll(@embedFile("shaders/coordinates_end.glsl"));
         return t.vertex;
     }
     // The vertex, as V3D's position words give it: x and y in 12.4 fixed point, z, and 1/W (taken
     // as 1 if 0); the varyings multiplied by 1/W.
     if (lang == .msl) {
-        try w.print(
-            \\  int xs = int(vo[0] << 16) >> 16;
-            \\  int ys = int(vo[0]) >> 16;
-            \\  float inv_w = f(vo[2]) == 0.0f ? 1.0f : f(vo[2]);
-            \\  Vertex v;
-            \\  v.x = float(xs) * 0.0625f + vi.vp_x;
-            \\  v.y = float(ys) * 0.0625f + vi.vp_y;
-            \\  v.z = f(vo[1]);
-            \\  v.inv_w = inv_w;
-            \\  v.unit_w = inv_w == 1.0f ? 1u : 0u;
-            \\  v.pad0 = 0u;
-            \\  v.pad1 = 0u;
-            \\  v.pad2 = 0u;
-            \\  uint n_out = min(vi.n_var, {d}u);
-            \\  float V[16];
-            \\  for (uint i = 0u; i < 16u; ++i) V[i] = i < n_out ? f(vo[3u + i]) * inv_w : 0.0f;
-            \\  v.v0 = float4(V[0], V[1], V[2], V[3]);
-            \\  v.v1 = float4(V[4], V[5], V[6], V[7]);
-            \\  v.v2 = float4(V[8], V[9], V[10], V[11]);
-            \\  v.v3 = float4(V[12], V[13], V[14], V[15]);
-            \\  verts[vi.first_vertex + vid] = v;
-            \\}}
-            \\
-        , .{t.vpm_writes -| 3});
+        // The varyings it writes.
+        try w.print("  const uint n_outputs = {d}u;\n", .{t.vpm_writes -| 3});
+        try w.writeAll(@embedFile("shaders/vertex_stage_end.metal"));
         return t.vertex;
     }
-    try w.print(
-        \\  int xs = int(vo[0] << 16) >> 16;
-        \\  int ys = int(vo[0]) >> 16;
-        \\  float inv_w = f(vo[2]) == 0.0 ? 1.0 : f(vo[2]);
-        \\  precise float x = float(xs) * 0.0625;
-        \\  precise float y = float(ys) * 0.0625;
-        \\  precise float px = x + vp.x;
-        \\  precise float py = y + vp.y;
-        \\  tf_pos = vec4(px, py, f(vo[1]), inv_w);
-        \\  tf_unit_w = uvec4(inv_w == 1.0 ? 1u : 0u, 0u, 0u, 0u);
-        \\  uint n_out = min(n_var, {d}u);
-        \\  float V[16];
-        \\  for (uint i = 0u; i < 16u; ++i) V[i] = i < n_out ? f(q_fmul(vo[3u + i], u(inv_w))) : 0.0;
-        \\  tf_v0 = vec4(V[0], V[1], V[2], V[3]);
-        \\  tf_v1 = vec4(V[4], V[5], V[6], V[7]);
-        \\  tf_v2 = vec4(V[8], V[9], V[10], V[11]);
-        \\  tf_v3 = vec4(V[12], V[13], V[14], V[15]);
-        \\  gl_Position = vec4(0.0);
-        \\}}
-        \\
-    , .{t.vpm_writes -| 3});
+    // The varyings it writes.
+    try w.print("  const uint n_outputs = {d}u;\n", .{t.vpm_writes -| 3});
+    try w.writeAll(@embedFile("shaders/vertex_stage_end.glsl"));
     return t.vertex;
 }
 

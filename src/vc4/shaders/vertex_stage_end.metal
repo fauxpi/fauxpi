@@ -1,0 +1,21 @@
+  int xs = int(vo[0] << 16) >> 16;
+  int ys = int(vo[0]) >> 16;
+  float inv_w = f(vo[2]) == 0.0f ? 1.0f : f(vo[2]);
+  Vertex v;
+  v.x = float(xs) * 0.0625f + vi.vp_x;
+  v.y = float(ys) * 0.0625f + vi.vp_y;
+  v.z = f(vo[1]);
+  v.inv_w = inv_w;
+  v.unit_w = inv_w == 1.0f ? 1u : 0u;
+  v.pad0 = 0u;
+  v.pad1 = 0u;
+  v.pad2 = 0u;
+  uint n_out = min(vi.n_var, n_outputs);
+  float V[16];
+  for (uint i = 0u; i < 16u; ++i) V[i] = i < n_out ? f(vo[3u + i]) * inv_w : 0.0f;
+  v.v0 = float4(V[0], V[1], V[2], V[3]);
+  v.v1 = float4(V[4], V[5], V[6], V[7]);
+  v.v2 = float4(V[8], V[9], V[10], V[11]);
+  v.v3 = float4(V[12], V[13], V[14], V[15]);
+  verts[vi.first_vertex + vid] = v;
+}
