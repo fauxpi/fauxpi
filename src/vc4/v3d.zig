@@ -3936,18 +3936,52 @@ pub const V3d = struct {
         const store_start = profile.now();
         defer profile.end(.gpu_store_tiles, store_start);
 
-        for (0..tiles_h) |ty| {
-            for (0..tiles_w) |tx| {
-                if (tiles[ty] & (@as(u64, 1) << @intCast(tx)) == 0) continue;
-                const x0: u32 = @intCast(tx * size);
-                const y0: u32 = @intCast(ty * size);
-                const vw = @min(size, w - x0);
-                const vh = @min(size, h - y0);
-                for (0..vh) |y| @memcpy(tile_color[y * size ..][0..vw], color[(y0 + y) * w + x0 ..][0..vw]);
-                tb.color_solid = null;
-                storeTileFromBuf(&tb, ram, first.dst_addr, w, h, @intCast(tx), @intCast(ty), size, first.tiling, first.ls_format);
+        // Each row of tiles stored (each to its own part of RAM), on several threads.
+        const Store = struct {
+            ram: []u8,
+            first: TileJob,
+            tiles: *const [64]u64,
+            color: []const u32,
+            w: u32,
+            h: u32,
+            size: u32,
+            tiles_w: usize,
+            tiles_h: usize,
+            next: std.atomic.Value(usize) = .init(0),
+
+            fn run(st: *@This()) void {
+                var t_color: [64 * 64]u32 = undefined;
+                var t_depth: [64 * 64]f32 = undefined;
+                var t_stencil: [64 * 64]u8 = undefined;
+                var t_vg: [64 * 64]u8 = undefined;
+                var buf: TileBuffer = .{ .color = &t_color, .depth = &t_depth, .stencil = &t_stencil, .vg_mask = &t_vg };
+                while (true) {
+                    const ty = st.next.fetchAdd(1, .monotonic);
+                    if (ty >= st.tiles_h) break;
+                    for (0..st.tiles_w) |tx| {
+                        if (st.tiles[ty] & (@as(u64, 1) << @intCast(tx)) == 0) continue;
+                        const x0: u32 = @intCast(tx * st.size);
+                        const y0: u32 = @intCast(ty * st.size);
+                        const vw = @min(st.size, st.w - x0);
+                        const vh = @min(st.size, st.h - y0);
+                        for (0..vh) |y| @memcpy(t_color[y * st.size ..][0..vw], st.color[(y0 + y) * st.w + x0 ..][0..vw]);
+                        buf.color_solid = null;
+                        storeTileFromBuf(&buf, st.ram, st.first.dst_addr, st.w, st.h, @intCast(tx), @intCast(ty), st.size, st.first.tiling, st.first.ls_format);
+                    }
+                }
+            }
+        };
+        var store: Store = .{ .ram = ram, .first = first, .tiles = tiles, .color = color, .w = w, .h = h, .size = size, .tiles_w = tiles_w, .tiles_h = tiles_h };
+        var threads: [3]std.Thread = undefined;
+        var spawned: usize = 0;
+        if (tiles_h >= 4) {
+            for (&threads) |*t| {
+                t.* = std.Thread.spawn(.{}, Store.run, .{&store}) catch break;
+                spawned += 1;
             }
         }
+        store.run();
+        for (threads[0..spawned]) |t| t.join();
         return true;
     }
 
