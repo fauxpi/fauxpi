@@ -24,6 +24,10 @@ pub const Stage = enum {
     gpu_store_tiles,
     gpu_programs,
     gpu_gather_vertices,
+    /// Of gathering them: whether the clipper cuts triangles (their clip coordinates, from the
+    /// coordinate shader), and the primitives made on the CPU (lines, points, and triangles cut).
+    gpu_clip_test,
+    gpu_cpu_primitives,
     gpu_shade_vertices,
     gpu_draw,
     gpu_read_back,
@@ -44,6 +48,18 @@ pub const Counter = enum {
     layers,
     textures_decoded,
     display_frames,
+    /// Frames whose vertices couldn't be shaded on the GPU, by why: lines or points (or NV or
+    /// VG), a triangle the clipper cuts, a shader too long or untranslatable, too many vertices or
+    /// draws, or no triangles.
+    gpu_vertices_no_triangles,
+    gpu_vertices_not_triangles,
+    gpu_vertices_clipped,
+    gpu_vertices_shaders,
+    gpu_vertices_too_many,
+    gpu_vertices_render,
+    /// Primitives of frames shaded on the GPU made on the CPU instead (lines, points, triangles
+    /// the clipper cuts).
+    cpu_primitives,
 };
 
 pub var enabled: bool = false;

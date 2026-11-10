@@ -166,6 +166,7 @@ const Gl = struct {
     BeginTransformFeedback: *const fn (GLenum) callconv(.c) void,
     EndTransformFeedback: *const fn () callconv(.c) void,
     GetBufferSubData: *const fn (GLenum, isize, isize, ?*anyopaque) callconv(.c) void,
+    BufferSubData: *const fn (GLenum, isize, isize, ?*const anyopaque) callconv(.c) void,
     CullFace: *const fn (GLenum) callconv(.c) void,
     FrontFace: *const fn (GLenum) callconv(.c) void,
     DisableVertexAttribArray: *const fn (GLuint) callconv(.c) void,
@@ -548,10 +549,12 @@ pub const Renderer = struct {
     }
 
     /// Shades the vertices of `draws` with a vertex stage, from `inputs`, into the vertex buffer.
-    fn shadeVertices(r: *Renderer, draws: []const Draw, programs: []const *const VertexProgram, inputs: []const u32, vertex_total: u32) void {
+    fn shadeVertices(r: *Renderer, draws: []const Draw, programs: []const *const VertexProgram, inputs: []const u32, vertex_total: u32, extra: []const Vertex) void {
         const gl = &r.gl;
         gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
-        gl.BufferData(GL_ARRAY_BUFFER, @intCast(@as(usize, vertex_total) * @sizeOf(Vertex)), null, GL_STREAM_DRAW);
+        gl.BufferData(GL_ARRAY_BUFFER, @intCast((@as(usize, vertex_total) + extra.len) * @sizeOf(Vertex)), null, GL_STREAM_DRAW);
+        // Vertices shaded already (triangles the CPU clipped), after those shaded here.
+        if (extra.len > 0) gl.BufferSubData(GL_ARRAY_BUFFER, @intCast(@as(usize, vertex_total) * @sizeOf(Vertex)), @intCast(extra.len * @sizeOf(Vertex)), extra.ptr);
         gl.BindVertexArray(r.input_vao);
         gl.BindBuffer(GL_ARRAY_BUFFER, r.inputs);
         gl.BufferData(GL_ARRAY_BUFFER, @intCast(inputs.len * 4), inputs.ptr, GL_STREAM_DRAW);
@@ -612,7 +615,7 @@ pub const Renderer = struct {
             .clip_w = 0,
             .clip_h = 0,
         };
-        r.shadeVertices(&.{d}, &.{p}, inputs, count);
+        r.shadeVertices(&.{d}, &.{p}, inputs, count, &.{});
         r.gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
         r.gl.GetBufferSubData(GL_ARRAY_BUFFER, 0, @intCast(@as(usize, count) * @sizeOf(Vertex)), out.ptr);
         if (r.gl.GetError() != GL_NO_ERROR) return error.GlFailed;
@@ -763,11 +766,12 @@ pub const Renderer = struct {
         // colour need them; or as given.
         var drawn: []const Vertex = vertices;
         if (shaded_on_gpu) {
-            r.shadeVertices(draws, vertex_programs[0..draws.len], inputs, vertex_total);
+            r.shadeVertices(draws, vertex_programs[0..draws.len], inputs, vertex_total, vertices);
             if (any_reads_color) {
-                r.shaded.resize(std.heap.smp_allocator, vertex_total) catch return error.Unsupported;
+                const all = vertex_total + vertices.len;
+                r.shaded.resize(std.heap.smp_allocator, all) catch return error.Unsupported;
                 gl.BindBuffer(GL_ARRAY_BUFFER, r.vbo);
-                gl.GetBufferSubData(GL_ARRAY_BUFFER, 0, @intCast(@as(usize, vertex_total) * @sizeOf(Vertex)), r.shaded.items.ptr);
+                gl.GetBufferSubData(GL_ARRAY_BUFFER, 0, @intCast(all * @sizeOf(Vertex)), r.shaded.items.ptr);
                 drawn = r.shaded.items;
             }
             profile.end(.gpu_shade_vertices, prof_start);
@@ -788,7 +792,9 @@ pub const Renderer = struct {
             const draw_corners: ?[]const u32 = if (d.vertex_stage) |vs| corners[vs.first_corner..][0..vs.corner_count] else null;
             if (p.shader.reads_color) {
                 profile.count(.blended_triangles, if (draw_corners) |dc| dc.len / 3 else d.vertex_count / 3);
-                const tris_vertices = if (shaded_on_gpu) drawn[d.first_vertex..][0..d.vertex_count] else drawn[d.first_vertex..][0 .. d.vertex_count / 3 * 3];
+                // Shaded on the GPU, its corners may be any after its first vertex (those the CPU
+                // clipped are after all those shaded on the GPU).
+                const tris_vertices = if (shaded_on_gpu) drawn[d.first_vertex..] else drawn[d.first_vertex..][0 .. d.vertex_count / 3 * 3];
                 const cull: u8 = if (d.vertex_stage) |vs| vs.cull else 3;
                 r.layers.build(width, height, tris_vertices, draw_corners, cull, d.first_vertex) catch return error.Unsupported;
                 r.indices.appendSlice(std.heap.smp_allocator, r.layers.order.items) catch return error.Unsupported;

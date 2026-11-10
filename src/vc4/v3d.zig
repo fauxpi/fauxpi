@@ -371,6 +371,8 @@ pub const V3d = struct {
     /// A draw's coordinate shader, decoded, and its vertices' clip coordinates (by slot, as
     /// `vs_out`).
     cs_decoded: std.ArrayList(qpu_sim.DecodedInst) = .empty,
+    /// Whether `vs_clip` has the clip coordinates of the last draw `needsClipping` looked at.
+    vs_clip_ok: bool = false,
     vs_clip: std.ArrayList(ClipVertex) = .empty,
     /// The frame's triangles, shaded, in draw order.
     shaded_tris: std.ArrayList(ShadedTriangle) = .empty,
@@ -1574,10 +1576,12 @@ pub const V3d = struct {
     /// Whether the clipper cuts any of `draw`'s `num_tris` triangles (their vertices listed by
     /// `collectVertices`), from their clip coordinates (its shader record at `rec_phys`).
     fn needsClipping(self: *V3d, ram: []const u8, draw: DrawCall, rec_phys: u32, num_tris: u32) bool {
+        self.vs_clip_ok = false;
         var cs_attrs: [8]AttrStream = undefined;
         const cs = coordStage(ram, rec_phys, draw.num_attrs, &self.vs_code, &self.cs_decoded, &cs_attrs) orelse return false;
         const unique = self.vs_unique.items;
         self.vs_clip.resize(tri_allocator, unique.len) catch return true;
+        self.vs_clip_ok = true;
         const job: VertexJob = .{
             .ram = ram,
             .draw = draw,
@@ -3417,19 +3421,120 @@ pub const V3d = struct {
 
     /// Draws the frame on the GPU, its vertices shaded there too (not on the CPU), if the GPU can
     /// run all its shaders the same as qpu_sim.
+    /// A draw's primitives for the GPU's vertex path (`vs_corner_slot`'s, with their clip
+    /// coordinates in `vs_clip` if `vs_clip_ok`): triangles the clipper doesn't cut, their corners
+    /// into `g.corners`; the rest (and, `all`, every primitive: lines and points), their vertices
+    /// shaded here (16 at a time) and made triangles (clipped, lines and points made quads), the
+    /// triangles' vertices into `g.vertices` from `n_clipped` on and their corners `mark`ed with
+    /// where. How many of those vertices there are then, or null (too many, or no memory).
+    fn clipOnCpu(self: *V3d, g: *GpuState, ram: []const u8, draw: DrawCall, num_tris: u32, vs_code_phys: u32, vs_unif_phys: u32, attrs: []const AttrStream, vpm_words: u32, fs_num_varyings: u8, n_clipped_in: u32, mark: u32, all: bool) ?u32 {
+        var n_clipped = n_clipped_in;
+        const no_clip: ClipVertex = .{ .x = 0, .y = 0, .z = 0, .w = std.math.nan(f32) };
+        // Which primitives are made here, and their vertices (each once).
+        var here_set: std.DynamicBitSetUnmanaged = std.DynamicBitSetUnmanaged.initEmpty(tri_allocator, num_tris) catch return null;
+        defer here_set.deinit(tri_allocator);
+        var n_here: usize = 0;
+        var slot_of: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+        defer slot_of.deinit(tri_allocator);
+        var indices: std.ArrayList(u32) = .empty;
+        defer indices.deinit(tri_allocator);
+        g.corners.ensureUnusedCapacity(tri_allocator, @as(usize, num_tris) * 3) catch return null;
+        for (0..num_tris) |t| {
+            const slots = self.vs_corner_slot.items[t * 3 ..][0..3];
+            var here = all;
+            if (!here and self.vs_clip_ok) {
+                var c: [3]ClipVertex = undefined;
+                for (&c, slots) |*v, sl| v.* = self.vs_clip.items[sl];
+                here = needsClip(draw, c);
+            }
+            if (!here) continue;
+            here_set.set(t);
+            n_here += 1;
+            for (slots) |sl| {
+                const got = slot_of.getOrPut(tri_allocator, sl) catch return null;
+                if (!got.found_existing) {
+                    got.value_ptr.* = @intCast(indices.items.len);
+                    indices.append(tri_allocator, self.vs_unique.items[sl]) catch return null;
+                }
+            }
+        }
+        if (n_here == 0) {
+            g.corners.appendSliceAssumeCapacity(self.vs_corner_slot.items[0 .. @as(usize, num_tris) * 3]);
+            return n_clipped;
+        }
+        profile.count(.cpu_primitives, n_here);
+
+        var code: std.ArrayList(qpu.Inst) = .empty;
+        defer code.deinit(tri_allocator);
+        var decoded_list: std.ArrayList(qpu_sim.DecodedInst) = .empty;
+        defer decoded_list.deinit(tri_allocator);
+        const vs_decoded = decodeProgramAt(ram, vs_code_phys, &code, &decoded_list) orelse return null;
+        const n_var = @min(@as(usize, fs_num_varyings), 16);
+        const verts = tri_allocator.alloc(ShadedVertex, indices.items.len) catch return null;
+        defer tri_allocator.free(verts);
+        const ok = tri_allocator.alloc(bool, indices.items.len) catch return null;
+        defer tri_allocator.free(ok);
+        const job: VertexJob = .{ .ram = ram, .draw = draw, .decoded = vs_decoded, .unifs = uniformsAt(ram, vs_unif_phys), .attrs = attrs, .vpm_words = vpm_words, .n_var = n_var, .indices = indices.items, .out = verts, .ok = ok };
+        job.runAll();
+
+        // In order: those shaded on the GPU, and those made here.
+        for (0..num_tris) |t| {
+            const slots = self.vs_corner_slot.items[t * 3 ..][0..3];
+            if (!here_set.isSet(t)) {
+                g.corners.appendSlice(tri_allocator, slots) catch return null;
+                continue;
+            }
+            var tv: [3]ShadedVertex = undefined;
+            var c: [3]ClipVertex = @splat(no_clip);
+            var all_ok = true;
+            for (0..3) |k| {
+                const at = slot_of.get(slots[k]).?;
+                all_ok = all_ok and ok[at];
+                tv[k] = verts[at];
+                if (self.vs_clip_ok) c[k] = self.vs_clip.items[slots[k]];
+            }
+            if (!all_ok) continue;
+            var pieces: [max_clipped][3]ShadedVertex = undefined;
+            const n_pieces = primitiveTriangles(draw, tv, c, n_var, &pieces);
+            for (pieces[0..n_pieces]) |piece| {
+                if (n_clipped + 3 > g.vertices.len) return null;
+                const unit = piece[0].inv_w == 1 and piece[1].inv_w == 1 and piece[2].inv_w == 1;
+                for (piece) |v| {
+                    g.vertices[n_clipped] = .{ .x = v.x, .y = v.y, .z = v.z, .inv_w = v.inv_w, .unit_w = @intFromBool(unit), .varyings = v.persp_varyings };
+                    g.corners.append(tri_allocator, mark | n_clipped) catch return null;
+                    n_clipped += 1;
+                }
+            }
+        }
+        return n_clipped;
+    }
+
+    /// A frame refused by the GPU's vertex path, counted by why.
+    fn rejected(why: profile.Counter) bool {
+        profile.count(why, 1);
+        return false;
+    }
+
     fn renderWithGpuVertices(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
         const g = self.gpuState() orelse return false;
         const frame = self.gpuFrame(ram, start_bus, end_bus) orelse return false;
         // Without triangles, the CPU loads and stores the tiles as fast.
-        if (!frame.first.has_render) return false;
+        if (!frame.first.has_render) return rejected(.gpu_vertices_no_triangles);
         g.inputs.clearRetainingCapacity();
         g.corners.clearRetainingCapacity();
         var n_draws: usize = 0;
         var vertex_total: u32 = 0;
+        // Triangles the clipper cuts: their pieces' corners, shaded and clipped here, after the
+        // vertices shaded on the GPU (their corners marked until how many those are is known).
+        var n_clipped: u32 = 0;
+        const clipped_mark: u32 = 1 << 31;
         if (!g.begin(self.draws.items.len)) return false;
         for (self.draws.items) |draw| {
-            // Lines and points are drawn from vertices shaded on the CPU, which makes them quads.
-            if (!isTriangles(draw) or draw.kind != .gl) return false;
+            if (draw.kind != .gl) return rejected(.gpu_vertices_not_triangles);
+            // Lines and points: made quads on the CPU (Metal: the frame drawn from vertices
+            // shaded on the CPU).
+            const lines_points = !isTriangles(draw);
+            if (lines_points and metal_renderer.supported) return rejected(.gpu_vertices_not_triangles);
             // What prepareDrawsForFrame skips, drawing nothing.
             if (numPrims(draw) == 0) continue;
             const rec_phys = draw.shader_rec_addr & vc_bus.ramMask(ram.len);
@@ -3440,13 +3545,13 @@ pub const V3d = struct {
             const vs_attr_mask = ram[rec_phys + 14];
             const vs_code_phys = std.mem.readInt(u32, ram[rec_phys + 16 ..][0..4], .little) & vc_bus.ramMask(ram.len);
             const vs_unif_phys = std.mem.readInt(u32, ram[rec_phys + 20 ..][0..4], .little) & vc_bus.ramMask(ram.len);
-            if (n_draws == gpu_draw.max_draws) return false;
+            if (n_draws == gpu_draw.max_draws) return rejected(.gpu_vertices_too_many);
             const num_tris = numPrims(draw);
             if (num_tris == 0) continue;
             if (programLen(ram, vs_code_phys) == 0 or programLen(ram, fs_code_phys) == 0) continue;
             // Longer shaders are drawn on the CPU.
-            const vs_code = g.addProgram(ram, vs_code_phys) orelse return false;
-            const fs_code = g.addProgram(ram, fs_code_phys) orelse return false;
+            const vs_code = g.addProgram(ram, vs_code_phys) orelse return rejected(.gpu_vertices_shaders);
+            const fs_code = g.addProgram(ram, fs_code_phys) orelse return rejected(.gpu_vertices_shaders);
             const fs_unifs = g.addUniforms(ram, fs_unif_phys);
             const vs_unifs = g.addUniforms(ram, vs_unif_phys);
 
@@ -3460,9 +3565,13 @@ pub const V3d = struct {
             defer profile.end(.gpu_gather_vertices, prof_start);
             if (!self.collectVertices(ram, draw, num_tris)) return false;
             const unique = self.vs_unique.items;
-            if (vertex_total + unique.len > max_gpu_vertices) return false;
-            // Triangles the clipper cuts are drawn from vertices shaded on the CPU, which clips.
-            if (self.needsClipping(ram, draw, rec_phys, num_tris)) return false;
+            if (vertex_total + unique.len > max_gpu_vertices) return rejected(.gpu_vertices_too_many);
+            // Triangles the clipper cuts: shaded and clipped here (Metal: the frame drawn from
+            // vertices shaded on the CPU, which clips).
+            const clip_start = profile.now();
+            const clips = self.needsClipping(ram, draw, rec_phys, num_tris);
+            profile.end(.gpu_clip_test, clip_start);
+            if (clips and metal_renderer.supported) return rejected(.gpu_vertices_clipped);
             // Each vertex's VPM words, as qpu_sim is given them.
             const first_input: u32 = @intCast(g.inputs.items.len);
             g.inputs.resize(tri_allocator, first_input + unique.len * stride) catch return false;
@@ -3478,7 +3587,13 @@ pub const V3d = struct {
                 }
             }
             const first_corner: u32 = @intCast(g.corners.items.len);
-            g.corners.appendSlice(tri_allocator, self.vs_corner_slot.items) catch return false;
+            if (!clips and !lines_points) {
+                g.corners.appendSlice(tri_allocator, self.vs_corner_slot.items) catch return false;
+            } else {
+                const cpu_start = profile.now();
+                defer profile.end(.gpu_cpu_primitives, cpu_start);
+                n_clipped = self.clipOnCpu(g, ram, draw, num_tris, vs_code_phys, vs_unif_phys, attrs, vpm_words, fs_num_varyings, n_clipped, clipped_mark, lines_points) orelse return rejected(.gpu_vertices_clipped);
+            }
 
             g.draws.appendAssumeCapacity(.{
                 .first_vertex = vertex_total,
@@ -3490,8 +3605,9 @@ pub const V3d = struct {
                     .first_input = first_input,
                     .input_stride = stride,
                     .first_corner = first_corner,
-                    .corner_count = @intCast(self.vs_corner_slot.items.len),
-                    .cull = draw.config_b0 & 7,
+                    .corner_count = @intCast(g.corners.items.len - first_corner),
+                    // Lines' and points' quads are drawn facing either way.
+                    .cull = if (lines_points) 3 else draw.config_b0 & 7,
                     .vp_x = draw.vp_x,
                     .vp_y = draw.vp_y,
                 },
@@ -3509,9 +3625,19 @@ pub const V3d = struct {
             vertex_total += @intCast(unique.len);
         }
         if (n_draws == 0) return false;
+        // The clipped pieces' corners: after the vertices shaded on the GPU.
+        for (g.draws.items) |d| {
+            const vs = d.vertex_stage.?;
+            for (g.corners.items[vs.first_corner..][0..vs.corner_count]) |*c| {
+                if (c.* & clipped_mark != 0) c.* = vertex_total + (c.* & ~clipped_mark) - d.first_vertex;
+            }
+        }
         const draws = g.end();
-        if (metal_renderer.supported) return renderWithMetal(g, ram, frame, &.{}, draws, g.inputs.items, g.corners.items);
-        return renderWithGl(g, ram, frame.first, &frame.tiles, &.{}, draws, g.inputs.items, g.corners.items);
+        const drawn = if (metal_renderer.supported)
+            renderWithMetal(g, ram, frame, &.{}, draws, g.inputs.items, g.corners.items)
+        else
+            renderWithGl(g, ram, frame.first, &frame.tiles, g.vertices[0..n_clipped], draws, g.inputs.items, g.corners.items);
+        return drawn or rejected(.gpu_vertices_render);
     }
 
     fn renderWithGpu(self: *V3d, ram: []u8, start_bus: u32, end_bus: u32) bool {
