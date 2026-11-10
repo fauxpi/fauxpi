@@ -929,7 +929,10 @@ pub const Renderer = struct {
             gl.DepthMask(@intFromBool(d.depth_write));
             gl.Scissor(@intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0));
             const starts = r.layer_starts.items[draw_layers[i]..draw_layers[i + 1]];
-            if (starts.len >= 2) {
+            // Draws by index (in layers, or by corners) draw only those: none, if each of their
+            // triangles is culled. Only a plain list of triangles is drawn as it is.
+            if (p.shader.reads_color or d.vertex_stage != null) {
+                if (starts.len < 2) continue;
                 for (starts[0 .. starts.len - 1], starts[1..]) |lo, hi| {
                     if (hi == lo) continue;
                     // Each layer reads what those before it drew.
