@@ -3022,9 +3022,19 @@ pub const DecodedTexture = struct {
     /// Decodes level `level` into `out` (its size's words), as `sample` fetches each texel.
     pub fn decodeLevel(memory: []const u8, p0: u32, p1: u32, level: u32, out: []u32) bool {
         const c = texture.decodeConfig(p0, p1);
-        const pt = PrecomputedTex.init(levelConfig(c, c.offset, level, memory.len), memory.len) catch return false;
+        return decodeConfig(memory, levelConfig(c, c.offset, level, memory.len), out);
+    }
+
+    /// Decodes texture `cfg` into `out`: the types read a whole word, half or byte at a time
+    /// (the right way up) detiled at once, the others a texel at a time.
+    fn decodeConfig(memory: []const u8, cfg: texture.Config, out: []u32) bool {
+        const pt = PrecomputedTex.init(cfg, memory.len) catch return false;
         const w = pt.cfg.width;
         if (out.len < @as(usize, w) * pt.cfg.height) return false;
+        if (pt.fast and @as(usize, pt.base_off) + pt.len <= memory.len) {
+            texture.detileTextureToBgra(memory, cfg, out[0 .. @as(usize, w) * pt.cfg.height]);
+            return true;
+        }
         for (0..pt.cfg.height) |y| {
             for (0..w) |x| {
                 out[y * w + x] = pt.fetchAt(memory, @intCast(x), @intCast(y)) catch return false;
@@ -3035,14 +3045,7 @@ pub const DecodedTexture = struct {
 
     /// Decodes it into `out` (`width * height` words), as `sample` fetches each texel.
     pub fn decode(memory: []const u8, p0: u32, p1: u32, out: []u32) bool {
-        const pt = PrecomputedTex.init(texture.decodeConfig(p0, p1), memory.len) catch return false;
-        const w = pt.cfg.width;
-        for (0..pt.cfg.height) |y| {
-            for (0..w) |x| {
-                out[y * w + x] = pt.fetchAt(memory, @intCast(x), @intCast(y)) catch return false;
-            }
-        }
-        return true;
+        return decodeConfig(memory, texture.decodeConfig(p0, p1), out);
     }
 };
 
@@ -3497,4 +3500,29 @@ test "TMU general memory lookups read the word at each address" {
     const out = directLookup(0, addrs, &.{ .texture_memory = &mem });
     try std.testing.expectEqual(@as(u32, 0x03020100), out[0]);
     try std.testing.expectEqual(@as(u32, 0x07060504), out[1]);
+}
+
+test "textures decoded at once as texel by texel" {
+    const gpa = std.testing.allocator;
+    const mem = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(mem);
+    var prng = std.Random.DefaultPrng.init(9);
+    prng.random().bytes(mem);
+    const out = try gpa.alloc(u32, 256 * 256);
+    defer gpa.free(out);
+    for ([_]texture.Config{
+        .{ .offset = 0x40000, .type = .rgba8888, .width = 256, .height = 128 },
+        .{ .offset = 0x40000, .type = .rgbx8888, .width = 100, .height = 60 },
+        .{ .offset = 0x40000, .type = .rgb565, .width = 64, .height = 32 },
+        .{ .offset = 0x40000, .type = .luminance, .width = 80, .height = 70 },
+        .{ .offset = 0x40000, .type = .alpha, .width = 8, .height = 8 },
+        .{ .offset = 0x40000, .type = .rgba32r, .width = 33, .height = 17 },
+        .{ .offset = 0x40000, .type = .rgba8888, .width = 4, .height = 64 },
+    }) |c| {
+        try std.testing.expect(DecodedTexture.decode(mem, texture.p0(c), texture.p1(c), out));
+        const pt = try PrecomputedTex.init(c, mem.len);
+        for (0..c.height) |y| {
+            for (0..c.width) |x| try std.testing.expectEqual(try pt.fetchAt(mem, @intCast(x), @intCast(y)), out[y * c.width + x]);
+        }
+    }
 }
